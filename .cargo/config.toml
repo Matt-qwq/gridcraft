@@ -1,2 +1,18 @@
 [alias]
 xtask = "run --package xtask --"
+
+# ---------------------------------------------------------------- fast local loop
+# The quality gate (`cargo xtask ci`) is for commits, not for iteration: it runs
+# fmt + clippy on every target, the whole test suite, the asset/layer checks and a
+# wasm build (a second, separate target tree). During development use these.
+#
+#   cargo ck -p gridcraft-engine           type-check one crate, no codegen/link  (~1 s)
+#   cargo ckt -p gridcraft-ui-egui         ...including its tests and examples
+#   cargo tq -p gridcraft-engine           run that crate's unit tests, quiet     (~1 s)
+#   cargo dev --sample sales --control 7979
+#   cargo snap -- --sample sales shot.png  offscreen UI render, no window
+ck = "check --lib"
+ckt = "check --lib --tests"
+tq = "test --lib --quiet"
+dev = "run --package gridcraft --"
+snap = "run -q -p gridcraft-ui-egui --example snapshot"
