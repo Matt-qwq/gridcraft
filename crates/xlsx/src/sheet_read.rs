@@ -44,6 +44,23 @@ struct RowState {
     row_cells: Vec<(u32, Cell)>,
 }
 
+/// The read-only half of [`Ctx`] that row decoding needs: shared strings, cell formats, value
+/// metadata and the date system. Nothing here mutates, so row chunks can share one — that is what
+/// makes the parallel read below possible. Warnings are collected by the caller instead, in
+/// document order.
+pub(crate) struct DecodeCtx<'a> {
+    sst: &'a [Arc<str>],
+    xf_map: &'a [gridcraft_model::StyleId],
+    pictures: &'a [Option<Arc<gridcraft_model::CellPicture>>],
+    date_system: DateSystem,
+}
+
+impl DecodeCtx<'_> {
+    fn style(&self, xf: Option<u32>) -> gridcraft_model::StyleId {
+        xf.and_then(|i| self.xf_map.get(i as usize).copied()).unwrap_or_default()
+    }
+}
+
 const MAX_HYPERLINK_CELLS: u64 = 10_000;
 const MAX_COLUMN_ASSIGNMENTS: u64 = 1_000_000;
 
@@ -51,25 +68,18 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
     let bytes = cx.pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing part {part}")))?;
     let rels = cx.pkg.rels(part)?;
     let mut sheet = Sheet::new(name);
-    let mut st = RowState::default();
-    let res = crate::rows::parse(&bytes, &mut |item| {
-        match item {
-            crate::rows::Item::RowStart(a) => row_start(cx, &mut sheet, &mut st, &a),
-            crate::rows::Item::Cell(c) => cell(cx, &mut sheet, &mut st, &c),
-            crate::rows::Item::RowEnd => row_end(&mut sheet, &mut st),
-        }
-        Ok(())
-    });
-    let root = match res {
-        Ok(r) => r,
-        Err(e) => {
-            cx.warn(format!("sheet \"{name}\" is damaged ({e}); kept {} rows", st.rows));
-            El::default()
-        }
+    let (root, warn, rows_read, dropped) = {
+        let dc = DecodeCtx { sst: &cx.sst, xf_map: &cx.xf_map, pictures: &cx.cell_pictures, date_system: cx.date_system };
+        let default_height = sheet.default_row_height;
+        read_rows(&bytes, &dc, &mut sheet, default_height, name)
     };
-    if st.dropped > 0 {
-        cx.warn(format!("sheet \"{name}\": {} cells or rows outside the 1,048,576 × 16,384 grid were dropped", st.dropped));
+    for w in warn {
+        cx.warn(w);
     }
+    if dropped > 0 {
+        cx.warn(format!("sheet \"{name}\": {dropped} cells or rows outside the 1,048,576 × 16,384 grid were dropped"));
+    }
+    let _ = rows_read;
     drop(bytes);
 
     let mut fit_to_page = false;
@@ -354,32 +364,239 @@ fn read_cols(cx: &Ctx<'_>, e: &El, sheet: &mut Sheet, remaining: &mut u64) -> Re
     Ok(())
 }
 
-fn row_start(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &crate::rows::RowAttrs<'_>) {
-    st.rows += 1;
-    st.skip_row = false;
-    st.row_cells.clear();
+/// Reads the rows of a worksheet part into `sheet`, returning the rest of the document (views,
+/// columns, merges, tables…), the warnings in document order and the two counters.
+///
+/// A large part whose rows carry no cross-row state (no shared or array formulas) is cut at row
+/// boundaries and decoded on several threads; the rows are then applied in document order, so the
+/// model sees exactly the sequence a single pass gives it.
+fn read_rows(bytes: &[u8], dc: &DecodeCtx<'_>, sheet: &mut Sheet, default_height: f32, name: &str) -> (El, Vec<String>, u64, u64) {
+    let mut warn = Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ranges) = plan_chunks(bytes) {
+        let threads = threads();
+        let last = ranges.last().map(|r| r.1).unwrap_or(0);
+        let mut root = El::default();
+        let mut first = true;
+        let mut rows_read = 0u64;
+        let mut dropped = 0u64;
+        for wave in ranges.chunks(threads) {
+            let decoded: Vec<Chunk> = std::thread::scope(|scope| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|&(a, b)| {
+                        let wrapped = b == last && a != 0;
+                        scope.spawn(move || decode_chunk(&bytes[a..b], dc, default_height, wrapped))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join()).filter_map(Result::ok).collect()
+            });
+            for chunk in decoded {
+                rows_read += chunk.rows_read;
+                dropped += chunk.dropped;
+                warn.extend(chunk.warn);
+                if first {
+                    root = chunk.root;
+                    first = false;
+                } else {
+                    root.children.extend(chunk.root.children);
+                }
+                apply_chunk(sheet, chunk.rows);
+            }
+        }
+        return (root, warn, rows_read, dropped);
+    }
+
+    let mut st = RowState::default();
+    let mut damaged = None;
+    let root = match crate::rows::parse(bytes, crate::rows::Mode::Document, &mut |item| {
+        match item {
+            crate::rows::Item::RowStart(a) => row_start(dc, sheet, &mut st, default_height, &a),
+            crate::rows::Item::Cell(c) => cell(dc, sheet, &mut st, &c, &mut warn),
+            crate::rows::Item::RowEnd => row_end(sheet, &mut st),
+        }
+        Ok(())
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            damaged = Some(e);
+            El::default()
+        }
+    };
+    if let Some(e) = damaged {
+        warn.push(format!("sheet \"{name}\" is damaged ({e}); kept {} rows", st.rows));
+    }
+    (root, warn, st.rows, st.dropped)
+}
+
+/// One cell after decoding: either a value/formula cell, or a picture with its style (a picture
+/// cell stores no value — the picture is held beside the cells).
+struct DecodedCell {
+    at: CellRef,
+    style: gridcraft_model::StyleId,
+    cell: Option<Cell>,
+    picture: Option<Arc<gridcraft_model::CellPicture>>,
+}
+
+/// Rows decoded off one slice of the part, waiting to be applied in order.
+struct Chunk {
+    root: El,
+    rows: Vec<(u32, Option<LineInfo>, Vec<DecodedCell>)>,
+    rows_read: u64,
+    dropped: u64,
+    warn: Vec<String>,
+}
+
+/// How many threads to read rows on: the machine's parallelism, capped so a big sheet does not
+/// spawn more workers than it can keep fed.
+#[cfg(not(target_arch = "wasm32"))]
+fn threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8)
+}
+
+/// Where a part may be cut so that every piece starts at a row that carries its own `r`. `None`
+/// means "read it in one pass": too small, not UTF-8, or carrying the two kinds of formula that
+/// make rows depend on each other (shared masters and array ranges).
+#[cfg(not(target_arch = "wasm32"))]
+fn plan_chunks(bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
+    const MIN_BYTES: usize = 8 * 1024 * 1024;
+    if bytes.len() < MIN_BYTES || threads() < 2 {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    if text.contains("t=\"shared\"") || text.contains("t=\"array\"") {
+        return None;
+    }
+    let close = if text.contains("</row>") { "</row>" } else { "</x:row>" };
+    let open = if close == "</row>" { "<row " } else { "<x:row " };
+    let parts = (threads() * 3).max(2);
+    let mut cuts = Vec::with_capacity(parts + 1);
+    let mut at = 0usize;
+    for i in 1..parts {
+        let want = text.len() / parts * i;
+        if want <= at {
+            continue;
+        }
+        let tail = text.get(want..)?;
+        let rel = tail.find(close)?;
+        let end = want + rel + close.len();
+        let rest = text.get(end..)?.trim_start();
+        if !rest.starts_with(open) {
+            break;
+        }
+        let tag = rest.get(..rest.find('>')?)?;
+        if !tag.contains(" r=\"") {
+            return None;
+        }
+        let next = text.len() - rest.len();
+        if next <= at {
+            continue;
+        }
+        cuts.push(at);
+        at = next;
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    cuts.push(at);
+    cuts.push(text.len());
+    Some(cuts.windows(2).map(|w| (w[0], w[1])).collect())
+}
+
+fn decode_chunk(bytes: &[u8], dc: &DecodeCtx<'_>, default_height: f32, wrapped: bool) -> Chunk {
+    let mut chunk = Chunk { root: El::default(), rows: Vec::new(), rows_read: 0, dropped: 0, warn: Vec::new() };
+    let mut st = RowState::default();
+    let mut row: Option<(u32, Option<LineInfo>, Vec<DecodedCell>)> = None;
+    let mut next_row = 0u32;
+    let mut take = |chunk: &mut Chunk, item: crate::rows::Item<'_>| match item {
+        crate::rows::Item::RowStart(a) => {
+            chunk.rows_read += 1;
+            if let Some((r, info)) = row_fields(dc, default_height, &a, next_row) {
+                next_row = r + 1;
+                row = Some((r, (info != LineInfo::default()).then_some(info), Vec::new()));
+            } else {
+                chunk.dropped += 1;
+            }
+        }
+        crate::rows::Item::Cell(c) => {
+            if let Some((_, _, cells)) = row.as_mut()
+                && let Some(pos) = cell_pos(&mut st, &c)
+                && let Some(cell) = decode_cell(dc, &mut chunk.warn, &mut st, &c, pos)
+            {
+                cells.push(cell);
+            }
+        }
+        crate::rows::Item::RowEnd => {
+            if let Some(done) = row.take() {
+                chunk.rows.push(done);
+            }
+        }
+    };
+    let parsed = if wrapped {
+        let mut buf = Vec::with_capacity(bytes.len() + 32);
+        buf.extend_from_slice(b"<worksheet><sheetData>");
+        buf.extend_from_slice(bytes);
+        crate::rows::parse(&buf, crate::rows::Mode::Document, &mut |it| {
+            take(&mut chunk, it);
+            Ok(())
+        })
+    } else {
+        crate::rows::parse(bytes, crate::rows::Mode::Rows, &mut |it| {
+            take(&mut chunk, it);
+            Ok(())
+        })
+    };
+    if let Some(done) = row.take() {
+        chunk.rows.push(done);
+    }
+    if let Ok(root) = parsed {
+        chunk.root = root;
+    }
+    chunk.dropped += st.dropped;
+    chunk
+}
+
+fn apply_chunk(sheet: &mut Sheet, rows: Vec<(u32, Option<LineInfo>, Vec<DecodedCell>)>) {
+    for (r, info, cells) in rows {
+        if let Some(info) = info {
+            sheet.rows.insert(r, info);
+        }
+        let mut batch: Vec<(u32, Cell)> = Vec::with_capacity(cells.len());
+        for d in cells {
+            if let Some(picture) = d.picture {
+                sheet.set_picture(d.at, picture);
+                sheet.set_style(d.at, d.style);
+                continue;
+            }
+            if let Some(cell) = d.cell {
+                // The cell's own reference wins over the row it sits in.
+                if d.at.row == r {
+                    batch.push((d.at.col, cell));
+                } else {
+                    sheet.cells.set(d.at, cell);
+                }
+            }
+        }
+        sheet.set_row_cells(r, &mut batch);
+    }
+}
+
+/// The row number and line settings of a `<row>`, or `None` when it falls outside the grid.
+fn row_fields(dc: &DecodeCtx<'_>, default_height: f32, row: &crate::rows::RowAttrs<'_>, fallback: u32) -> Option<(u32, LineInfo)> {
     let r = match row.r.and_then(|v| v.trim().parse::<u32>().ok()) {
         Some(r) if r >= 1 => r - 1,
-        Some(_) => {
-            st.dropped += 1;
-            st.skip_row = true;
-            return;
-        }
-        None => st.next_row,
+        Some(_) => return None,
+        // A row without `r` continues from the row before it.
+        None => fallback,
     };
     if r >= MAX_ROWS {
-        st.dropped += 1;
-        st.skip_row = true;
-        return;
+        return None;
     }
-    st.row = r;
-    st.next_col = 0;
-    st.next_row = r + 1;
     let mut info = LineInfo::default();
     if let Some(ht) = row.ht.and_then(|v| v.trim().parse::<f64>().ok()) {
         info.custom = row.custom_height;
         // Automatic heights equal to the default are noise.
-        if info.custom || (pt_to_px(ht) - sheet.default_row_height).abs() > 0.5 {
+        if info.custom || (pt_to_px(ht) - default_height).abs() > 0.5 {
             info.size = Some(pt_to_px(ht));
         }
     }
@@ -389,38 +606,67 @@ fn row_start(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &crate
     if row.custom_format
         && let Some(s) = row.s.and_then(|v| v.trim().parse::<u32>().ok())
     {
-        info.style = Some(cx.style(Some(s)));
+        info.style = Some(dc.style(Some(s)));
     }
-    if info != LineInfo::default() {
-        sheet.rows.insert(r, info);
+    Some((r, info))
+}
+
+fn row_start(dc: &DecodeCtx<'_>, sheet: &mut Sheet, st: &mut RowState, default_height: f32, row: &crate::rows::RowAttrs<'_>) {
+    st.rows += 1;
+    st.skip_row = false;
+    st.row_cells.clear();
+    match row_fields(dc, default_height, row, st.next_row) {
+        Some((r, info)) => {
+            st.row = r;
+            st.next_col = 0;
+            st.next_row = r + 1;
+            if info != LineInfo::default() {
+                sheet.rows.insert(r, info);
+            }
+        }
+        None => {
+            st.dropped += 1;
+            st.skip_row = true;
+        }
     }
 }
 
-fn cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::rows::CellAttrs<'_>) {
+/// The position of a `<c>`, advancing the row's column cursor. `None` means it was dropped.
+fn cell_pos(st: &mut RowState, c: &crate::rows::CellAttrs<'_>) -> Option<CellRef> {
     if st.skip_row {
-        return;
+        return None;
     }
-    let r = st.row;
     let pos = match c.r {
         Some(a) => match CellRef::parse(a.trim()) {
             Some(p) => p,
             None => {
                 st.dropped += 1;
-                return;
+                return None;
             }
         },
-        None => CellRef::new(r, st.next_col),
+        None => CellRef::new(st.row, st.next_col),
     };
     if pos.col >= MAX_COLS || pos.row >= MAX_ROWS {
         st.dropped += 1;
-        return;
+        return None;
     }
     st.next_col = pos.col + 1;
-    match read_cell(cx, sheet, st, c, pos) {
+    Some(pos)
+}
+
+fn cell(dc: &DecodeCtx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::rows::CellAttrs<'_>, warn: &mut Vec<String>) {
+    let Some(pos) = cell_pos(st, c) else { return };
+    let Some(d) = decode_cell(dc, warn, st, c, pos) else { return };
+    if let Some(picture) = d.picture {
+        sheet.set_picture(d.at, picture);
+        sheet.set_style(d.at, d.style);
+        return;
+    }
+    match d.cell {
         // The cell's own reference wins over the row it sits in (a file may put a cell in a
         // different row); only the common case goes through the row batch.
-        Some((at, cell)) if at.row == r => st.row_cells.push((at.col, cell)),
-        Some((at, cell)) => sheet.cells.set(at, cell),
+        Some(cell) if d.at.row == st.row => st.row_cells.push((d.at.col, cell)),
+        Some(cell) => sheet.cells.set(d.at, cell),
         None => {}
     }
 }
@@ -432,15 +678,15 @@ fn row_end(sheet: &mut Sheet, st: &mut RowState) {
     st.row_cells.clear();
 }
 
-fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::rows::CellAttrs<'_>, pos: CellRef) -> Option<(CellRef, Cell)> {
-    let style = cx.style(c.s.and_then(|v| v.trim().parse::<u32>().ok()));
+fn decode_cell(dc: &DecodeCtx<'_>, warn: &mut Vec<String>, st: &mut RowState, c: &crate::rows::CellAttrs<'_>, pos: CellRef) -> Option<DecodedCell> {
+    let style = dc.style(c.s.and_then(|v| v.trim().parse::<u32>().ok()));
     let v = c.v;
     let value = match c.t.unwrap_or("n") {
         "s" => match v.and_then(|v| v.trim().parse::<usize>().ok()) {
-            Some(i) => match cx.sst.get(i) {
+            Some(i) => match dc.sst.get(i) {
                 Some(s) => Value::Text(s.clone()),
                 None => {
-                    cx.warn("some cells refer to missing shared strings");
+                    warn.push("some cells refer to missing shared strings".into());
                     Value::Empty
                 }
             },
@@ -452,13 +698,13 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::
         }
         "b" => v.map(|v| Value::Bool(matches!(v.trim(), "1" | "true" | "TRUE"))).unwrap_or(Value::Empty),
         "e" => v.map(|v| Value::Error(CellError::parse(v.trim()).unwrap_or(CellError::Value))).unwrap_or(Value::Empty),
-        "d" => match v.and_then(|v| parse_iso_datetime(v.trim(), cx.date_system)) {
+        "d" => match v.and_then(|v| parse_iso_datetime(v.trim(), dc.date_system)) {
             Some(n) => Value::number(n),
             None => {
                 if let Some(v) = v
                     && !v.trim().is_empty()
                 {
-                    cx.warn("some date cells could not be read");
+                    warn.push("some date cells could not be read".into());
                 }
                 Value::Empty
             }
@@ -467,7 +713,7 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::
             Some(t) => match t.parse::<f64>() {
                 Ok(n) if n.is_finite() => Value::Number(if n == 0.0 { 0.0 } else { n }),
                 _ => {
-                    cx.warn("some numeric cells could not be read");
+                    warn.push("some numeric cells could not be read".into());
                     Value::Empty
                 }
             },
@@ -478,32 +724,30 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::
         if vm == "0" {
             return None;
         }
-        let picture = vm.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|n| cx.cell_pictures.get(n)).cloned().flatten();
+        let picture = vm.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|n| dc.pictures.get(n)).cloned().flatten().clone();
         if picture.is_none() {
-            cx.warn("some cells have unsupported or missing value metadata; kept their scalar fallback (cell pictures may be missing)");
+            warn.push("some cells have unsupported or missing value metadata; kept their scalar fallback (cell pictures may be missing)".into());
         }
         picture
     });
     if let Some(picture) = picture {
         if c.f.is_some() {
-            cx.warn("formula-generated cell pictures were imported as static pictures; their formulas were not retained");
+            warn.push("formula-generated cell pictures were imported as static pictures; their formulas were not retained".into());
         }
-        sheet.set_picture(pos, picture);
-        sheet.set_style(pos, style);
-        return None;
+        return Some(DecodedCell { at: pos, style, cell: None, picture: Some(picture) });
     }
     let dynamic = c.cm;
-    let formula = c.f.as_ref().and_then(|f| read_formula(cx, st, f, pos, dynamic));
+    let formula = c.f.as_ref().and_then(|f| read_formula(warn, st, f, pos, dynamic));
     let value = if formula.is_none() && st.dynamic.iter().any(|r| r.contains(pos) && r.start != pos) { Value::Empty } else { value };
-    Some((pos, Cell { value, formula: formula.map(Arc::new), style }))
+    Some(DecodedCell { at: pos, style, cell: Some(Cell { value, formula: formula.map(Arc::new), style }), picture: None })
 }
 
-fn read_formula(cx: &mut Ctx<'_>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
+fn read_formula(warn: &mut Vec<String>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
     // Keep the file's dynamic-array mark, so saving never turns the formula into a legacy one.
-    read_formula_text(cx, st, f, pos, dynamic).map(|fm| Formula { dynamic, ..fm })
+    read_formula_text(warn, st, f, pos, dynamic).map(|fm| Formula { dynamic, ..fm })
 }
 
-fn read_formula_text(cx: &mut Ctx<'_>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
+fn read_formula_text(warn: &mut Vec<String>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
     let model = from_file(f.text.trim());
     let text = model.as_str();
     match f.kind.unwrap_or("normal") {
@@ -515,7 +759,7 @@ fn read_formula_text(cx: &mut Ctx<'_>, st: &mut RowState, f: &crate::rows::Formu
                 Some(Formula::new(text))
             } else {
                 let Some(sh) = st.shared.get(&si) else {
-                    cx.warn("a shared formula refers to a missing master cell; kept the cached value");
+                    warn.push("a shared formula refers to a missing master cell; kept the cached value".into());
                     return None;
                 };
                 Some(match &sh.expr {
@@ -543,7 +787,7 @@ fn read_formula_text(cx: &mut Ctx<'_>, st: &mut RowState, f: &crate::rows::Formu
             Some(fm)
         }
         "dataTable" => {
-            cx.warn("what-if data tables are not supported; kept their values");
+            warn.push("what-if data tables are not supported; kept their values".into());
             None
         }
         _ => {

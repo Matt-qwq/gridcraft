@@ -55,6 +55,14 @@ pub struct CellAttrs<'a> {
     pub inline: Option<&'a El>,
 }
 
+/// How a slice of the part is read: a whole document (the start of a sheet, or a tail wrapped in
+/// its own `<worksheet><sheetData>`), or a run of rows cut out of the middle of one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Document,
+    Rows,
+}
+
 /// What the walker reports, in document order.
 pub enum Item<'a> {
     RowStart(RowAttrs<'a>),
@@ -226,7 +234,7 @@ fn append_ref(out: &mut String, r: &quick_xml::events::BytesRef<'_>) {
 /// Reads a worksheet part: `cb` sees every row element and every cell of `<sheetData>`, in order.
 /// The returned tree holds everything else, so callers that want the sheet's views, columns,
 /// merges or tables find them where `parse_streaming` would have put them.
-pub fn parse(xml: &[u8], cb: &mut dyn FnMut(Item<'_>) -> Result<(), IoError>) -> Result<El, IoError> {
+pub fn parse(xml: &[u8], mode: Mode, cb: &mut dyn FnMut(Item<'_>) -> Result<(), IoError>) -> Result<El, IoError> {
     let data = xml::to_utf8(xml);
     let mut reader = Reader::from_reader(data.as_ref());
     {
@@ -242,7 +250,7 @@ pub fn parse(xml: &[u8], cb: &mut dyn FnMut(Item<'_>) -> Result<(), IoError>) ->
     let mut root: Option<El> = None;
     let mut buf = Vec::new();
     let mut b = Buffers::default();
-    let mut in_sheet_data = false;
+    let mut in_sheet_data = mode == Mode::Rows;
     let mut in_row = false;
     let mut in_v = false;
     let mut in_f = false;
