@@ -166,28 +166,70 @@ pub(crate) fn to_utf8(xml: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Borrowed(xml)
 }
 
-fn local(name: &[u8]) -> String {
+fn local_into(name: &[u8], out: &mut String) {
     let n = match name.iter().rposition(|&b| b == b':') {
         Some(i) => name.get(i + 1..).unwrap_or(name),
         None => name,
     };
-    String::from_utf8_lossy(n).into_owned()
+    out.clear();
+    match std::str::from_utf8(n) {
+        Ok(s) => out.push_str(s),
+        Err(_) => out.push_str(&String::from_utf8_lossy(n)),
+    }
 }
 
-fn start_el(e: &BytesStart<'_>) -> El {
-    let mut el = El { name: local(e.name().as_ref()), ..Default::default() };
+/// Recycled element trees. A worksheet has one element per cell, so a fresh `El` (name string,
+/// attribute vector, text string) for each of them is tens of millions of allocations; a split
+/// callback that only reads an element hands it back here and the next one reuses its memory.
+#[derive(Default)]
+struct Pool {
+    free: Vec<El>,
+}
+
+/// How many recycled elements a part parks. A row needs one per element it has (a dozen); the cap
+/// only stops a hostile part from keeping a large tree around.
+const MAX_POOL: usize = 4096;
+
+impl Pool {
+    fn take(&mut self) -> El {
+        self.free.pop().unwrap_or_default()
+    }
+    fn give(&mut self, mut el: El) {
+        for child in el.children.drain(..) {
+            self.give(child);
+        }
+        el.name.clear();
+        el.text.clear();
+        // `attrs` keeps its entries; the next element overwrites their strings in place.
+        if self.free.len() < MAX_POOL {
+            self.free.push(el);
+        }
+    }
+}
+
+fn start_el(pool: &mut Pool, e: &BytesStart<'_>) -> El {
+    let mut el = pool.take();
+    local_into(e.name().as_ref(), &mut el.name);
+    let mut n = 0;
     for a in e.attributes().with_checks(false).flatten() {
         let key = a.key.as_ref();
         // Namespace declarations carry no data for us.
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
             continue;
         }
-        let v = match a.normalized_value(XmlVersion::Explicit1_0) {
-            Ok(v) => v.into_owned(),
-            Err(_) => String::from_utf8_lossy(&a.value).into_owned(),
-        };
-        el.attrs.push((local(key), v));
+        if n == el.attrs.len() {
+            el.attrs.push((String::new(), String::new()));
+        }
+        let Some(slot) = el.attrs.get_mut(n) else { continue };
+        local_into(key, &mut slot.0);
+        slot.1.clear();
+        match a.normalized_value(XmlVersion::Explicit1_0) {
+            Ok(v) => slot.1.push_str(&v),
+            Err(_) => slot.1.push_str(&String::from_utf8_lossy(&a.value)),
+        }
+        n += 1;
     }
+    el.attrs.truncate(n);
     el
 }
 
@@ -209,7 +251,7 @@ pub fn parse(xml: &[u8]) -> Result<El, IoError> {
 
 /// Parses a part; complete elements named in `split` (below the root) are handed to `cb` and not
 /// kept in the returned tree.
-pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(El) -> Result<(), IoError>) -> Result<El, IoError> {
+pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(&mut El) -> Result<(), IoError>) -> Result<El, IoError> {
     let data = to_utf8(xml);
     let mut reader = Reader::from_reader(data.as_ref());
     {
@@ -223,12 +265,21 @@ pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(El) -> Res
     let mut stack: Vec<El> = Vec::new();
     let mut root: Option<El> = None;
     let mut buf = Vec::new();
+    let mut pool = Pool::default();
     // Attach a finished element to its parent (or emit it / make it the root).
-    fn finish(stack: &mut [El], root: &mut Option<El>, el: El, split: &[&str], cb: &mut dyn FnMut(El) -> Result<(), IoError>) -> Result<(), IoError> {
+    fn finish(
+        stack: &mut [El],
+        root: &mut Option<El>,
+        mut el: El,
+        split: &[&str],
+        cb: &mut dyn FnMut(&mut El) -> Result<(), IoError>,
+        pool: &mut Pool,
+    ) -> Result<(), IoError> {
         match stack.last_mut() {
             Some(parent) => {
                 if split.contains(&el.name.as_str()) {
-                    cb(el)?;
+                    cb(&mut el)?;
+                    pool.give(el);
                 } else {
                     parent.children.push(el);
                 }
@@ -248,15 +299,15 @@ pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(El) -> Res
                 if stack.len() >= MAX_DEPTH {
                     return Err(IoError::Xml("XML nested too deeply".into()));
                 }
-                stack.push(start_el(&e));
+                stack.push(start_el(&mut pool, &e));
             }
             Event::Empty(e) => {
-                let el = start_el(&e);
-                finish(&mut stack, &mut root, el, split, cb)?;
+                let el = start_el(&mut pool, &e);
+                finish(&mut stack, &mut root, el, split, cb, &mut pool)?;
             }
             Event::End(_) => {
                 if let Some(el) = stack.pop() {
-                    finish(&mut stack, &mut root, el, split, cb)?;
+                    finish(&mut stack, &mut root, el, split, cb, &mut pool)?;
                 }
             }
             Event::Text(t) => {
@@ -295,7 +346,7 @@ pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(El) -> Res
     }
     // Unclosed elements (truncated part): close them so we keep what we have.
     while let Some(el) = stack.pop() {
-        finish(&mut stack, &mut root, el, split, cb)?;
+        finish(&mut stack, &mut root, el, split, cb, &mut pool)?;
     }
     root.ok_or_else(|| IoError::Xml("no root element".into()))
 }

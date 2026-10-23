@@ -182,9 +182,9 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
                 let mut phonetics = Vec::new();
                 let mut dropped = 0usize;
                 let res = xml::parse_streaming(&b, &["si"], &mut |si| {
-                    let text = xml::rich_text(&si);
+                    let text = xml::rich_text(si);
                     let raw = si.kids("rPh").count();
-                    let (runs, props) = xml::phonetic_data(&si, &text);
+                    let (runs, props) = xml::phonetic_data(si, &text);
                     dropped += raw.saturating_sub(runs.len());
                     if !runs.is_empty() || props.is_some() {
                         phonetics.push(PhoneticString { text: text.clone(), runs, props });

@@ -46,7 +46,7 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
     let mut sheet = Sheet::new(name);
     let mut st = RowState::default();
     let res = xml::parse_streaming(&bytes, &["row"], &mut |row| {
-        read_row(cx, &mut sheet, &mut st, &row);
+        read_row(cx, &mut sheet, &mut st, row);
         Ok(())
     });
     let root = match res {
