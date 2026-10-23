@@ -240,6 +240,10 @@ impl Sheet {
         self.cell_pictures.remove(&c);
         self.cells.set(c, cell);
     }
+    /// Stores a whole row of cells at once (what a file reader does); see [`CellStore::set_row`].
+    pub fn set_row_cells(&mut self, row: u32, cells: &mut Vec<(u32, Cell)>) {
+        self.cells.set_row(row, cells);
+    }
     pub fn remove_cell(&mut self, c: CellRef) -> Option<Cell> {
         self.cell_pictures.remove(&c);
         self.cells.remove(c)

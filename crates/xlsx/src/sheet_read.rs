@@ -35,6 +35,8 @@ struct RowState {
     dynamic: Vec<RangeRef>,
     dropped: u64,
     rows: u64,
+    /// The cells of the row being read, handed to the store in one go and reused for the next row.
+    row_cells: Vec<(u32, Cell)>,
 }
 
 const MAX_HYPERLINK_CELLS: u64 = 10_000;
@@ -394,11 +396,18 @@ fn read_row(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &El) {
             continue;
         }
         next_col = pos.col + 1;
-        read_cell(cx, sheet, st, c, pos);
+        match read_cell(cx, sheet, st, c, pos) {
+            // The cell's own reference wins over the row it sits in (a file may put a cell in a
+            // different row); only the common case goes through the row batch.
+            Some((at, cell)) if at.row == r => st.row_cells.push((at.col, cell)),
+            Some((at, cell)) => sheet.cells.set(at, cell),
+            None => {}
+        }
     }
+    sheet.set_row_cells(r, &mut st.row_cells);
 }
 
-fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos: CellRef) {
+fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos: CellRef) -> Option<(CellRef, Cell)> {
     let style = cx.style(c.attr_u32("s"));
     let v = c.child("v").map(|v| v.text.as_str());
     let value = match c.attr("t").unwrap_or("n") {
@@ -456,12 +465,12 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
         }
         sheet.set_picture(pos, picture);
         sheet.set_style(pos, style);
-        return;
+        return None;
     }
     let dynamic = c.attr("cm").is_some();
     let formula = c.child("f").and_then(|f| read_formula(cx, st, f, pos, dynamic));
     let value = if formula.is_none() && st.dynamic.iter().any(|r| r.contains(pos) && r.start != pos) { Value::Empty } else { value };
-    sheet.cells.set(pos, Cell { value, formula: formula.map(Arc::new), style });
+    Some((pos, Cell { value, formula: formula.map(Arc::new), style }))
 }
 
 fn read_formula(cx: &mut Ctx<'_>, st: &mut RowState, f: &El, pos: CellRef, dynamic: bool) -> Option<Formula> {

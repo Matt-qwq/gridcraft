@@ -61,6 +61,37 @@ impl CellStore {
             self.len += 1;
         }
     }
+    /// Stores a whole row at once: one band lookup and one row lookup instead of one per cell,
+    /// which is how a worksheet arrives when a file is read. Whatever the row already holds (a
+    /// styled cell under a picture, say) stays; the cells given win. `cells` is drained so a
+    /// reader can hand in the same buffer for every row.
+    pub fn set_row(&mut self, row: u32, cells: &mut Vec<(u32, Cell)>) {
+        if cells.is_empty() {
+            return;
+        }
+        let key = row / BAND;
+        let (before, after) = {
+            let band = Arc::make_mut(self.bands.entry(key).or_default());
+            let map = band.rows.entry(row).or_default();
+            let before = map.len();
+            for (col, cell) in cells.drain(..) {
+                if cell.is_blank() {
+                    map.remove(&col);
+                } else {
+                    map.insert(col, cell);
+                }
+            }
+            let after = map.len();
+            if after == 0 {
+                band.rows.remove(&row);
+            }
+            (before, after)
+        };
+        self.len = self.len - before + after;
+        if after == 0 && self.bands.get(&key).is_some_and(|b| b.rows.is_empty()) {
+            self.bands.remove(&key);
+        }
+    }
     /// Puts every cell in the band its row says and recounts the length — serialized band keys
     /// and the cached count are derived state, and the ones a file carries are not trusted. Cells
     /// outside the sheet grid are dropped; returns how many (#1008).
