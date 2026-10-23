@@ -11,7 +11,7 @@ use quick_xml::events::{BytesStart, Event};
 use crate::IoError;
 
 /// Maximum element nesting accepted in any part.
-pub const MAX_DEPTH: usize = 256;
+pub(crate) const MAX_DEPTH: usize = 256;
 
 /// An element: local name (namespace prefix dropped), attributes by local name, children and
 /// its direct text content.
@@ -207,6 +207,12 @@ impl Pool {
     }
 }
 
+/// One element built without a pool: the cold path (`<sheetData>` has its own decoder).
+pub(crate) fn element(e: &BytesStart<'_>) -> El {
+    let mut pool = Pool::default();
+    start_el(&mut pool, e)
+}
+
 fn start_el(pool: &mut Pool, e: &BytesStart<'_>) -> El {
     let mut el = pool.take();
     local_into(e.name().as_ref(), &mut el.name);
@@ -233,7 +239,7 @@ fn start_el(pool: &mut Pool, e: &BytesStart<'_>) -> El {
     el
 }
 
-fn named_entity(name: &str) -> Option<char> {
+pub(crate) fn named_entity(name: &str) -> Option<char> {
     Some(match name {
         "amp" => '&',
         "lt" => '<',

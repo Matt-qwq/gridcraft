@@ -35,6 +35,11 @@ struct RowState {
     dynamic: Vec<RangeRef>,
     dropped: u64,
     rows: u64,
+    /// The row being read (0-based) and the next column when a `<c>` has no `r`.
+    row: u32,
+    next_col: u32,
+    /// The current `<row>` was outside the grid, so its cells are dropped.
+    skip_row: bool,
     /// The cells of the row being read, handed to the store in one go and reused for the next row.
     row_cells: Vec<(u32, Cell)>,
 }
@@ -47,8 +52,12 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
     let rels = cx.pkg.rels(part)?;
     let mut sheet = Sheet::new(name);
     let mut st = RowState::default();
-    let res = xml::parse_streaming(&bytes, &["row"], &mut |row| {
-        read_row(cx, &mut sheet, &mut st, row);
+    let res = crate::rows::parse(&bytes, &mut |item| {
+        match item {
+            crate::rows::Item::RowStart(a) => row_start(cx, &mut sheet, &mut st, &a),
+            crate::rows::Item::Cell(c) => cell(cx, &mut sheet, &mut st, &c),
+            crate::rows::Item::RowEnd => row_end(&mut sheet, &mut st),
+        }
         Ok(())
     });
     let root = match res {
@@ -345,72 +354,88 @@ fn read_cols(cx: &Ctx<'_>, e: &El, sheet: &mut Sheet, remaining: &mut u64) -> Re
     Ok(())
 }
 
-fn read_row(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &El) {
+fn row_start(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &crate::rows::RowAttrs<'_>) {
     st.rows += 1;
-    let r = match row.attr_u32("r") {
+    st.skip_row = false;
+    st.row_cells.clear();
+    let r = match row.r.and_then(|v| v.trim().parse::<u32>().ok()) {
         Some(r) if r >= 1 => r - 1,
         Some(_) => {
             st.dropped += 1;
+            st.skip_row = true;
             return;
         }
         None => st.next_row,
     };
     if r >= MAX_ROWS {
         st.dropped += 1;
+        st.skip_row = true;
         return;
     }
+    st.row = r;
+    st.next_col = 0;
     st.next_row = r + 1;
     let mut info = LineInfo::default();
-    if let Some(ht) = row.attr_f64("ht") {
-        info.custom = row.flag("customHeight", false);
+    if let Some(ht) = row.ht.and_then(|v| v.trim().parse::<f64>().ok()) {
+        info.custom = row.custom_height;
         // Automatic heights equal to the default are noise.
         if info.custom || (pt_to_px(ht) - sheet.default_row_height).abs() > 0.5 {
             info.size = Some(pt_to_px(ht));
         }
     }
-    info.hidden = row.flag("hidden", false);
-    info.outline = row.attr_u32("outlineLevel").unwrap_or(0).min(7) as u8;
-    info.collapsed = row.flag("collapsed", false);
-    if row.flag("customFormat", false)
-        && let Some(s) = row.attr_u32("s")
+    info.hidden = row.hidden;
+    info.outline = row.outline.and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(7) as u8;
+    info.collapsed = row.collapsed;
+    if row.custom_format
+        && let Some(s) = row.s.and_then(|v| v.trim().parse::<u32>().ok())
     {
         info.style = Some(cx.style(Some(s)));
     }
     if info != LineInfo::default() {
         sheet.rows.insert(r, info);
     }
-    let mut next_col = 0u32;
-    for c in row.kids("c") {
-        let pos = match c.attr("r") {
-            Some(a) => match CellRef::parse(a.trim()) {
-                Some(p) => p,
-                None => {
-                    st.dropped += 1;
-                    continue;
-                }
-            },
-            None => CellRef::new(r, next_col),
-        };
-        if pos.col >= MAX_COLS || pos.row >= MAX_ROWS {
-            st.dropped += 1;
-            continue;
-        }
-        next_col = pos.col + 1;
-        match read_cell(cx, sheet, st, c, pos) {
-            // The cell's own reference wins over the row it sits in (a file may put a cell in a
-            // different row); only the common case goes through the row batch.
-            Some((at, cell)) if at.row == r => st.row_cells.push((at.col, cell)),
-            Some((at, cell)) => sheet.cells.set(at, cell),
-            None => {}
-        }
-    }
-    sheet.set_row_cells(r, &mut st.row_cells);
 }
 
-fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos: CellRef) -> Option<(CellRef, Cell)> {
-    let style = cx.style(c.attr_u32("s"));
-    let v = c.child("v").map(|v| v.text.as_str());
-    let value = match c.attr("t").unwrap_or("n") {
+fn cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::rows::CellAttrs<'_>) {
+    if st.skip_row {
+        return;
+    }
+    let r = st.row;
+    let pos = match c.r {
+        Some(a) => match CellRef::parse(a.trim()) {
+            Some(p) => p,
+            None => {
+                st.dropped += 1;
+                return;
+            }
+        },
+        None => CellRef::new(r, st.next_col),
+    };
+    if pos.col >= MAX_COLS || pos.row >= MAX_ROWS {
+        st.dropped += 1;
+        return;
+    }
+    st.next_col = pos.col + 1;
+    match read_cell(cx, sheet, st, c, pos) {
+        // The cell's own reference wins over the row it sits in (a file may put a cell in a
+        // different row); only the common case goes through the row batch.
+        Some((at, cell)) if at.row == r => st.row_cells.push((at.col, cell)),
+        Some((at, cell)) => sheet.cells.set(at, cell),
+        None => {}
+    }
+}
+
+fn row_end(sheet: &mut Sheet, st: &mut RowState) {
+    if !st.skip_row {
+        sheet.set_row_cells(st.row, &mut st.row_cells);
+    }
+    st.row_cells.clear();
+}
+
+fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::rows::CellAttrs<'_>, pos: CellRef) -> Option<(CellRef, Cell)> {
+    let style = cx.style(c.s.and_then(|v| v.trim().parse::<u32>().ok()));
+    let v = c.v;
+    let value = match c.t.unwrap_or("n") {
         "s" => match v.and_then(|v| v.trim().parse::<usize>().ok()) {
             Some(i) => match cx.sst.get(i) {
                 Some(s) => Value::Text(s.clone()),
@@ -423,7 +448,7 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
         },
         "str" => v.map(|v| Value::text(xml::decode_xstring(v))).unwrap_or(Value::Empty),
         "inlineStr" => {
-            c.child("is").map(|is| Value::text(xml::rich_text(is))).or_else(|| v.map(|v| Value::text(xml::decode_xstring(v)))).unwrap_or(Value::Empty)
+            c.inline.map(|is| Value::text(xml::rich_text(is))).or_else(|| v.map(|v| Value::text(xml::decode_xstring(v)))).unwrap_or(Value::Empty)
         }
         "b" => v.map(|v| Value::Bool(matches!(v.trim(), "1" | "true" | "TRUE"))).unwrap_or(Value::Empty),
         "e" => v.map(|v| Value::Error(CellError::parse(v.trim()).unwrap_or(CellError::Value))).unwrap_or(Value::Empty),
@@ -449,7 +474,7 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
             None => Value::Empty,
         },
     };
-    let picture = c.attr("vm").and_then(|vm| {
+    let picture = c.vm.and_then(|vm| {
         if vm == "0" {
             return None;
         }
@@ -460,30 +485,30 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
         picture
     });
     if let Some(picture) = picture {
-        if c.child("f").is_some() {
+        if c.f.is_some() {
             cx.warn("formula-generated cell pictures were imported as static pictures; their formulas were not retained");
         }
         sheet.set_picture(pos, picture);
         sheet.set_style(pos, style);
         return None;
     }
-    let dynamic = c.attr("cm").is_some();
-    let formula = c.child("f").and_then(|f| read_formula(cx, st, f, pos, dynamic));
+    let dynamic = c.cm;
+    let formula = c.f.as_ref().and_then(|f| read_formula(cx, st, f, pos, dynamic));
     let value = if formula.is_none() && st.dynamic.iter().any(|r| r.contains(pos) && r.start != pos) { Value::Empty } else { value };
     Some((pos, Cell { value, formula: formula.map(Arc::new), style }))
 }
 
-fn read_formula(cx: &mut Ctx<'_>, st: &mut RowState, f: &El, pos: CellRef, dynamic: bool) -> Option<Formula> {
+fn read_formula(cx: &mut Ctx<'_>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
     // Keep the file's dynamic-array mark, so saving never turns the formula into a legacy one.
     read_formula_text(cx, st, f, pos, dynamic).map(|fm| Formula { dynamic, ..fm })
 }
 
-fn read_formula_text(cx: &mut Ctx<'_>, st: &mut RowState, f: &El, pos: CellRef, dynamic: bool) -> Option<Formula> {
+fn read_formula_text(cx: &mut Ctx<'_>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
     let model = from_file(f.text.trim());
     let text = model.as_str();
-    match f.attr("t").unwrap_or("normal") {
+    match f.kind.unwrap_or("normal") {
         "shared" => {
-            let si = f.attr_u32("si")?;
+            let si = f.si.and_then(|v| v.trim().parse::<u32>().ok())?;
             if !text.is_empty() {
                 let expr = gridcraft_formula::parse(text).ok();
                 st.shared.insert(si, Shared { anchor: pos, expr, text: text.to_string() });
@@ -508,7 +533,7 @@ fn read_formula_text(cx: &mut Ctx<'_>, st: &mut RowState, f: &El, pos: CellRef, 
                 return None;
             }
             let mut fm = Formula::new(text);
-            let range = f.attr("ref").and_then(RangeRef::parse).unwrap_or(RangeRef::cell(pos));
+            let range = f.range.and_then(RangeRef::parse).unwrap_or(RangeRef::cell(pos));
             if !range.is_single() {
                 st.dynamic.push(range);
             }
