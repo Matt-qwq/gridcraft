@@ -500,11 +500,11 @@ fn decode_rows(
                     let handles: Vec<_> = wave.iter().map(|&(a, b)| scope.spawn(move || decode_chunk(&bytes[a..b], dc, default_height))).collect();
                     handles.into_iter().map(|h| h.join()).filter_map(Result::ok).collect()
                 });
-                for chunk in decoded {
+                for mut chunk in decoded {
                     *rows_read += chunk.rows_read;
                     *dropped += chunk.dropped;
-                    warn.extend(chunk.warn);
-                    apply_chunk(sheet, chunk.rows);
+                    warn.extend(std::mem::take(&mut chunk.warn));
+                    apply_chunk(sheet, chunk);
                 }
             }
             return;
@@ -536,9 +536,14 @@ struct DecodedCell {
     picture: Option<Arc<gridcraft_model::CellPicture>>,
 }
 
-/// Rows decoded off one slice of the part, waiting to be applied in order.
+/// Rows decoded off one slice of the part: packed into bands on the thread that decoded them, with
+/// the row settings, pictures and stray cells (a `<c>` whose reference names another row) that the
+/// sheet, not the store, holds.
 struct Chunk {
-    rows: Vec<(u32, Option<LineInfo>, Vec<DecodedCell>)>,
+    bands: gridcraft_model::BandBatch,
+    rows: Vec<(u32, Option<LineInfo>)>,
+    pictures: Vec<(CellRef, Arc<gridcraft_model::CellPicture>, gridcraft_model::StyleId)>,
+    strays: Vec<(CellRef, Cell)>,
     rows_read: u64,
     dropped: u64,
     warn: Vec<String>,
@@ -651,10 +656,20 @@ fn plan_chunks(bytes: &[u8], min_bytes: usize) -> Option<Vec<(usize, usize)>> {
 }
 
 fn decode_chunk(bytes: &[u8], dc: &DecodeCtx<'_>, default_height: f32) -> Chunk {
-    let mut chunk = Chunk { rows: Vec::new(), rows_read: 0, dropped: 0, warn: Vec::new() };
+    let mut chunk = Chunk {
+        bands: gridcraft_model::BandBatch::new(),
+        rows: Vec::new(),
+        pictures: Vec::new(),
+        strays: Vec::new(),
+        rows_read: 0,
+        dropped: 0,
+        warn: Vec::new(),
+    };
     let mut st = RowState::default();
     let mut row: Option<(u32, Option<LineInfo>, Vec<DecodedCell>)> = None;
     let mut next_row = 0u32;
+    // Reused for every row: the store drains it, so one buffer serves the whole chunk.
+    let mut batch: Vec<(u32, Cell)> = Vec::new();
     let mut take = |chunk: &mut Chunk, item: crate::rows::Item<'_>| match item {
         crate::rows::Item::RowStart(a) => {
             chunk.rows_read += 1;
@@ -681,8 +696,8 @@ fn decode_chunk(bytes: &[u8], dc: &DecodeCtx<'_>, default_height: f32) -> Chunk 
             }
         }
         crate::rows::Item::RowEnd => {
-            if let Some(done) = row.take() {
-                chunk.rows.push(done);
+            if let Some((r, info, cells)) = row.take() {
+                pack_row(chunk, &mut batch, r, info, cells);
             }
         }
     };
@@ -690,8 +705,8 @@ fn decode_chunk(bytes: &[u8], dc: &DecodeCtx<'_>, default_height: f32) -> Chunk 
         take(&mut chunk, it);
         Ok(())
     });
-    if let Some(done) = row.take() {
-        chunk.rows.push(done);
+    if let Some((r, info, cells)) = row.take() {
+        pack_row(&mut chunk, &mut batch, r, info, cells);
     }
     chunk.dropped += st.dropped;
     chunk
@@ -711,71 +726,27 @@ const READ_CHUNK: usize = 1024 * 1024;
 /// unpacks to a gigabyte costs a window instead of a gigabyte. Everything outside `<sheetData>` is
 /// small and still goes through the `El` tree, exactly as the whole-buffer read does it.
 fn stream_rows(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet, default_height: f32, plan: ReadPlan) -> Result<Streamed, IoError> {
-    let Some(mut reader) = cx.pkg.open_part(part)? else {
+    // The reader borrows the package; the decode context borrows the shared strings and the
+    // formats. Two disjoint halves of `cx`, which is what lets the inflating thread take the first
+    // and this thread keep the second.
+    let Ctx { pkg, sst, xf_map, cell_pictures, date_system, .. } = cx;
+    let dc = DecodeCtx { sst, xf_map, pictures: cell_pictures, date_system: *date_system };
+    let Some(reader) = pkg.open_part(part)? else {
         return Ok(Streamed::Whole(Vec::new()));
     };
-    let dc = DecodeCtx { sst: &cx.sst, xf_map: &cx.xf_map, pictures: &cx.cell_pictures, date_system: cx.date_system };
-    let mut warn = Vec::new();
-    let mut buf = Vec::new();
-    let mut eof = !fill(&mut reader, &mut buf, 8 * 1024)?;
-    if !starts_like_utf8_xml(&buf) {
-        // A UTF-16 part, or one opening with something else: the window scan works on bytes, so
-        // read it whole and let the XML layer decide.
-        fill_to_end(&mut reader, &mut buf)?;
-        return Ok(Streamed::Whole(buf));
-    }
-    let (open_start, open_end, self_closing) = loop {
-        if let Some(span) = sheet_data_span(&buf) {
-            break span;
-        }
-        if eof {
-            fill_to_end(&mut reader, &mut buf)?;
-            return Ok(Streamed::Whole(buf));
-        }
-        eof = !fill(&mut reader, &mut buf, plan.window)?;
-    };
-    let mut root = worksheet_part(&buf[..open_start], Part::Head, &mut warn);
-    buf.drain(..open_end);
-
-    let mut st = RowState::default();
-    let mut parallel = true;
-    let mut rows_read = 0u64;
-    let mut dropped = 0u64;
-    let mut suffix: Vec<u8> = Vec::new();
-    if self_closing {
-        suffix = std::mem::take(&mut buf);
-        fill_to_end(&mut reader, &mut suffix)?;
-    } else {
-        loop {
-            if let Some((close, past)) = sheet_data_close(&buf) {
-                decode_rows(&buf[..close], &dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
-                suffix = buf.split_off(past);
-                fill_to_end(&mut reader, &mut suffix)?;
-                break;
-            }
-            if eof {
-                // A part that never closes `<sheetData>`: decode what came and stop.
-                decode_rows(&buf, &dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
-                break;
-            }
-            if buf.len() >= plan.window
-                && let Some(cut) = last_row_end(&buf)
-            {
-                decode_rows(&buf[..cut], &dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
-                buf.drain(..cut);
-            }
-            // A single row longer than a window grows the buffer rather than spinning on it.
-            let target = if buf.len() < plan.window { plan.window } else { buf.len().saturating_mul(2) };
-            eof = !fill(&mut reader, &mut buf, target)?;
-        }
-    }
-    if reader.hit_limit() {
-        warn.push(format!("sheet \"{}\": {part} was cut at the decompression limit", sheet.name));
-    }
-    let tail = worksheet_part(&suffix, Part::Tail, &mut warn);
-    root.children.extend(tail.children);
-    Ok(Streamed::Rows((root, warn, rows_read, dropped)))
+    // Compressing takes 0.55 s and decoding 1.45 s of the 614 MB sheet this was measured on, and
+    // they took turns. Inflating the next window while this one decodes takes the inflate out of
+    // the open.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Inflated>(2);
+    std::thread::scope(|scope| {
+        scope.spawn(move || inflate_windows(reader, plan.window, tx));
+        consume_windows(rx, &dc, sheet, part, default_height, plan)
+    })
 }
+
+/// One window of a part, decompressed: the bytes, whether more may follow, and whether the part
+/// stopped at the package's decompression limit rather than at its own end.
+type Inflated = Result<(Vec<u8>, bool, bool), IoError>;
 
 /// Fills `buf` to at least `target` bytes, or to the end of `input`. Returns whether more may come.
 fn fill(input: &mut impl std::io::Read, buf: &mut Vec<u8>, target: usize) -> Result<bool, IoError> {
@@ -799,9 +770,129 @@ fn fill(input: &mut impl std::io::Read, buf: &mut Vec<u8>, target: usize) -> Res
     Ok(true)
 }
 
-fn fill_to_end(input: &mut impl std::io::Read, buf: &mut Vec<u8>) -> Result<(), IoError> {
-    while fill(input, buf, buf.len() + READ_CHUNK)? {}
-    Ok(())
+/// Decompresses a part a window at a time for [`consume_windows`] to decode.
+fn inflate_windows(
+    mut reader: crate::package::PartReader<'_, Box<dyn crate::package::Source + '_>>,
+    window: usize,
+    tx: std::sync::mpsc::SyncSender<Inflated>,
+) {
+    let mut buf = Vec::new();
+    loop {
+        let more = match fill(&mut reader, &mut buf, window) {
+            Ok(more) => more,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        let cut_at_limit = reader.hit_limit();
+        let sent = tx.send(Ok((std::mem::take(&mut buf), more, cut_at_limit)));
+        if sent.is_err() || !more {
+            return;
+        }
+    }
+}
+
+/// The decode side: the same walk a whole-buffer read does, over bytes that arrive in windows.
+fn consume_windows(
+    rx: std::sync::mpsc::Receiver<Inflated>,
+    dc: &DecodeCtx<'_>,
+    sheet: &mut Sheet,
+    part: &str,
+    default_height: f32,
+    plan: ReadPlan,
+) -> Result<Streamed, IoError> {
+    let mut warn = Vec::new();
+    let mut cut_at_limit = false;
+    let mut buf = Vec::new();
+    // Pulls the next window in; the second argument says whether the part has ended.
+    let mut pull = |buf: &mut Vec<u8>, eof: &mut bool| -> Result<(), IoError> {
+        if *eof {
+            return Ok(());
+        }
+        match rx.recv() {
+            Ok(Ok((bytes, more, cut))) => {
+                cut_at_limit |= cut;
+                buf.extend_from_slice(&bytes);
+                *eof = !more;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            // The inflating thread stopped without a word: treat it as the end of the part.
+            Err(_) => {
+                *eof = true;
+                Ok(())
+            }
+        }
+    };
+    let mut eof = false;
+    while buf.len() < 8 * 1024 && !eof {
+        pull(&mut buf, &mut eof)?;
+    }
+    if !starts_like_utf8_xml(&buf) {
+        // A UTF-16 part, or one opening with something else: the window scan works on bytes, so
+        // read it whole and let the XML layer decide.
+        while !eof {
+            pull(&mut buf, &mut eof)?;
+        }
+        return Ok(Streamed::Whole(buf));
+    }
+    let (open_start, open_end, self_closing) = loop {
+        if let Some(span) = sheet_data_span(&buf) {
+            break span;
+        }
+        if eof {
+            while !eof {
+                pull(&mut buf, &mut eof)?;
+            }
+            return Ok(Streamed::Whole(buf));
+        }
+        pull(&mut buf, &mut eof)?;
+    };
+    let mut root = worksheet_part(&buf[..open_start], Part::Head, &mut warn);
+    buf.drain(..open_end);
+
+    let mut st = RowState::default();
+    let mut parallel = true;
+    let mut rows_read = 0u64;
+    let mut dropped = 0u64;
+    let mut suffix: Vec<u8> = Vec::new();
+    if self_closing {
+        suffix = std::mem::take(&mut buf);
+        while !eof {
+            pull(&mut suffix, &mut eof)?;
+        }
+    } else {
+        loop {
+            if let Some((close, past)) = sheet_data_close(&buf) {
+                decode_rows(&buf[..close], dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
+                suffix = buf.split_off(past);
+                while !eof {
+                    pull(&mut suffix, &mut eof)?;
+                }
+                break;
+            }
+            if eof {
+                // A part that never closes `<sheetData>`: decode what came and stop.
+                decode_rows(&buf, dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
+                break;
+            }
+            if buf.len() >= plan.window
+                && let Some(cut) = last_row_end(&buf)
+            {
+                decode_rows(&buf[..cut], dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
+                buf.drain(..cut);
+                continue;
+            }
+            pull(&mut buf, &mut eof)?;
+        }
+    }
+    if cut_at_limit {
+        warn.push(format!("sheet \"{}\": {part} was cut at the decompression limit", sheet.name));
+    }
+    let tail = worksheet_part(&suffix, Part::Tail, &mut warn);
+    root.children.extend(tail.children);
+    Ok(Streamed::Rows((root, warn, rows_read, dropped)))
 }
 
 /// A part that opens with `<` after an optional UTF-8 BOM and whitespace can be scanned for tags;
@@ -814,29 +905,41 @@ fn starts_like_utf8_xml(head: &[u8]) -> bool {
     }
 }
 
-fn apply_chunk(sheet: &mut Sheet, rows: Vec<(u32, Option<LineInfo>, Vec<DecodedCell>)>) {
-    for (r, info, cells) in rows {
+fn apply_chunk(sheet: &mut Sheet, chunk: Chunk) {
+    sheet.cells.insert_batch(chunk.bands);
+    for (r, info) in chunk.rows {
         if let Some(info) = info {
             sheet.rows.insert(r, info);
         }
-        let mut batch: Vec<(u32, Cell)> = Vec::with_capacity(cells.len());
-        for d in cells {
-            if let Some(picture) = d.picture {
-                sheet.set_picture(d.at, picture);
-                sheet.set_style(d.at, d.style);
-                continue;
-            }
-            if let Some(cell) = d.cell {
-                // The cell's own reference wins over the row it sits in.
-                if d.at.row == r {
-                    batch.push((d.at.col, cell));
-                } else {
-                    sheet.cells.set(d.at, cell);
-                }
+    }
+    for (at, picture, style) in chunk.pictures {
+        sheet.set_picture(at, picture);
+        sheet.set_style(at, style);
+    }
+    // A cell whose own reference names another row (a malformed file) cannot join its row's band.
+    for (at, cell) in chunk.strays {
+        sheet.cells.set(at, cell);
+    }
+}
+
+/// Packs one decoded row into the chunk's bands, keeping aside what the sheet holds itself.
+fn pack_row(chunk: &mut Chunk, batch: &mut Vec<(u32, Cell)>, r: u32, info: Option<LineInfo>, cells: Vec<DecodedCell>) {
+    chunk.rows.push((r, info));
+    for d in cells {
+        if let Some(picture) = d.picture {
+            chunk.pictures.push((d.at, picture, d.style));
+            continue;
+        }
+        if let Some(cell) = d.cell {
+            // The cell's own reference wins over the row it sits in.
+            if d.at.row == r {
+                batch.push((d.at.col, cell));
+            } else {
+                chunk.strays.push((d.at, cell));
             }
         }
-        sheet.set_row_cells(r, &mut batch);
     }
+    chunk.bands.set_row(r, batch);
 }
 
 /// The row number and line settings of a `<row>`, or `None` when it falls outside the grid.

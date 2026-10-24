@@ -46,8 +46,8 @@ pub const MAX_ENTRIES: usize = 200_000;
 /// Where a package's bytes come from: a slice already in memory, or the file itself, read a part at
 /// a time. Boxed so the two share every code path — a zip archive is generic over its reader, and
 /// threading that type parameter through the whole reader would cost a hundred signatures.
-pub trait Source: Read + Seek {}
-impl<T: Read + Seek> Source for T {}
+pub trait Source: Read + Seek + Send {}
+impl<T: Read + Seek + Send> Source for T {}
 
 pub struct Package<'a> {
     zip: zip::ZipArchive<Box<dyn Source + 'a>>,
