@@ -66,6 +66,15 @@ fn error_code(e: CellError) -> u64 {
     }
 }
 
+/// The two things a cell only rarely carries: a formula, and an array value.
+#[derive(Clone, Debug, Default)]
+struct RowExtras {
+    /// `(column, formula)`, sorted by column.
+    formulas: Vec<(u32, Arc<Formula>)>,
+    /// `(column, array value)`, sorted by column.
+    arrays: Vec<(u32, Arc<gridcraft_core::Array>)>,
+}
+
 /// One row of a band: a bitmap of the columns it touches plus one entry per stored cell.
 #[derive(Clone, Debug, Default)]
 struct Row {
@@ -74,17 +83,43 @@ struct Row {
     bits: Vec<u64>,
     kinds: Vec<u8>,
     payloads: Vec<u64>,
-    /// Index into the band's style dictionary.
+    /// Index into the band's style dictionary, one per stored cell — empty when every cell of the
+    /// row shares `one_style`, which is how most rows of a report are formatted.
     styles: Vec<u16>,
-    /// `(column, formula)`, sorted by column; empty for almost every row.
-    formulas: Vec<(u32, Arc<Formula>)>,
-    /// `(column, array value)`, sorted by column; empty for almost every row.
-    arrays: Vec<(u32, Arc<gridcraft_core::Array>)>,
+    one_style: u16,
+    /// Held out of line: a row with neither a formula nor an array pays nothing for them.
+    extras: Option<Box<RowExtras>>,
 }
 
 impl Row {
     fn is_empty(&self) -> bool {
-        self.kinds.is_empty() && self.formulas.is_empty() && self.arrays.is_empty()
+        self.kinds.is_empty() && self.extras.is_none()
+    }
+
+    /// The style of the `i`th stored cell.
+    fn style_at(&self, i: usize) -> u16 {
+        if self.styles.is_empty() { self.one_style } else { self.styles.get(i).copied().unwrap_or(self.one_style) }
+    }
+
+    fn formulas(&self) -> &[(u32, Arc<Formula>)] {
+        self.extras.as_ref().map_or(&[], |e| e.formulas.as_slice())
+    }
+
+    fn arrays(&self) -> &[(u32, Arc<gridcraft_core::Array>)] {
+        self.extras.as_ref().map_or(&[], |e| e.arrays.as_slice())
+    }
+
+    /// Gives the row one style per cell, so a cell that differs can be set.
+    fn split_styles(&mut self) {
+        if self.styles.is_empty() {
+            self.styles = vec![self.one_style; self.kinds.len()];
+        }
+    }
+
+    fn drop_unused_extras(&mut self) {
+        if self.extras.as_ref().is_some_and(|e| e.formulas.is_empty() && e.arrays.is_empty()) {
+            self.extras = None;
+        }
     }
 
     /// Number of stored cells before `bit` of `word`.
@@ -156,33 +191,46 @@ impl Row {
     }
 
     fn formula_at(&self, col: u32) -> Option<&Arc<Formula>> {
-        self.formulas.binary_search_by_key(&col, |(c, _)| *c).ok().map(|i| &self.formulas[i].1)
+        let formulas = self.formulas();
+        formulas.binary_search_by_key(&col, |(c, _)| *c).ok().map(|i| &formulas[i].1)
     }
 
     fn set_formula(&mut self, col: u32, formula: Option<&Arc<Formula>>) {
         match formula {
-            Some(f) => match self.formulas.binary_search_by_key(&col, |(c, _)| *c) {
-                Ok(i) => self.formulas[i].1 = f.clone(),
-                Err(i) => self.formulas.insert(i, (col, f.clone())),
-            },
-            None => {
-                if let Ok(i) = self.formulas.binary_search_by_key(&col, |(c, _)| *c) {
-                    self.formulas.remove(i);
+            Some(f) => {
+                let e = self.extras.get_or_insert_with(Default::default);
+                match e.formulas.binary_search_by_key(&col, |(c, _)| *c) {
+                    Ok(i) => e.formulas[i].1 = f.clone(),
+                    Err(i) => e.formulas.insert(i, (col, f.clone())),
                 }
+            }
+            None => {
+                if let Some(e) = &mut self.extras
+                    && let Ok(i) = e.formulas.binary_search_by_key(&col, |(c, _)| *c)
+                {
+                    e.formulas.remove(i);
+                }
+                self.drop_unused_extras();
             }
         }
     }
 
     fn set_array(&mut self, col: u32, array: Option<&Arc<gridcraft_core::Array>>) {
         match array {
-            Some(a) => match self.arrays.binary_search_by_key(&col, |(c, _)| *c) {
-                Ok(i) => self.arrays[i].1 = a.clone(),
-                Err(i) => self.arrays.insert(i, (col, a.clone())),
-            },
-            None => {
-                if let Ok(i) = self.arrays.binary_search_by_key(&col, |(c, _)| *c) {
-                    self.arrays.remove(i);
+            Some(a) => {
+                let e = self.extras.get_or_insert_with(Default::default);
+                match e.arrays.binary_search_by_key(&col, |(c, _)| *c) {
+                    Ok(i) => e.arrays[i].1 = a.clone(),
+                    Err(i) => e.arrays.insert(i, (col, a.clone())),
                 }
+            }
+            None => {
+                if let Some(e) = &mut self.extras
+                    && let Ok(i) = e.arrays.binary_search_by_key(&col, |(c, _)| *c)
+                {
+                    e.arrays.remove(i);
+                }
+                self.drop_unused_extras();
             }
         }
     }
@@ -190,7 +238,12 @@ impl Row {
     fn remove_at(&mut self, i: usize, col: u32) {
         self.kinds.remove(i);
         self.payloads.remove(i);
-        self.styles.remove(i);
+        if !self.styles.is_empty() {
+            let kept = self.styles.remove(i);
+            if self.styles.is_empty() {
+                self.one_style = kept;
+            }
+        }
         let slot = col - self.first;
         let word = (slot / 64) as usize;
         self.bits[word] &= !(1u64 << (slot % 64));
@@ -242,14 +295,14 @@ impl Band {
             TEXT => Value::Text(self.text(payload)),
             BOOL => Value::Bool(payload != 0),
             ERROR => Value::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value)),
-            ARRAY => match row.arrays.binary_search_by_key(&col, |(c, _)| *c) {
-                Ok(j) => Value::Array(row.arrays[j].1.clone()),
+            ARRAY => match row.arrays().binary_search_by_key(&col, |(c, _)| *c) {
+                Ok(j) => Value::Array(row.arrays()[j].1.clone()),
                 Err(_) => Value::Empty,
             },
             EMPTY => Value::Empty,
             _ => Value::Number(f64::from_bits(payload)),
         };
-        Cell { value, formula: row.formula_at(col).cloned(), style: self.style(row.styles[i]) }
+        Cell { value, formula: row.formula_at(col).cloned(), style: self.style(row.style_at(i)) }
     }
 
     /// Stores `cell` at `col`; a blank cell is removed instead. Text and style slots are resolved
@@ -283,13 +336,27 @@ impl Band {
             Some(i) => {
                 row.kinds[i] = kind;
                 row.payloads[i] = payload;
-                row.styles[i] = style;
+                if row.styles.is_empty() && style != row.one_style {
+                    row.split_styles();
+                }
+                if row.styles.is_empty() {
+                    row.one_style = style;
+                } else {
+                    row.styles[i] = style;
+                }
             }
             None if !blank => {
                 let i = row.rank_before(col);
                 row.kinds.insert(i, kind);
                 row.payloads.insert(i, payload);
-                row.styles.insert(i, style);
+                if row.styles.is_empty() && style != row.one_style {
+                    row.split_styles();
+                }
+                if row.styles.is_empty() {
+                    row.one_style = style;
+                } else {
+                    row.styles.insert(i, style);
+                }
                 let slot = col - row.first;
                 row.bits[(slot / 64) as usize] |= 1u64 << (slot % 64);
             }
@@ -336,17 +403,24 @@ impl Band {
         let mut bits = vec![0u64; words];
         let mut kinds = Vec::with_capacity(kept.len());
         let mut payloads = Vec::with_capacity(kept.len());
-        let mut styles = Vec::with_capacity(kept.len());
+        // A row whose cells share one style keeps it once: a report formats its rows, not its cells.
+        let first_style = kept[0].3;
+        let uniform = kept.iter().all(|(_, _, _, style)| *style == first_style);
+        let mut styles: Vec<u16> = if uniform { Vec::new() } else { Vec::with_capacity(kept.len()) };
         for (col, kind, payload, style) in kept {
             let slot = col - first;
             bits[(slot / 64) as usize] |= 1u64 << (slot % 64);
             kinds.push(kind);
             payloads.push(payload);
-            styles.push(style);
+            if !uniform {
+                styles.push(style);
+            }
         }
         formulas.sort_by_key(|(c, _)| *c);
         arrays.sort_by_key(|(c, _)| *c);
-        self.rows.insert(row_key, Row { first, bits, kinds, payloads, styles, formulas, arrays });
+        let extras = if formulas.is_empty() && arrays.is_empty() { None } else { Some(Box::new(RowExtras { formulas, arrays })) };
+        let row = Row { first, bits, kinds, payloads, styles, one_style: first_style, extras };
+        self.rows.insert(row_key, row);
     }
 
     fn take(&mut self, row_key: u32, col: u32) -> Option<Cell> {
@@ -388,7 +462,7 @@ fn row_same_as(a: &Band, ra: &Row, b: &Band, rb: &Row) -> bool {
         return false;
     }
     for i in 0..ra.kinds.len() {
-        if a.style(ra.styles[i]) != b.style(rb.styles[i]) {
+        if a.style(ra.style_at(i)) != b.style(rb.style_at(i)) {
             return false;
         }
         match ra.kinds[i] {
@@ -405,7 +479,7 @@ fn row_same_as(a: &Band, ra: &Row, b: &Band, rb: &Row) -> bool {
             }
         }
     }
-    let texts = |row: &Row| -> Vec<(u32, String)> { row.formulas.iter().map(|(c, f)| (*c, f.text.clone())).collect() };
+    let texts = |row: &Row| -> Vec<(u32, String)> { row.formulas().iter().map(|(c, f)| (*c, f.text.clone())).collect() };
     texts(ra) == texts(rb)
 }
 
@@ -635,7 +709,7 @@ impl CellStore {
     pub fn formulas(&self) -> impl Iterator<Item = (CellRef, &Arc<Formula>, bool)> + '_ {
         self.bands.iter().flat_map(|(bk, band)| {
             band.rows.iter().flat_map(move |(row, cells)| {
-                cells.formulas.iter().map(move |(col, f)| {
+                cells.formulas().iter().map(move |(col, f)| {
                     let has_value = cells.index_of(*col).is_some_and(|i| cells.kinds[i] != EMPTY);
                     (CellRef::new(bk * BAND + *row, *col), f, has_value)
                 })
@@ -717,12 +791,13 @@ impl CellStore {
                     let same = match (x, y) {
                         (None, None) => true,
                         (Some((xb, xr, xi)), Some((yb, yr, yi))) => {
-                            xb.style(xr.styles[xi]) == yb.style(yr.styles[yi])
+                            xb.style(xr.style_at(xi)) == yb.style(yr.style_at(yi))
                                 && xr.kinds[xi] == yr.kinds[yi]
                                 && match xr.kinds[xi] {
                                     TEXT => xb.text(xr.payloads[xi]) == yb.text(yr.payloads[yi]),
                                     ARRAY => {
-                                        let at = |row: &Row| row.arrays.binary_search_by_key(&col, |(c, _)| *c).ok().map(|k| row.arrays[k].1.clone());
+                                        let at =
+                                            |row: &Row| row.arrays().binary_search_by_key(&col, |(c, _)| *c).ok().map(|k| row.arrays()[k].1.clone());
                                         at(xr) == at(yr)
                                     }
                                     _ => xr.payloads[xi] == yr.payloads[yi],
@@ -754,13 +829,13 @@ impl CellStore {
                     + row.kinds.len()
                     + row.payloads.len() * 8
                     + row.styles.len() * 2
-                    + row.formulas.len() * (4 + std::mem::size_of::<Formula>())
-                    + row.arrays.len() * 8;
+                    + row.formulas().len() * (4 + std::mem::size_of::<Formula>())
+                    + row.arrays().len() * 8;
             }
             for t in &band.texts {
                 bytes += t.len() + std::mem::size_of::<Arc<str>>();
             }
-            for f in band.rows.values().flat_map(|r| r.formulas.iter().map(|(_, f)| f)) {
+            for f in band.rows.values().flat_map(|r| r.formulas().iter().map(|(_, f)| f)) {
                 bytes += f.text.len();
                 if let Some(expr) = &f.expr {
                     expr.walk(&mut |_| bytes += std::mem::size_of::<gridcraft_formula::Expr>());
@@ -787,7 +862,7 @@ impl CellStore {
                 out[2] += row.kinds.capacity();
                 out[3] += row.payloads.capacity() * 8;
                 out[4] += row.styles.capacity() * 2;
-                out[6] += row.formulas.capacity() * (4 + 8) + row.arrays.capacity() * (4 + 8);
+                out[6] += row.extras.as_ref().map_or(0, |e| e.formulas.capacity() * (4 + 8) + e.arrays.capacity() * (4 + 8));
             }
         }
         out
