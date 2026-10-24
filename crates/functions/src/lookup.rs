@@ -656,6 +656,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_lookup_value_matches_a_blank_cell() {
+        // A lookup for "no value" has to find the blank cell; without this, XLOOKUP over a column
+        // with gaps answers #N/A where Excel answers with the blank's row.
+        let keys = arr(vec![vec![Value::Empty], vec![tv("x")]]);
+        close(ev("MATCH", vec![av(tv("")), av(keys), n(0.0)]), 1.0);
+        let hay = arr(vec![vec![Value::Empty, tv("x")]]);
+        let out = arr(vec![vec![nv(7.0), nv(8.0)]]);
+        close(ev("XLOOKUP", vec![av(tv("")), av(hay), av(out)]), 7.0);
+        // Only the empty text matches a blank: a real value still does not.
+        assert!(matches!(ev("MATCH", vec![av(tv("x")), av(arr(vec![vec![Value::Empty]])), n(0.0)]), Value::Error(CellError::NA)));
+    }
+
+    #[test]
     fn match_fn() {
         let v = col(&[10.0, 20.0, 30.0, 40.0]);
         close(ev("MATCH", vec![n(30.0), rf(v.clone()), n(0.0)]), 3.0);

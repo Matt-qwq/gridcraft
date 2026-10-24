@@ -328,6 +328,10 @@ pub(crate) fn lookup_equal(needle: &Value, hay: &Value, wild: bool) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Error(a), Value::Error(b)) => a == b,
         (Value::Empty, Value::Empty) => true,
+        // An empty cell matches an empty text: `MATCH("", A:A, 0)`, `VLOOKUP("", …)` and
+        // `XLOOKUP("", …)` find the first blank, which is how a workbook that looks a value up and
+        // writes "" for "none" works. Excel treats a blank as "" in an exact lookup.
+        (Value::Text(t), Value::Empty) | (Value::Empty, Value::Text(t)) => t.is_empty(),
         _ => false,
     }
 }
