@@ -21,7 +21,7 @@
 //! A band that overflows the index (more than 65,535 distinct numbers in 64 rows) falls back to
 //! `NUMBER_WIDE`, which keeps the bits in the row's side table.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gridcraft_core::{CellError, CellRef, RangeRef, Value};
@@ -407,15 +407,19 @@ impl Row {
 /// The rows of one band, plus the two tables their packed cells index into.
 #[derive(Clone, Debug, Default)]
 struct Band {
-    rows: BTreeMap<u32, Row>,
+    /// `(row in band, row)`, sorted: 64 rows of ~116 bytes each, where a `BTreeMap`'s leaves sit
+    /// three quarters full and cost some forty bytes a row for the privilege.
+    rows: Vec<(u32, Row)>,
     /// The distinct numbers of this band, in the order they were seen; a `NUMBER` payload is an
     /// index into it.
     numbers: Vec<f64>,
     /// Open addressing over `numbers`: each slot holds an index plus one, zero meaning free.
     number_slots: Vec<u16>,
     texts: Vec<Arc<str>>,
-    /// Pointer of each kept text → its slot, so one shared `Arc` is stored once per band.
-    text_index: HashMap<usize, u32>,
+    /// Pointer of each kept text → its slot, sorted by pointer, so one shared `Arc` is stored once
+    /// per band. A band holds a handful of texts: a sorted vector beats a hash map's bookkeeping at
+    /// that size, which is why the number table (hundreds of entries) is a hash and this is not.
+    text_index: Vec<(usize, u32)>,
     styles: Vec<StyleId>,
 }
 
@@ -427,15 +431,52 @@ fn number_hash(bits: u64) -> usize {
 }
 
 impl Band {
+    fn row(&self, key: u32) -> Option<&Row> {
+        self.rows.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.rows[i].1)
+    }
+
+    fn row_mut(&mut self, key: u32) -> Option<&mut Row> {
+        match self.rows.binary_search_by_key(&key, |(k, _)| *k) {
+            Ok(i) => Some(&mut self.rows[i].1),
+            Err(_) => None,
+        }
+    }
+
+    /// The row's cell, adding an empty row when it isn't there yet.
+    fn row_or_insert(&mut self, key: u32) -> &mut Row {
+        match self.rows.binary_search_by_key(&key, |(k, _)| *k) {
+            Ok(i) => &mut self.rows[i].1,
+            Err(i) => {
+                self.rows.insert(i, (key, Row::default()));
+                &mut self.rows[i].1
+            }
+        }
+    }
+
+    fn remove_row(&mut self, key: u32) {
+        if let Ok(i) = self.rows.binary_search_by_key(&key, |(k, _)| *k) {
+            self.rows.remove(i);
+        }
+    }
+
+    /// Gives back what building the band over-allocated: the rows, and the number index that only
+    /// adding cells needs.
+    fn finish(&mut self) {
+        self.rows.shrink_to_fit();
+        self.drop_number_slots();
+    }
+
     fn text_slot(&mut self, s: &Arc<str>) -> Option<u16> {
         let key = Arc::as_ptr(s) as *const u8 as usize;
-        if let Some(i) = self.text_index.get(&key) {
-            return u16::try_from(*i).ok();
+        match self.text_index.binary_search_by_key(&key, |(at, _)| *at) {
+            Ok(i) => u16::try_from(self.text_index[i].1).ok(),
+            Err(at) => {
+                let slot = self.texts.len() as u32;
+                self.texts.push(s.clone());
+                self.text_index.insert(at, (key, slot));
+                u16::try_from(slot).ok()
+            }
         }
-        let i = self.texts.len() as u32;
-        self.texts.push(s.clone());
-        self.text_index.insert(key, i);
-        u16::try_from(i).ok()
     }
 
     /// The band's slot for `v`, adding it when new — `None` once the band holds more numbers than
@@ -443,7 +484,11 @@ impl Band {
     fn number_slot(&mut self, v: f64) -> Option<u16> {
         let bits = if v == 0.0 { 0f64.to_bits() } else { v.to_bits() };
         if self.number_slots.is_empty() {
-            self.number_slots = vec![0; 16];
+            if self.numbers.is_empty() {
+                self.number_slots = vec![0; 16];
+            } else {
+                self.reindex_numbers();
+            }
         }
         let mask = self.number_slots.len() - 1;
         let mut i = number_hash(bits) & mask;
@@ -469,6 +514,26 @@ impl Band {
             self.grow_numbers();
         }
         Some(index)
+    }
+
+    /// Offers the number index back to the allocator. It is only needed to find a value while
+    /// cells are being added, so a band that has been built does not keep it; an edit rebuilds it
+    /// from the numbers the band still holds.
+    fn drop_number_slots(&mut self) {
+        self.number_slots = Vec::new();
+    }
+
+    fn reindex_numbers(&mut self) {
+        let len = (self.numbers.len() * 2).max(16).next_power_of_two();
+        self.number_slots = vec![0; len];
+        let mask = len - 1;
+        for (index, v) in self.numbers.iter().enumerate() {
+            let mut i = number_hash(v.to_bits()) & mask;
+            while self.number_slots[i] != 0 {
+                i = (i + 1) & mask;
+            }
+            self.number_slots[i] = index as u16 + 1;
+        }
     }
 
     fn grow_numbers(&mut self) {
@@ -552,7 +617,7 @@ impl Band {
             _ => None,
         };
         let formula = cell.formula.clone();
-        let row = self.rows.entry(row_key).or_default();
+        let row = self.row_or_insert(row_key);
         row.cover(col);
         let existing = row.index_of(col);
         row.set_formula(col, if blank { None } else { formula.as_ref() });
@@ -579,7 +644,7 @@ impl Band {
             None => {}
         }
         if row.is_empty() {
-            self.rows.remove(&row_key);
+            self.remove_row(row_key);
         }
     }
 
@@ -604,7 +669,7 @@ impl Band {
             kept.push((col, kind, payload, style));
         }
         if kept.is_empty() {
-            self.rows.remove(&row_key);
+            self.remove_row(row_key);
             return;
         }
         let first = kept[0].0 / 64 * 64;
@@ -635,18 +700,21 @@ impl Band {
         kinds.compact();
         styles.compact();
         let row = Row { first, bits, kinds, payloads, styles, extras };
-        self.rows.insert(row_key, row);
+        match self.rows.binary_search_by_key(&row_key, |(k, _)| *k) {
+            Ok(i) => self.rows[i].1 = row,
+            Err(i) => self.rows.insert(i, (row_key, row)),
+        }
     }
 
     fn take(&mut self, row_key: u32, col: u32) -> Option<Cell> {
-        let i = self.rows.get(&row_key)?.index_of(col)?;
-        let cell = self.cell_at(self.rows.get(&row_key)?, i, col);
-        let row = self.rows.get_mut(&row_key)?;
+        let i = self.row(row_key)?.index_of(col)?;
+        let cell = self.cell_at(self.row(row_key)?, i, col);
+        let row = self.row_mut(row_key)?;
         row.set_formula(col, None);
         row.set_array(col, None);
         row.remove_at(i, col);
         if row.is_empty() {
-            self.rows.remove(&row_key);
+            self.remove_row(row_key);
         }
         Some(cell)
     }
@@ -655,8 +723,8 @@ impl Band {
     /// from different reads index different tables.
     fn same_as(&self, other: &Band) -> bool {
         self.rows.len() == other.rows.len()
-            && self.rows.keys().eq(other.rows.keys())
-            && self.rows.iter().all(|(k, a)| other.rows.get(k).is_some_and(|b| row_same_as(self, a, other, b)))
+            && self.rows.iter().map(|(k, _)| k).eq(other.rows.iter().map(|(k, _)| k))
+            && self.rows.iter().all(|(k, a)| other.row(*k).is_some_and(|b| row_same_as(self, a, other, b)))
     }
 }
 
@@ -697,10 +765,22 @@ fn row_same_as(a: &Band, ra: &Row, b: &Band, rb: &Row) -> bool {
 }
 
 /// A `CellStore`'s packed bands, plus the count of stored cells.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct CellStore {
     bands: BTreeMap<u32, Arc<Band>>,
     len: usize,
+    /// The band cells were last added to. Cells arrive band by band as a file is read, so the band
+    /// before it is complete and can stop carrying its number index. Not part of what a store is:
+    /// two stores holding the same cells are equal whatever this says.
+    building: Option<u32>,
+}
+
+impl Clone for CellStore {
+    /// A copy shares the bands; where the next cell would go is not part of what a store is, so the
+    /// copy starts afresh and the first row it takes settles it.
+    fn clone(&self) -> Self {
+        CellStore { bands: self.bands.clone(), len: self.len, building: None }
+    }
 }
 
 impl PartialEq for CellStore {
@@ -773,14 +853,14 @@ impl CellStore {
     /// bump, not a string copy.
     pub fn get(&self, c: CellRef) -> Option<Cell> {
         let band = self.bands.get(&(c.row / BAND))?;
-        let row = band.rows.get(&(c.row % BAND))?;
+        let row = band.row(c.row % BAND)?;
         let i = row.index_of(c.col)?;
         Some(band.cell_at(row, i, c.col))
     }
 
     /// True when the position holds a cell at all (a stored style counts).
     pub fn contains(&self, c: CellRef) -> bool {
-        self.bands.get(&(c.row / BAND)).and_then(|b| b.rows.get(&(c.row % BAND))).and_then(|r| r.index_of(c.col)).is_some()
+        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND)).and_then(|r| r.index_of(c.col)).is_some()
     }
 
     /// Stores a cell; a default (empty, unstyled) cell is removed instead.
@@ -816,19 +896,28 @@ impl CellStore {
         });
         let key = row / BAND;
         let band_row = row % BAND;
+        if self.building != Some(key) {
+            // The band this replaces is finished; give back its index, if nobody shares it.
+            if let Some(done) = self.building.replace(key)
+                && let Some(band) = self.bands.get_mut(&done)
+                && let Some(band) = Arc::get_mut(band)
+            {
+                band.finish();
+            }
+        }
         let band = Arc::make_mut(self.bands.entry(key).or_default());
         // A row that isn't there yet — every row while a file opens — is built in one go: the
         // arrays are sized once from the cells instead of grown cell by cell.
-        if band.rows.get(&band_row).is_none_or(Row::is_empty) {
-            let before = band.rows.get(&band_row).map_or(0, |r| r.kinds.len());
+        if band.row(band_row).is_none_or(Row::is_empty) {
+            let before = band.row(band_row).map_or(0, |r| r.kinds.len());
             band.put_row(band_row, cells);
-            let after = band.rows.get(&band_row).map_or(0, |r| r.kinds.len());
+            let after = band.row(band_row).map_or(0, |r| r.kinds.len());
             self.len = self.len + after - before;
         } else {
             for (col, cell) in cells.drain(..) {
-                let had = band.rows.get(&band_row).is_some_and(|r| r.index_of(col).is_some());
+                let had = band.row(band_row).is_some_and(|r| r.index_of(col).is_some());
                 band.put(band_row, col, cell);
-                let has = band.rows.get(&band_row).is_some_and(|r| r.index_of(col).is_some());
+                let has = band.row(band_row).is_some_and(|r| r.index_of(col).is_some());
                 match (had, has) {
                     (false, true) => self.len += 1,
                     (true, false) => self.len -= 1,
@@ -890,7 +979,7 @@ impl CellStore {
     }
 
     pub fn row(&self, row: u32, c0: u32, c1: u32) -> impl Iterator<Item = (u32, Cell)> + '_ {
-        let packed = self.bands.get(&(row / BAND)).and_then(|b| b.rows.get(&(row % BAND)).map(|cells| packed_row(b, row, cells, c0, c1)));
+        let packed = self.bands.get(&(row / BAND)).and_then(|b| b.row(row % BAND).map(|cells| packed_row(b, row, cells, c0, c1)));
         packed.into_iter().flatten().map(|(at, cell)| (at.col, cell))
     }
 
@@ -932,7 +1021,7 @@ impl CellStore {
 
     /// A stored cell with a value or a formula (a style alone does not count).
     pub fn has(&self, c: CellRef) -> bool {
-        self.bands.get(&(c.row / BAND)).and_then(|b| b.rows.get(&(c.row % BAND))).is_some_and(|row| row_has_value(row, c.col))
+        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND)).is_some_and(|row| row_has_value(row, c.col))
     }
 
     /// Last row (inclusive, capped at `cap`) of the maximal run of contiguous rows at or after
@@ -945,7 +1034,8 @@ impl CellStore {
             let Some(band) = self.bands.get(&band_key) else { break };
             let mut advanced = false;
             let start = expect % BAND;
-            for (in_band, row) in band.rows.range(start..) {
+            let first = band.rows.partition_point(|(k, _)| *k < start);
+            for (in_band, row) in &band.rows[first..] {
                 let at = band_key * BAND + *in_band;
                 if at != expect || at > cap {
                     break;
@@ -980,15 +1070,15 @@ impl CellStore {
             let band = k * BAND;
             let mut rows: Vec<u32> = Vec::new();
             if let Some(a) = a {
-                rows.extend(a.rows.keys().copied());
+                rows.extend(a.rows.iter().map(|(k, _)| *k));
             }
             if let Some(b) = b {
-                rows.extend(b.rows.keys().copied());
+                rows.extend(b.rows.iter().map(|(k, _)| *k));
             }
             rows.sort_unstable();
             rows.dedup();
             for row in rows {
-                let (ra, rb) = (a.and_then(|x| x.rows.get(&row)), b.and_then(|x| x.rows.get(&row)));
+                let (ra, rb) = (a.and_then(|x| x.row(row)), b.and_then(|x| x.row(row)));
                 let mut cols: Vec<u32> = Vec::new();
                 if let (Some(a), Some(ra)) = (a, ra) {
                     cols.extend(packed_row(a, band + row, ra, 0, u32::MAX).map(|(c, _)| c.col));
@@ -1028,7 +1118,7 @@ impl CellStore {
                 continue;
             }
             bytes += std::mem::size_of::<Band>();
-            for row in band.rows.values() {
+            for (_, row) in &band.rows {
                 bytes += std::mem::size_of::<Row>()
                     + row.bits.len() * 8
                     + row.kinds.runs.len() * 4
@@ -1041,7 +1131,7 @@ impl CellStore {
             for t in &band.texts {
                 bytes += t.len() + std::mem::size_of::<Arc<str>>();
             }
-            for f in band.rows.values().flat_map(|r| r.formulas().iter().map(|(_, f)| f)) {
+            for f in band.rows.iter().flat_map(|(_, r)| r.formulas().iter().map(|(_, f)| f)) {
                 bytes += f.text.len();
                 if let Some(expr) = &f.expr {
                     expr.walk(&mut |_| bytes += std::mem::size_of::<gridcraft_formula::Expr>());
@@ -1059,12 +1149,12 @@ impl CellStore {
         let mut out = [0usize; 8];
         for band in self.bands.values() {
             out[7] += size_of::<Band>() + band.texts.capacity() * size_of::<Arc<str>>() + band.styles.capacity() * size_of::<StyleId>();
-            out[7] += band.text_index.capacity() * (size_of::<usize>() + size_of::<u32>() + 1);
+            out[7] += band.text_index.capacity() * size_of::<(usize, u32)>();
             out[7] += band.numbers.capacity() * size_of::<f64>() + band.number_slots.capacity() * size_of::<u16>();
             out[6] += band.styles.capacity() * size_of::<StyleId>();
             out[5] += band.texts.capacity() * size_of::<Arc<str>>();
-            out[0] += band.rows.len() * size_of::<(u32, Row)>();
-            for row in band.rows.values() {
+            out[0] += band.rows.capacity() * size_of::<(u32, Row)>();
+            for (_, row) in &band.rows {
                 out[1] += row.bits.capacity() * 8;
                 out[2] += row.kinds.runs.capacity() * 4;
                 out[3] += row.payloads.capacity() * 2;
@@ -1332,7 +1422,7 @@ mod tests {
         assert_eq!(s.len(), 128_000);
         // The band really did overflow: some cells index the number table, the rest are wide.
         let band = s.bands.get(&0).expect("band");
-        let kinds: Vec<u8> = band.rows.values().flat_map(|row| (0..row.kinds.len()).map(|i| row.kind_at(i))).collect();
+        let kinds: Vec<u8> = band.rows.iter().flat_map(|(_, row)| (0..row.kinds.len()).map(|i| row.kind_at(i))).collect();
         assert_eq!(kinds.iter().filter(|k| **k == NUMBER).count(), 65_535, "cells the table could hold");
         assert_eq!(kinds.iter().filter(|k| **k == NUMBER_WIDE).count(), 128_000 - 65_535, "cells that fell back");
         for row in 0..64u32 {
