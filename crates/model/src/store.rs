@@ -309,6 +309,29 @@ impl Row {
         (w & (1u64 << bit) != 0).then(|| self.rank(word, bit))
     }
 
+    /// The column of the `i`th stored cell.
+    fn col_at(&self, i: usize) -> u32 {
+        let mut seen = 0usize;
+        for (word, bits) in self.bits.iter().enumerate() {
+            let count = bits.count_ones() as usize;
+            if seen + count <= i {
+                seen += count;
+                continue;
+            }
+            let mut left = i - seen;
+            let mut w = *bits;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                if left == 0 {
+                    return self.first + word as u32 * 64 + bit;
+                }
+                left -= 1;
+                w &= w - 1;
+            }
+        }
+        self.first
+    }
+
     fn columns(&self) -> u32 {
         self.bits.len() as u32 * 64
     }
@@ -764,6 +787,51 @@ fn row_same_as(a: &Band, ra: &Row, b: &Band, rb: &Row) -> bool {
     texts(ra) == texts(rb)
 }
 
+/// Bands built away from the store, by a reader decoding rows on several threads. The step that
+/// packs rows — interning their numbers and texts, then the four arrays of a row — is most of what
+/// reading costs (1.7 s of a 2.3 s decode on a 21M-cell sheet), and it cannot be shared out unless
+/// the bands are built beside the store and spliced in afterwards.
+#[derive(Debug, Default)]
+pub struct BandBatch {
+    bands: BTreeMap<u32, Band>,
+}
+
+impl BandBatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bands.is_empty()
+    }
+
+    /// Stores a whole row, exactly as [`CellStore::set_row`] would; `cells` is drained.
+    pub fn set_row(&mut self, row: u32, cells: &mut Vec<(u32, Cell)>) {
+        if cells.is_empty() {
+            return;
+        }
+        cells.sort_unstable_by_key(|(c, _)| *c);
+        cells.dedup_by(|a, b| {
+            a.0 == b.0 && {
+                b.1 = a.1.clone();
+                true
+            }
+        });
+        let band_row = row % BAND;
+        let band = self.bands.entry(row / BAND).or_default();
+        if band.row(band_row).is_none_or(Row::is_empty) {
+            band.put_row(band_row, cells);
+        } else {
+            for (col, cell) in cells.drain(..) {
+                band.put(band_row, col, cell);
+            }
+        }
+        if band.rows.is_empty() {
+            self.bands.remove(&(row / BAND));
+        }
+    }
+}
+
 /// A `CellStore`'s packed bands, plus the count of stored cells.
 #[derive(Debug, Default)]
 pub struct CellStore {
@@ -877,6 +945,47 @@ impl CellStore {
         }
         if self.bands.get(&key).is_some_and(|b| b.rows.is_empty()) {
             self.bands.remove(&key);
+        }
+    }
+
+    /// Adds bands a [`BandBatch`] built off this thread. Whole bands are moved, not cells: packing
+    /// a row needs its band's tables, so a reader that decodes rows on several threads builds them
+    /// there and hands them over here. A band the store already holds is replaced.
+    pub fn insert_batch(&mut self, batch: BandBatch) {
+        let count = |band: &Band| band.rows.iter().map(|(_, row)| row.kinds.len()).sum::<usize>();
+        for (key, mut band) in batch.bands {
+            // A batch is complete: give back what building it over-allocated.
+            band.finish();
+            let Some(existing) = self.bands.get_mut(&key) else {
+                self.len += count(&band);
+                self.bands.insert(key, Arc::new(band));
+                continue;
+            };
+            // A band both sides hold: a chunk boundary fell inside it, since chunks are cut at row
+            // boundaries and a band is 64 rows. The batch's rows point into its own number and text
+            // tables, so they are rebuilt here rather than moved.
+            let rows = std::mem::take(&mut band.rows);
+            let target = Arc::make_mut(existing);
+            for (row_key, row) in rows {
+                let before = target.row(row_key).map_or(0, |r| r.kinds.len());
+                let mut cells: Vec<(u32, Cell)> = (0..row.kinds.len())
+                    .map(|i| {
+                        let col = row.col_at(i);
+                        (col, band.cell_at(&row, i, col))
+                    })
+                    .collect();
+                if before == 0 && target.row(row_key).is_none_or(Row::is_empty) {
+                    target.put_row(row_key, &mut cells);
+                } else {
+                    for (col, cell) in cells {
+                        target.put(row_key, col, cell);
+                    }
+                }
+                self.len += target.row(row_key).map_or(0, |r| r.kinds.len()) - before;
+            }
+        }
+        if self.building.is_none() {
+            self.building = self.bands.keys().next_back().copied();
         }
     }
 
