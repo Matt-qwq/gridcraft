@@ -118,6 +118,41 @@ fn decrypt_message(name: &str, e: gridcraft_xlsx::DecryptError) -> String {
     }
 }
 
+/// Opens a workbook straight from a file, when its parts can be decompressed on demand instead of
+/// the whole file arriving as one buffer. `Ok(None)` means this file has to be read whole: an
+/// encrypted workbook (the decryption wants every byte), an old binary, ODS or XLSB package (their
+/// readers take bytes) or anything that is not a package at all.
+pub fn open_from_path(name: &str, path: &str, password: Option<&str>) -> Result<Option<(Workbook, Vec<String>)>> {
+    if password.is_some() || !matches!(FileKind::from_path(name), Some(FileKind::Xlsx)) {
+        return Ok(None);
+    }
+    script_sandbox_check(path)?;
+    let mut file = std::fs::File::open(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut head = [0u8; 4];
+    let read = std::io::Read::read(&mut file, &mut head).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if !head[..read].starts_with(b"PK") {
+        return Ok(None);
+    }
+    let size = file.metadata().map_err(|e| EngineError::Other(format!("{path}: {e}")))?.len();
+    if size > 2 * 1024 * 1024 * 1024 {
+        return Err(EngineError::Other("files larger than 2 GB aren't supported".into()));
+    }
+    let (mut wb, report) = match gridcraft_xlsx::read_xlsx_file(std::path::Path::new(path)) {
+        Ok(read) => read,
+        // A size complaint is the answer, not a reason to load the file to hear it again.
+        Err(e @ gridcraft_xlsx::IoError::TooLarge(_)) => {
+            return Err(EngineError::Other(format!(
+                "We can't open '{name}': {e} (a guard against damaged or malicious files). For a file you trust,                  raise the limit with the GRIDCRAFT_MAX_PART_MB and GRIDCRAFT_MAX_TOTAL_MB environment variables."
+            )));
+        }
+        // Some other package named `.xlsx` — an OpenDocument or XLSB file, say: let the reader that
+        // knows those formats have the bytes.
+        Err(_) => return Ok(None),
+    };
+    fit_imported_rows(&mut wb);
+    Ok(Some((wb, report.warnings)))
+}
+
 /// Parses bytes that aren't encrypted.
 fn open_plain(name: &str, bytes: &[u8], csv_as_text: bool) -> Result<(Workbook, Vec<String>)> {
     let kind = FileKind::from_path(name);

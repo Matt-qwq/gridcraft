@@ -185,3 +185,30 @@ fn an_inline_string_across_a_window_boundary_keeps_its_text() {
     let text = sheet.cells.get(at).and_then(|c| c.value.as_text().map(str::to_string)).unwrap_or_default();
     assert_eq!(text.len(), 1200, "inline string text");
 }
+
+/// Reading from a file must give the same workbook as reading from its bytes — the zip directory is
+/// the same but the parts arrive through a file the reader seeks in.
+#[test]
+fn reading_a_file_matches_reading_its_bytes() {
+    let body = r#"<cols><col min="2" max="2" width="30"/></cols><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1"><v>1.5</v></c></row><row r="2"><c r="A2"><f>A1</f><v>2</v></c></row></sheetData><mergeCells><mergeCell ref="A1:B2"/></mergeCells>"#;
+    let strings = "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"1\" uniqueCount=\"1\"><si><t>text</t></si></sst>";
+    let rels = r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>"#;
+    let bytes = minimal(body, &[("xl/sharedStrings.xml", strings)], rels, "");
+    let (from_bytes, bytes_report) = crate::read_xlsx(&bytes).expect("read bytes");
+
+    let dir = std::env::temp_dir().join(format!("gridcraft-file-read-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("fixture.xlsx");
+    std::fs::write(&path, &bytes).expect("write fixture");
+    let (from_file, report) = crate::read_xlsx_file(&path).expect("read file");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(report.warnings, bytes_report.warnings, "warnings");
+    assert_eq!(from_file.sheets.len(), from_bytes.sheets.len(), "sheets");
+    for (a, b) in from_file.sheets.iter().zip(&from_bytes.sheets) {
+        assert_eq!(a.name, b.name, "sheet name");
+        assert_eq!(a.cells, b.cells, "cells");
+        assert_eq!(a.merges, b.merges, "merges");
+        assert_eq!(a.cols, b.cols, "columns");
+    }
+}

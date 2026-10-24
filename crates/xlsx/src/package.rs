@@ -2,7 +2,7 @@
 //! resolution; writing a zip package deterministically.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Write};
+use std::io::{BufReader, Cursor, Read, Seek, Write};
 
 use crate::IoError;
 use crate::xml::{self, El};
@@ -43,8 +43,14 @@ fn limits() -> (u64, u64) {
 /// Most entries accepted in the zip directory.
 pub const MAX_ENTRIES: usize = 200_000;
 
+/// Where a package's bytes come from: a slice already in memory, or the file itself, read a part at
+/// a time. Boxed so the two share every code path — a zip archive is generic over its reader, and
+/// threading that type parameter through the whole reader would cost a hundred signatures.
+pub trait Source: Read + Seek {}
+impl<T: Read + Seek> Source for T {}
+
 pub struct Package<'a> {
-    zip: zip::ZipArchive<Cursor<&'a [u8]>>,
+    zip: zip::ZipArchive<Box<dyn Source + 'a>>,
     /// Lower-case normalized part name → zip index.
     names: HashMap<String, usize>,
     total: u64,
@@ -98,7 +104,19 @@ pub fn normalize(name: &str) -> String {
 
 impl<'a> Package<'a> {
     pub fn open(bytes: &'a [u8]) -> Result<Package<'a>, IoError> {
-        let zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| IoError::Zip(e.to_string()))?;
+        Self::from_source(Box::new(Cursor::new(bytes)))
+    }
+
+    /// Reads the directory of a zip file and decompresses parts as they are asked for, so a
+    /// workbook whose parts are mostly unread — a 1.3 GB report of which 49 MB is looked at —
+    /// costs the parts it reads and not the size of the file.
+    pub fn open_file(file: std::fs::File) -> Result<Package<'a>, IoError> {
+        let source: Box<dyn Source + 'static> = Box::new(BufReader::with_capacity(64 * 1024, file));
+        Self::from_source(source)
+    }
+
+    fn from_source(source: Box<dyn Source + 'a>) -> Result<Package<'a>, IoError> {
+        let zip = zip::ZipArchive::new(source).map_err(|e| IoError::Zip(e.to_string()))?;
         if zip.len() > MAX_ENTRIES {
             return Err(IoError::TooLarge(format!("{} zip entries", zip.len())));
         }
@@ -130,7 +148,7 @@ impl<'a> Package<'a> {
     /// Opens a part for streaming: the decompressor itself, with the same limits `read` enforces.
     /// The caller reads the part in windows and never holds more than a window of it, which is how
     /// a sheet that unpacks to a gigabyte is read without a gigabyte of buffer.
-    pub fn open_part(&mut self, part: &str) -> Result<Option<PartReader<'_, Cursor<&'a [u8]>>>, IoError> {
+    pub fn open_part(&mut self, part: &str) -> Result<Option<PartReader<'_, Box<dyn Source + 'a>>>, IoError> {
         let (max_part, max_total) = limits();
         let Some(&idx) = self.names.get(&normalize(part)) else {
             return Ok(None);

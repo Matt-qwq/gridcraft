@@ -103,7 +103,16 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
 /// [`read_xlsx`] with the row-reading plan spelled out: tests use it to read one fixture whole, in
 /// chunks and streamed, and to hold the three against each other.
 pub(crate) fn read_xlsx_with(bytes: &[u8], plan: crate::sheet_read::ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
-    let pkg = Package::open(bytes)?;
+    read_package(Package::open(bytes)?, plan)
+}
+
+/// [`read_xlsx`] from a file, decompressing parts as they are needed instead of holding the file.
+pub fn read_xlsx_file(path: &std::path::Path) -> Result<(Workbook, ReadReport), IoError> {
+    let file = std::fs::File::open(path).map_err(|e| IoError::Format(format!("{}: {e}", path.display())))?;
+    read_package(Package::open_file(file)?, crate::sheet_read::ReadPlan::default())
+}
+
+fn read_package(pkg: Package<'_>, plan: crate::sheet_read::ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
     let mut cx = Ctx {
         pkg,
         report: ReadReport::default(),

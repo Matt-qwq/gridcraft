@@ -42,6 +42,9 @@ fn new_workbook(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn open(s: &mut Session, p: &Json) -> Result<Json> {
+    // A workbook read straight from its file never comes back as bytes: a package of a gigabyte
+    // whose sheets are small then costs the parts it reads instead of a gigabyte of buffer.
+    let mut from_file: Option<(Workbook, Vec<String>)> = None;
     let (name, bytes) = if let Some(b) = str_param(p, "base64") {
         (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
     } else if let Some(path) = str_param(p, "path") {
@@ -50,13 +53,22 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
             s.set_active(i);
             return Ok(json!({"index": i, "alreadyOpen": true}));
         }
-        (path.to_string(), crate::io::read_file(path)?)
+        match crate::io::open_from_path(path, path, str_param(p, "password"))? {
+            Some((wb, warnings)) => {
+                from_file = Some((wb, warnings));
+                (path.to_string(), Vec::new())
+            }
+            None => (path.to_string(), crate::io::read_file(path)?),
+        }
     } else {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
-    let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
-    let (mut wb, warnings) = crate::io::open_bytes_with(&name, &bytes, str_param(p, "password"), bool_param(p, "csvAsText").unwrap_or(false))?;
+    let encrypted = from_file.is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
+    let (mut wb, warnings) = match from_file {
+        Some((wb, warnings)) => (wb, warnings),
+        None => crate::io::open_bytes_with(&name, &bytes, str_param(p, "password"), bool_param(p, "csvAsText").unwrap_or(false))?,
+    };
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
     // What `CELL("filename")` reports (#1489). A workbook opened from bytes knows its name but
     // never a folder, so it reports `[name]Sheet` with none; an import reports the file it came
