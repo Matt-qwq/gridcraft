@@ -55,14 +55,6 @@ pub struct CellAttrs<'a> {
     pub inline: Option<&'a El>,
 }
 
-/// How a slice of the part is read: a whole document (the start of a sheet, or a tail wrapped in
-/// its own `<worksheet><sheetData>`), or a run of rows cut out of the middle of one.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Document,
-    Rows,
-}
-
 /// What the walker reports, in document order.
 pub enum Item<'a> {
     RowStart(RowAttrs<'a>),
@@ -231,10 +223,11 @@ fn append_ref(out: &mut String, r: &quick_xml::events::BytesRef<'_>) {
     }
 }
 
-/// Reads a worksheet part: `cb` sees every row element and every cell of `<sheetData>`, in order.
-/// The returned tree holds everything else, so callers that want the sheet's views, columns,
-/// merges or tables find them where `parse_streaming` would have put them.
-pub fn parse(xml: &[u8], mode: Mode, cb: &mut dyn FnMut(Item<'_>) -> Result<(), IoError>) -> Result<El, IoError> {
+/// Reads a worksheet's rows: `cb` sees every `<row>` and every cell of the rows region, in order,
+/// plus the `<is>` inline strings it needs. Nothing outside the rows is kept — the caller parses
+/// the rest of the worksheet (views, columns, merges…) on its own, which is what lets a sheet be
+/// read in windows.
+pub fn parse(xml: &[u8], cb: &mut dyn FnMut(Item<'_>) -> Result<(), IoError>) -> Result<(), IoError> {
     let data = xml::to_utf8(xml);
     let mut reader = Reader::from_reader(data.as_ref());
     {
@@ -246,114 +239,78 @@ pub fn parse(xml: &[u8], mode: Mode, cb: &mut dyn FnMut(Item<'_>) -> Result<(), 
         cfg.trim_text_end = false;
     }
 
+    // Only `<is>` subtrees build elements, so this stack stays small.
     let mut stack: Vec<El> = Vec::new();
-    let mut root: Option<El> = None;
     let mut buf = Vec::new();
     let mut b = Buffers::default();
-    let mut in_sheet_data = mode == Mode::Rows;
     let mut in_row = false;
     let mut in_v = false;
     let mut in_f = false;
     // `<is>` nesting depth inside a cell (0 = not in one).
     let mut in_is = 0usize;
 
-    // Attach a finished element to its parent (or make it the root).
-    fn finish(stack: &mut [El], root: &mut Option<El>, el: El) {
-        match stack.last_mut() {
-            Some(parent) => parent.children.push(el),
-            None => {
-                if root.is_none() {
-                    *root = Some(el);
-                }
-            }
-        }
-    }
-
-    loop {
-        let ev = reader.read_event_into(&mut buf);
-        let ev = match ev {
-            Ok(e) => e,
-            Err(e) => {
-                if in_sheet_data {
-                    break; // a damaged sheet keeps the rows read so far
-                }
-                return Err(IoError::Xml(format!("{e} at byte {}", reader.buffer_position())));
-            }
-        };
+    // A damaged sheet ends the loop and keeps the rows read so far.
+    while let Ok(ev) = reader.read_event_into(&mut buf) {
         match ev {
             Event::Start(e) => {
                 let qname = e.name();
                 let name = local(qname.as_ref());
                 if in_is > 0 {
+                    if stack.len() >= xml::MAX_DEPTH {
+                        return Err(IoError::Xml("XML nested too deeply".into()));
+                    }
                     in_is += 1;
                     stack.push(xml::element(&e));
                     continue;
                 }
-                if in_sheet_data {
-                    match name {
-                        b"row" => {
-                            in_row = true;
-                            let attrs = row_attrs(&mut b, &e);
-                            cb(Item::RowStart(attrs))?;
-                        }
-                        b"c" => b.start_cell(&e),
-                        b"v" => {
-                            in_v = true;
-                            b.cell_has_v = true;
-                        }
-                        b"f" => {
-                            in_f = true;
-                            b.start_formula(&e);
-                        }
-                        b"is" => {
-                            in_is = 1;
-                            stack.push(xml::element(&e));
-                        }
-                        _ => {}
+                match name {
+                    b"row" => {
+                        in_row = true;
+                        let attrs = row_attrs(&mut b, &e);
+                        cb(Item::RowStart(attrs))?;
                     }
-                    continue;
+                    b"c" => b.start_cell(&e),
+                    b"v" => {
+                        in_v = true;
+                        b.cell_has_v = true;
+                    }
+                    b"f" => {
+                        in_f = true;
+                        b.start_formula(&e);
+                    }
+                    b"is" => {
+                        in_is = 1;
+                        stack.push(xml::element(&e));
+                    }
+                    _ => {}
                 }
-                if name == b"sheetData" {
-                    in_sheet_data = true;
-                    continue;
-                }
-                if stack.len() >= xml::MAX_DEPTH {
-                    return Err(IoError::Xml("XML nested too deeply".into()));
-                }
-                stack.push(xml::element(&e));
             }
             Event::Empty(e) => {
                 let qname = e.name();
                 let name = local(qname.as_ref());
                 if in_is > 0 {
                     let el = xml::element(&e);
-                    finish(&mut stack, &mut root, el);
-                    continue;
-                }
-                if in_sheet_data {
-                    match name {
-                        b"row" => {
-                            let attrs = row_attrs(&mut b, &e);
-                            cb(Item::RowStart(attrs))?;
-                            cb(Item::RowEnd)?;
-                        }
-                        b"c" => {
-                            b.start_cell(&e);
-                            cb(Item::Cell(b.cell_attrs()))?;
-                            b.inline = None;
-                        }
-                        b"f" => b.start_formula(&e),
-                        b"v" => b.cell_has_v = true,
-                        b"is" => b.inline = Some(El::default()),
-                        _ => {}
+                    if let Some(parent) = stack.last_mut() {
+                        parent.children.push(el);
                     }
                     continue;
                 }
-                if name == b"sheetData" {
-                    continue;
+                match name {
+                    b"row" => {
+                        let attrs = row_attrs(&mut b, &e);
+                        cb(Item::RowStart(attrs))?;
+                        cb(Item::RowEnd)?;
+                    }
+                    b"c" => {
+                        b.start_cell(&e);
+                        cb(Item::Cell(b.cell_attrs()))?;
+                        b.inline = None;
+                    }
+                    b"f" => b.start_formula(&e),
+                    b"v" => b.cell_has_v = true,
+                    b"is" => b.inline = Some(El::default()),
+                    _ => {}
                 }
-                let el = xml::element(&e);
-                finish(&mut stack, &mut root, el);
             }
             Event::End(e) => {
                 let qname = e.name();
@@ -363,34 +320,24 @@ pub fn parse(xml: &[u8], mode: Mode, cb: &mut dyn FnMut(Item<'_>) -> Result<(), 
                     if let Some(el) = stack.pop() {
                         if in_is == 0 {
                             b.inline = Some(el);
-                        } else {
-                            finish(&mut stack, &mut root, el);
+                        } else if let Some(parent) = stack.last_mut() {
+                            parent.children.push(el);
                         }
                     }
                     continue;
                 }
-                if name == b"sheetData" {
-                    in_sheet_data = false;
-                    continue;
-                }
-                if in_sheet_data {
-                    match name {
-                        b"v" => in_v = false,
-                        b"f" => in_f = false,
-                        b"c" => {
-                            cb(Item::Cell(b.cell_attrs()))?;
-                            b.inline = None;
-                        }
-                        b"row" => {
-                            in_row = false;
-                            cb(Item::RowEnd)?;
-                        }
-                        _ => {}
+                match name {
+                    b"v" => in_v = false,
+                    b"f" => in_f = false,
+                    b"c" => {
+                        cb(Item::Cell(b.cell_attrs()))?;
+                        b.inline = None;
                     }
-                    continue;
-                }
-                if let Some(el) = stack.pop() {
-                    finish(&mut stack, &mut root, el);
+                    b"row" => {
+                        in_row = false;
+                        cb(Item::RowEnd)?;
+                    }
+                    _ => {}
                 }
             }
             Event::Text(t) => {
@@ -429,8 +376,5 @@ pub fn parse(xml: &[u8], mode: Mode, cb: &mut dyn FnMut(Item<'_>) -> Result<(), 
     if in_row {
         cb(Item::RowEnd)?;
     }
-    while let Some(el) = stack.pop() {
-        finish(&mut stack, &mut root, el);
-    }
-    Ok(root.unwrap_or_default())
+    Ok(())
 }

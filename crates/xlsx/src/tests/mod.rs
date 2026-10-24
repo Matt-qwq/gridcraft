@@ -25,6 +25,7 @@ mod shared_media;
 mod shared_ranges;
 mod sheet_names;
 mod smooth_roundtrip;
+mod streaming;
 mod trendline_roundtrip;
 mod xls_tests;
 mod xlsb_tests;

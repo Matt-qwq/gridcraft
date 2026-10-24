@@ -97,6 +97,12 @@ pub fn find_rel<'r>(rels: &'r [Rel], kind: &str) -> Option<&'r Rel> {
 }
 
 pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
+    read_xlsx_with(bytes, crate::sheet_read::ReadPlan::default())
+}
+
+/// [`read_xlsx`] with the row-reading plan spelled out: tests use it to read one fixture whole, in
+/// chunks and streamed, and to hold the three against each other.
+pub(crate) fn read_xlsx_with(bytes: &[u8], plan: crate::sheet_read::ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
     let pkg = Package::open(bytes)?;
     let mut cx = Ctx {
         pkg,
@@ -272,7 +278,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
             continue;
         }
         let name = unique_name(&wb, &name, i);
-        let mut sheet = match crate::sheet_read::read_sheet(&mut cx, &rel.target, &name) {
+        let mut sheet = match crate::sheet_read::read_sheet_with(&mut cx, &rel.target, &name, plan) {
             Ok(s) => s,
             Err(IoError::TooLarge(m)) => return Err(IoError::TooLarge(m)),
             Err(e) => {

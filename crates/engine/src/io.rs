@@ -193,7 +193,7 @@ fn open_plain(name: &str, bytes: &[u8], csv_as_text: bool) -> Result<(Workbook, 
 /// per part, so smaller sheets fit; the shared strings are one part for every sheet, so only a
 /// CSV, which has no parts, helps there.
 fn part_too_large_message(name: &str, part: &str, size: u64) -> String {
-    let limit = gridcraft_xlsx::MAX_PART >> 20;
+    let limit = gridcraft_xlsx::max_part() >> 20;
     let mb = size >> 20;
     let size = if mb > limit { format!("{mb} MB") } else { format!("more than {limit} MB") };
     let remedy = if part.contains("worksheets/") {
@@ -203,7 +203,7 @@ fn part_too_large_message(name: &str, part: &str, size: u64) -> String {
     };
     format!(
         "We can't open '{name}': its part {part} unpacks to {size}, over GridCraft's limit of {limit} MB for one part \
-         (a guard against damaged or malicious files). {remedy}"
+         (a guard against damaged or malicious files). {remedy} For a file you trust, raise the limit with the GRIDCRAFT_MAX_PART_MB environment variable."
     )
 }
 

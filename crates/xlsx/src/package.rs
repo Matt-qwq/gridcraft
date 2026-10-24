@@ -11,6 +11,35 @@ use crate::xml::{self, El};
 pub const MAX_PART: u64 = 512 * 1024 * 1024;
 /// Largest total decompressed size read from one package.
 pub const MAX_TOTAL: u64 = 1024 * 1024 * 1024;
+
+/// The limits the reading in this process actually uses.
+///
+/// They are the defaults above unless `GRIDCRAFT_MAX_PART_MB` / `GRIDCRAFT_MAX_TOTAL_MB` say
+/// otherwise: real reports and data exports do exceed 512 MB in one sheet, and someone opening
+/// their own file is not the threat these caps are about. The defaults stay hostile-input safe;
+/// an override is clamped so a typo cannot ask for terabytes.
+pub fn max_part() -> u64 {
+    limits().0
+}
+
+fn limits() -> (u64, u64) {
+    const CEILING: u64 = 16 * 1024; // 16 GB, far above any real workbook
+    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let mb = |name: &str, default: u64| -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .map(|v| v.min(CEILING))
+                .map(|v| v * 1024 * 1024)
+                .unwrap_or(default)
+        };
+        let part = mb("GRIDCRAFT_MAX_PART_MB", MAX_PART);
+        let total = mb("GRIDCRAFT_MAX_TOTAL_MB", MAX_TOTAL).max(part);
+        (part, total)
+    })
+}
 /// Most entries accepted in the zip directory.
 pub const MAX_ENTRIES: usize = 200_000;
 
@@ -19,6 +48,36 @@ pub struct Package<'a> {
     /// Lower-case normalized part name → zip index.
     names: HashMap<String, usize>,
     total: u64,
+}
+
+/// A part being decompressed as it is read. Stops at the package's remaining budget, so a part
+/// that lies about its size still cannot expand past the limit `read` applies.
+pub struct PartReader<'z, R: Read> {
+    inner: zip::read::ZipFile<'z, R>,
+    left: u64,
+    eof: bool,
+}
+
+impl<R: Read> PartReader<'_, R> {
+    /// True when the part stopped at the limit rather than at its own end.
+    pub fn hit_limit(&self) -> bool {
+        self.left == 0 && !self.eof
+    }
+}
+
+impl<R: Read> Read for PartReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let take = buf.len().min(self.left as usize);
+        let n = self.inner.read(&mut buf[..take])?;
+        if n == 0 {
+            self.eof = true;
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
 }
 
 /// A relationship.
@@ -58,12 +117,43 @@ impl<'a> Package<'a> {
 
     /// Reads a part's bytes; `Ok(None)` when it doesn't exist.
     pub fn read(&mut self, part: &str) -> Result<Option<Vec<u8>>, IoError> {
-        self.read_limited(part, MAX_PART)
+        self.read_limited(part, limits().0)
+    }
+
+    /// Everything `read` would check about a part, without reading it: its decompressed size as the
+    /// zip directory declares it. `None` when the part is missing.
+    pub fn declared_size(&mut self, part: &str) -> Option<u64> {
+        let idx = *self.names.get(&normalize(part))?;
+        self.zip.by_index(idx).ok().map(|f| f.size())
+    }
+
+    /// Opens a part for streaming: the decompressor itself, with the same limits `read` enforces.
+    /// The caller reads the part in windows and never holds more than a window of it, which is how
+    /// a sheet that unpacks to a gigabyte is read without a gigabyte of buffer.
+    pub fn open_part(&mut self, part: &str) -> Result<Option<PartReader<'_, Cursor<&'a [u8]>>>, IoError> {
+        let (max_part, max_total) = limits();
+        let Some(&idx) = self.names.get(&normalize(part)) else {
+            return Ok(None);
+        };
+        let used = self.total;
+        let f = self.zip.by_index(idx).map_err(|e| IoError::Zip(format!("{part}: {e}")))?;
+        let size = f.size();
+        if size > max_part {
+            return Err(IoError::TooLarge(format!("{part} expands to {size} bytes")));
+        }
+        let remaining = max_total.saturating_sub(used);
+        if size > remaining {
+            return Err(IoError::TooLarge(format!("package expands to more than {} MB", max_total / (1024 * 1024))));
+        }
+        self.total = used.saturating_add(size);
+        // The directory's size is only a claim: a part that lies still cannot expand past the limit.
+        Ok(Some(PartReader { inner: f, left: remaining, eof: false }))
     }
 
     /// Reads a small metadata part without allowing it to expand to the general part limit.
     pub fn read_limited(&mut self, part: &str, maximum: u64) -> Result<Option<Vec<u8>>, IoError> {
-        let maximum = maximum.min(MAX_PART);
+        let (max_part, max_total) = limits();
+        let maximum = maximum.min(max_part);
         let Some(&idx) = self.names.get(&normalize(part)) else {
             return Ok(None);
         };
@@ -71,13 +161,17 @@ impl<'a> Package<'a> {
         if f.size() > maximum {
             return Err(IoError::TooLarge(format!("{part} expands to {} bytes", f.size())));
         }
-        let remaining = MAX_TOTAL.saturating_sub(self.total);
+        let remaining = max_total.saturating_sub(self.total);
         let limit = maximum.min(remaining);
-        let mut out = Vec::with_capacity(f.size().min(16 * 1024 * 1024) as usize);
+        // Allocate what the directory says the part unpacks to. Growing a 600 MB part from a 16 MB
+        // start doubles half a dozen times, and the last step holds the old and the new buffer at
+        // once: 1.5 GB of peak for a 600 MB part. `f.size()` is checked against the limit above, so
+        // this can never ask for more than the guard allows.
+        let mut out = Vec::with_capacity(f.size().min(limit) as usize);
         (&mut f).take(limit + 1).read_to_end(&mut out).map_err(|e| IoError::Zip(format!("{part}: {e}")))?;
         if out.len() as u64 > limit {
             return Err(IoError::TooLarge(if remaining < maximum {
-                "package expands to more than 1 GB".into()
+                format!("package expands to more than {} MB", max_total / (1024 * 1024))
             } else {
                 format!("{part} expands to more than {maximum} bytes")
             }));
@@ -125,7 +219,7 @@ pub fn oversized_part(bytes: &[u8]) -> Option<(String, u64)> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
     (0..zip.len().min(MAX_ENTRIES)).find_map(|i| {
         let f = zip.by_index_raw(i).ok()?;
-        (f.size() > MAX_PART).then(|| (f.name().to_string(), f.size()))
+        (f.size() > limits().0).then(|| (f.name().to_string(), f.size()))
     })
 }
 

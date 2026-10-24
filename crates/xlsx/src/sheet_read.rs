@@ -64,14 +64,45 @@ impl DecodeCtx<'_> {
 const MAX_HYPERLINK_CELLS: u64 = 10_000;
 const MAX_COLUMN_ASSIGNMENTS: u64 = 1_000_000;
 
-pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoError> {
-    let bytes = cx.pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing part {part}")))?;
+/// How a worksheet part is read. Parts at least `stream_min` bytes long are decompressed as they
+/// are decoded, window by window, so the buffer never grows to the size of the part; smaller ones
+/// are read whole, which is faster when the whole part fits in a window anyway.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadPlan {
+    /// Parts at least this big are decompressed as they are decoded.
+    pub stream_min: u64,
+    /// Bytes of rows held in memory at a time while streaming.
+    pub window: usize,
+    /// Rows region at least this long may be cut into parallel chunks. Tests lower it so a small
+    /// fixture exercises the chunked path.
+    pub chunk_min: usize,
+}
+
+impl Default for ReadPlan {
+    fn default() -> Self {
+        // One window is big enough to keep the parallel row decode busy and small enough that a
+        // sheet unpacks through memory instead of into it.
+        ReadPlan { stream_min: 64 * 1024 * 1024, window: 24 * 1024 * 1024, chunk_min: 8 * 1024 * 1024 }
+    }
+}
+
+pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: ReadPlan) -> Result<Sheet, IoError> {
     let rels = cx.pkg.rels(part)?;
     let mut sheet = Sheet::new(name);
-    let (root, warn, rows_read, dropped) = {
-        let dc = DecodeCtx { sst: &cx.sst, xf_map: &cx.xf_map, pictures: &cx.cell_pictures, date_system: cx.date_system };
-        let default_height = sheet.default_row_height;
-        read_rows(&bytes, &dc, &mut sheet, default_height, name)
+    let default_height = sheet.default_row_height;
+    // A big worksheet is decompressed and decoded window by window; a small one is read whole,
+    // which the chunked row decode then splits on its own.
+    let streamed = if cx.pkg.declared_size(part).is_some_and(|size| size >= plan.stream_min) {
+        stream_rows(cx, part, &mut sheet, default_height, plan)?
+    } else {
+        Streamed::Whole(cx.pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing part {part}")))?)
+    };
+    let (root, warn, rows_read, dropped) = match streamed {
+        Streamed::Rows(r) => r,
+        Streamed::Whole(bytes) => {
+            let dc = DecodeCtx { sst: &cx.sst, xf_map: &cx.xf_map, pictures: &cx.cell_pictures, date_system: cx.date_system };
+            read_rows(&bytes, &dc, &mut sheet, default_height, name, plan)
+        }
     };
     for w in warn {
         cx.warn(w);
@@ -80,7 +111,6 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
         cx.warn(format!("sheet \"{name}\": {dropped} cells or rows outside the 1,048,576 × 16,384 grid were dropped"));
     }
     let _ = rows_read;
-    drop(bytes);
 
     let mut fit_to_page = false;
     let mut column_assignments_left = MAX_COLUMN_ASSIGNMENTS;
@@ -367,66 +397,134 @@ fn read_cols(cx: &Ctx<'_>, e: &El, sheet: &mut Sheet, remaining: &mut u64) -> Re
 /// Reads the rows of a worksheet part into `sheet`, returning the rest of the document (views,
 /// columns, merges, tables…), the warnings in document order and the two counters.
 ///
-/// A large part whose rows carry no cross-row state (no shared or array formulas) is cut at row
-/// boundaries and decoded on several threads; the rows are then applied in document order, so the
-/// model sees exactly the sequence a single pass gives it.
-fn read_rows(bytes: &[u8], dc: &DecodeCtx<'_>, sheet: &mut Sheet, default_height: f32, name: &str) -> (El, Vec<String>, u64, u64) {
+/// The part is split at `<sheetData>`: what comes before it and after it is a small document of its
+/// own and goes through the `El` tree, while the rows in between are decoded straight from the XML
+/// events. A rows region whose rows carry no cross-row state (no shared or array formulas) is cut
+/// at row boundaries and decoded on several threads; the rows are then applied in document order,
+/// so the model sees exactly the sequence a single pass gives it.
+fn read_rows(bytes: &[u8], dc: &DecodeCtx<'_>, sheet: &mut Sheet, default_height: f32, name: &str, plan: ReadPlan) -> (El, Vec<String>, u64, u64) {
     let mut warn = Vec::new();
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(ranges) = plan_chunks(bytes) {
-        let threads = threads();
-        let last = ranges.last().map(|r| r.1).unwrap_or(0);
-        let mut root = El::default();
-        let mut first = true;
-        let mut rows_read = 0u64;
-        let mut dropped = 0u64;
-        for wave in ranges.chunks(threads) {
-            let decoded: Vec<Chunk> = std::thread::scope(|scope| {
-                let handles: Vec<_> = wave
-                    .iter()
-                    .map(|&(a, b)| {
-                        let wrapped = b == last && a != 0;
-                        scope.spawn(move || decode_chunk(&bytes[a..b], dc, default_height, wrapped))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join()).filter_map(Result::ok).collect()
-            });
-            for chunk in decoded {
-                rows_read += chunk.rows_read;
-                dropped += chunk.dropped;
-                warn.extend(chunk.warn);
-                if first {
-                    root = chunk.root;
-                    first = false;
-                } else {
-                    root.children.extend(chunk.root.children);
-                }
-                apply_chunk(sheet, chunk.rows);
+    let Some((open_start, open_end, self_closing)) = sheet_data_span(bytes) else {
+        // No `<sheetData>` at all: read the part as the document it is.
+        return match xml::parse(bytes) {
+            Ok(root) => (root, warn, 0, 0),
+            Err(e) => {
+                warn.push(format!("sheet \"{name}\" is damaged ({e})"));
+                (El::default(), warn, 0, 0)
             }
-        }
-        return (root, warn, rows_read, dropped);
-    }
-
-    let mut st = RowState::default();
-    let mut damaged = None;
-    let root = match crate::rows::parse(bytes, crate::rows::Mode::Document, &mut |item| {
-        match item {
-            crate::rows::Item::RowStart(a) => row_start(dc, sheet, &mut st, default_height, &a),
-            crate::rows::Item::Cell(c) => cell(dc, sheet, &mut st, &c, &mut warn),
-            crate::rows::Item::RowEnd => row_end(sheet, &mut st),
-        }
-        Ok(())
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            damaged = Some(e);
-            El::default()
+        };
+    };
+    let mut root = worksheet_part(&bytes[..open_start], Part::Head, &mut warn);
+    let (rows, suffix) = if self_closing {
+        (&bytes[open_end..open_end], &bytes[open_end..])
+    } else {
+        match sheet_data_close(&bytes[open_end..]) {
+            Some((close, past)) => (&bytes[open_end..open_end + close], &bytes[open_end + past..]),
+            // A damaged part that never closes `<sheetData>`: read the rest as rows.
+            None => (&bytes[open_end..], &bytes[bytes.len()..]),
         }
     };
-    if let Some(e) = damaged {
-        warn.push(format!("sheet \"{name}\" is damaged ({e}); kept {} rows", st.rows));
+    let mut st = RowState::default();
+    let mut parallel = true;
+    let mut rows_read = 0u64;
+    let mut dropped = 0u64;
+    decode_rows(rows, dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
+    let tail = worksheet_part(suffix, Part::Tail, &mut warn);
+    root.children.extend(tail.children);
+    (root, warn, rows_read, dropped)
+}
+
+/// Which end of `<sheetData>` a fragment of a worksheet part comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Head,
+    Tail,
+}
+
+/// Parses the small document around `<sheetData>` (the sheet's views, columns, merges, page setup…)
+/// by closing it into the fragment it is. A damaged fragment costs those elements, not the rows.
+fn worksheet_part(fragment: &[u8], part: Part, warn: &mut Vec<String>) -> El {
+    let mut doc = Vec::with_capacity(fragment.len() + 24);
+    if part == Part::Tail {
+        let end = trim_end_len(fragment);
+        doc.extend_from_slice(b"<worksheet>");
+        doc.extend_from_slice(&fragment[..end]);
+        if !doc.ends_with(b"</worksheet>") {
+            doc.extend_from_slice(b"</worksheet>");
+        }
+    } else {
+        doc.extend_from_slice(fragment);
+        doc.extend_from_slice(b"</worksheet>");
     }
-    (root, warn, st.rows, st.dropped)
+    match xml::parse(&doc) {
+        Ok(el) => el,
+        Err(e) => {
+            warn.push(format!("the sheet's settings are damaged ({e}); kept its rows"));
+            El::default()
+        }
+    }
+}
+
+fn trim_end_len(bytes: &[u8]) -> usize {
+    bytes.len() - bytes.iter().rev().take_while(|b| b.is_ascii_whitespace()).count()
+}
+
+/// Decodes the complete rows in `bytes` into `sheet`: on several threads when the rows can be cut
+/// apart, otherwise in one pass whose [`RowState`] carries over from the previous window (a shared
+/// formula's master may sit in an earlier window).
+#[allow(clippy::too_many_arguments)]
+fn decode_rows(
+    bytes: &[u8],
+    dc: &DecodeCtx<'_>,
+    sheet: &mut Sheet,
+    default_height: f32,
+    st: &mut RowState,
+    parallel: &mut bool,
+    warn: &mut Vec<String>,
+    rows_read: &mut u64,
+    dropped: &mut u64,
+    plan: ReadPlan,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if *parallel {
+        if has_cross_row_formulas(bytes) {
+            // Shared and array formulas tie rows together, so from here on the rows are decoded by
+            // one pass that carries its state — the same rule a whole-part read follows.
+            *parallel = false;
+        } else if let Some(ranges) = plan_chunks(bytes, plan.chunk_min) {
+            for wave in ranges.chunks(threads()) {
+                let decoded: Vec<Chunk> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = wave.iter().map(|&(a, b)| scope.spawn(move || decode_chunk(&bytes[a..b], dc, default_height))).collect();
+                    handles.into_iter().map(|h| h.join()).filter_map(Result::ok).collect()
+                });
+                for chunk in decoded {
+                    *rows_read += chunk.rows_read;
+                    *dropped += chunk.dropped;
+                    warn.extend(chunk.warn);
+                    apply_chunk(sheet, chunk.rows);
+                }
+            }
+            return;
+        }
+    }
+    let rows_before = st.rows;
+    let dropped_before = st.dropped;
+    let parsed = crate::rows::parse(bytes, &mut |item| {
+        match item {
+            crate::rows::Item::RowStart(a) => row_start(dc, sheet, st, default_height, &a),
+            crate::rows::Item::Cell(c) => cell(dc, sheet, st, &c, warn),
+            crate::rows::Item::RowEnd => row_end(sheet, st),
+        }
+        Ok(())
+    });
+    if let Err(e) = parsed {
+        warn.push(format!("the sheet's rows are damaged ({e}); kept {} rows", st.rows));
+    }
+    *rows_read += st.rows - rows_before;
+    *dropped += st.dropped - dropped_before;
 }
 
 /// One cell after decoding: either a value/formula cell, or a picture with its style (a picture
@@ -440,7 +538,6 @@ struct DecodedCell {
 
 /// Rows decoded off one slice of the part, waiting to be applied in order.
 struct Chunk {
-    root: El,
     rows: Vec<(u32, Option<LineInfo>, Vec<DecodedCell>)>,
     rows_read: u64,
     dropped: u64,
@@ -454,41 +551,91 @@ fn threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8)
 }
 
+/// True when the rows depend on each other: a shared formula's uses need its master, and an array
+/// range's cached values are only read at the anchor.
+fn has_cross_row_formulas(bytes: &[u8]) -> bool {
+    find(bytes, b"t=\"shared\"").is_some() || find(bytes, b"t=\"array\"").is_some()
+}
+
+/// Where `<sheetData>` opens: the offset of `<`, the offset just past its `>`, and whether the tag
+/// closes itself (a sheet with no rows). `None` when the part has no `<sheetData>`.
+fn sheet_data_span(bytes: &[u8]) -> Option<(usize, usize, bool)> {
+    for tag in [&b"<sheetData"[..], &b"<x:sheetData"[..]] {
+        if let Some(start) = find(bytes, tag)
+            && let Some(len) = bytes[start..].iter().position(|b| *b == b'>')
+        {
+            let end = start + len + 1;
+            let self_closing = bytes[..end].iter().rev().skip(1).find(|b| !b.is_ascii_whitespace()) == Some(&b'/');
+            return Some((start, end, self_closing));
+        }
+    }
+    None
+}
+
+/// Where the `</sheetData>` that closes the rows starts and ends, if the slice holds it.
+fn sheet_data_close(bytes: &[u8]) -> Option<(usize, usize)> {
+    let a = find(bytes, b"</sheetData>").map(|p| (p, p + 12));
+    let b = find(bytes, b"</x:sheetData>").map(|p| (p, p + 14));
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Offset just past the last complete `</row>` in the slice, so the rest can wait for more bytes.
+fn last_row_end(bytes: &[u8]) -> Option<usize> {
+    let a = rfind(bytes, b"</row>").map(|p| p + 6);
+    let b = rfind(bytes, b"</x:row>").map(|p| p + 8);
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// First offset of `needle` in `haystack` (SIMD search: these scans run over every byte of every
+/// window, so a hand-written loop is the wrong tool).
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    memchr::memmem::find(haystack, needle)
+}
+
+/// Last offset of `needle` in `haystack`.
+fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    memchr::memmem::rfind(haystack, needle)
+}
+
 /// Where a part may be cut so that every piece starts at a row that carries its own `r`. `None`
 /// means "read it in one pass": too small, not UTF-8, or carrying the two kinds of formula that
 /// make rows depend on each other (shared masters and array ranges).
 #[cfg(not(target_arch = "wasm32"))]
-fn plan_chunks(bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
-    const MIN_BYTES: usize = 8 * 1024 * 1024;
-    if bytes.len() < MIN_BYTES || threads() < 2 {
+fn plan_chunks(bytes: &[u8], min_bytes: usize) -> Option<Vec<(usize, usize)>> {
+    if bytes.len() < min_bytes || threads() < 2 {
         return None;
     }
-    let text = std::str::from_utf8(bytes).ok()?;
-    if text.contains("t=\"shared\"") || text.contains("t=\"array\"") {
-        return None;
-    }
-    let close = if text.contains("</row>") { "</row>" } else { "</x:row>" };
-    let open = if close == "</row>" { "<row " } else { "<x:row " };
-    let parts = (threads() * 3).max(2);
+    // The caller has already established that no row depends on another.
+    let close: &[u8] = if find(bytes, b"</row>").is_some() { b"</row>" } else { b"</x:row>" };
+    let open: &[u8] = if close == b"</row>" { b"<row " } else { b"<x:row " };
+    // Enough pieces to balance the threads, but never so many that the fixed cost of a piece
+    // (its own thread, its own row state, its own row buffers) outweighs the rows in it.
+    const PIECE: usize = 4 * 1024 * 1024;
+    let parts = (threads() * 3).max(2).min(1 + bytes.len() / PIECE);
     let mut cuts = Vec::with_capacity(parts + 1);
     let mut at = 0usize;
     for i in 1..parts {
-        let want = text.len() / parts * i;
+        let want = bytes.len() / parts * i;
         if want <= at {
             continue;
         }
-        let tail = text.get(want..)?;
-        let rel = tail.find(close)?;
+        let rel = find(&bytes[want..], close)?;
         let end = want + rel + close.len();
-        let rest = text.get(end..)?.trim_start();
-        if !rest.starts_with(open) {
+        let mut next = end;
+        while bytes.get(next).is_some_and(|b| b.is_ascii_whitespace()) {
+            next += 1;
+        }
+        if !bytes[next..].starts_with(open) {
             break;
         }
-        let tag = rest.get(..rest.find('>')?)?;
-        if !tag.contains(" r=\"") {
-            return None;
-        }
-        let next = text.len() - rest.len();
+        let tag_end = next + find(&bytes[next..], b">")?;
+        find(&bytes[next..tag_end], b" r=\"")?;
         if next <= at {
             continue;
         }
@@ -499,22 +646,29 @@ fn plan_chunks(bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
         return None;
     }
     cuts.push(at);
-    cuts.push(text.len());
+    cuts.push(bytes.len());
     Some(cuts.windows(2).map(|w| (w[0], w[1])).collect())
 }
 
-fn decode_chunk(bytes: &[u8], dc: &DecodeCtx<'_>, default_height: f32, wrapped: bool) -> Chunk {
-    let mut chunk = Chunk { root: El::default(), rows: Vec::new(), rows_read: 0, dropped: 0, warn: Vec::new() };
+fn decode_chunk(bytes: &[u8], dc: &DecodeCtx<'_>, default_height: f32) -> Chunk {
+    let mut chunk = Chunk { rows: Vec::new(), rows_read: 0, dropped: 0, warn: Vec::new() };
     let mut st = RowState::default();
     let mut row: Option<(u32, Option<LineInfo>, Vec<DecodedCell>)> = None;
     let mut next_row = 0u32;
     let mut take = |chunk: &mut Chunk, item: crate::rows::Item<'_>| match item {
         crate::rows::Item::RowStart(a) => {
             chunk.rows_read += 1;
+            // The cell positions come from the state, not from the row tuple: a `<c>` without `r`
+            // belongs to this row and to the column after the previous cell.
+            st.skip_row = false;
+            st.row = 0;
+            st.next_col = 0;
             if let Some((r, info)) = row_fields(dc, default_height, &a, next_row) {
                 next_row = r + 1;
+                st.row = r;
                 row = Some((r, (info != LineInfo::default()).then_some(info), Vec::new()));
             } else {
+                st.skip_row = true;
                 chunk.dropped += 1;
             }
         }
@@ -532,28 +686,132 @@ fn decode_chunk(bytes: &[u8], dc: &DecodeCtx<'_>, default_height: f32, wrapped: 
             }
         }
     };
-    let parsed = if wrapped {
-        let mut buf = Vec::with_capacity(bytes.len() + 32);
-        buf.extend_from_slice(b"<worksheet><sheetData>");
-        buf.extend_from_slice(bytes);
-        crate::rows::parse(&buf, crate::rows::Mode::Document, &mut |it| {
-            take(&mut chunk, it);
-            Ok(())
-        })
-    } else {
-        crate::rows::parse(bytes, crate::rows::Mode::Rows, &mut |it| {
-            take(&mut chunk, it);
-            Ok(())
-        })
-    };
+    let _ = crate::rows::parse(bytes, &mut |it| {
+        take(&mut chunk, it);
+        Ok(())
+    });
     if let Some(done) = row.take() {
         chunk.rows.push(done);
     }
-    if let Ok(root) = parsed {
-        chunk.root = root;
-    }
     chunk.dropped += st.dropped;
     chunk
+}
+
+/// What a streaming read produced: the rows it could decode, or — when the part turned out not to
+/// be streamable (UTF-16, or no `<sheetData>`) — its bytes, to be read the ordinary way.
+enum Streamed {
+    Rows((El, Vec<String>, u64, u64)),
+    Whole(Vec<u8>),
+}
+
+/// Bytes asked of the decompressor at a time while filling a window.
+const READ_CHUNK: usize = 1024 * 1024;
+
+/// Reads a worksheet part as it decompresses: rows are decoded window by window, so a sheet that
+/// unpacks to a gigabyte costs a window instead of a gigabyte. Everything outside `<sheetData>` is
+/// small and still goes through the `El` tree, exactly as the whole-buffer read does it.
+fn stream_rows(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet, default_height: f32, plan: ReadPlan) -> Result<Streamed, IoError> {
+    let Some(mut reader) = cx.pkg.open_part(part)? else {
+        return Ok(Streamed::Whole(Vec::new()));
+    };
+    let dc = DecodeCtx { sst: &cx.sst, xf_map: &cx.xf_map, pictures: &cx.cell_pictures, date_system: cx.date_system };
+    let mut warn = Vec::new();
+    let mut buf = Vec::new();
+    let mut eof = !fill(&mut reader, &mut buf, 8 * 1024)?;
+    if !starts_like_utf8_xml(&buf) {
+        // A UTF-16 part, or one opening with something else: the window scan works on bytes, so
+        // read it whole and let the XML layer decide.
+        fill_to_end(&mut reader, &mut buf)?;
+        return Ok(Streamed::Whole(buf));
+    }
+    let (open_start, open_end, self_closing) = loop {
+        if let Some(span) = sheet_data_span(&buf) {
+            break span;
+        }
+        if eof {
+            fill_to_end(&mut reader, &mut buf)?;
+            return Ok(Streamed::Whole(buf));
+        }
+        eof = !fill(&mut reader, &mut buf, plan.window)?;
+    };
+    let mut root = worksheet_part(&buf[..open_start], Part::Head, &mut warn);
+    buf.drain(..open_end);
+
+    let mut st = RowState::default();
+    let mut parallel = true;
+    let mut rows_read = 0u64;
+    let mut dropped = 0u64;
+    let mut suffix: Vec<u8> = Vec::new();
+    if self_closing {
+        suffix = std::mem::take(&mut buf);
+        fill_to_end(&mut reader, &mut suffix)?;
+    } else {
+        loop {
+            if let Some((close, past)) = sheet_data_close(&buf) {
+                decode_rows(&buf[..close], &dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
+                suffix = buf.split_off(past);
+                fill_to_end(&mut reader, &mut suffix)?;
+                break;
+            }
+            if eof {
+                // A part that never closes `<sheetData>`: decode what came and stop.
+                decode_rows(&buf, &dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
+                break;
+            }
+            if buf.len() >= plan.window
+                && let Some(cut) = last_row_end(&buf)
+            {
+                decode_rows(&buf[..cut], &dc, sheet, default_height, &mut st, &mut parallel, &mut warn, &mut rows_read, &mut dropped, plan);
+                buf.drain(..cut);
+            }
+            // A single row longer than a window grows the buffer rather than spinning on it.
+            let target = if buf.len() < plan.window { plan.window } else { buf.len().saturating_mul(2) };
+            eof = !fill(&mut reader, &mut buf, target)?;
+        }
+    }
+    if reader.hit_limit() {
+        warn.push(format!("sheet \"{}\": {part} was cut at the decompression limit", sheet.name));
+    }
+    let tail = worksheet_part(&suffix, Part::Tail, &mut warn);
+    root.children.extend(tail.children);
+    Ok(Streamed::Rows((root, warn, rows_read, dropped)))
+}
+
+/// Fills `buf` to at least `target` bytes, or to the end of `input`. Returns whether more may come.
+fn fill(input: &mut impl std::io::Read, buf: &mut Vec<u8>, target: usize) -> Result<bool, IoError> {
+    while buf.len() < target {
+        let start = buf.len();
+        let want = (target - start).clamp(READ_CHUNK, 4 * READ_CHUNK);
+        buf.resize(start + want, 0);
+        match input.read(&mut buf[start..]) {
+            Ok(0) => {
+                buf.truncate(start);
+                return Ok(false);
+            }
+            Ok(n) => buf.truncate(start + n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => buf.truncate(start),
+            Err(e) => {
+                buf.truncate(start);
+                return Err(IoError::Zip(e.to_string()));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn fill_to_end(input: &mut impl std::io::Read, buf: &mut Vec<u8>) -> Result<(), IoError> {
+    while fill(input, buf, buf.len() + READ_CHUNK)? {}
+    Ok(())
+}
+
+/// A part that opens with `<` after an optional UTF-8 BOM and whitespace can be scanned for tags;
+/// a UTF-16 one cannot, and is read whole.
+fn starts_like_utf8_xml(head: &[u8]) -> bool {
+    let head = head.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(head);
+    match head.iter().position(|b| !b.is_ascii_whitespace()) {
+        Some(i) => head[i] == b'<' && head.get(i + 1) != Some(&0),
+        None => true,
+    }
 }
 
 fn apply_chunk(sheet: &mut Sheet, rows: Vec<(u32, Option<LineInfo>, Vec<DecodedCell>)>) {

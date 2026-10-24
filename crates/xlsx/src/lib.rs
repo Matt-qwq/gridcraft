@@ -49,6 +49,12 @@ pub use crypto::{DecryptError, check_encryption, decrypt};
 pub use csv::{MAX_CSV_BYTES, read_csv, write_csv, write_csv_limited};
 pub use ods::read_ods;
 pub use package::MAX_PART;
+
+/// The per-part limit this process actually uses (the default, or what `GRIDCRAFT_MAX_PART_MB`
+/// asks for).
+pub fn max_part() -> u64 {
+    package::max_part()
+}
 pub use passthrough::rebase_links;
 pub use xls::read_xls;
 pub use xlsb::read_xlsb;
