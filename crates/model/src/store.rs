@@ -13,6 +13,13 @@
 //! its rows use and the payload holds an index into it. Strings that arrive as the same `Arc` (as a
 //! file's shared strings do — one `Arc` shared by every cell that mentions it) are found by
 //! pointer, so deduplicating them costs a hash of a pointer, not a comparison of strings.
+//!
+//! Numbers are handled the same way, and it pays more: a report repeats its figures — counted on
+//! one of 31.7 million cells, only 6% of the numbers in a band of 64 rows are distinct. A band
+//! therefore keeps the distinct numbers it saw and a cell's payload is a two-byte index into that
+//! table, so the eight bytes a number costs are paid once per distinct figure instead of per cell.
+//! A band that overflows the index (more than 65,535 distinct numbers in 64 rows) falls back to
+//! `NUMBER_WIDE`, which keeps the bits in the row's side table.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -35,6 +42,18 @@ const ERROR: u8 = 3;
 const EMPTY: u8 = 4;
 /// An array value, held in the row's `arrays` side table.
 const ARRAY: u8 = 5;
+/// A number whose band holds more distinct values than a `u16` can index; the payload points into
+/// the row's `wide` table, which holds the bits.
+const NUMBER_WIDE: u8 = 6;
+/// The same for a text.
+const TEXT_WIDE: u8 = 7;
+
+/// A payload that fits the row's `u16` array, or one that has to go to the row's side table.
+#[derive(Clone, Copy, Debug)]
+enum Payload {
+    Small(u16),
+    Wide(u64),
+}
 
 const ERRORS: [CellError; 11] = [
     CellError::Null,
@@ -199,6 +218,9 @@ struct RowExtras {
     formulas: Vec<(u32, Arc<Formula>)>,
     /// `(column, array value)`, sorted by column.
     arrays: Vec<(u32, Arc<gridcraft_core::Array>)>,
+    /// Payloads too wide for the `u16` array, in the order their cells reached for them. Only a
+    /// band with more than 65,535 distinct numbers ever has one.
+    wide: Vec<u64>,
 }
 
 /// One row of a band: a bitmap of the columns it touches plus one entry per stored cell.
@@ -210,7 +232,9 @@ struct Row {
     /// The kind of each stored cell, in runs: a row is mostly a block of numbers and a block of
     /// text.
     kinds: Runs,
-    payloads: Vec<u64>,
+    /// A `u16` per stored cell: an index into the band's number or text table, a boolean, an error
+    /// code — or, for the rare wide kinds, an index into `extras.wide`.
+    payloads: Vec<u16>,
     /// Index into the band's style dictionary, in runs: a report formats a row in two or three.
     styles: Runs,
     /// Held out of line: a row with neither a formula nor an array pays nothing for them.
@@ -231,6 +255,18 @@ impl Row {
         self.kinds.at_or(i, u16::from(EMPTY)) as u8
     }
 
+    /// Puts a payload that does not fit `u16` in the side table and returns its index there.
+    fn push_wide(&mut self, value: u64) -> u16 {
+        let extras = self.extras.get_or_insert_with(Default::default);
+        extras.wide.push(value);
+        (extras.wide.len() - 1) as u16
+    }
+
+    fn wide_at(&self, i: usize) -> u64 {
+        let slot = self.payloads[i] as usize;
+        self.extras.as_ref().and_then(|e| e.wide.get(slot).copied()).unwrap_or(0)
+    }
+
     fn formulas(&self) -> &[(u32, Arc<Formula>)] {
         self.extras.as_ref().map_or(&[], |e| e.formulas.as_slice())
     }
@@ -240,7 +276,7 @@ impl Row {
     }
 
     fn drop_unused_extras(&mut self) {
-        if self.extras.as_ref().is_some_and(|e| e.formulas.is_empty() && e.arrays.is_empty()) {
+        if self.extras.as_ref().is_some_and(|e| e.formulas.is_empty() && e.arrays.is_empty() && e.wide.is_empty()) {
             self.extras = None;
         }
     }
@@ -372,22 +408,102 @@ impl Row {
 #[derive(Clone, Debug, Default)]
 struct Band {
     rows: BTreeMap<u32, Row>,
+    /// The distinct numbers of this band, in the order they were seen; a `NUMBER` payload is an
+    /// index into it.
+    numbers: Vec<f64>,
+    /// Open addressing over `numbers`: each slot holds an index plus one, zero meaning free.
+    number_slots: Vec<u16>,
     texts: Vec<Arc<str>>,
     /// Pointer of each kept text → its slot, so one shared `Arc` is stored once per band.
     text_index: HashMap<usize, u32>,
     styles: Vec<StyleId>,
 }
 
+/// Mixes the bits of a double into a slot index.
+fn number_hash(bits: u64) -> usize {
+    let mut h = bits.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 31;
+    h as usize
+}
+
 impl Band {
-    fn text_slot(&mut self, s: &Arc<str>) -> u64 {
+    fn text_slot(&mut self, s: &Arc<str>) -> Option<u16> {
         let key = Arc::as_ptr(s) as *const u8 as usize;
         if let Some(i) = self.text_index.get(&key) {
-            return *i as u64;
+            return u16::try_from(*i).ok();
         }
         let i = self.texts.len() as u32;
         self.texts.push(s.clone());
         self.text_index.insert(key, i);
-        i as u64
+        u16::try_from(i).ok()
+    }
+
+    /// The band's slot for `v`, adding it when new — `None` once the band holds more numbers than
+    /// a `u16` can index, which sends the cell to the row's wide table instead.
+    fn number_slot(&mut self, v: f64) -> Option<u16> {
+        let bits = if v == 0.0 { 0f64.to_bits() } else { v.to_bits() };
+        if self.number_slots.is_empty() {
+            self.number_slots = vec![0; 16];
+        }
+        let mask = self.number_slots.len() - 1;
+        let mut i = number_hash(bits) & mask;
+        loop {
+            let slot = self.number_slots[i];
+            if slot == 0 {
+                break;
+            }
+            if self.numbers[(slot - 1) as usize].to_bits() == bits {
+                return Some(slot - 1);
+            }
+            i = (i + 1) & mask;
+        }
+        if self.numbers.len() >= 0xFFFF {
+            return None;
+        }
+        let index = self.numbers.len() as u16;
+        self.numbers.push(f64::from_bits(bits));
+        self.number_slots[i] = index + 1;
+        // Three quarters full: the probe walk stays short and the table stays small, which matters
+        // because a band only holds a couple of hundred distinct numbers.
+        if self.numbers.len() * 4 > self.number_slots.len() * 3 {
+            self.grow_numbers();
+        }
+        Some(index)
+    }
+
+    fn grow_numbers(&mut self) {
+        let len = self.number_slots.len() * 2;
+        self.number_slots = vec![0; len];
+        let mask = len - 1;
+        for (index, v) in self.numbers.iter().enumerate() {
+            let mut i = number_hash(v.to_bits()) & mask;
+            while self.number_slots[i] != 0 {
+                i = (i + 1) & mask;
+            }
+            self.number_slots[i] = index as u16 + 1;
+        }
+    }
+
+    fn number(&self, slot: u16) -> f64 {
+        self.numbers.get(slot as usize).copied().unwrap_or(0.0)
+    }
+
+    /// Kind and payload for a value. The tables are per band, so this needs the band.
+    fn payload(&mut self, value: &Value) -> (u8, Payload) {
+        match value {
+            Value::Text(t) => match self.text_slot(t) {
+                Some(slot) => (TEXT, Payload::Small(slot)),
+                None => (TEXT_WIDE, Payload::Wide(u64::from(self.texts.len() as u32 - 1))),
+            },
+            Value::Number(n) => match self.number_slot(*n) {
+                Some(slot) => (NUMBER, Payload::Small(slot)),
+                None => (NUMBER_WIDE, Payload::Wide(if *n == 0.0 { 0f64.to_bits() } else { n.to_bits() })),
+            },
+            Value::Bool(b) => (BOOL, Payload::Small(u16::from(*b))),
+            Value::Error(e) => (ERROR, Payload::Small(error_code(*e) as u16)),
+            Value::Array(_) => (ARRAY, Payload::Small(0)),
+            Value::Empty => (EMPTY, Payload::Small(0)),
+        }
     }
 
     fn style_slot(&mut self, s: StyleId) -> u16 {
@@ -410,15 +526,17 @@ impl Band {
     fn cell_at(&self, row: &Row, i: usize, col: u32) -> Cell {
         let payload = row.payloads[i];
         let value = match row.kind_at(i) {
-            TEXT => Value::Text(self.text(payload)),
+            NUMBER => Value::Number(self.number(payload)),
+            NUMBER_WIDE => Value::Number(f64::from_bits(row.wide_at(i))),
+            TEXT => Value::Text(self.text(u64::from(payload))),
+            TEXT_WIDE => Value::Text(self.text(row.wide_at(i))),
             BOOL => Value::Bool(payload != 0),
             ERROR => Value::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value)),
             ARRAY => match row.arrays().binary_search_by_key(&col, |(c, _)| *c) {
                 Ok(j) => Value::Array(row.arrays()[j].1.clone()),
                 Err(_) => Value::Empty,
             },
-            EMPTY => Value::Empty,
-            _ => Value::Number(f64::from_bits(payload)),
+            _ => Value::Empty,
         };
         Cell { value, formula: row.formula_at(col).cloned(), style: self.style(row.style_at(i)) }
     }
@@ -427,17 +545,7 @@ impl Band {
     /// before the row is borrowed, because both live in the band.
     fn put(&mut self, row_key: u32, col: u32, cell: Cell) {
         let blank = cell.is_blank();
-        let (kind, payload) = if blank {
-            (EMPTY, 0)
-        } else {
-            match &cell.value {
-                Value::Text(t) => {
-                    let slot = self.text_slot(t);
-                    (TEXT, slot)
-                }
-                other => encode(other),
-            }
-        };
+        let (kind, payload) = if blank { (EMPTY, Payload::Small(0)) } else { self.payload(&cell.value) };
         let style = if blank { 0 } else { self.style_slot(cell.style) };
         let array = match &cell.value {
             Value::Array(a) => Some(a.clone()),
@@ -449,6 +557,10 @@ impl Band {
         let existing = row.index_of(col);
         row.set_formula(col, if blank { None } else { formula.as_ref() });
         row.set_array(col, if blank { None } else { array.as_ref() });
+        let payload = match payload {
+            Payload::Small(p) => p,
+            Payload::Wide(v) => row.push_wide(v),
+        };
         match existing {
             Some(i) if blank => row.remove_at(i, col),
             Some(i) => {
@@ -474,20 +586,14 @@ impl Band {
     /// Builds a whole row at once, from cells already sorted by column. Every array is sized
     /// once, so there is no growth slack to give back and no insert-per-cell shifting.
     fn put_row(&mut self, row_key: u32, cells: &mut Vec<(u32, Cell)>) {
-        let mut kept: Vec<(u32, u8, u64, u16)> = Vec::with_capacity(cells.len());
+        let mut kept: Vec<(u32, u8, Payload, u16)> = Vec::with_capacity(cells.len());
         let mut formulas: Vec<(u32, Arc<Formula>)> = Vec::new();
         let mut arrays: Vec<(u32, Arc<gridcraft_core::Array>)> = Vec::new();
         for (col, cell) in cells.drain(..) {
             if cell.is_blank() {
                 continue;
             }
-            let (kind, payload) = match &cell.value {
-                Value::Text(t) => {
-                    let slot = self.text_slot(t);
-                    (TEXT, slot)
-                }
-                other => encode(other),
-            };
+            let (kind, payload) = self.payload(&cell.value);
             let style = self.style_slot(cell.style);
             if let Some(f) = &cell.formula {
                 formulas.push((col, f.clone()));
@@ -508,16 +614,24 @@ impl Band {
         let mut kinds = Runs::default();
         let mut payloads = Vec::with_capacity(kept.len());
         let mut styles = Runs::default();
+        let mut wide: Vec<u64> = Vec::new();
         for (col, kind, payload, style) in kept {
             let slot = col - first;
             bits[(slot / 64) as usize] |= 1u64 << (slot % 64);
             kinds.push(u16::from(kind));
-            payloads.push(payload);
+            payloads.push(match payload {
+                Payload::Small(p) => p,
+                Payload::Wide(v) => {
+                    wide.push(v);
+                    (wide.len() - 1) as u16
+                }
+            });
             styles.push(style);
         }
         formulas.sort_by_key(|(c, _)| *c);
         arrays.sort_by_key(|(c, _)| *c);
-        let extras = if formulas.is_empty() && arrays.is_empty() { None } else { Some(Box::new(RowExtras { formulas, arrays })) };
+        let extras =
+            if formulas.is_empty() && arrays.is_empty() && wide.is_empty() { None } else { Some(Box::new(RowExtras { formulas, arrays, wide })) };
         kinds.compact();
         styles.compact();
         let row = Row { first, bits, kinds, payloads, styles, extras };
@@ -546,38 +660,36 @@ impl Band {
     }
 }
 
-/// The kind and payload for a value. Text slots are per band, so this needs the band.
-fn encode(value: &Value) -> (u8, u64) {
-    match value {
-        Value::Number(n) => (NUMBER, if *n == 0.0 { 0f64.to_bits() } else { n.to_bits() }),
-        Value::Text(_) => (TEXT, 0),
-        Value::Bool(b) => (BOOL, u64::from(*b)),
-        Value::Error(e) => (ERROR, error_code(*e)),
-        Value::Array(_) => (ARRAY, 0),
-        Value::Empty => (EMPTY, 0),
+/// True when two stored cells hold the same value, whatever slot their band gave it.
+fn same_value(a: &Band, ra: &Row, i: usize, b: &Band, rb: &Row, j: usize) -> bool {
+    if a.style(ra.style_at(i)) != b.style(rb.style_at(j)) {
+        return false;
+    }
+    let (ka, kb) = (ra.kind_at(i), rb.kind_at(j));
+    let number = |band: &Band, row: &Row, kind: u8, i: usize| match kind {
+        NUMBER => band.number(row.payloads[i]).to_bits(),
+        _ => row.wide_at(i),
+    };
+    let text = |row: &Row, kind: u8, i: usize| match kind {
+        TEXT => u64::from(row.payloads[i]),
+        _ => row.wide_at(i),
+    };
+    match (ka, kb) {
+        (NUMBER | NUMBER_WIDE, NUMBER | NUMBER_WIDE) => number(a, ra, ka, i) == number(b, rb, kb, j),
+        (TEXT | TEXT_WIDE, TEXT | TEXT_WIDE) => a.text(text(ra, ka, i)) == b.text(text(rb, kb, j)),
+        // Arrays are compared by value where their column is known; here the position is enough.
+        (ARRAY, ARRAY) => true,
+        _ => ka == kb && ra.payloads[i] == rb.payloads[j],
     }
 }
 
 fn row_same_as(a: &Band, ra: &Row, b: &Band, rb: &Row) -> bool {
-    if ra.first != rb.first || ra.bits != rb.bits || ra.kinds.runs != rb.kinds.runs {
+    if ra.first != rb.first || ra.bits != rb.bits || ra.kinds.len() != rb.kinds.len() {
         return false;
     }
     for i in 0..ra.kinds.len() {
-        if a.style(ra.style_at(i)) != b.style(rb.style_at(i)) {
+        if !same_value(a, ra, i, b, rb, i) {
             return false;
-        }
-        match ra.kind_at(i) {
-            TEXT => {
-                if a.text(ra.payloads[i]).as_ref() != b.text(rb.payloads[i]).as_ref() {
-                    return false;
-                }
-            }
-            ARRAY => {}
-            _ => {
-                if ra.payloads[i] != rb.payloads[i] {
-                    return false;
-                }
-            }
         }
     }
     let texts = |row: &Row| -> Vec<(u32, String)> { row.formulas().iter().map(|(c, f)| (*c, f.text.clone())).collect() };
@@ -892,17 +1004,9 @@ impl CellStore {
                     let same = match (x, y) {
                         (None, None) => true,
                         (Some((xb, xr, xi)), Some((yb, yr, yi))) => {
-                            xb.style(xr.style_at(xi)) == yb.style(yr.style_at(yi))
-                                && xr.kind_at(xi) == yr.kind_at(yi)
-                                && match xr.kind_at(xi) {
-                                    TEXT => xb.text(xr.payloads[xi]) == yb.text(yr.payloads[yi]),
-                                    ARRAY => {
-                                        let at =
-                                            |row: &Row| row.arrays().binary_search_by_key(&col, |(c, _)| *c).ok().map(|k| row.arrays()[k].1.clone());
-                                        at(xr) == at(yr)
-                                    }
-                                    _ => xr.payloads[xi] == yr.payloads[yi],
-                                }
+                            let arrays = |row: &Row| row.arrays().binary_search_by_key(&col, |(c, _)| *c).ok().map(|k| row.arrays()[k].1.clone());
+                            same_value(xb, xr, xi, yb, yr, yi)
+                                && (xr.kind_at(xi) != ARRAY || arrays(xr) == arrays(yr))
                                 && xr.formula_at(col).map(|f| f.text.clone()) == yr.formula_at(col).map(|f| f.text.clone())
                         }
                         _ => false,
@@ -928,11 +1032,12 @@ impl CellStore {
                 bytes += std::mem::size_of::<Row>()
                     + row.bits.len() * 8
                     + row.kinds.runs.len() * 4
-                    + row.payloads.len() * 8
+                    + row.payloads.len() * 2
                     + row.styles.runs.len() * 4
                     + row.formulas().len() * (4 + std::mem::size_of::<Formula>())
                     + row.arrays().len() * 8;
             }
+            bytes += band.numbers.capacity() * 8 + band.number_slots.capacity() * 2;
             for t in &band.texts {
                 bytes += t.len() + std::mem::size_of::<Arc<str>>();
             }
@@ -955,13 +1060,14 @@ impl CellStore {
         for band in self.bands.values() {
             out[7] += size_of::<Band>() + band.texts.capacity() * size_of::<Arc<str>>() + band.styles.capacity() * size_of::<StyleId>();
             out[7] += band.text_index.capacity() * (size_of::<usize>() + size_of::<u32>() + 1);
+            out[7] += band.numbers.capacity() * size_of::<f64>() + band.number_slots.capacity() * size_of::<u16>();
             out[6] += band.styles.capacity() * size_of::<StyleId>();
             out[5] += band.texts.capacity() * size_of::<Arc<str>>();
             out[0] += band.rows.len() * size_of::<(u32, Row)>();
             for row in band.rows.values() {
                 out[1] += row.bits.capacity() * 8;
                 out[2] += row.kinds.runs.capacity() * 4;
-                out[3] += row.payloads.capacity() * 8;
+                out[3] += row.payloads.capacity() * 2;
                 out[4] += row.styles.runs.capacity() * 4;
                 out[6] += row.extras.as_ref().map_or(0, |e| e.formulas.capacity() * (4 + 8) + e.arrays.capacity() * (4 + 8));
             }
@@ -1041,7 +1147,8 @@ impl Row {
         match self.index_of(col) {
             Some(i) => match self.kind_at(i) {
                 EMPTY => false,
-                TEXT => !band.text(self.payloads[i]).is_empty(),
+                TEXT => !band.text(u64::from(self.payloads[i])).is_empty(),
+                TEXT_WIDE => !band.text(self.wide_at(i)).is_empty(),
                 _ => true,
             },
             None => false,
@@ -1210,6 +1317,40 @@ mod tests {
         s.set(c(500, 0), Cell::value(4.0.into()));
         let v: Vec<f64> = s.iter_range(RangeRef::parse("A1:D100").unwrap()).map(|(_, x)| x.value.as_f64().unwrap()).collect();
         assert_eq!(v, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn a_band_that_overflows_its_number_table_still_reads_back() {
+        // 64 rows of 2,000 distinct numbers is 128,000 values in one band — twice what the
+        // two-byte payload can index, so the tail of it has to go through the wide table.
+        let value = |row: u32, col: u32| row as f64 * 2_000.0 + col as f64 + 0.5;
+        let mut s = CellStore::new();
+        for row in 0..64u32 {
+            let mut cells: Vec<(u32, Cell)> = (0..2_000u32).map(|col| (col, Cell::value(value(row, col).into()))).collect();
+            s.set_row(row, &mut cells);
+        }
+        assert_eq!(s.len(), 128_000);
+        // The band really did overflow: some cells index the number table, the rest are wide.
+        let band = s.bands.get(&0).expect("band");
+        let kinds: Vec<u8> = band.rows.values().flat_map(|row| (0..row.kinds.len()).map(|i| row.kind_at(i))).collect();
+        assert_eq!(kinds.iter().filter(|k| **k == NUMBER).count(), 65_535, "cells the table could hold");
+        assert_eq!(kinds.iter().filter(|k| **k == NUMBER_WIDE).count(), 128_000 - 65_535, "cells that fell back");
+        for row in 0..64u32 {
+            for col in 0..2_000u32 {
+                let got = s.get(c(row, col)).map(|cell| cell.value);
+                assert_eq!(got, Some(Value::Number(value(row, col))), "row {row} col {col}");
+            }
+        }
+        // An edit into the overflowed rows keeps working: overwrite, insert a new column, remove.
+        s.set(c(63, 1_999), Cell::value((-1.5).into()));
+        assert_eq!(s.get(c(63, 1_999)).map(|cell| cell.value), Some(Value::Number(-1.5)));
+        s.set(c(63, 2_500), Cell::value(7.25.into()));
+        assert_eq!(s.get(c(63, 2_500)).map(|cell| cell.value), Some(Value::Number(7.25)));
+        assert_eq!(s.remove(c(0, 1_500)).map(|cell| cell.value), Some(Value::Number(value(0, 1_500))));
+        assert_eq!(s.len(), 128_000);
+        // Text in the same band, past the numbers, is still found.
+        s.set(c(0, 3_000), Cell::value("tail".into()));
+        assert_eq!(s.get(c(0, 3_000)).map(|cell| cell.value), Some(Value::Text("tail".into())));
     }
 
     #[test]
