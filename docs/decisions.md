@@ -63,12 +63,8 @@ A Ctrl+wheel notch moves the zoom to the next step on `grid::WHEEL_ZOOM_LADDER`:
 21, 25, 30, 35, 42, 50, 60, 70, 85, 100, 120, 140, 170, 200, 240, 280, 340, 400 (four steps per
 doubling, 17–25% apart). A step less than 5% away is skipped, except 100% and the 10% / 400%
 limits, which are never skipped: 121% out goes to 100%, and 99% or 101% towards 100% goes to 100%.
-The wheel's turning is counted in notches (egui eases each notch in over several frames, and
-fine-grained wheels send parts of one); a notch steps once 60% of it has turned. With animations
-on, the zoom then glides to the step over about a tenth of a second (as egui eases a scroll notch),
-and a notch turned during a glide steps on from the step it's going to. With View › Animations off
-it goes to the step at once. Whether the zoom glide should have a setting of its own is left to the
-maintainers.
+The wheel's turning is counted in notches (fine-grained wheels send parts of one); a notch steps
+once 60% of it has turned, and the step is taken in that frame — there is no easing towards it.
 
 Before, each frame multiplied the whole-number zoom by egui's eased factor and rounded, so a notch
 out never undid a notch in (100 → 122 → 101 → 123 → 102). Keeping the zoom unrounded fixed that
@@ -80,3 +76,23 @@ relative steps keep each notch feeling the same, and the doublings land on 25, 5
 400%. The status bar's Zoom In / Zoom Out buttons and Ctrl+Alt+= / Ctrl+Alt+- keep their 10%
 steps, so the wheel and the buttons now step differently. Whether they should share one ladder
 (this one, Excel's, or another) is left to the maintainers.
+## The interface has no motion
+
+The selection outline glided to a new selection over 120 ms, a Ctrl+wheel zoom eased to its step,
+egui faded widget states over 83 ms and scrolled smoothly, and a copied range's dashed border
+crawled. All of it is gone, and `theme::apply` sets `animation_time = 0.0` and
+`ScrollAnimation::none()` so egui does not reintroduce any.
+
+The reason is what the software is for: a spreadsheet is read by looking and driven by repeating
+the same keystroke a hundred times. Motion there does not explain a change, it delivers the answer
+late. A gliding outline is worse than late: hit testing and the cell editor use the real cells, so
+for those 120 ms the outline was not where a click would land. It also kept a repaint per frame
+going on every arrow key, which on a 31.7-million-cell sheet is real work for no information.
+
+Excel is the reference here and does the same: its cell cursor jumps, its grid does not animate.
+The earlier glide was justified in its doc comment as "like Excel's cell cursor", which was a
+misremembering — Excel's animation settings cover things like chart transitions in other Office
+applications.
+
+Consequence for the harness: nothing waits for animation to settle before a screenshot, so
+`Shots::in_flight` is gone and the control-channel `ui.set {animations}` field with it.

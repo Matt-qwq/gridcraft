@@ -12,8 +12,8 @@
 //! - `ui.ribbon {tab}`, `ui.dialog {name}`, `ui.dialog.set {field, value}`,
 //!   `ui.dialog.confirm`, `ui.dialog.cancel`, `ui.message.dismiss`
 //! - `ui.edit.begin {text?}`, `ui.edit.commit {move?}`, `ui.edit.cancel`
-//! - `ui.screenshot {path?}` — PNG of the window (base64 when no path); animations are settled
-//! - `ui.resize {width, height}`, `ui.set {dark?, formulaBar?, ribbonCollapsed?, animations?}`
+//! - `ui.screenshot {path?}` — PNG of the window (base64 when no path)
+//! - `ui.resize {width, height}`, `ui.set {dark?, formulaBar?, ribbonCollapsed?}`
 //! - `app.open {path, password?}`, `app.save {path?}`, `app.quit`
 
 use std::sync::mpsc::Sender;
@@ -71,14 +71,6 @@ pub struct Shots {
     token: u64,
     queued: Vec<(u64, f64, u32)>,
     pending: Vec<(u64, Option<String>, Sender<ControlResponse>, f64)>,
-}
-
-impl Shots {
-    /// A screenshot was asked for and hasn't been delivered yet: animations hold still, so the
-    /// picture shows the settled state.
-    pub(crate) fn in_flight(&self) -> bool {
-        !self.queued.is_empty() || !self.pending.is_empty()
-    }
 }
 
 fn ok(v: Json) -> Outcome {
@@ -232,7 +224,6 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
                 ("view.collapseRibbon", "Collapse Ribbon", ""),
                 ("view.darkMode", "Dark Mode", ""),
                 ("view.theme", "Display Theme", ""),
-                ("view.animations", "Animations", "{on?: bool} (toggles without it) → {on}"),
                 ("options.autoComplete", "Enable AutoComplete for cell values", "{on?: bool} (toggles without it) → {on}"),
                 ("view.interfaceScale", "Interface Size", "{percent: 75–200 | \"auto\"} (100 = auto; clamped)"),
                 ("ui.dialog", "Open Dialog", ""),
@@ -273,9 +264,6 @@ pub fn handle(app: &mut SheetApp, ctx: &egui::Context, method: &str, p: &Json) -
             }
             if let Some(v) = p.get("ribbonCollapsed").and_then(Json::as_bool) {
                 app.ui.ribbon_collapsed = v;
-            }
-            if let Some(v) = p.get("animations").and_then(Json::as_bool) {
-                app.ui.animations = v;
             }
             let mut out = serde_json::to_value(&app.ui).unwrap_or_default();
             if let Some(o) = out.as_object_mut() {

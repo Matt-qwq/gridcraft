@@ -2351,11 +2351,6 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
                 }
             }
         });
-        let mut animations = app.ui.animations;
-        let hint = lang.tr("Glide the selection outline to the cell you move to instead of jumping there");
-        if ui.checkbox(&mut animations, lang.tr("Animations")).on_hover_text(hint).changed() {
-            act(app, "view.animations", json!({"on": animations}));
-        }
     });
     sep(ui);
     // Interface size (issue #230): scales the whole window on top of the desktop's scale.

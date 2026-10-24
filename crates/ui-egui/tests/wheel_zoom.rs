@@ -52,75 +52,24 @@ fn wheel(h: &mut Harness, notches: f32) {
     wheel_turns(h, &[notches], 1);
 }
 
-/// The harness turns egui's animations off (and the zoom glide follows that); this turns them on.
-fn animated() -> Harness {
+#[test]
+fn a_notch_steps_at_once() {
     let mut h = harness();
-    h.ctx.all_styles_mut(|s| s.animation_time = 0.1);
-    h.step();
-    h
-}
-
-/// Turns the wheel `notches` with Ctrl held and records the zoom over the next `frames` frames.
-fn turn_and_watch(h: &mut Harness, notches: f32, frames: usize) -> Vec<u16> {
     h.input_mut().events.push(Event::ModifiersChanged(Modifiers::COMMAND));
-    let delta = vec2(0.0, notches);
-    h.input_mut().events.push(Event::MouseWheel { unit: MouseWheelUnit::Line, delta, phase: TouchPhase::Move, modifiers: Modifiers::COMMAND });
-    (0..frames)
+    h.input_mut().events.push(Event::MouseWheel {
+        unit: MouseWheelUnit::Line,
+        delta: vec2(0.0, 1.0),
+        phase: TouchPhase::Move,
+        modifiers: Modifiers::COMMAND,
+    });
+    let seen: Vec<u16> = (0..20)
         .map(|_| {
             h.step();
-            zoom(h)
+            zoom(&h)
         })
-        .collect()
-}
-
-#[test]
-fn with_animations_the_zoom_glides_to_the_step() {
-    let mut h = animated();
-    let seen = turn_and_watch(&mut h, 1.0, 40);
-    assert!(seen.windows(2).all(|w| w[0] <= w[1]), "only ever towards the step: {seen:?}");
-    let between = seen.iter().filter(|&&z| z > 100 && z < 120).count();
-    assert!(between >= 3, "on its way over several frames: {seen:?}");
-    assert_eq!(seen.last(), Some(&120), "and exactly on the step: {seen:?}");
-    let seen = turn_and_watch(&mut h, -1.0, 40);
-    assert!(seen.windows(2).all(|w| w[0] >= w[1]) && seen.iter().any(|&z| z > 100 && z < 120), "{seen:?}");
-    assert_eq!(seen.last(), Some(&100), "{seen:?}");
-}
-
-#[test]
-fn a_notch_during_a_glide_steps_on_from_where_it_is_going() {
-    let mut h = animated();
-    let seen = turn_and_watch(&mut h, 1.0, 6);
-    assert!(seen.last().is_some_and(|&z| z > 100 && z < 120), "still gliding: {seen:?}");
-    turn_and_watch(&mut h, 1.0, 60);
-    assert_eq!(zoom(&h), 140);
-    let seen = turn_and_watch(&mut h, -1.0, 6);
-    assert!(seen.last().is_some_and(|&z| z > 120 && z < 140), "{seen:?}");
-    turn_and_watch(&mut h, -1.0, 60);
-    assert_eq!(zoom(&h), 100);
-}
-
-#[test]
-fn a_zoom_set_another_way_stops_a_glide() {
-    let mut h = animated();
-    let seen = turn_and_watch(&mut h, 1.0, 6);
-    assert!(seen.last().is_some_and(|&z| z > 100 && z < 120), "{seen:?}");
-    h.state_mut().run("view.zoom", json!({"percent": 150})).unwrap();
-    h.run_steps(60);
-    assert_eq!(zoom(&h), 150);
-    // Setting the percentage the glide had got to doesn't start it again.
-    let stopped_at = seen.last().copied().unwrap();
-    set_zoom(&mut h, stopped_at);
-    h.run_steps(60);
-    assert_eq!(zoom(&h), stopped_at);
-}
-
-#[test]
-fn with_view_animations_off_a_notch_steps_at_once() {
-    let mut h = animated();
-    h.state_mut().run("view.animations", json!({"on": false})).unwrap();
-    let seen = turn_and_watch(&mut h, 1.0, 40);
-    assert!(seen.iter().all(|&z| z == 100 || z == 120), "no percentages in between: {seen:?}");
-    assert_eq!(seen.last(), Some(&120));
+        .collect();
+    assert!(seen.iter().all(|&z| z == 120 || z == 100), "no percentage in between: {seen:?}");
+    assert!(seen.iter().take(3).any(|&z| z == 120), "within a couple of frames: {seen:?}");
 }
 
 #[test]

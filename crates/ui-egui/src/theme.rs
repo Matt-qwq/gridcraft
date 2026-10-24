@@ -827,6 +827,11 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
     ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
     ctx.all_styles_mut(|s| {
+        // Nothing moves. A spreadsheet is a work tool: a hover that fades in over 80 ms and a
+        // selection outline that takes 120 ms to arrive are waiting, not polish. egui animates
+        // widget states, popups and scrolling by default; all of it goes.
+        s.animation_time = 0.0;
+        s.scroll_animation = egui::style::ScrollAnimation::none();
         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
         s.spacing.button_padding = egui::vec2(6.0, 3.0);
         s.spacing.interact_size.y = 22.0;
@@ -1171,5 +1176,19 @@ mod tests {
         assert!(first_liberation.is_some() && first_liberation > last_dejavu, "Liberation Mono must follow DejaVu Sans Mono: {mono:?}");
         let noto = mono.iter().position(|p| p == "/usr/share/fonts/google-noto-vf/NotoSansMono[wght].ttf");
         assert!(noto.is_some() && noto.unwrap_or(0) + 1 == mono.len(), "Fedora's default Noto Sans Mono must be the last resort: {mono:?}");
+    }
+
+    #[test]
+    fn the_interface_does_not_animate() {
+        // A spreadsheet is a work tool: a hover that fades in over 80 ms and a selection that takes
+        // 120 ms to arrive are waiting, not polish. Both themes, since egui keeps them apart.
+        let ctx = egui::Context::default();
+        apply(&ctx, false);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let dark = theme == egui::Theme::Dark;
+            let style = ctx.style_of(theme);
+            assert_eq!(style.animation_time, 0.0, "no widget or popup fading (dark: {dark})");
+            assert_eq!(style.scroll_animation.points_per_second, f32::INFINITY, "no scroll easing (dark: {dark})");
+        }
     }
 }

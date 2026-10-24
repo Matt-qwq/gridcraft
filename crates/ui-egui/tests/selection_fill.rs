@@ -28,7 +28,7 @@ fn fill(session: &Session) -> Vec<Rect> {
     let doc = session.active().unwrap();
     let sheet = doc.wb.active().unwrap();
     let geo = geo(session);
-    selection_fill(&geo, sheet, &doc.selection, geo.range_rect(sheet, doc.selection.current()))
+    selection_fill(&geo, sheet, &doc.selection)
 }
 
 fn shaded(fill: &[Rect], cell: Rect) -> bool {
@@ -82,18 +82,4 @@ fn a_merged_active_cell_is_left_clear_as_a_whole() {
     assert!(!shaded(&fill, cells(&s, "B2:C3")), "the merged cell, not just its first cell: {fill:?}");
     assert!(shaded(&fill, cells(&s, "D2")) && shaded(&fill, cells(&s, "B4")) && shaded(&fill, cells(&s, "E6")));
     assert!((area(&fill) - (cells(&s, "B2:E6").area() - cells(&s, "B2:C3").area())).abs() < 0.5);
-}
-
-#[test]
-fn the_current_area_is_shaded_where_its_gliding_outline_is() {
-    let mut s = session();
-    s.execute("selection.set", json!({"range": "A1:A3,C2:D3", "active": "C2"})).unwrap();
-    let doc = s.active().unwrap();
-    let sheet = doc.wb.active().unwrap();
-    // Mid-glide the outline of the current area (C2:D3) is somewhere else on screen.
-    let outline = Rect::from_min_max(egui::pos2(600.0, 400.0), egui::pos2(700.0, 500.0));
-    let fill = selection_fill(&geo(&s), sheet, &doc.selection, outline);
-    assert!(fill.contains(&outline), "the current area follows its outline: {fill:?}");
-    assert!(shaded(&fill, cells(&s, "A2")), "the other areas stay on their cells");
-    assert!(!shaded(&fill, cells(&s, "D3")), "nothing is left behind on the current area's cells");
 }
