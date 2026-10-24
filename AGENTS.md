@@ -40,6 +40,24 @@ People trust GridCraft with their numbers; a crash loses their work. **This outr
 - **Rust only** (no handwritten JS/TS). **Never break wasm** (`cargo xtask wasm`).
 - **Quality gates** before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests, assets, layers, wasm). One task id per commit (`M2.1: borders gallery`).
 
+## How much testing (test budget)
+Fixing one bug means proving **that bug** stays fixed, not running everything. The full suite belongs to the commit gate, not to the edit loop. Measured on the dev machine, 2026-10:
+
+| when | run | cost |
+| --- | --- | --- |
+| after an edit | `cargo ck` (`check --lib`) | 9 s |
+| a bug fix is done | `cargo test -p <crate you changed> --lib <filter>` | 1–25 s |
+| the change crosses a crate boundary | plus the one crate on the other side of that contract | +0–25 s |
+| before a commit or push, once | `cargo xtask ci` if the change is cheap to gate, otherwise `fmt` + `clippy -D warnings` + the crates you touched | seconds to minutes |
+| **at release only** | `cargo xtask ci` (whole suite, every target) | the whole thing |
+| not while iterating | `cargo tq` / `cargo test --workspace` / any `ui-egui` test | 161 s / >40 min / 146 s |
+
+- **Write the regression test first.** It is the "related functionality" you re-check after the fix; if the bug can be reproduced in a test, that test is the proof, and the neighbouring tests of the same module are the blast radius.
+- **Pick the crate by where the change is**, not by what might be affected: storage layout → `-p gridcraft-model`, a reader/writer → `-p gridcraft-xlsx`, a command → `-p gridcraft-engine`. Filter with a module path (`store::`, `sheet_read::`) to run one module instead of a crate.
+- **`ui-egui` holds 903 of the 2136 tests** and takes 146 s of the 161 s workspace run. Touch it only when the change is in the UI.
+- **Full suite at release, not per commit.** The gate is fmt + clippy -D warnings + the crates you touched while iterating; the 2136-test sweep (and wasm/assets/layers/parity) runs once when cutting a release. Shared value types (`Value`, `Cell`) and the command protocol's JSON shape are the cases where widening to the caller's crate is worth it.
+- **Say what you ran and what you skipped.** "Not run" is not "passing"; a perf or memory claim without a test run says so explicitly.
+
 ## Running and looking at the app
 - `cargo run --release -p gridcraft -- --sample sales --control 7979` (sample workbook + control channel).
 - Drive it: JSON lines on `127.0.0.1:7979`, e.g. `{"id":1,"method":"engine.execute","params":{"command":"cell.set","params":{"cell":"B2","input":"=SUM(A1:A9)"}}}` then `{"id":2,"method":"ui.screenshot","params":{"path":"/tmp/shot.png"}}`. Methods: `crates/ui-egui/src/control.rs`, docs: `docs/control-protocol.md`.
