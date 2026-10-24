@@ -67,9 +67,8 @@ fn open() -> Workbook {
 fn shared_formula_uses_follow_their_master_across_bands() {
     let wb = open();
     let sheet = wb.sheet(0).expect("sheet");
-    let text = |a: &str| -> String {
-        sheet.cell(at(a)).and_then(|c| c.formula.as_ref()).map(|f| f.text.clone()).unwrap_or_else(|| panic!("no formula at {a}"))
-    };
+    let text =
+        |a: &str| -> String { sheet.cell(at(a)).and_then(|c| c.formula).map(|f| f.text.clone()).unwrap_or_else(|| panic!("no formula at {a}")) };
     assert_eq!(text("B10"), "A10*2");
     // Shifted by the row offset, not copied verbatim.
     assert_eq!(text("B11"), "A11*2");
@@ -125,6 +124,6 @@ fn shared_and_array_formulas_round_trip() {
         let got = b.cell(at_).unwrap_or_else(|| panic!("missing {at_}"));
         assert_eq!(got.value, cell.value, "value at {at_}");
         let f = |c: &gridcraft_model::Cell| c.formula.as_ref().map(|f| (f.text.clone(), f.array, f.dynamic));
-        assert_eq!(f(got), f(cell), "formula at {at_}");
+        assert_eq!(f(&got), f(&cell), "formula at {at_}");
     }
 }

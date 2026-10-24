@@ -630,7 +630,7 @@ fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
                             // As below: only the first value of each row survives.
                             let others: Vec<CellRef> = sh.cells.iter_range(m).map(|(c, _)| c).filter(|c| *c != m.start).collect();
                             for c in others {
-                                if let Some(mut cell) = sh.cells.get(c).cloned() {
+                                if let Some(mut cell) = sh.cells.get(c) {
                                     cell.value = gridcraft_core::Value::Empty;
                                     cell.formula = None;
                                     sh.set_cell(c, cell);
@@ -648,7 +648,7 @@ fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
                     if r.count() <= 1_000_000 {
                         let others: Vec<CellRef> = sh.cells.iter_range(*r).map(|(c, _)| c).filter(|c| *c != r.start).collect();
                         for c in others {
-                            if let Some(mut cell) = sh.cells.get(c).cloned() {
+                            if let Some(mut cell) = sh.cells.get(c) {
                                 cell.value = gridcraft_core::Value::Empty;
                                 cell.formula = None;
                                 sh.set_cell(c, cell);

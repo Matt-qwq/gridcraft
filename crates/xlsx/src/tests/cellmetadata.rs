@@ -78,7 +78,8 @@ fn dynamic_array_metadata_is_read_onto_formulas() {
     assert!(!report.warnings.iter().any(|w| w.contains("metadata")), "{:?}", report.warnings);
     let sh = wb.sheet(0).unwrap();
     for (address, _) in DYNAMIC {
-        let f = sh.cell(at(address)).unwrap().formula.as_ref().unwrap();
+        let cell = sh.cell(at(address)).unwrap();
+        let f = cell.formula.as_ref().unwrap();
         assert!(f.dynamic, "{address}");
         assert_eq!(f.array, None, "{address} is not a legacy CSE array");
     }

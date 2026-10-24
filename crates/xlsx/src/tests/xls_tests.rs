@@ -290,7 +290,7 @@ fn v(wb: &gridcraft_model::Workbook, sheet: usize, a1: &str) -> Value {
 }
 
 fn ftext(wb: &gridcraft_model::Workbook, a1: &str) -> Option<String> {
-    wb.sheets[0].cell(CellRef::parse(a1).unwrap()).and_then(|c| c.formula.as_ref()).map(|f| f.text.clone())
+    wb.sheets[0].cell(CellRef::parse(a1).unwrap()).and_then(|c| c.formula).map(|f| f.text.clone())
 }
 
 #[test]

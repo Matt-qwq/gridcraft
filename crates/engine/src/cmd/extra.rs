@@ -1124,7 +1124,7 @@ fn checkbox(s: &mut Session, p: &Json) -> Result<Json> {
                 let sh = cx.sheet_mut(si)?;
                 // Values and formulas already there stay (only TRUE/FALSE draw as a box); an empty
                 // cell starts unchecked.
-                let mut cell = sh.cell(c).cloned().unwrap_or_default();
+                let mut cell = sh.cell(c).unwrap_or_default();
                 if cell.value.is_empty() && cell.formula.is_none() {
                     cell.value = Value::Bool(false);
                 }
@@ -1148,7 +1148,7 @@ fn toggle_checkbox(s: &mut Session, p: &Json) -> Result<Json> {
         for c in cells {
             let checkbox = cx.wb.sheet(si).is_some_and(|sh| is_checkbox_cell(&cx.wb, sh, c));
             let sh = cx.sheet_mut(si)?;
-            if let Some(cell) = sh.cells.get_mut(c)
+            if let Some(mut cell) = sh.cells.get(c)
                 && cell.formula.is_none()
             {
                 // An empty checkbox cell counts as FALSE.
@@ -1158,6 +1158,7 @@ fn toggle_checkbox(s: &mut Session, p: &Json) -> Result<Json> {
                     _ => continue,
                 };
                 cell.value = next;
+                sh.cells.set(c, cell);
                 cx.changed.push((si, c));
             }
         }
@@ -1282,7 +1283,7 @@ fn watch_window(s: &mut Session, p: &Json) -> Result<Json> {
             let si = sheet.and_then(|n| d.wb.sheet_index(&n)).unwrap_or(d.wb.active_sheet);
             let c = CellRef::parse(body).unwrap_or_default();
             let sh = d.wb.sheet(si);
-            json!({"cell": w, "value": sh.map(|s| s.value(c).display()), "formula": sh.and_then(|s| s.cell(c)).and_then(|x| x.formula.as_ref()).map(|f| format!("={}", f.text))})
+            json!({"cell": w, "value": sh.map(|s| s.value(c).display()), "formula": sh.and_then(|s| s.cell(c)).and_then(|x| x.formula).map(|f| format!("={}", f.text))})
         })
         .collect();
     Ok(Json::Array(rows))

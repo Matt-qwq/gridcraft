@@ -180,7 +180,8 @@ fn pictures_roundtrip_across_sheets_with_and_without_dynamic_arrays() {
         assert_eq!(loaded.sheet(1).unwrap().cell_pictures.get(&at("C7")), Some(&first));
         assert_eq!(loaded.sheet(0).unwrap().cell_pictures.get(&at("A4")).unwrap().data, jpeg());
         if dynamic {
-            let f = loaded.sheet(0).unwrap().cells.get(at("E1")).unwrap().formula.as_ref().unwrap();
+            let cell = loaded.sheet(0).unwrap().cells.get(at("E1")).unwrap();
+            let f = cell.formula.as_ref().unwrap();
             assert_eq!(f.text, "SEQUENCE(2)");
             assert!(f.array.is_none());
         }

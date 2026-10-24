@@ -243,8 +243,12 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
                 }
                 o => o,
             });
-            if hit && let Some(cell) = cx.wb.sheet_mut(i).and_then(|s| s.cells.get_mut(c)) {
+            if hit
+                && let Some(sh) = cx.wb.sheet_mut(i)
+                && let Some(mut cell) = sh.cells.get(c)
+            {
                 cell.formula = Some(std::sync::Arc::new(Formula::from_expr(ne)));
+                sh.cells.set(c, cell);
             }
         }
     }

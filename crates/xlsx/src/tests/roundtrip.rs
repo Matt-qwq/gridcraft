@@ -20,7 +20,14 @@ fn rr(a: &str) -> RangeRef {
 fn sample() -> Workbook {
     let mut wb = Workbook::new();
     wb.date_system = DateSystem::D1904;
-    wb.calc = CalcSettings { mode: CalcMode::Manual, iterative: true, max_iterations: 42, max_change: 0.5, precision_as_displayed: true };
+    wb.calc = CalcSettings {
+        mode: CalcMode::Manual,
+        iterative: true,
+        max_iterations: 42,
+        max_change: 0.5,
+        precision_as_displayed: true,
+        full_calc_on_load: true,
+    };
     wb.protected_structure = true;
     wb.structure_password = Some(gridcraft_model::PasswordHash::new_sha512("s3cret", b"0123456789abcdef"));
     wb.props = DocProps {
@@ -996,8 +1003,8 @@ fn implicit_intersection_is_written_as_single() {
     assert!(metadata);
     let (back, _) = read_xlsx(&bytes).unwrap();
     let sh = back.sheet(0).unwrap();
-    assert_eq!(sh.cell(at("D3")).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("@A1:A3*2"));
-    assert_eq!(sh.cell(at("D3")).and_then(|c| c.formula.as_ref()).and_then(|f| f.array), None);
+    assert_eq!(sh.cell(at("D3")).and_then(|c| c.formula).map(|f| f.text.clone()), Some("@A1:A3*2".to_string()));
+    assert_eq!(sh.cell(at("D3")).and_then(|c| c.formula).and_then(|f| f.array), None);
 }
 
 #[test]
@@ -1084,7 +1091,7 @@ fn let_lambda_parameters_drop_xlpm_on_read() {
     assert!(xml.contains("_xlpm.v"), "{xml}");
     let (back, _) = read_xlsx(&bytes).unwrap();
     let sh = back.sheet(0).unwrap();
-    let text = |a: &str| sh.cell(at(a)).and_then(|c| c.formula.as_ref()).map(|f| f.text.clone());
+    let text = |a: &str| sh.cell(at(a)).and_then(|c| c.formula).map(|f| f.text.clone());
     assert_eq!(text("A1").as_deref(), Some("LET(x,1,x+1)"));
     assert_eq!(text("A2").as_deref(), Some("LAMBDA(a,a*2)(3)"));
     assert_eq!(text("C1").as_deref(), Some("MAP(B1:B2,LAMBDA(v,v+1))"));
@@ -1123,7 +1130,7 @@ fn table_newline_column_and_backslash_name_survive() {
     assert_eq!(s.tables[0].name, "\\_Prime.1");
     assert_eq!(s.tables[0].columns[0].name, "Handle\nBars");
     assert_eq!(s.value(at("A1")), Value::text("Handle\nBars"));
-    assert_eq!(s.cell(at("D1")).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("COUNTA(\\_Prime.1[Name])"));
+    assert_eq!(s.cell(at("D1")).and_then(|c| c.formula).map(|f| f.text.clone()), Some("COUNTA(\\_Prime.1[Name])".to_string()));
     assert!(gridcraft_formula::parse("COUNTA(\\_Prime.1[Name])").is_ok(), "backslash table name parses as a structured reference");
 }
 

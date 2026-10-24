@@ -42,6 +42,11 @@ pub struct CalcSettings {
     pub max_change: f64,
     /// Use precision as displayed.
     pub precision_as_displayed: bool,
+    /// `fullCalcOnLoad`: the file says its cached values cannot be trusted, so a reader must
+    /// recalculate everything before showing it. Without it the cached values stand, which is what
+    /// makes opening a big workbook fast.
+    #[serde(default)]
+    pub full_calc_on_load: bool,
 }
 
 impl Default for CalcSettings {
@@ -52,6 +57,7 @@ impl Default for CalcSettings {
             max_iterations: Self::DEFAULT_ITERATIONS,
             max_change: Self::DEFAULT_CHANGE,
             precision_as_displayed: false,
+            full_calc_on_load: false,
         }
     }
 }
@@ -307,8 +313,9 @@ impl Workbook {
             }
             let sheet = Arc::make_mut(sheet);
             for (c, f) in fixed {
-                if let Some(cell) = sheet.cells.get_mut(c) {
+                if let Some(mut cell) = sheet.cells.get(c) {
                     cell.formula = Some(Arc::new(f));
+                    sheet.cells.set(c, cell);
                 }
             }
         }

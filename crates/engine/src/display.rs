@@ -109,7 +109,7 @@ pub fn formula_hidden(wb: &Workbook, sheet: &Sheet, c: CellRef) -> bool {
 /// The text a cell shows (full precision General; the grid narrows General to fit the column).
 pub fn cell_text(wb: &Workbook, sheet: &Sheet, c: CellRef) -> String {
     if sheet.show_formulas
-        && let Some(f) = sheet.cell(c).and_then(|x| x.formula.as_ref())
+        && let Some(f) = sheet.cell(c).and_then(|x| x.formula)
         && !formula_hidden(wb, sheet, c)
     {
         return format!("={}", f.text);

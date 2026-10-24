@@ -208,7 +208,7 @@ pub(crate) fn dispatch(app: &mut SheetApp, ctx: &egui::Context, key: Key, physic
             } else {
                 app.session
                     .active()
-                    .and_then(|d| sh.value_ref(above).map(|v| gridcraft_engine::display::format(v, "General", &d.wb).text))
+                    .and_then(|d| sh.value_ref(above).map(|v| gridcraft_engine::display::format(&v, "General", &d.wb).text))
                     .unwrap_or_default()
             };
             edit_with(app, text);

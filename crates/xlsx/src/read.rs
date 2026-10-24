@@ -234,6 +234,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
             _ => CalcMode::Automatic,
         };
         wb.calc.iterative = c.flag("iterate", false);
+        wb.calc.full_calc_on_load = c.flag("fullCalcOnLoad", false);
         if let Some(n) = c.attr_u32("iterateCount") {
             wb.calc.set_max_iterations(n);
         }

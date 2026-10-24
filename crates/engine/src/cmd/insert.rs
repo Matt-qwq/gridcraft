@@ -521,8 +521,9 @@ fn table_rename(s: &mut Session, p: &Json) -> Result<Json> {
                     gridcraft_formula::Expr::Name(n) if !shadowed && n.eq_ignore_ascii_case(&old) => gridcraft_formula::Expr::Name(name.clone()),
                     o => o,
                 });
-                if let Some(cell) = sh.cells.get_mut(c) {
+                if let Some(mut cell) = sh.cells.get(c) {
                     cell.formula = Some(std::sync::Arc::new(Formula::from_expr(ne)));
+                    sh.cells.set(c, cell);
                 }
             }
         }

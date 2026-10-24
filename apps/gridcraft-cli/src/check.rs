@@ -561,11 +561,11 @@ pub fn oracle(cached: &Workbook, fresh: &Workbook, calc: &Calc, trust_cache: boo
     listed.sort_by_key(|(primary, _, _)| !*primary);
     for (primary, k, functions) in listed.into_iter().take(opts.max_report) {
         let cell = cached.sheet(k.0).and_then(|s| s.cell(k.1));
-        let expected = cell.map(|c| c.value.clone()).unwrap_or_default();
+        let expected = cell.as_ref().map(|c| c.value.clone()).unwrap_or_default();
         let actual = fresh.sheet(k.0).and_then(|s| s.cell(k.1)).map(|x| x.value.scalar()).unwrap_or_default();
         r.mismatches.push(Mismatch {
             cell: cell_name(cached, k),
-            formula: cell.map(formula_text).unwrap_or_default(),
+            formula: cell.as_ref().map(formula_text).unwrap_or_default(),
             kind: mismatch_kind(&expected, &actual),
             expected,
             actual,
@@ -697,11 +697,11 @@ pub fn diff_workbooks(a: &Workbook, b: &Workbook, opts: &Options) -> Vec<Categor
             }
         };
         for (c, ca) in sa.cells.iter() {
-            cell(c, Some(ca), sb.cell(c));
+            cell(c, Some(&ca), sb.cell(c).as_ref());
         }
         for (c, cb) in sb.cells.iter() {
             if sa.cell(c).is_none() {
-                cell(c, None, Some(cb));
+                cell(c, None, Some(&cb));
             }
         }
         let set = |f: &dyn Fn(&Sheet) -> Vec<String>, s: &Sheet| f(s).into_iter().collect::<BTreeSet<String>>();

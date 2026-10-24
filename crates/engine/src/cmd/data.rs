@@ -351,7 +351,7 @@ fn do_sort(s: &mut Session, sheet: usize, r: RangeRef, header: bool, keys: Vec<S
             for &k in &lanes {
                 let src = line(src_i, k);
                 let dst = line(dst_i as u32, k);
-                let mut cell = sh.cell(src).cloned();
+                let mut cell = sh.cell(src);
                 if let Some(c) = cell.as_mut()
                     && let Some(f) = &c.formula
                     && let Some(e) = f.expr()
@@ -871,7 +871,7 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
             })
             .collect();
         let rows: Vec<Vec<Option<Cell>>> =
-            keep.iter().map(|row| (r.start.col..=r.end.col).map(|c| sh.cell(CellRef::new(*row, c)).cloned()).collect()).collect();
+            keep.iter().map(|row| (r.start.col..=r.end.col).map(|c| sh.cell(CellRef::new(*row, c))).collect()).collect();
         let shm = cx.sheet_mut(sheet)?;
         for row in start..=r.end.row {
             for c in r.start.col..=r.end.col {

@@ -167,7 +167,7 @@ impl Sheet {
         }
     }
 
-    pub fn cell(&self, c: CellRef) -> Option<&Cell> {
+    pub fn cell(&self, c: CellRef) -> Option<Cell> {
         self.cells.get(c)
     }
     /// The source of a non-anchor dynamic-array spill cell, from the current calc state.
@@ -183,10 +183,10 @@ impl Sheet {
             _ => self.spill.get(&c).cloned().unwrap_or(Value::Empty),
         }
     }
-    pub fn value_ref(&self, c: CellRef) -> Option<&Value> {
+    pub fn value_ref(&self, c: CellRef) -> Option<Value> {
         match self.cells.get(c) {
-            Some(cell) if !cell.value.is_empty() || cell.formula.is_some() => Some(&cell.value),
-            _ => self.spill.get(&c),
+            Some(cell) if !cell.value.is_empty() || cell.formula.is_some() => Some(cell.value),
+            _ => self.spill.get(&c).cloned(),
         }
     }
     /// Last row (inclusive) of the maximal contiguous run of non-empty values in `col`, starting
@@ -260,10 +260,10 @@ impl Sheet {
         self.cell_pictures.insert(c, picture);
     }
     pub fn input_text(&self, c: CellRef) -> String {
-        if self.cell_pictures.contains_key(&c) { String::new() } else { self.cell(c).map(Cell::input_text).unwrap_or_default() }
+        if self.cell_pictures.contains_key(&c) { String::new() } else { self.cell(c).map(|cell| cell.input_text()).unwrap_or_default() }
     }
     pub fn set_style(&mut self, c: CellRef, style: StyleId) {
-        let mut cell = self.cells.get(c).cloned().unwrap_or_default();
+        let mut cell = self.cells.get(c).unwrap_or_default();
         cell.style = style;
         self.cells.set(c, cell);
     }

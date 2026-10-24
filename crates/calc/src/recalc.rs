@@ -603,7 +603,7 @@ impl PassHost<'_> {
             return Value::Error(CellError::Calc);
         }
         // A legacy array formula fills the range it was entered in.
-        let legacy = self.wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.array);
+        let legacy = self.wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula).and_then(|f| f.array);
         let v = match legacy {
             Some(range) => fit_to_range(v, range),
             None => v,
@@ -898,6 +898,21 @@ impl Host for PassHost<'_> {
     }
 }
 
+/// True when evaluating the formula can change on its own: `NOW`, `TODAY`, `RAND`, `OFFSET`…
+/// Walking the parsed expression is cheap next to evaluating it, and a cell that reads one of these
+/// must be recalculated on open even though the file carries a value for it.
+fn is_volatile(e: &Expr) -> bool {
+    let mut found = false;
+    e.walk(&mut |node| {
+        if let Expr::Call(name, _) = node
+            && gridcraft_functions::lookup(name).is_some_and(|f| f.volatile)
+        {
+            found = true;
+        }
+    });
+    found
+}
+
 impl Calc {
     pub fn new() -> Self {
         Self::default()
@@ -914,10 +929,8 @@ impl Calc {
     pub fn rebuild(&mut self, wb: &Workbook) {
         self.graph = Graph::default();
         for (si, sheet) in wb.sheets.iter().enumerate() {
-            for (c, cell) in sheet.cells.iter() {
-                if let Some(f) = &cell.formula
-                    && let Some(e) = f.expr()
-                {
+            for (c, f, _) in sheet.cells.formulas() {
+                if let Some(e) = f.expr() {
                     let (areas, dynamic) = precedents(wb, si, &e);
                     self.graph.insert((si, c), Node { areas, dynamic });
                 }
@@ -943,6 +956,49 @@ impl Calc {
         self.run(wb, all, true);
     }
 
+    /// Recalculates what a freshly opened workbook needs, and nothing else.
+    ///
+    /// A file carries the values of its formulas, so recalculating all of them only repeats what it
+    /// already says — on a large sheet that is seconds of the open. Values are still computed when
+    /// the file asks for it (`fullCalcOnLoad`), when a cell has no cached value (saved by a producer
+    /// that did not calculate), when the formula is volatile (a cached `NOW()` is out of date by
+    /// definition), and when the value is not in the file at all: a dynamic array's spilled cells
+    /// and a legacy array formula's non-anchor cells are derived on open. Their dependents come
+    /// along, so nothing is left reading a value the file does not hold.
+    pub fn recalc_on_open(&mut self, wb: &mut Workbook) {
+        let tp = prof_now();
+        self.rebuild(wb);
+        let rebuild_ms = prof_now() - tp;
+        let ts = prof_now();
+        if wb.calc.full_calc_on_load {
+            self.recalc_all(wb);
+            return;
+        }
+        // Spilled cells are derived state, never file content.
+        let mut seeds: Vec<Key> = self.graph.dynamic.iter().copied().collect();
+        for (si, sheet) in wb.sheets.iter().enumerate() {
+            for (c, f, has_value) in sheet.cells.formulas() {
+                let derived = f.array.is_some()      // a legacy array fills its range
+                    || f.dynamic                     // a dynamic array's spilled cells are derived
+                    || !has_value; // the producer saved no value
+                if derived || f.expr().is_some_and(|e| is_volatile(&e)) {
+                    seeds.push((si, c));
+                }
+            }
+        }
+        if seeds.is_empty() {
+            if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
+                eprintln!("  open: rebuild {rebuild_ms:.1} ms, no stale cells ({} ms)", prof_now() - ts);
+            }
+            return;
+        }
+        let stale = self.dirty_closure(wb, &seeds);
+        if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
+            eprintln!("  open: rebuild {rebuild_ms:.1} ms, {} seeds, {} stale ({} ms)", seeds.len(), stale.len(), prof_now() - ts);
+        }
+        self.run(wb, stale, true);
+    }
+
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
@@ -965,10 +1021,12 @@ impl Calc {
                         cleared.push((k.0, r));
                     }
                     // A formula that doesn't parse evaluates to #NAME?.
-                    if let Some(cell) = wb.sheet_mut(k.0).and_then(|s| s.cells.get_mut(k.1))
+                    if let Some(sheet) = wb.sheet_mut(k.0)
+                        && let Some(mut cell) = sheet.cells.get(k.1)
                         && cell.formula.is_some()
                     {
                         cell.value = Value::Error(CellError::Name);
+                        sheet.cells.set(k.1, cell);
                     }
                 }
             }
@@ -1076,7 +1134,7 @@ impl Calc {
             dirty.sort_by_key(|(s, c)| (*s, c.row, c.col));
             let mut exprs: HashMap<Key, std::sync::Arc<Expr>> = HashMap::with_capacity_and_hasher(dirty.len(), Default::default());
             for k in &dirty {
-                if let Some(e) = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.expr_arc()) {
+                if let Some(e) = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula).and_then(|f| f.expr_arc()) {
                     exprs.insert(*k, e);
                 }
             }
@@ -1109,10 +1167,11 @@ impl Calc {
             let mut freed: Vec<(usize, RangeRef)> = Vec::new();
             for (k, v) in results {
                 let Some(sheet) = wb.sheet_mut(k.0) else { continue };
-                if let Some(cell) = sheet.cells.get_mut(k.1)
+                if let Some(mut cell) = sheet.cells.get(k.1)
                     && cell.value != v
                 {
                     cell.value = v;
+                    sheet.cells.set(k.1, cell);
                 }
             }
             for k in &dirty {
@@ -1146,8 +1205,9 @@ impl Calc {
                         || sheet.merges.iter().any(|m| m.intersects(&range))
                         || sheet.tables.iter().any(|t| t.range.contains(k.1));
                     if blocked {
-                        if let Some(cell) = sheet.cells.get_mut(k.1) {
+                        if let Some(mut cell) = sheet.cells.get(k.1) {
                             cell.value = Value::Error(CellError::Spill);
+                            sheet.cells.set(k.1, cell);
                         }
                         // Not blocked while the pass ran (it would have been #SPILL! there), so
                         // blocked by another array of this pass: the formulas that read this one,

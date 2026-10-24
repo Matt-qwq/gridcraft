@@ -1527,7 +1527,7 @@ impl<'h> Evaluator<'h> {
                             let hidden =
                                 s.is_some_and(|s| if skip_hidden { s.is_row_hidden(c.row) } else { skip_filtered && s.is_row_filtered(c.row) });
                             let nested = skip_nested
-                                && s.and_then(|s| s.cell(c)).and_then(|cell| cell.formula.as_ref()).is_some_and(|f| {
+                                && s.and_then(|s| s.cell(c)).and_then(|cell| cell.formula).is_some_and(|f| {
                                     let u = f.text.to_ascii_uppercase();
                                     u.contains("SUBTOTAL(") || u.contains("AGGREGATE(")
                                 });

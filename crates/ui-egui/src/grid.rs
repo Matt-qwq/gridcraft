@@ -523,7 +523,7 @@ fn display_text(
     char_w: f32,
 ) -> (String, Option<Color32>, bool, Option<(char, usize)>) {
     if sh.show_formulas
-        && let Some(f) = sh.cell(c).and_then(|x| x.formula.as_ref())
+        && let Some(f) = sh.cell(c).and_then(|x| x.formula)
     {
         return (format!("={}", f.text), None, false, None);
     }
@@ -1111,7 +1111,7 @@ pub(crate) fn paint_quadrant(
             cells.push(CellRef::new(r, c));
         }
     }
-    let empty_ok = |c: CellRef| -> bool { sh.value_ref(c).is_none_or(Value::is_empty) && in_merge(c).is_none() };
+    let empty_ok = |c: CellRef| -> bool { sh.value_ref(c).is_none_or(|v| v.is_empty()) && in_merge(c).is_none() };
     // Backgrounds.
     let mut looks: Vec<(CellRef, Rect, Look, Option<CfLook>)> = Vec::with_capacity(cells.len().min(20_000));
     for &c in &cells {
@@ -1413,7 +1413,7 @@ pub(crate) fn paint_quadrant(
             ));
         }
         // Background error checking: a number stored as text gets Excel's green corner (#1994).
-        if !sh.show_formulas && sh.cell(*c).and_then(gridcraft_engine::cmd::formulas::number_stored_as_text).is_some() {
+        if !sh.show_formulas && sh.cell(*c).as_ref().and_then(gridcraft_engine::cmd::formulas::number_stored_as_text).is_some() {
             let s = 6.0 * z.max(0.7);
             p.add(egui::Shape::convex_polygon(
                 vec![rect.left_top(), pos2(rect.left() + s, rect.top()), pos2(rect.left(), rect.top() + s)],
@@ -3405,7 +3405,7 @@ fn error_check_tag(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, sh: &Sheet)
         return;
     }
     let Some(active) = app.session.active().map(|d| d.selection.active) else { return };
-    if sh.cell(active).and_then(gridcraft_engine::cmd::formulas::number_stored_as_text).is_none() {
+    if sh.cell(active).as_ref().and_then(gridcraft_engine::cmd::formulas::number_stored_as_text).is_none() {
         return;
     }
     let cell = geo.cell_rect(sh, active);

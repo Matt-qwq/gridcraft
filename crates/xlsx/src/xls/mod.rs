@@ -461,8 +461,9 @@ impl SheetState<'_> {
                     return;
                 }
                 f.array = array.filter(|r| !r.is_single());
-                if let Some(cell) = self.sheet.cells.get_mut(pos) {
+                if let Some(mut cell) = self.sheet.cells.get(pos) {
                     cell.formula = Some(Arc::new(f));
+                    self.sheet.cells.set(pos, cell);
                 } else {
                     self.sheet.cells.set(pos, Cell { value: Value::Empty, formula: Some(Arc::new(f)), style: StyleId::DEFAULT });
                 }
@@ -548,7 +549,7 @@ fn worksheet(
     // .xlsx is read, so that the formula fills its range on recalculation. If the formula itself
     // couldn't be imported, they keep their values.
     for p in &pending {
-        let filled = st.sheet.cell(p.anchor).and_then(|c| c.formula.as_ref()).and_then(|f| f.array).is_some_and(|r| r.contains(p.pos));
+        let filled = st.sheet.cell(p.anchor).and_then(|c| c.formula).and_then(|f| f.array).is_some_and(|r| r.contains(p.pos));
         if p.pos != p.anchor && filled {
             let style = st.sheet.style_id(p.pos);
             st.sheet.cells.set(p.pos, Cell { value: Value::Empty, formula: None, style });
@@ -635,8 +636,9 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             if let Some((pos, style)) = st.pending_string.take() {
                 let s = c.string()?;
                 budget.text(s.len())?;
-                if let Some(cell) = st.sheet.cells.get_mut(pos) {
+                if let Some(mut cell) = st.sheet.cells.get(pos) {
                     cell.value = Value::from(s);
+                    st.sheet.cells.set(pos, cell);
                 } else {
                     st.sheet.cells.set(pos, Cell { value: Value::from(s), formula: None, style });
                 }

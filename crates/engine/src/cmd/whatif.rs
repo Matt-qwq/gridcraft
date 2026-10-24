@@ -826,7 +826,7 @@ fn advanced_filter(s: &mut Session, p: &Json) -> Result<Json> {
                 let at = CellRef::new(cr, cc);
                 let cell = csh.cell(at);
                 let v = csh.value(at);
-                let formula = cell.and_then(|c| c.formula.as_ref());
+                let formula = cell.and_then(|c| c.formula);
                 if v.is_empty() && formula.is_none() {
                     continue;
                 }

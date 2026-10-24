@@ -172,7 +172,7 @@ fn push_history_with_budget(
 impl DocState {
     pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
         let mut calc = Calc::new();
-        calc.recalc_all(&mut wb);
+        calc.recalc_on_open(&mut wb);
         let scripts_trusted = !cmd::extra::has_scripts(&wb);
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());

@@ -573,7 +573,7 @@ mod spill_tests {
         check(&mut app, "D2", "hello", false);
         check(&mut app, "E1", "", false);
         let sh = app.session.active().unwrap().wb.active().unwrap();
-        assert!(sh.cell(gridcraft_engine::core::CellRef::parse("A2").unwrap()).and_then(|c| c.formula.as_ref()).is_none());
+        assert!(sh.cell(gridcraft_engine::core::CellRef::parse("A2").unwrap()).and_then(|c| c.formula).is_none());
         // Intentional grid replacement retains the existing entry behavior.
         select(&mut app, "A2");
         app.begin_edit(Some("replacement".into()), false);

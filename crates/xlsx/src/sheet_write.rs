@@ -324,10 +324,10 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
             let ov = overrides.get(c);
             let ex = extra.get(c);
             let array = dynamic.get(c).copied().or_else(|| {
-                let f = cell?.formula.as_ref()?;
+                let f = cell.as_ref()?.formula.as_ref()?;
                 (f.array.is_none() && crate::array_formula::needs_array(wb, si, *c, f)).then_some(RangeRef::cell(*c))
             });
-            write_cell(&mut s, *c, cell, sheet.cell_pictures.get(c), ov, ex, array.as_ref(), &sid, out);
+            write_cell(&mut s, *c, cell.as_ref(), sheet.cell_pictures.get(c), ov, ex, array.as_ref(), &sid, out);
         }
         s.push_str("</row>");
     }

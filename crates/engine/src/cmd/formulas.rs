@@ -360,8 +360,9 @@ fn rename_name_in_formulas(wb: &mut gridcraft_model::Workbook, old: &str, old_sc
             let mut nf = Formula::from_expr(e);
             nf.array = f.array;
             nf.dynamic = f.dynamic;
-            if let Some(cell) = sh.cells.get_mut(c) {
+            if let Some(mut cell) = sh.cells.get(c) {
                 cell.formula = Some(std::sync::Arc::new(nf));
+                sh.cells.set(c, cell);
             }
         }
     }
@@ -600,7 +601,7 @@ fn convert_to_number(s: &mut Session, p: &Json) -> Result<Json> {
             let found: Vec<(CellRef, f64)> = cx
                 .wb
                 .sheet(sheet)
-                .map(|sh| sh.cells.iter_range(r).filter_map(|(c, x)| number_stored_as_text(x).map(|n| (c, n))).collect())
+                .map(|sh| sh.cells.iter_range(r).filter_map(|(c, x)| number_stored_as_text(&x).map(|n| (c, n))).collect())
                 .unwrap_or_default();
             let sh = cx.sheet_mut(sheet)?;
             for (c, n) in &found {
@@ -642,7 +643,7 @@ fn evaluate_formula(s: &mut Session, p: &Json) -> Result<Json> {
         None => {
             d.wb.sheet(sheet)
                 .and_then(|sh| sh.cell(at))
-                .and_then(|c| c.formula.as_ref())
+                .and_then(|c| c.formula)
                 .map(|f| f.text.clone())
                 .ok_or_else(|| EngineError::Other("The cell has no formula.".into()))?
         }

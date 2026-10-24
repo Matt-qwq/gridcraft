@@ -440,8 +440,7 @@ fn check_arrays(old: &Workbook, new: &Workbook) -> Result<()> {
                 continue;
             }
             let in_array = sh.spill_ranges.keys().any(|&anchor| {
-                anchor != c
-                    && after.cell(anchor).and_then(|x| x.formula.as_ref()).and_then(|f| f.array).is_some_and(|a| a.start == anchor && a.contains(c))
+                anchor != c && after.cell(anchor).and_then(|x| x.formula).and_then(|f| f.array).is_some_and(|a| a.start == anchor && a.contains(c))
             });
             if in_array {
                 return Err(EngineError::Other("You can't change part of an array.".into()));
@@ -452,15 +451,15 @@ fn check_arrays(old: &Workbook, new: &Workbook) -> Result<()> {
 }
 
 /// Two cells hold the same value or formula (formats aside).
-fn same_content(a: Option<&gridcraft_model::Cell>, b: Option<&gridcraft_model::Cell>) -> bool {
-    let empty = |c: Option<&gridcraft_model::Cell>| c.is_none_or(|c| c.formula.is_none() && c.value.is_empty());
-    match (a, b) {
+fn same_content(a: Option<gridcraft_model::Cell>, b: Option<gridcraft_model::Cell>) -> bool {
+    let empty = |c: &Option<gridcraft_model::Cell>| c.as_ref().is_none_or(|c| c.formula.is_none() && c.value.is_empty());
+    match (&a, &b) {
         (Some(a), Some(b)) => match (&a.formula, &b.formula) {
             (Some(x), Some(y)) => x.text == y.text && x.array == y.array,
             (None, None) => a.value == b.value,
             _ => false,
         },
-        _ => empty(a) && empty(b),
+        _ => empty(&a) && empty(&b),
     }
 }
 

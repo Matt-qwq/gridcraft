@@ -351,7 +351,7 @@ fn content_diff(a: &Workbook, b: &Workbook) -> Option<String> {
         }
         for c in x.cells.diff(&y.cells) {
             let content = |s: &Sheet| {
-                s.cell(c).filter(|c| has_content(c)).map(|c| match &c.formula {
+                s.cell(c).filter(has_content).map(|c| match &c.formula {
                     Some(f) => format!("={}", f.text),
                     None => format!("{:?}", c.value),
                 })
@@ -433,7 +433,7 @@ fn value_diff(a: &Workbook, b: &Workbook, what: &str) -> Option<String> {
         for c in keys {
             let (va, vb) = (x.value(c), y.value(c));
             if !same_value(&va, &vb) {
-                let f = x.cell(c).and_then(|c| c.formula.as_ref()).map(|f| format!(" (formula ={})", f.text)).unwrap_or_default();
+                let f = x.cell(c).and_then(|c| c.formula).map(|f| format!(" (formula ={})", f.text)).unwrap_or_default();
                 return Some(format!("{}!{c}{f}: {va:?} in memory, {vb:?} after {what}", x.name));
             }
         }

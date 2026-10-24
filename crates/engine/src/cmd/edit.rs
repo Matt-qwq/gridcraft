@@ -1029,17 +1029,14 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
                         let sc = CellRef::new(src.start.row + r, src.start.col + c);
                         let (dr, dc) = if transpose { (c, r) } else { (r, c) };
                         let Some(dest) = at.offset((tr * h + dr) as i64, (tc * w + dc) as i64) else { continue };
-                        let src_cell = if cut_move {
-                            moved_formulas.iter().find(|(k, _)| *k == sc).map(|(_, v)| v.clone())
-                        } else {
-                            src_sheet.cell(sc).cloned()
-                        };
+                        let src_cell =
+                            if cut_move { moved_formulas.iter().find(|(k, _)| *k == sc).map(|(_, v)| v.clone()) } else { src_sheet.cell(sc) };
                         let src_val = src_sheet.value(sc);
                         let src_picture = if cut_move { moved_pictures.get(&sc) } else { src_sheet.cell_pictures.get(&sc) }.cloned();
                         if skip_blanks && src_picture.is_none() && src_val.is_empty() && src_cell.as_ref().is_none_or(|x| x.formula.is_none()) {
                             continue;
                         }
-                        let old = cx.wb.sheet(dest_sheet).and_then(|sh| sh.cell(dest)).cloned().unwrap_or_default();
+                        let old = cx.wb.sheet(dest_sheet).and_then(|sh| sh.cell(dest)).unwrap_or_default();
                         let old_picture = cx.wb.sheet(dest_sheet).and_then(|sh| sh.cell_pictures.get(&dest)).cloned();
                         let mut new_picture = old_picture.clone();
                         let mut new = old.clone();
@@ -1270,12 +1267,13 @@ pub(crate) fn rewrite_all_formulas(wb: &mut gridcraft_model::Workbook, target: &
                 a => a,
             };
             if (text != f.text || array != f.array)
-                && let Some(cell) = sheet.cells.get_mut(c)
+                && let Some(mut cell) = sheet.cells.get(c)
             {
                 let mut nf = Formula::from_expr(new);
                 nf.array = array;
                 nf.dynamic = f.dynamic;
                 cell.formula = Some(std::sync::Arc::new(nf));
+                sheet.cells.set(c, cell);
             }
         }
     }

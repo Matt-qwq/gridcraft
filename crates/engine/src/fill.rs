@@ -88,7 +88,7 @@ pub fn fill(cx: &mut Ctx, sheet: usize, src: RangeRef, target: RangeRef, mode: F
         let src_cells: Vec<(CellRef, Option<Cell>)> = (0..src_len)
             .map(|i| {
                 let c = if vertical { CellRef::new(src.start.row + i, lane) } else { CellRef::new(lane, src.start.col + i) };
-                (c, sh.cell(c).cloned())
+                (c, sh.cell(c))
             })
             .collect();
         let targets: Vec<CellRef> = if vertical {
@@ -125,7 +125,7 @@ pub fn fill(cx: &mut Ctx, sheet: usize, src: RangeRef, target: RangeRef, mode: F
             let mut cell = scell.clone().unwrap_or_default();
             match mode {
                 FillMode::Formats => {
-                    let mut existing = sh.cell(*t).cloned().unwrap_or_default();
+                    let mut existing = sh.cell(*t).unwrap_or_default();
                     existing.style = cell.style;
                     writes.push((*t, Some(existing)));
                     continue;
