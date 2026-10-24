@@ -284,10 +284,14 @@ impl ZipOut {
     pub fn new() -> ZipOut {
         ZipOut { zip: zip::ZipWriter::new(Cursor::new(Vec::new())) }
     }
+    /// The level is 3, not the usual 6: measured on a 599 MB worksheet, level 6 packs it in 4.29 s
+    /// to 65 MB, level 3 in 1.25 s to 74 MB, level 1 in 0.53 s to 107 MB. A report that took 9 s to
+    /// save takes 4.3 at level 3 and comes out 13% larger — still smaller than the file WPS wrote for
+    /// it. Saving is the slowest thing a spreadsheet does; that trade is worth making.
     pub fn add(&mut self, name: &str, data: &[u8]) -> Result<(), IoError> {
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6))
+            .compression_level(Some(3))
             .last_modified_time(zip::DateTime::default())
             .large_file(data.len() as u64 >= u32::MAX as u64);
         self.zip.start_file(name, opts).map_err(|e| IoError::Zip(e.to_string()))?;

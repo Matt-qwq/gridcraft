@@ -1,6 +1,6 @@
 //! Writing worksheet parts and the parts they own (tables, comments, drawings, charts).
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use gridcraft_core::{CellError, CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
@@ -280,54 +280,84 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         s.push_str("</cols>");
     }
 
-    // sheetData
-    let mut keys: BTreeSet<CellRef> = sheet.cells.iter().map(|(c, _)| c).collect();
-    keys.extend(sheet.cell_pictures.keys().copied());
-    keys.extend(extra.keys().copied());
-    keys.extend(overrides.keys().copied());
-    let mut rows: BTreeMap<u32, Vec<CellRef>> = BTreeMap::new();
-    for k in keys {
-        rows.entry(k.row).or_default().push(k);
+    // sheetData. The store hands its cells out in (row, column) order and the sparse additions —
+    // table headers, spilled values, pictures, dynamic-array anchors — are a handful, so the sheet
+    // is written in one merge walk. This used to collect all 31.7M cell references into a `BTreeSet`
+    // first (1.4 s and half a gigabyte on the report this was measured against) and then look every
+    // cell up again, one random `cells.get` at a time.
+    let mut additions: BTreeMap<u32, Vec<(u32, Additions)>> = BTreeMap::new();
+    for (c, name) in &overrides {
+        touch(&mut additions, *c).override_text = Some(name);
     }
-    for r in sheet.rows.keys() {
-        rows.entry(*r).or_default();
+    for (c, v) in &extra {
+        touch(&mut additions, *c).value = Some(v);
     }
+    for (c, picture) in &sheet.cell_pictures {
+        touch(&mut additions, *c).picture = Some(picture);
+    }
+    for (c, r) in &dynamic {
+        touch(&mut additions, *c).dynamic = Some(*r);
+    }
+
     s.push_str("<sheetData>");
-    for (r, cells) in &rows {
-        let info = sheet.rows.get(r).copied().unwrap_or_default();
-        if cells.is_empty() && info == LineInfo::default() {
+    let mut store = sheet.cells.iter().peekable();
+    let mut sparse = additions.into_iter().peekable();
+    let mut info_rows = sheet.rows.iter().peekable();
+    loop {
+        let next_store = store.peek().map(|(at, _)| at.row);
+        let next_sparse = sparse.peek().map(|(r, _)| *r);
+        let next_info = info_rows.peek().map(|(r, _)| **r);
+        let Some(row) = [next_store, next_sparse, next_info].into_iter().flatten().min() else { break };
+        let info = if next_info == Some(row) {
+            info_rows.next().map(|(_, i)| *i).unwrap_or_default()
+        } else {
+            sheet.rows.get(&row).copied().unwrap_or_default()
+        };
+        let mut adds: std::iter::Peekable<std::vec::IntoIter<(u32, Additions<'_>)>> = if next_sparse == Some(row) {
+            sparse.next().map(|(_, v)| v).unwrap_or_default().into_iter().peekable()
+        } else {
+            Vec::new().into_iter().peekable()
+        };
+        let has_cells = next_store == Some(row) || adds.peek().is_some();
+        if !has_cells && info == LineInfo::default() {
             continue;
         }
-        let _ = write!(s, "<row r=\"{}\"", r + 1);
-        if let Some(st) = info.style {
-            let _ = write!(s, " s=\"{}\" customFormat=\"1\"", sid(st));
-        }
-        if let Some(h) = info.size {
-            let _ = write!(s, " ht=\"{}\"{}", num(px_to_pt(h)), if info.custom { " customHeight=\"1\"" } else { "" });
-        }
-        if info.hidden {
-            s.push_str(" hidden=\"1\"");
-        }
-        if info.outline > 0 {
-            let _ = write!(s, " outlineLevel=\"{}\"", info.outline.min(7));
-        }
-        if info.collapsed {
-            s.push_str(" collapsed=\"1\"");
-        }
-        if cells.is_empty() {
+        write_row_open(&mut s, row, &info, &sid);
+        if !has_cells {
             s.push_str("/>");
             continue;
         }
         s.push('>');
-        for c in cells {
-            let cell = sheet.cells.get(*c);
-            let ov = overrides.get(c);
-            let ex = extra.get(c);
-            let array = dynamic.get(c).copied().or_else(|| {
+        loop {
+            let stored = store.peek().filter(|(at, _)| at.row == row);
+            let add_col = adds.peek().map(|(col, _)| *col);
+            let mut a = Additions::default();
+            let (col, cell) = match (stored, add_col) {
+                (Some((at, _)), Some(acol)) if acol < at.col => {
+                    let (col, addition) = adds.next().unwrap_or((0, Additions::default()));
+                    a = addition;
+                    (col, None)
+                }
+                (Some(_), _) => {
+                    let (at, cell) = store.next().unwrap_or((CellRef::new(row, 0), Cell::default()));
+                    if add_col == Some(at.col) {
+                        a = adds.next().map(|(_, addition)| addition).unwrap_or_default();
+                    }
+                    (at.col, Some(cell))
+                }
+                (None, Some(_)) => {
+                    let (col, addition) = adds.next().unwrap_or((0, Additions::default()));
+                    a = addition;
+                    (col, None)
+                }
+                (None, None) => break,
+            };
+            let at = CellRef::new(row, col);
+            let array = a.dynamic.or_else(|| {
                 let f = cell.as_ref()?.formula.as_ref()?;
-                (f.array.is_none() && crate::array_formula::needs_array(wb, si, *c, f)).then_some(RangeRef::cell(*c))
+                (f.array.is_none() && crate::array_formula::needs_array(wb, si, at, f)).then_some(RangeRef::cell(at))
             });
-            write_cell(&mut s, *c, cell.as_ref(), sheet.cell_pictures.get(c), ov, ex, array.as_ref(), &sid, out);
+            write_cell(&mut s, at, cell.as_ref(), a.picture, a.override_text, a.value, array.as_ref(), &sid, out);
         }
         s.push_str("</row>");
     }
@@ -651,6 +681,114 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
     (s, rels)
 }
 
+/// What a cell needs beyond the store: a table header's text, a spilled value, a picture, or the
+/// range a dynamic array formula spills into. All are sparse, which is why they are looked up in a
+/// per-row list during the one ordered walk rather than in a map keyed by cell.
+#[derive(Default)]
+struct Additions<'a> {
+    override_text: Option<&'a String>,
+    value: Option<&'a Value>,
+    picture: Option<&'a std::sync::Arc<gridcraft_model::CellPicture>>,
+    dynamic: Option<RangeRef>,
+}
+
+/// The additions for one cell, adding the entry when it isn't there yet.
+fn touch<'b, 'a>(additions: &'b mut BTreeMap<u32, Vec<(u32, Additions<'a>)>>, c: CellRef) -> &'b mut Additions<'a> {
+    let row = additions.entry(c.row).or_default();
+    let at = match row.binary_search_by_key(&c.col, |(col, _)| *col) {
+        Ok(i) => i,
+        Err(i) => {
+            row.insert(i, (c.col, Additions::default()));
+            i
+        }
+    };
+    &mut row[at].1
+}
+
+/// `<row …` up to the point where its cells (or `/>`) follow.
+fn write_row_open(s: &mut String, r: u32, info: &LineInfo, sid: &dyn Fn(gridcraft_model::StyleId) -> u32) {
+    s.push_str("<row r=\"");
+    push_u32(s, r + 1);
+    s.push('"');
+    if let Some(st) = info.style {
+        s.push_str(" s=\"");
+        push_u32(s, sid(st));
+        s.push_str("\" customFormat=\"1\"");
+    }
+    if let Some(h) = info.size {
+        let _ = write!(s, " ht=\"{}\"{}", num(px_to_pt(h)), if info.custom { " customHeight=\"1\"" } else { "" });
+    }
+    if info.hidden {
+        s.push_str(" hidden=\"1\"");
+    }
+    if info.outline > 0 {
+        let _ = write!(s, " outlineLevel=\"{}\"", info.outline.min(7));
+    }
+    if info.collapsed {
+        s.push_str(" collapsed=\"1\"");
+    }
+}
+
+/// `c.a1()` appended without the `String` it would allocate: this runs once per cell.
+fn a1_into(s: &mut String, c: CellRef) {
+    let mut col = c.col as usize + 1;
+    let mut letters = [0u8; 3];
+    let mut n = 0;
+    while col > 0 {
+        letters[n] = b'A' + ((col - 1) % 26) as u8;
+        n += 1;
+        col = (col - 1) / 26;
+    }
+    for i in (0..n).rev() {
+        s.push(letters[i] as char);
+    }
+    push_u32(s, c.row + 1);
+}
+
+/// `n` in decimal, appended without the formatting machinery.
+fn push_u32(s: &mut String, n: u32) {
+    push_u64(s, u64::from(n));
+}
+
+fn push_u64(s: &mut String, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    s.push_str(std::str::from_utf8(&digits[i..]).unwrap_or("0"));
+}
+
+/// [`num`] appended to the buffer: a report writes tens of millions of these, and the `String` that
+/// `num` builds (and, for a fraction, the `replace` that builds a second one) is most of the cost.
+fn push_num(s: &mut String, n: f64) {
+    if !n.is_finite() {
+        s.push('0');
+        return;
+    }
+    if n == n.trunc() && n.abs() < 1e15 {
+        let v = n as i64;
+        if v < 0 {
+            s.push('-');
+        }
+        push_u64(s, v.unsigned_abs());
+        return;
+    }
+    use std::fmt::Write as _;
+    let start = s.len();
+    let _ = write!(s, "{n:?}");
+    if s[start..].contains('e') {
+        let replaced = s[start..].replace('e', "E");
+        s.truncate(start);
+        s.push_str(&replaced);
+    }
+}
+
 fn write_cell(
     s: &mut String,
     c: CellRef,
@@ -663,9 +801,13 @@ fn write_cell(
     out: &mut Out,
 ) {
     let style = cell.map(|x| sid(x.style)).unwrap_or(0);
-    let _ = write!(s, "<c r=\"{}\"", c.a1());
+    s.push_str("<c r=\"");
+    a1_into(s, c);
+    s.push('"');
     if style != 0 {
-        let _ = write!(s, " s=\"{style}\"");
+        s.push_str(" s=\"");
+        push_u32(s, style);
+        s.push('"');
     }
     if let Some(picture) = picture {
         let vm = out.cell_pictures.index(picture);
@@ -721,7 +863,9 @@ fn write_cell(
         }
         match &value {
             Value::Number(n) => {
-                let _ = write!(s, "<v>{}</v>", num(*n));
+                s.push_str("<v>");
+                push_num(s, *n);
+                s.push_str("</v>");
             }
             Value::Text(t) => {
                 let _ = write!(s, "<v>{}</v>", esc(&encode_xstring(t)));
@@ -740,7 +884,9 @@ fn write_cell(
     match &value {
         Value::Empty | Value::Array(_) => s.push_str("/>"),
         Value::Number(n) => {
-            let _ = write!(s, "><v>{}</v></c>", num(*n));
+            s.push_str("><v>");
+            push_num(s, *n);
+            s.push_str("</v></c>");
         }
         Value::Text(t) => {
             let i = out.sst.index(t);
@@ -1326,4 +1472,93 @@ fn vml_xml(sheet: &Sheet, n: u32) -> String {
     }
     s.push_str("</xml>");
     s
+}
+
+#[cfg(test)]
+mod perf {
+    use super::*;
+
+    /// The whole save split into "make the XML" and "compress the package". Point it at a file with
+    /// GRIDCRAFT_PERF_FILE (the clock is read here, which the crate bans on wasm):
+    ///   GRIDCRAFT_PERF_FILE=big.xlsx cargo test --release -p gridcraft-xlsx --lib -- --ignored --nocapture saving_a_big_file
+    #[test]
+    #[ignore = "timing, not a check"]
+    #[cfg_attr(not(target_arch = "wasm32"), allow(clippy::disallowed_methods))]
+    fn saving_a_big_file() {
+        let Ok(path) = std::env::var("GRIDCRAFT_PERF_FILE") else { return };
+        let (wb, _) = crate::read_xlsx_file(std::path::Path::new(&path)).expect("read");
+        let mut out = crate::write::Out::default();
+        for (i, sheet) in wb.sheets.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let (xml, _) = write_sheet(&wb, i, i == wb.active_sheet, &mut out);
+            println!(
+                "  {:<28} {:>10.1} MB xml   {:>8.2?}   {:.0} ns a cell",
+                sheet.name.chars().take(28).collect::<String>(),
+                xml.len() as f64 / 1048576.0,
+                t.elapsed(),
+                t.elapsed().as_secs_f64() * 1e9 / sheet.cells.len().max(1) as f64
+            );
+        }
+        let t = std::time::Instant::now();
+        let bytes = crate::write_xlsx(&wb).expect("write");
+        println!("  total write_xlsx {:?}   {:.0} MB out", t.elapsed(), bytes.len() as f64 / 1048576.0);
+
+        // The biggest worksheet's XML through the zip writer at several levels: what compression
+        // costs and what it buys, on this file's real text rather than a synthetic row.
+        if let Some(sheet) = wb.sheets.iter().max_by_key(|s| s.cells.len()) {
+            let mut out = crate::write::Out::default();
+            let (xml, _) = write_sheet(&wb, wb.sheets.iter().position(|s| std::ptr::eq(&**s, &**sheet)).unwrap_or(0), false, &mut out);
+            let data = xml.as_bytes();
+            println!("  {} ({:.0} MB), through the zip writer:", sheet.name, data.len() as f64 / 1048576.0);
+            for level in [1, 3, 6, 9] {
+                let t = std::time::Instant::now();
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .compression_level(Some(level))
+                    .large_file(true);
+                use std::io::Write as _;
+                zip.start_file("xl/worksheets/sheet.xml", options).expect("start");
+                zip.write_all(data).expect("write");
+                let packed = zip.finish().expect("finish").into_inner();
+                let secs = t.elapsed().as_secs_f64();
+                println!(
+                    "    level {level}   {:>8.2?}   {:>5.0} MB/s   {:.0} MB packed",
+                    t.elapsed(),
+                    data.len() as f64 / 1048576.0 / secs,
+                    packed.len() as f64 / 1048576.0
+                );
+            }
+        }
+    }
+
+    /// Where a saved report's time goes. Run it with:
+    ///   cargo test --release -p gridcraft-xlsx --lib -- --ignored --nocapture number_formatting
+    #[test]
+    #[ignore = "timing, not a check"]
+    #[cfg_attr(not(target_arch = "wasm32"), allow(clippy::disallowed_methods))]
+    fn number_formatting() {
+        // The mix a report has: whole counts and two-decimal money.
+        let sample: Vec<f64> = (0..1_000_000).map(|i| if i % 3 == 0 { i as f64 } else { i as f64 * 0.0188 + 0.5 }).collect();
+        let mut s = String::with_capacity(32);
+        let t = std::time::Instant::now();
+        for v in &sample {
+            s.clear();
+            let _ = write!(s, "{v:?}");
+        }
+        println!("write!({{:?}})  {:?}  ({:.0} ns a number)", t.elapsed(), t.elapsed().as_secs_f64() * 1e9 / sample.len() as f64);
+        let t = std::time::Instant::now();
+        for v in &sample {
+            s.clear();
+            push_num(&mut s, *v);
+        }
+        println!("push_num      {:?}  ({:.0} ns a number)", t.elapsed(), t.elapsed().as_secs_f64() * 1e9 / sample.len() as f64);
+        // And the same numbers through `num`, which builds a String first.
+        let t = std::time::Instant::now();
+        let mut len = 0usize;
+        for v in &sample {
+            len += num(*v).len();
+        }
+        println!("num() + String {:?}  ({:.0} ns a number, {len} bytes)", t.elapsed(), t.elapsed().as_secs_f64() * 1e9 / sample.len() as f64);
+    }
 }

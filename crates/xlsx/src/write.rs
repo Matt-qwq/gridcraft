@@ -130,6 +130,31 @@ pub struct Out {
     pub kept: crate::passthrough::KeptOut,
 }
 
+impl Default for Out {
+    fn default() -> Self {
+        Out {
+            parts: vec![],
+            overrides: vec![],
+            defaults: BTreeMap::new(),
+            dxfs: vec![],
+            sst: Sst::default(),
+            images: 0,
+            charts: 0,
+            book_name: DEFAULT_BOOK_NAME.to_string(),
+            chart_names: vec![],
+            drawings: 0,
+            tables: 0,
+            comments: 0,
+            persons: vec![],
+            table_id: 0,
+            dynamic_arrays: false,
+            needs_calc: false,
+            cell_pictures: Default::default(),
+            kept: Default::default(),
+        }
+    }
+}
+
 impl Out {
     pub fn part(&mut self, name: &str, content_type: Option<&str>, data: Vec<u8>) {
         if let Some(ct) = content_type {
