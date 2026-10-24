@@ -56,7 +56,10 @@ pub struct UiState {
     pub ribbon_collapsed: bool,
     pub formula_bar_expanded: bool,
     pub status_bar: bool,
-    /// Motion in the UI: the selection outline glides to a new selection (View ▸ Animations).
+    /// Motion in the UI: the selection outline glides to a new selection and a wheel zoom eases to
+    /// its step (View ▸ Animations). Off by default: a spreadsheet is read by looking, and an
+    /// outline that arrives a tenth of a second late only makes the reader wait. Excel's cell
+    /// cursor jumps.
     pub animations: bool,
     /// Enable AutoComplete for cell values (File ▸ Options ▸ Editing): typed text is completed
     /// from the one matching entry in the same column.
@@ -105,7 +108,7 @@ impl Default for UiState {
             ribbon_collapsed: false,
             formula_bar_expanded: false,
             status_bar: true,
-            animations: true,
+            animations: false,
             autocomplete: true,
             autosave: false,
             recent: vec![],
