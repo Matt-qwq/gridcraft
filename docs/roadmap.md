@@ -156,6 +156,22 @@ attribute order, quoting, entities, inline strings, comments, CDATA, prefixed na
 closes, and the forty-row mixed fixture. Open **1.9 → 1.7 s** for the 118 MB report; the scanner is
 2.6× faster but the per-cell work now dominates, which is where the next second is.
 
+`examples/cell_probe.rs` splits that per-cell work on a 255 MiB sheet of the report's shape,
+single-threaded, 6M cells:
+
+| step | time | per cell |
+|---|---|---|
+| scan only | 0.43 s | — |
+| + what `decode_cell` does (attribute, number, `Cell`) | 0.59 s | 28 ns |
+| + the band packing `pack_row` does | 0.99 s | **68 ns** |
+
+Two guesses died on the measurement, and are recorded so nobody repeats them: a one-entry memo on a
+band's number, style and text dictionaries (values repeat across *rows*, not within one, so the memo
+almost never hits — the report opened 1.69 → 1.79 s) and skipping the post-row `Runs` compaction
+(no measurable difference). What is left is allocation: a row with six cells builds eight small
+`Vec`s, so six million cells means seven million allocations. That is the band-stripe layout above,
+not a patch.
+
 ### M17 — Block statistics (zone maps) · 8–12 h
 
 **Scope.** Every band records, per column it touches, `(min, max, last row with a value, count)`.
@@ -350,6 +366,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-25 | minor | `cell_probe` records where the decode's time is (band packing 68 ns a cell, mostly allocation), and two measured dead ends: dictionary memos and skipping compaction |
 | 2026-10-25 | minor | Open path: a fast cell-reference parse, no row fitting when a workbook's styles cannot grow a row, and a hand-written row scanner (590 MiB/s against the general walker's 226) — a 118 MB report opens in 1.7 s instead of 4.1, the 1.28 GB one in 3.8 instead of 5.2 |
 | 2026-10-24 | minor | `MAX`/`MIN` fold references (105 → 47 ms a million cells); a block no formula can change is built once a pass and shared, and text-key columns get an exact-match index: a full recalculation of the 1.28 GB report 8.5 → 3.7 s |
 | 2026-10-24 | minor | Parquet export landed (M21's write half): 26M cells to 8.5 MB in ~2.6 s, verified against pyarrow |
