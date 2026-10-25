@@ -75,6 +75,12 @@ pub trait Host {
     fn used_range(&mut self, sheet: usize) -> Option<RangeRef> {
         self.workbook().sheet(sheet).and_then(|s| s.used_range())
     }
+    /// The block already built, when the host can share one: a workbook that looks up the same
+    /// table from eighty thousand rows reads it once a pass instead of eighty thousand times.
+    /// `None` means "read it with `range_values`".
+    fn range_array(&mut self, _sheet: usize, _range: RangeRef) -> Option<Arc<Array>> {
+        None
+    }
     /// Calls `f` on each stored value of a block, row-major (formula cells evaluated first),
     /// until `f` returns false. `false` when this host can't (callers use `range_values`).
     fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
@@ -212,6 +218,12 @@ impl<'h> Evaluator<'h> {
         let (h, w) = (range.height() as usize, range.width() as usize);
         if (h as u64) * (w as u64) > MAX_CELLS {
             return Value::Error(CellError::Num);
+        }
+        if let Some(shared) = self.host.range_array(a.sheet, range)
+            && shared.rows == h
+            && shared.cols == w
+        {
+            return Value::Array(shared);
         }
         let data = self.host.range_values(a.sheet, range);
         Array::new(h, w, data).map(Value::from).unwrap_or(Value::Error(CellError::Value))
@@ -954,6 +966,22 @@ impl<'h> Evaluator<'h> {
     /// Adds one argument's value by calling `SUM` and `COUNT` on it, so coercion and error rules
     /// stay in one place (`AVERAGE` of an argument is its `SUM` over its `COUNT`).
     fn aggregate_value(&mut self, kind: Agg, value: Value, from_ref: bool, acc: &mut Acc) -> Result<(), Ev> {
+        if matches!(kind, Agg::Max | Agg::Min) {
+            // The function already knows how a direct argument coerces (`MAX("7")` is 7) and what
+            // an array of them folds to, so a non-reference argument goes through it.
+            let name = if kind == Agg::Max { "MAX" } else { "MIN" };
+            let Some(f) = gridcraft_functions::lookup(name) else { return Err(err(CellError::Name)) };
+            let args = [Arg { value, from_ref }];
+            match gridcraft_functions::call(f, &args, &mut FnCtx { ev: self, criteria: None, lambda: None }) {
+                Value::Number(n) => {
+                    acc.sum += n;
+                    acc.count = acc.count.saturating_add(1);
+                    acc.note(n, kind);
+                    return Ok(());
+                }
+                other => return Err(Ev::V(other)),
+            }
+        }
         let (Some(sum), Some(count)) = (gridcraft_functions::lookup("SUM"), gridcraft_functions::lookup("COUNT")) else {
             return Err(err(CellError::Name));
         };
@@ -1652,6 +1680,8 @@ pub enum Agg {
     Sum,
     Count,
     Average,
+    Max,
+    Min,
 }
 
 impl Agg {
@@ -1660,6 +1690,8 @@ impl Agg {
             "SUM" => Some(Agg::Sum),
             "COUNT" => Some(Agg::Count),
             "AVERAGE" => Some(Agg::Average),
+            "MAX" => Some(Agg::Max),
+            "MIN" => Some(Agg::Min),
             _ => None,
         }
     }
@@ -1671,6 +1703,8 @@ impl Agg {
 pub struct Acc {
     sum: f64,
     count: u64,
+    /// The largest (or smallest) number seen, for `MAX` and `MIN`; `None` until one is read.
+    best: Option<f64>,
 }
 
 impl Acc {
@@ -1681,6 +1715,7 @@ impl Acc {
             Value::Number(n) => {
                 self.sum += n;
                 self.count = self.count.saturating_add(1);
+                self.note(*n, kind);
                 Ok(())
             }
             Value::Error(e) if kind != Agg::Count => Err(*e),
@@ -1695,10 +1730,22 @@ impl Acc {
             gridcraft_model::Packed::Number(n) => {
                 self.sum += n;
                 self.count = self.count.saturating_add(1);
+                self.note(n, kind);
                 Ok(())
             }
             gridcraft_model::Packed::Error(e) if kind != Agg::Count => Err(e),
             _ => Ok(()),
+        }
+    }
+
+    /// Keeps the extreme for `MAX` and `MIN`, which ignore everything but numbers.
+    fn note(&mut self, n: f64, kind: Agg) {
+        if matches!(kind, Agg::Max | Agg::Min) {
+            self.best = Some(match self.best {
+                Some(b) if kind == Agg::Max => b.max(n),
+                Some(b) => b.min(n),
+                None => n,
+            });
         }
     }
 
@@ -1708,6 +1755,8 @@ impl Acc {
             Agg::Count => Value::number(self.count as f64),
             Agg::Average if self.count == 0 => Value::Error(CellError::Div0),
             Agg::Average => Value::number(self.sum / self.count as f64),
+            // Excel's `MAX` and `MIN` of no numbers at all are 0, not an error.
+            Agg::Max | Agg::Min => Value::number(self.best.unwrap_or(0.0)),
         }
     }
 }

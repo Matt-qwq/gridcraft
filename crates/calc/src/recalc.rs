@@ -385,6 +385,12 @@ impl Default for Calc {
     }
 }
 
+/// The largest single block the pass keeps built and shared. A lookup table is small; a whole
+/// column read as an array is not, and rebuilding it is cheaper than holding it.
+const MAX_CACHED_BLOCK_CELLS: usize = 4_000_000;
+/// All shared blocks together, at 24 bytes a value.
+const MAX_CACHED_BLOCK_CELLS_TOTAL: usize = 4_000_000;
+
 struct PassHost<'a> {
     wb: &'a Workbook,
     exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
@@ -396,6 +402,10 @@ struct PassHost<'a> {
     /// Used range per sheet: the workbook doesn't change during a pass, and working it out walks
     /// every row, so once per sheet rather than once per range read.
     used: HashMap<usize, Option<RangeRef>>,
+    /// Blocks with no formula in them, read once a pass and shared. A reporting workbook's eighty
+    /// thousand lookups read the same few columns; rebuilding each block costs ~100 µs a formula.
+    blocks: HashMap<(usize, RangeRef), std::sync::Arc<Array>>,
+    block_cells: usize,
     rng: &'a mut u64,
     now: f64,
     cycle: bool,
@@ -444,6 +454,8 @@ impl<'a> PassHost<'a> {
             in_progress: HashSet::default(),
             spills: HashMap::default(),
             used: HashMap::default(),
+            blocks: HashMap::default(),
+            block_cells: 0,
             rng,
             now,
             cycle: false,
@@ -783,6 +795,41 @@ impl Host for PassHost<'_> {
             }
         }
         self.wb.sheet(sheet).map(|s| s.value(c)).unwrap_or_default()
+    }
+    fn range_array(&mut self, sheet: usize, range: RangeRef) -> Option<std::sync::Arc<Array>> {
+        // A block can only be reused while nothing that writes can change it: no formula cell
+        // inside it (those are recalculated), no spill inside it, and no spill produced by this
+        // pass anywhere on the sheet (a later formula could spill into it).
+        if !self.spills.is_empty() {
+            return None;
+        }
+        if let Some(hit) = self.blocks.get(&(sheet, range)) {
+            return Some(std::sync::Arc::clone(hit));
+        }
+        let (h, w) = (range.height() as usize, range.width() as usize);
+        let cells = h.checked_mul(w)?;
+        if cells > MAX_CACHED_BLOCK_CELLS || self.block_cells.saturating_add(cells) > MAX_CACHED_BLOCK_CELLS_TOTAL {
+            return None;
+        }
+        let sh = self.wb.sheet(sheet)?;
+        if sh.spill.range(range.start..=range.end).next().is_some() {
+            return None;
+        }
+        // A formula cell in the block usually rules the block out — its value is being worked
+        // out. Once it has been, the pass never evaluates it again (`results` is authoritative),
+        // so the block is as fixed as a block of constants, and the next formula that reads it
+        // gets the same array. That is the shape of a reporting sheet: eighty thousand lookups
+        // into one small table whose own few formulas were worked out on the first read.
+        let stable =
+            !self.iterate && sh.cells.formula_cells(range).all(|c| self.results.contains_key(&(sheet, c)) && !self.pending.contains(&(sheet, c)));
+        if !stable {
+            return None;
+        }
+        let data = self.range_values(sheet, range);
+        let array = std::sync::Arc::new(Array::new(h, w, data)?);
+        self.block_cells += cells;
+        self.blocks.insert((sheet, range), std::sync::Arc::clone(&array));
+        Some(array)
     }
     fn range_values(&mut self, sheet: usize, range: RangeRef) -> Vec<Value> {
         let (h, w) = (range.height() as usize, range.width() as usize);

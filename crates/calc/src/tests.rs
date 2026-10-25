@@ -1219,6 +1219,37 @@ fn aggregate_of(error: bool, formula: &str) -> Value {
     t.get("AB1")
 }
 
+/// `MAX` and `MIN` fold a reference the same way `SUM` does: numbers only, errors through, text
+/// and logicals in a reference ignored, direct arguments coerced, and 0 when nothing is numeric.
+#[test]
+fn max_and_min_over_ranges() {
+    let n = Value::Number;
+    let e = Value::Error;
+
+    // (MAX, error in E2?, [MAX, MIN] of the same block)
+    #[rustfmt::skip]
+    let cases: &[(&str, bool, [Value; 2])] = &[
+        ("=MAX(A1:A4)", false, [n(2.0), n(-0.25)]),
+        ("=MAX(A1:B4)", false, [n(10.0), n(-0.25)]),
+        ("=MAX(B1:B3)", false, [n(10.0), n(3.0)]),
+        ("=MAX(A1:A4,B3)", false, [n(3.0), n(-0.25)]),
+        ("=MAX(A1:A4,5)", false, [n(5.0), n(-0.25)]),
+        ("=MAX(A1:A4,\"7\")", false, [n(7.0), n(-0.25)]),
+        ("=MAX(A1:A4,TRUE)", false, [n(2.0), n(-0.25)]),
+        ("=MAX(C1:C1)", false, [n(6.0), n(6.0)]),
+        ("=MAX(E1:E3)", false, [n(0.0), n(0.0)]),
+        ("=MAX(Z1:Z9)", false, [n(0.0), n(0.0)]),
+        ("=MAX(A:C)", false, [n(10.0), n(-0.25)]),
+        ("=MAX(A1:E4)", true, [e(CellError::Div0), e(CellError::Div0)]),
+    ];
+    for (formula, error, want) in cases {
+        for (func, want) in ["MAX", "MIN"].into_iter().zip(want) {
+            let f = formula.replacen("MAX", func, 1);
+            assert_eq!(&aggregate_of(*error, &f), want, "{f} (error in E2: {error})");
+        }
+    }
+}
+
 #[test]
 fn sum_count_average_over_ranges() {
     // Text, booleans, blanks and a formula cell inside ranges; direct arguments; unions; whole

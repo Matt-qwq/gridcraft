@@ -1077,6 +1077,22 @@ impl CellStore {
         Some(cell)
     }
 
+    /// The cells of `r` that carry a formula, in row-major order.
+    pub fn formula_cells(&self, r: RangeRef) -> impl Iterator<Item = CellRef> + '_ {
+        self.bands.range(r.start.row / BAND..=r.end.row / BAND).flat_map(move |(bk, band)| {
+            band.rows.iter().flat_map(move |(in_band, row)| {
+                let at_row = bk * BAND + *in_band;
+                row.extras
+                    .as_ref()
+                    .map(|e| e.formulas.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(move |(c, _)| at_row >= r.start.row && at_row <= r.end.row && *c >= r.start.col && *c <= r.end.col)
+                    .map(move |(c, _)| CellRef::new(at_row, *c))
+            })
+        })
+    }
+
     /// Whether the block holds a cell whose value the store cannot give: a formula (it holds the
     /// value the file cached) or an array. Cheap next to reading the block: one check a row.
     pub fn has_owned_cells(&self, r: RangeRef) -> bool {

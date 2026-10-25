@@ -156,6 +156,20 @@ for numeric columns only. Rollback is a one-line switch in the band builder.
 
 ### M18 — Vectorized aggregation kernels · 30–45 h
 
+**Landed (10-24).** `MAX` and `MIN` fold a reference the way `SUM` already did (105 → 47 ms over a
+million cells), and a block of the sheet that no formula can change during a pass is built once a
+pass and shared (`Host::range_array`): a reporting sheet's thousands of lookups into one table read
+it once. On the 1.28 GB report the full recalculation went 8.5 → 8.1 s, which is small — and that is
+the finding worth keeping: seventy thousand of its eighty thousand formulas read *small* blocks, so
+materialising them was never what cost the time.
+
+**Open question.** A full recalculation of that report spends ~99 µs a formula, and the block reads
+account for only a few hundred milliseconds. Timing the shapes one at a time (one `FILTER(SEARCH)`
+over 351k rows is 0.7 ms; one `SUMIFS` is cheap; the `IFERROR(INDEX(…MATCH…))` lookups are tens of
+microseconds) does not find where the rest goes, so the next step is a profiler rather than more
+guesses. Whatever it is, it is per formula and paid on every pass (<F9> is 8.1 s every time, not just
+the first).
+
 **Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
 band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
 `MIN`, `MAX`. The scalar evaluator stays the fallback for everything else; nothing changes about
@@ -304,6 +318,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-24 | minor | `MAX`/`MIN` fold references (105 → 47 ms a million cells); formula-free blocks are built once a pass and shared, and the open question about the remaining ~99 µs a formula is written down |
 | 2026-10-24 | minor | Parquet export landed (M21's write half): 26M cells to 8.5 MB in ~2.6 s, verified against pyarrow |
 | 2026-10-24 | minor | M17 re-scoped after measuring: whole-column references are already clipped, and `SUM`/`COUNT`/`AVERAGE` now fold the stored pages (154/286/414 → 52/50/53 ms a million cells); the layout cost behind the rest is written into M19 |
 | 2026-10-11 | minor | PivotTable calculated fields landed |
