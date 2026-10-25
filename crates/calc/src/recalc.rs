@@ -856,6 +856,52 @@ impl Host for PassHost<'_> {
         }
         out
     }
+    fn visit_aggregate(
+        &mut self,
+        sheet: usize,
+        range: RangeRef,
+        kind: crate::eval::Agg,
+        acc: &mut crate::eval::Acc,
+    ) -> Option<Result<(), gridcraft_core::CellError>> {
+        let wb = self.wb;
+        let sh = wb.sheet(sheet)?;
+        // Spilled values sit between the stored cells, and a spill may hold a number: leave such
+        // blocks to `visit_range`, which knows about them.
+        if self.spills.keys().any(|a| a.0 == sheet) || sh.spill.range(range.start..=range.end).any(|(c, _)| range.contains(*c)) {
+            return None;
+        }
+        // Decide before folding anything: a block with a formula in it is priced by `visit_range`,
+        // which evaluates those first, and folding half of it here would count the rest twice.
+        if sh.cells.has_owned_cells(range) {
+            return None;
+        }
+        let mut needs_host = false;
+        let mut error = None;
+        let done = sh.cells.visit_packed(range, &mut |_, packed| {
+            let Some(packed) = packed else {
+                needs_host = true;
+                return false;
+            };
+            match acc.add_packed(kind, packed) {
+                Ok(()) => true,
+                Err(e) => {
+                    error = Some(e);
+                    false
+                }
+            }
+        });
+        if needs_host {
+            return None;
+        }
+        // A stop with no error is the closure's only other exit, so `!done` here means `error`.
+        Some(match error {
+            Some(e) => Err(e),
+            None => {
+                let _ = done;
+                Ok(())
+            }
+        })
+    }
     fn visit_range(&mut self, sheet: usize, range: RangeRef, f: &mut dyn FnMut(&Value) -> bool) -> bool {
         let wb = self.wb;
         let Some(sh) = wb.sheet(sheet) else { return false };

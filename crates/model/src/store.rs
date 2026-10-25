@@ -832,6 +832,15 @@ impl BandBatch {
     }
 }
 
+/// One stored cell as its page holds it: no `Cell`, no `Value`, no allocation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Packed<'a> {
+    Number(f64),
+    Text(&'a str),
+    Bool(bool),
+    Error(CellError),
+}
+
 /// A `CellStore`'s packed bands, plus the count of stored cells.
 #[derive(Debug, Default)]
 pub struct CellStore {
@@ -1066,6 +1075,90 @@ impl CellStore {
             self.bands.remove(&key);
         }
         Some(cell)
+    }
+
+    /// Whether the block holds a cell whose value the store cannot give: a formula (it holds the
+    /// value the file cached) or an array. Cheap next to reading the block: one check a row.
+    pub fn has_owned_cells(&self, r: RangeRef) -> bool {
+        self.bands.range(r.start.row / BAND..=r.end.row / BAND).any(|(bk, band)| {
+            band.rows.iter().any(|(in_band, row)| {
+                let at_row = bk * BAND + *in_band;
+                at_row >= r.start.row
+                    && at_row <= r.end.row
+                    && row.extras.as_ref().is_some_and(|e| {
+                        e.formulas.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
+                            || e.arrays.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
+                    })
+            })
+        })
+    }
+
+    /// Calls `f` on each stored cell of `r`, row-major, handing the value as the page holds it, and
+    /// `None` for a cell whose value the evaluator owns (a formula, an array, or a blank one).
+    ///
+    /// Reading a range through `iter_range` builds a `Cell` an iteration — a `Value`, a style, and
+    /// two `Arc` bumps — which costs ~77 ns a cell against ~2 ns for the numbers themselves. Summing
+    /// a million-cell column spent all of its 154 ms there.
+    pub fn visit_packed(&self, r: RangeRef, f: &mut dyn FnMut(CellRef, Option<Packed<'_>>) -> bool) -> bool {
+        let (r0, r1) = (r.start.row, r.end.row);
+        for (bk, band) in self.bands.range(r0 / BAND..=r1 / BAND) {
+            for (in_band, row) in &band.rows {
+                let at_row = bk * BAND + *in_band;
+                if at_row < r0 || at_row > r1 {
+                    continue;
+                }
+                // Start at the first stored column of the range and stop past its last, so a
+                // narrow read of a wide row costs the cells it asks for, not the row's width.
+                let lo = r.start.col.max(row.first);
+                let hi = r.end.col.min(row.first.saturating_add(row.columns()).saturating_sub(1));
+                if lo > hi {
+                    continue;
+                }
+                let start_slot = (lo - row.first) as usize;
+                // A cell that carries a formula stores the value the file cached, which is not
+                // its value now: the evaluator owns it, so hand it over as `None`.
+                let formulas = row.extras.as_ref().map(|e| e.formulas.as_slice()).filter(|f| !f.is_empty());
+                let mut i = row.rank_before(lo);
+                'words: for (word, bits) in row.bits.iter().enumerate().skip(start_slot / 64) {
+                    let mut w = *bits;
+                    if word == start_slot / 64 {
+                        w &= !((1u64 << (start_slot % 64)) - 1);
+                    }
+                    while w != 0 {
+                        let bit = w.trailing_zeros();
+                        w &= w - 1;
+                        let index = i;
+                        i += 1;
+                        let col = row.first + word as u32 * 64 + bit;
+                        if col > hi {
+                            // Past this row's last wanted column; later rows may still be inside.
+                            break 'words;
+                        }
+                        let has_formula = formulas.is_some_and(|f| f.binary_search_by_key(&col, |(c, _)| *c).is_ok());
+                        let packed = if has_formula {
+                            None
+                        } else {
+                            match row.kind_at(index) {
+                                // An empty slot is not a stored value (no value, a style at most),
+                                // and `iter_range` does not hand one out either.
+                                EMPTY => continue,
+                                NUMBER => Some(Packed::Number(band.number(row.payloads[index]))),
+                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(index)))),
+                                TEXT => band.texts.get(row.payloads[index] as usize).map(|t| Packed::Text(t)),
+                                TEXT_WIDE => band.texts.get(row.wide_at(index) as usize).map(|t| Packed::Text(t)),
+                                BOOL => Some(Packed::Bool(row.payloads[index] != 0)),
+                                ERROR => Some(Packed::Error(*ERRORS.get(row.payloads[index] as usize).unwrap_or(&CellError::Value))),
+                                _ => None,
+                            }
+                        };
+                        if !f(CellRef::new(at_row, col), packed) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub fn iter_range(&self, r: RangeRef) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
@@ -1403,6 +1496,109 @@ impl<'de> Deserialize<'de> for CellStore {
         Ok(store)
     }
 }
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+    use crate::Cell;
+    use gridcraft_core::{CellRef, RangeRef, Value};
+
+    fn plain(n: u32) -> Cell {
+        Cell::value(Value::Number(n as f64))
+    }
+
+    /// One row per width, one band boundary, holes in both directions.
+    fn store() -> CellStore {
+        let mut s = CellStore::new();
+        for (r, c, v) in
+            [(0u32, 0u32, 1u32), (0, 1, 2), (0, 70, 3), (1, 0, 4), (1, 64, 5), (5, 3, 6), (63, 70, 7), (64, 0, 8), (64, 70, 9), (200, 1, 10)]
+        {
+            s.set(CellRef::new(r, c), plain(v));
+        }
+        s
+    }
+
+    /// A dense row read through a narrow window: the kind and payload indexes must not slip.
+    #[test]
+    fn packed_walk_over_a_dense_row() {
+        let mut s = CellStore::new();
+        for c in 0..200u32 {
+            s.set(CellRef::new(3, c), plain(10_000 + c));
+        }
+        for (c0, c1) in [(0u32, 0u32), (26, 26), (26, 30), (63, 64), (64, 70), (127, 200), (199, 199)] {
+            let range = RangeRef::new(CellRef::new(3, c0), CellRef::new(3, c1));
+            let want: Vec<(CellRef, f64)> = s.iter_range(range).filter_map(|(at, c)| c.value.as_f64().map(|n| (at, n))).collect();
+            let mut got = Vec::new();
+            s.visit_packed(range, &mut |at, packed| {
+                if let Some(Packed::Number(n)) = packed {
+                    got.push((at, n));
+                }
+                true
+            });
+            assert_eq!(got, want, "range {}", range.a1());
+        }
+    }
+
+    /// A row built through `BandBatch` may hold a slot with a style and no value: the packed walk
+    /// must skip it exactly as `iter_range` does. The report that found this had `SUM(AA74:AA81)`
+    /// answer 83,551.75 instead of 43,045.08 because the slot stopped the walk midway and the
+    /// caller folded the block a second time.
+    #[test]
+    fn packed_walk_skips_a_slot_with_no_value() {
+        let mut batch = BandBatch::new();
+        let mut cells = vec![(3u32, plain(1)), (4, Cell { value: Value::Empty, formula: None, style: StyleId(0) }), (5, plain(3))];
+        batch.set_row(9, &mut cells);
+        let mut s = CellStore::new();
+        s.insert_batch(batch);
+        let range = RangeRef::new(CellRef::new(9, 0), CellRef::new(9, 10));
+        let want: Vec<(CellRef, f64)> = s.iter_range(range).filter_map(|(at, c)| c.value.as_f64().map(|n| (at, n))).collect();
+        let mut got = Vec::new();
+        let mut needs_host = false;
+        s.visit_packed(range, &mut |at, packed| {
+            match packed {
+                Some(Packed::Number(n)) => got.push((at, n)),
+                None => needs_host = true,
+                other => panic!("{} came out as {other:?}", at.a1()),
+            }
+            true
+        });
+        assert_eq!(got, want);
+        assert!(!needs_host, "a value-less slot must not look like a formula");
+    }
+
+    /// The packed walk must hand out exactly the cells `iter_range` does, in the same order.
+    #[test]
+    fn packed_walk_matches_iter_range() {
+        let s = store();
+        for (r0, r1, c0, c1) in [
+            (0u32, 300u32, 0u32, 100u32),
+            (0, 0, 0, 0),
+            (0, 0, 1, 1),
+            (0, 0, 2, 69),
+            (0, 0, 70, 70),
+            (0, 1, 0, 200),
+            (0, 63, 70, 70),
+            (1, 1, 64, 64),
+            (63, 64, 0, 0),
+            (64, 200, 0, 70),
+            (201, 400, 0, 200),
+            (0, 400, 71, 200),
+        ] {
+            let range = RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1));
+            let want: Vec<(CellRef, f64)> = s.iter_range(range).filter_map(|(at, cell)| cell.value.as_f64().map(|n| (at, n))).collect();
+            let mut got: Vec<(CellRef, f64)> = Vec::new();
+            let done = s.visit_packed(range, &mut |at, packed| {
+                match packed {
+                    Some(Packed::Number(n)) => got.push((at, n)),
+                    other => panic!("{} came out as {other:?}", at.a1()),
+                }
+                true
+            });
+            assert!(done);
+            assert_eq!(got, want, "range {}", range.a1());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

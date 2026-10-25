@@ -80,6 +80,12 @@ pub trait Host {
     fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
         false
     }
+    /// Folds a block into an aggregate straight from the stored pages: no `Value` an iteration.
+    /// `None` when the block holds a cell only the evaluator can price (a formula, an array, or the
+    /// spills of one), and the caller falls back to `visit_range`.
+    fn visit_aggregate(&mut self, _sheet: usize, _range: RangeRef, _kind: Agg, _acc: &mut Acc) -> Option<Result<(), CellError>> {
+        None
+    }
 }
 
 pub struct Evaluator<'h> {
@@ -924,6 +930,11 @@ impl<'h> Evaluator<'h> {
     /// Adds one area to `acc`; `Err` is the result the function ends with.
     fn aggregate_area(&mut self, kind: Agg, a: &Area, acc: &mut Acc) -> Result<(), Ev> {
         if !a.range.is_single() {
+            match self.host.visit_aggregate(a.sheet, a.range, kind, acc) {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(e)) => return Err(err(e)),
+                None => {}
+            }
             let mut error = None;
             let walked = self.host.visit_range(a.sheet, a.range, &mut |v| match acc.add_cell(kind, v) {
                 Ok(()) => true,
@@ -1636,7 +1647,8 @@ pub fn r1c1_to_a1(s: &str, at: CellRef) -> Result<Option<String>, CellError> {
 
 /// The aggregates that can fold a reference without building an array.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Agg {
+/// Which aggregate `SUM`, `COUNT` and `AVERAGE` fold.
+pub enum Agg {
     Sum,
     Count,
     Average,
@@ -1655,7 +1667,8 @@ impl Agg {
 
 /// What a folded aggregate carries from one value to the next.
 #[derive(Default)]
-struct Acc {
+/// The running total of an aggregate. A host folds a block into it with `add_packed`.
+pub struct Acc {
     sum: f64,
     count: u64,
 }
@@ -1671,6 +1684,20 @@ impl Acc {
                 Ok(())
             }
             Value::Error(e) if kind != Agg::Count => Err(*e),
+            _ => Ok(()),
+        }
+    }
+
+    /// The same fold as `add_cell`, on a cell read straight from a page.
+    /// Folds a cell read straight from a stored page.
+    pub fn add_packed(&mut self, kind: Agg, v: gridcraft_model::Packed<'_>) -> Result<(), CellError> {
+        match v {
+            gridcraft_model::Packed::Number(n) => {
+                self.sum += n;
+                self.count = self.count.saturating_add(1);
+                Ok(())
+            }
+            gridcraft_model::Packed::Error(e) if kind != Agg::Count => Err(e),
             _ => Ok(()),
         }
     }
