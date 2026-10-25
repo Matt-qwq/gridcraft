@@ -25,13 +25,23 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Impact:** the main format; a repair prompt or silent loss destroys trust.
 - **Estimate:** 15–25 h, plus owner time in Excel. [file-format-parity.md](file-format-parity.md)
 
-### 2. Large workbooks don't open; recalc is single-threaded (P, H)
-- **Missing:** streaming read for ~100 MB XLSX; multi-threaded recalc; 100k-dependent edit under
-  100 ms (was ~0.4 s); whole-sheet operations bounded.
-- **Evidence:** #175; no threading in `crates/calc`; PR #152 (whole-sheet Fill/Remove Duplicates
-  out of memory), PR #151 (current region past 10,000 rows).
+### 2. Large workbooks: what remains of the open/save problem (P, H)
+- **Landed (10-24):** the read path streams a worksheet as it decompresses, decodes windows on
+  eight threads, packs row bands inside those threads (`BandBatch`), and inflates the next window
+  while the last decodes; the write path walks the store once and compresses at level 3. The 118 MB
+  report of 31,709,565 cells now opens in 4.1 s (6.1 s on the desktop) at 549 MB of working set and
+  saves in 10.8 s; the 1.28 GB report opens in 5.2 s at 569 MB.
+- **Missing:** multi-threaded recalc; 100k-dependent edit under 100 ms (was ~0.4 s); whole-sheet
+  operations bounded (#152, #151); memory still proportional to the file (no cold paging);
+  structural edits still shift every cell below them; whole-column references scan to row
+  1,048,576 instead of the used range (2,463 cells differ from Excel's cached values on the 1.28 GB
+  report).
+- **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
+  (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
-- **Estimate:** 25–40 h. [target-app-parity.md](target-app-parity.md#performance), [hardware-parity.md](hardware-parity.md)
+- **Estimate:** 20–30 h for the rest of the beta gate (recalc threading, edit latency, bounded
+  whole-sheet work); the big-data-shaped work beyond it is planned in
+  [`roadmap.md`](roadmap.md#large-workbooks-what-big-data-engineering-offers-a-spreadsheet).
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)
 - **Missing:** slicers and their caches, timelines, the data model, query tables attached to

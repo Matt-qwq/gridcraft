@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-11 · **Change:** minor (PivotTable calculated fields) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-24 · **Change:** major (large-workbook plan, M17–M22) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -79,6 +79,145 @@ to check our files, and Windows machines with the reported GPU drivers.
 | M14 | **Beta gates** (table above) | not started as a milestone; parts in open PRs |
 | M15 | Localization infrastructure and the twelve languages | started: ribbon catalog in ja, zh, ko, pt-BR, ru (#31, #104, #82); German in PR #163 |
 | M16 | Get & Transform, data model | not started |
+| M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
+| M18 | Vectorized aggregation kernels | planned |
+| M19 | Cold paging: bands leave memory when unused | planned |
+| M20 | Append-style structural edits (segments, no whole-sheet shifts) | planned |
+| M21 | Parquet / Arrow interchange and linked tables | planned |
+| M22 | A native working format (decision needed) | undecided |
+
+## Large workbooks: what big-data engineering offers a spreadsheet
+
+Baseline, measured 2026-10-24 on the deployable build `A162544A98`, on the machine the work is
+done on (8 threads, loaded): a **118 MB report of 31,709,565 cells** opens in **4.1 s** without
+the interface and **6.1 s** on the desktop, holds **191 MiB** of model (**6.0 bytes a cell**) and
+**549 MB** of working set, and **saves in 10.8 s**. A **1.28 GB** workbook of 220,715 cells opens
+in 5.2 s and 569 MB. An empty window is 293 MB of that working set — GPU driver and interface, not
+data.
+
+The instruments live beside the fork in `_gridcraft-bench/`: `cell_digest` (every cell's value,
+formula and style as one hash — the correctness net for any storage change), `save_probe`,
+`session_breakdown`, `memprobe`, `deploy_check.py`, `bench.ps1`.
+
+### Already migrated — do not re-buy it
+
+| Big-data idea | Where it already is |
+|---|---|
+| Parquet row groups (a block of rows, columnar inside) | `Band`: 64 rows behind an `Arc`, one page |
+| Dictionary encoding (values once, small indexes per cell) | per band number and text tables; a cell's payload is a `u16` index |
+| Run-length encoding | `Runs` for kinds (0.74 B a cell) and styles (0.14 B a cell) |
+| Immutable snapshots and a manifest (Iceberg/Delta) | copy-on-write bands; undo is a few `Arc` pointers |
+| Batch-parallel scan | a worksheet decoded window by window on eight threads; bands packed in the workers (`BandBatch`) |
+| Compression level as a speed/size dial | zip level 3: a 599 MB worksheet packs in 1.25 s into 74 MB (level 6: 4.29 s, 65 MB) |
+
+### M17 — Block statistics (zone maps) · 8–12 h
+
+**Scope.** Every band records, per column it touches, `(min, max, last row with a value, count)`.
+Three uses: skip bands whose range cannot match a predicate (`COUNTIF`, `SUMIFS`, filters,
+`MATCH` over a whole column); bound a whole-column reference (`$O:$O`) at the used range instead of
+1,048,576 rows; `used_range` in O(bands).
+
+**Acceptance.**
+- `=SUMIF(A:A,">0",B:B)` over 3.1M cells: ≥5× faster than the same formula on the build before it.
+- Whole-column semantics match the values Excel cached: the 2,463 differing cells documented for
+  the 1.28 GB file go to 0 (`_gridcraft-bench/recalc_check`).
+- Memory: ≤ 2 MiB added to the 31.7M-cell model; open time within 5%.
+- Digest of that report unchanged.
+
+**Risk.** Computing statistics on read costs time; measure it and, if it does, compute them lazily
+for numeric columns only. Rollback is a one-line switch in the band builder.
+
+### M18 — Vectorized aggregation kernels · 30–45 h
+
+**Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
+band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
+`MIN`, `MAX`. The scalar evaluator stays the fallback for everything else; nothing changes about
+what a formula means.
+
+**Acceptance.**
+- `=SUM(A:A)` over 1M numeric cells: ≥10× the scalar path.
+- Differential test: 1,000 random ranges, identical results (bit for bit) against the scalar path.
+- A 1M-row sheet with 100k formulas: full recalc ≤ 2 s (today: minutes at the per-cell rate).
+
+**Depends on** M17 for the stripes being worth walking.
+
+### M19 — Cold paging · 60–90 h
+
+**Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
+document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
+An LRU budget (default a few hundred MB) decides what stays.
+
+**Acceptance.**
+- Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size.
+- The 31.7M-cell report: open time within 15% of the 4.1 s baseline; paint and edit within 5%.
+- Digest unchanged after a cold-then-warm round trip of every sheet.
+- A spill file never outlives the document, and a crash leaves no half-written state that a reopen
+  would trust.
+
+**Risk.** The highest of the group: I/O errors, eviction bugs, and a slow first paint after
+switching sheets. Ship behind `settings.paging` (default on once measured), with the old behaviour
+reachable.
+
+### M20 — Append-style structural edits · 80–120 h
+
+**Scope.** Inserting or deleting rows stops rewriting the sheet. Each sheet keeps a row-mapping
+segment list (immutable runs plus a delta), reads resolve a logical row to a physical one, and a
+compaction pass folds segments on save or while idle. Today `shift_rows` walks every cell below the
+insertion point.
+
+**Acceptance.**
+- Insert one row above a 1M-row, 20-column sheet: ≤ 50 ms (today: a full shift, seconds).
+- Every existing undo, sort, filter, merge and save test unchanged; digest of the saved file
+  unchanged.
+- Reading a mapped sheet within 5% of an unmapped one (the mapping is one lookup per row).
+
+**Risk.** Every read path gains a mapping step. Do it after M17–M19, when the benches to prove "no
+regression" exist.
+
+### M21 — Parquet and Arrow interchange, linked tables · 20–30 h
+
+**Scope.** Export a sheet or table to Parquet (and to Arrow IPC); open a Parquet file as a sheet;
+`data.linkParquet` for a read-only linked table whose row groups map one-to-one onto bands and are
+read lazily.
+
+**Acceptance.**
+- Export of the 31.7M-cell report ≤ 15 s, file no larger than the xlsx we write today.
+- DuckDB `SELECT count(*), sum(col)` on the export equals our own `SUM` over the same range.
+- A 100M-row Parquet opened as a linked table: working set ≤ 300 MB, scroll ≥ 30 fps, and `SUM`
+  over one column within 3× of the same sum on a native sheet.
+
+**Depends on** M19 for the lazy half. This is the cheapest way to give users real big-data
+capability: the data goes to the tools that already do it well, instead of a spreadsheet growing
+one.
+
+### M22 — A native working format (undecided) · 60–100 h
+
+**Scope.** A block-based, append-friendly primary format that opens by mapping instead of parsing,
+saves incrementally, and has no 1,048,576-row ceiling; `.xlsx` becomes the import/export format.
+
+**Why it is not scheduled.** It contradicts the standing decision against a custom binary format.
+That decision was about a *cache* (rebuildable, worthless without the file); a primary format is a
+different trade — speed and size against interoperability, and against every tool that reads xlsx.
+Needs the owner's call, not an agent's.
+
+### Order, and why
+
+1. **M17** — cheapest, fixes a known correctness gap, and pays for the other work with skips.
+2. **M21 (export half)** — a week of work that answers "my 30M rows are a nightmare" without a
+   single line of query engine: the file goes to DuckDB or pandas, which are built for it.
+3. **M18** — the compute side; needs M17's stripes.
+4. **M19** — the memory side; the only change that decouples memory from file size.
+5. **M20** — the structural side; largest surface, do it last of the five.
+6. **M22** only if the owner decides interoperability is worth trading.
+
+### Not doing
+
+| Idea | Why not |
+|---|---|
+| Whole-table columnar layout (Parquet's shape) | a spreadsheet's locality is a 2D viewport and its hottest operation is a row insert; columnar helps only sort/filter and costs paint, edit and structural edits |
+| Distributed or partitioned execution | one user, one machine; block-parallel over threads is the transferable part and is done |
+| Vectorized joins and hash aggregation | no table objects to join yet; PivotTables scan their source region and are fast enough at 30M cells |
+| MVCC / transaction logs | copy-on-write bands are the simpler equivalent for one writer |
 
 ## After beta (ranked)
 
@@ -106,12 +245,16 @@ to check our files, and Windows machines with the reported GPU drivers.
 - Function coverage: the script method in [function-parity.md](function-parity.md). A
   `cargo xtask functions` that diffs the registry against a checked-in Excel name list would make
   it a CI number (1–2 h).
-- No `cargo xtask scorecard` or `bench` yet.
+- No `cargo xtask scorecard` or `bench` yet. Until there is: **every performance change ships with
+  before and after numbers from the same machine and the same files, and a `cell_digest` of a real
+  report before and after** — the 31,194,822-cell bug in M19's predecessor was found by that digest
+  and by nothing else in the suite.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
 | 2026-10-11 | minor | PivotTable calculated fields landed |
 | 2026-10-10 | minor | Current focus and M15 updated for the 10-10 merges |
 | 2026-10-10 | minor | Added the alpha gate table (six core workflows; passes, stays alpha) |
