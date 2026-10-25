@@ -230,6 +230,22 @@ what a formula means.
 
 **Depends on** M17 for the stripes being worth walking.
 
+### The save path, measured (10-25)
+
+Saving the 118 MB report takes **~4.2 s** without the interface (a 1.7 s open, then a save), and it
+is two sequential CPU loops and nothing else:
+
+| phase | time | what would move it |
+|---|---|---|
+| XML generation (`sheet4` 1.53 s, `sheet3` 0.50, `sheet2` 0.22) | **2.25 s** | rows are independent — but the shared-string table is filled as the cells are written, so the generation cannot run on several threads until the table is filled in a pass of its own, in the same order. Then `write_cell` needs a read-only table, the cell-picture table (`vm=`) needs the same treatment, and the `dynamic_arrays` flag becomes a per-chunk result. |
+| deflate (`sheet4` 1.15 s, `sheet3` 0.41, `sheet2` 0.19) | **1.76 s** | `zip::write::ZipWriter` compresses while it writes; parallelising this needs a writer that takes pre-compressed parts, which is a zip writer of our own. |
+| everything else (workbook, styles, theme, the zip directory) | ~0.2 s | — |
+
+Both blockers are structural, not micro-optimisation, and each is a round of its own. The same
+breakdown re-run after any change here is what to hold it against (a byte-for-byte `cmp` against
+the file the previous build wrote is the cleanest acceptance test there is, and the report's cells
+must still digest to `f5b186062e525ec8`).
+
 ### M19 — Cold paging · 60–90 h
 
 The layout a page is made of was measured on the way to M17: a 64-row band is a vector of `Row`s,
@@ -366,6 +382,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-25 | minor | Save path measured: 2.25 s of XML and 1.76 s of deflate, with the two structural blockers (shared-string order, the zip writer) written down |
 | 2026-10-25 | minor | `cell_probe` records where the decode's time is (band packing 68 ns a cell, mostly allocation), and two measured dead ends: dictionary memos and skipping compaction |
 | 2026-10-25 | minor | Open path: a fast cell-reference parse, no row fitting when a workbook's styles cannot grow a row, and a hand-written row scanner (590 MiB/s against the general walker's 226) — a 118 MB report opens in 1.7 s instead of 4.1, the 1.28 GB one in 3.8 instead of 5.2 |
 | 2026-10-24 | minor | `MAX`/`MIN` fold references (105 → 47 ms a million cells); a block no formula can change is built once a pass and shared, and text-key columns get an exact-match index: a full recalculation of the 1.28 GB report 8.5 → 3.7 s |
