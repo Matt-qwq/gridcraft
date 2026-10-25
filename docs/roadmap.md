@@ -110,15 +110,42 @@ formula and style as one hash — the correctness net for any storage change), `
 | Batch-parallel scan | a worksheet decoded window by window on eight threads; bands packed in the workers (`BandBatch`) |
 | Compression level as a speed/size dial | zip level 3: a 599 MB worksheet packs in 1.25 s into 74 MB (level 6: 4.29 s, 65 MB) |
 
+### Landed on the way to M17 (10-24)
+
+Two things the numbers asked for before the phase itself, both measured on a
+million-row sheet (`_gridcraft-bench/formula_bench`):
+
+| Formula over 1,000,000 cells | before | after |
+|---|---|---|
+| `SUM(A:A)` | 154 ms | 52 ms |
+| `COUNT(A:A)` | 286 ms | 50 ms |
+| `AVERAGE(A:A)` | 414 ms | 53 ms |
+
+Of the 52 ms, 6 is the recalculation pass itself (`=1` costs that). The fold now
+reads the stored pages directly (`CellStore::visit_packed`,
+`Host::visit_aggregate`) instead of building a `Cell` an iteration. The rest is
+memory: a row is four heap allocations apart from its neighbours, so the walk is
+pointer chasing at DRAM speed — which is what the layout item below is for.
+
+`XLOOKUP` now reads a blank as a zero for an exact search, which took the 1.28 GB
+report from 2,463 cells disagreeing with its cached values to 159 (see the
+`2026-10-24` revision).
+
 ### M17 — Block statistics (zone maps) · 8–12 h
 
 **Scope.** Every band records, per column it touches, `(min, max, last row with a value, count)`.
-Three uses: skip bands whose range cannot match a predicate (`COUNTIF`, `SUMIFS`, filters,
-`MATCH` over a whole column); bound a whole-column reference (`$O:$O`) at the used range instead of
-1,048,576 rows; `used_range` in O(bands).
+Two uses: skip bands whose range cannot match a predicate (`COUNTIF`, `SUMIFS`, filters) when a
+sheet is sparse in rows or columns, and keep `used_range` in O(bands).
+
+Measured first, and the plan changed: a dense million-row sheet has no band that can be skipped,
+and a whole-column reference is *already* clipped to the used range (`Evaluator::trim`), so the
+"≥5× on SUMIF" claim in the first draft of this phase was wrong. What zone maps still buy is the
+sparse case — the 31.7M-cell report holds 62 cells a row over 16,384 columns — and skipping
+predicates on columns that are empty or constant over a band.
 
 **Acceptance.**
-- `=SUMIF(A:A,">0",B:B)` over 3.1M cells: ≥5× faster than the same formula on the build before it.
+- `=SUMIF(A:A,">0",B:B)` on a sheet where most bands cannot match: ≥3× faster than the same
+  formula on the build before it, with the dense-sheet case no slower.
 - Whole-column semantics match the values Excel cached: the 2,463 differing cells documented for
   the 1.28 GB file go to 0 (`_gridcraft-bench/recalc_check`).
 - Memory: ≤ 2 MiB added to the 31.7M-cell model; open time within 5%.
@@ -142,6 +169,13 @@ what a formula means.
 **Depends on** M17 for the stripes being worth walking.
 
 ### M19 — Cold paging · 60–90 h
+
+The layout a page is made of was measured on the way to M17: a 64-row band is a vector of `Row`s,
+and each `Row` owns four separately allocated vectors. Reading a million single-cell rows therefore
+chases four million pointers at ~46 ns a cell, against ~2 ns for the arithmetic. A band that kept
+its kinds, payloads and bitmaps in one stripe each would make the same walk sequential, cut the
+model by ~90 MiB (the per-row headers are 58 MiB of 191), and make paging a single copy instead of
+a thousand. It touches every read and write path, so it is a phase of its own, before or with M19.
 
 **Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
 document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
@@ -255,6 +289,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-24 | minor | M17 re-scoped after measuring: whole-column references are already clipped, and `SUM`/`COUNT`/`AVERAGE` now fold the stored pages (154/286/414 → 52/50/53 ms a million cells); the layout cost behind the rest is written into M19 |
 | 2026-10-11 | minor | PivotTable calculated fields landed |
 | 2026-10-10 | minor | Current focus and M15 updated for the 10-10 merges |
 | 2026-10-10 | minor | Added the alpha gate table (six core workflows; passes, stays alpha) |
