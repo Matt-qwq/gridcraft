@@ -674,9 +674,26 @@ impl Band {
     /// Builds a whole row at once, from cells already sorted by column. Every array is sized
     /// once, so there is no growth slack to give back and no insert-per-cell shifting.
     fn put_row(&mut self, row_key: u32, cells: &mut Vec<(u32, Cell)>) {
-        let mut kept: Vec<(u32, u8, Payload, u16)> = Vec::with_capacity(cells.len());
+        // One pass: the cells arrive sorted by column, so the bitmap can be sized from the first
+        // and last non-blank ones and the row built as it is walked. This used to collect a
+        // `Vec<(u32, u8, Payload, u16)>` first and walk that, which was one allocation and one
+        // copy per cell more than the work needs.
+        let first = match cells.iter().find(|(_, cell)| !cell.is_blank()).map(|(col, _)| col / 64 * 64) {
+            Some(first) => first,
+            None => {
+                self.remove_row(row_key);
+                return;
+            }
+        };
+        let last = cells.iter().rev().find(|(_, cell)| !cell.is_blank()).map(|(col, _)| *col).unwrap_or(first);
+        let words = ((last - first) / 64 + 1) as usize;
+        let mut bits = vec![0u64; words];
+        let mut kinds = Runs::default();
+        let mut payloads = Vec::with_capacity(cells.len());
+        let mut styles = Runs::default();
         let mut formulas: Vec<(u32, Arc<Formula>)> = Vec::new();
         let mut arrays: Vec<(u32, Arc<gridcraft_core::Array>)> = Vec::new();
+        let mut wide: Vec<u64> = Vec::new();
         for (col, cell) in cells.drain(..) {
             if cell.is_blank() {
                 continue;
@@ -689,21 +706,6 @@ impl Band {
             if let Value::Array(a) = &cell.value {
                 arrays.push((col, a.clone()));
             }
-            kept.push((col, kind, payload, style));
-        }
-        if kept.is_empty() {
-            self.remove_row(row_key);
-            return;
-        }
-        let first = kept[0].0 / 64 * 64;
-        let last = kept[kept.len() - 1].0;
-        let words = ((last - first) / 64 + 1) as usize;
-        let mut bits = vec![0u64; words];
-        let mut kinds = Runs::default();
-        let mut payloads = Vec::with_capacity(kept.len());
-        let mut styles = Runs::default();
-        let mut wide: Vec<u64> = Vec::new();
-        for (col, kind, payload, style) in kept {
             let slot = col - first;
             bits[(slot / 64) as usize] |= 1u64 << (slot % 64);
             kinds.push(u16::from(kind));
@@ -716,8 +718,6 @@ impl Band {
             });
             styles.push(style);
         }
-        formulas.sort_by_key(|(c, _)| *c);
-        arrays.sort_by_key(|(c, _)| *c);
         let extras =
             if formulas.is_empty() && arrays.is_empty() && wide.is_empty() { None } else { Some(Box::new(RowExtras { formulas, arrays, wide })) };
         kinds.compact();

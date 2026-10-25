@@ -172,6 +172,12 @@ almost never hits — the report opened 1.69 → 1.79 s) and skipping the post-r
 `Vec`s, so six million cells means seven million allocations. That is the band-stripe layout above,
 not a patch.
 
+**First increment (10-25)**: `put_row` builds the row in one pass instead of collecting a
+`Vec<(u32, u8, Payload, u16)>` first and walking it — one allocation and one copy per cell less.
+Packing 68 → 59 ns a cell in `cell_probe` (0.400 → 0.345 s over 6M cells), the report opens in
+1.55 s instead of 1.69, and its cells still digest to `f5b186062e525ec8`. The rest of the 59 ns is
+the row's own buffers, which is the stripe layout.
+
 ### M17 — Block statistics (zone maps) · 8–12 h
 
 **Scope.** Every band records, per column it touches, `(min, max, last row with a value, count)`.
@@ -395,6 +401,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-25 | minor | `put_row` in one pass (packing 68 → 59 ns a cell, open 1.69 → 1.55 s) |
 | 2026-10-25 | minor | The zip container is written by us now, so the parts compress on several threads: deflate 1.76 → 1.18 s, a save 4.2 → 3.7 s, every part verified to unpack to the same bytes with Python's `zipfile` |
 | 2026-10-25 | minor | Parallel sheet XML tried and reverted: the file was byte identical and the formatting 3× faster, but the serial walk that the shared-string table forces is 60% of the cost, so the second pass ate the gain |
 | 2026-10-25 | minor | Save path measured: 2.25 s of XML and 1.76 s of deflate, with the two structural blockers (shared-string order, the zip writer) written down |
