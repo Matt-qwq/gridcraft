@@ -238,7 +238,7 @@ is two sequential CPU loops and nothing else:
 | phase | time | what would move it |
 |---|---|---|
 | XML generation (`sheet4` 1.53 s, `sheet3` 0.50, `sheet2` 0.22) | **2.25 s** | rows are independent — but `write_cell` mutates `Out` in four places, so the generation cannot run on several threads until each is either filled in a pass of its own (in the same order) or turned into a per-chunk result: `out.sst.index(t)` (line 892), `out.cell_pictures.index(picture)` (813), `out.dynamic_arrays = true` (841) and `out.needs_calc` (879). The first two need a `slot()` read path and a prefill pass over the merged row/cell order; the last two return from the chunk and are OR-ed. Tried, and it lost — see below. |
-| deflate (`sheet4` 1.15 s, `sheet3` 0.41, `sheet2` 0.19) | **1.76 s** | `zip::write::ZipWriter` compresses while it writes; parallelising this needs a writer that takes pre-compressed parts, which is a zip writer of our own. |
+| deflate (`sheet4` 1.15 s, `sheet3` 0.41, `sheet2` 0.19) | **1.76 s** | **Done, partly**: `ZipOut` writes the container itself and compresses the parts on the machine's threads. 1.76 → 1.18 s — the parts that are not the big sheet (0.6 s together) compress in parallel; `sheet4` is 85% of the bytes and is *one* deflate stream, so it stays serial. Splitting a stream is not possible inside one zip entry, which is where the rest of this second is. |
 | everything else (workbook, styles, theme, the zip directory) | ~0.2 s | — |
 
 **Tried: a two-mode walk.** `write_cell` was made read-only (`sst.slot`, `cell_pictures.slot`, two
@@ -395,6 +395,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-25 | minor | The zip container is written by us now, so the parts compress on several threads: deflate 1.76 → 1.18 s, a save 4.2 → 3.7 s, every part verified to unpack to the same bytes with Python's `zipfile` |
 | 2026-10-25 | minor | Parallel sheet XML tried and reverted: the file was byte identical and the formatting 3× faster, but the serial walk that the shared-string table forces is 60% of the cost, so the second pass ate the gain |
 | 2026-10-25 | minor | Save path measured: 2.25 s of XML and 1.76 s of deflate, with the two structural blockers (shared-string order, the zip writer) written down |
 | 2026-10-25 | minor | `cell_probe` records where the decode's time is (band packing 68 ns a cell, mostly allocation), and two measured dead ends: dictionary memos and skipping compaction |

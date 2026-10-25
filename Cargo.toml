@@ -36,6 +36,9 @@ regex = { version = "1", default-features = false, features = ["std", "unicode",
 quick-xml = "0.41"
 memchr = "2"
 zip = { version = "3", default-features = false, features = ["deflate"] }
+# The same deflate the zip crate uses, reached directly so parts can be compressed in parallel.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+crc32fast = "1"
 sha2 = { version = "0.11", default-features = false }
 # Decrypting password-protected workbooks ([MS-OFFCRYPTO]): AES and SHA-1, pure Rust (wasm-safe).
 aes = { version = "0.9", default-features = false }

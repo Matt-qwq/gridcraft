@@ -14,13 +14,7 @@ fn main() {
     let xml = std::fs::read(&path).expect("read");
     let mib = xml.len() as f64 / (1024.0 * 1024.0);
 
-    fn run(
-        what: &str,
-        xml: &[u8],
-        mib: f64,
-        mut cell: impl FnMut(&gridcraft_xlsx::rows::CellAttrs<'_>) -> Option<(u32, Cell)>,
-        pack: bool,
-    ) {
+    fn run(what: &str, xml: &[u8], mib: f64, mut cell: impl FnMut(&gridcraft_xlsx::rows::CellAttrs<'_>) -> Option<(u32, Cell)>, pack: bool) {
         let t = std::time::Instant::now();
         let mut cells = 0u64;
         let mut pending: Vec<(u32, Cell)> = Vec::new();
