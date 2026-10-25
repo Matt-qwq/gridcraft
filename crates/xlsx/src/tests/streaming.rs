@@ -212,3 +212,19 @@ fn reading_a_file_matches_reading_its_bytes() {
         assert_eq!(a.cols, b.cols, "columns");
     }
 }
+
+/// A cell's own `r=` is parsed by a tight loop, and odd forms must still land where the file says
+/// rather than be dropped. The same rows are read whole, chunked and streamed.
+#[test]
+fn a_cell_reference_lands_where_the_file_says() {
+    use gridcraft_core::CellRef;
+    let body = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="XFD1"><v>2</v></c><c r="B1048576"><v>3</v></c><c r="$C$2"><v>4</v></c></row></sheetData>"#;
+    for plan in [whole(), chunked(), streamed()] {
+        let sheet = sheet_of(body, plan);
+        let value = |a: &str| sheet.value(CellRef::parse(a).expect("address")).display();
+        assert_eq!(value("A1"), "1");
+        assert_eq!(value("XFD1"), "2");
+        assert_eq!(value("B1048576"), "3");
+        assert_eq!(value("C2"), "4");
+    }
+}

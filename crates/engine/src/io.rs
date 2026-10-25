@@ -91,6 +91,16 @@ pub fn open_bytes_with(name: &str, bytes: &[u8], password: Option<&str>, csv_as_
 /// line-height estimate can differ from Excel's, and shrinking files that already look
 /// right would be a visible regression. Custom-height rows are left alone entirely.
 fn fit_imported_rows(wb: &mut Workbook) {
+    // Only a wrapped or larger-than-default font can make a row taller than the sheet's default:
+    // without one, every row takes the fast path below, which leaves it as the file had it. A
+    // 31.7M-cell report has no such style and this walk used to cost a second of every open.
+    let grows = (0..wb.styles.len() as u32).any(|i| {
+        let st = wb.styles.get(gridcraft_model::StyleId(i));
+        st.font.size > gridcraft_model::DEFAULT_FONT_SIZE || st.align.wrap
+    });
+    if !grows {
+        return;
+    }
     for si in 0..wb.sheets.len() {
         let Some(sh) = wb.sheet(si) else { continue };
         let mut rows: Vec<u32> = sh.cells.iter().map(|(c, _)| c.row).collect();

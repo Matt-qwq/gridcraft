@@ -895,6 +895,38 @@ fn consume_windows(
     Ok(Streamed::Rows((root, warn, rows_read, dropped)))
 }
 
+/// `AB123` → the cell, for the exact form a spreadsheet writes in a cell's `r=`. Anything else
+/// (a `$`, a missing row, an out-of-range address) is `None` and goes through `CellRef::parse`,
+/// whose error handling the decoder then reports.
+fn fast_cell_ref(b: &[u8]) -> Option<CellRef> {
+    let mut i = 0usize;
+    let mut col: u32 = 0;
+    while i < 3 {
+        match b.get(i) {
+            Some(x) if x.is_ascii_alphabetic() => {
+                col = col * 26 + u32::from(x.to_ascii_uppercase() - b'A') + 1;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    if i == 0 || i >= b.len() {
+        return None;
+    }
+    let mut row: u32 = 0;
+    while let Some(d) = b.get(i) {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        row = row.checked_mul(10)?.checked_add(u32::from(d - b'0'))?;
+        i += 1;
+    }
+    if row == 0 || row > gridcraft_core::MAX_ROWS {
+        return None;
+    }
+    Some(CellRef::new(row - 1, col - 1))
+}
+
 /// A part that opens with `<` after an optional UTF-8 BOM and whitespace can be scanned for tags;
 /// a UTF-16 one cannot, and is read whole.
 fn starts_like_utf8_xml(head: &[u8]) -> bool {
@@ -998,12 +1030,17 @@ fn cell_pos(st: &mut RowState, c: &crate::rows::CellAttrs<'_>) -> Option<CellRef
         return None;
     }
     let pos = match c.r {
-        Some(a) => match CellRef::parse(a.trim()) {
+        // The general parser handles `$`, ranges and the rest of the address grammar; a cell's own
+        // `r=` is always letters then digits, and there is one per cell of the sheet.
+        Some(a) => match fast_cell_ref(a.trim().as_bytes()) {
             Some(p) => p,
-            None => {
-                st.dropped += 1;
-                return None;
-            }
+            None => match CellRef::parse(a.trim()) {
+                Some(p) => p,
+                None => {
+                    st.dropped += 1;
+                    return None;
+                }
+            },
         },
         None => CellRef::new(st.row, st.next_col),
     };

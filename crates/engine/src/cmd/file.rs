@@ -119,9 +119,8 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.ui_requests.push(crate::UiRequest::Message(message));
     }
     let d = s.doc()?;
-    Ok(
-        json!({"index": i, "title": d.display_title(), "sheets": d.wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(), "warnings": warnings}),
-    )
+    let out = json!({"index": i, "title": d.display_title(), "sheets": d.wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(), "warnings": warnings});
+    Ok(out)
 }
 
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
