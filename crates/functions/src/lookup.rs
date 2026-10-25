@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use gridcraft_core::{Array, CellError, Value, col_to_letters, compare};
 
-use crate::criteria::{has_wildcards, lookup_equal};
+use crate::criteria::{has_wildcards, lookup_equal, lookup_equal_blank_zero};
 use crate::util::{R, arg, array_val, as_array, has, int, num, opt_bool, opt_int, opt_num, text, text_val};
 use crate::{Arg, Ctx, FnSpec};
 
@@ -29,8 +29,14 @@ fn same_type(a: &Value, b: &Value) -> bool {
 
 /// Exact search (first match, or last when `reverse`). Text needles match wildcards when `wild`.
 fn find_exact(x: &Value, hay: &[Value], wild: bool, reverse: bool) -> Option<usize> {
+    find_exact_by(x, hay, wild, reverse, lookup_equal)
+}
+
+/// `find_exact` under a chosen equality: `XLOOKUP` passes a comparison that also reads a blank as a
+/// zero, the other lookups do not.
+fn find_exact_by(x: &Value, hay: &[Value], wild: bool, reverse: bool, eq: fn(&Value, &Value, bool) -> bool) -> Option<usize> {
     let wild = wild && matches!(x, Value::Text(t) if has_wildcards(t));
-    if reverse { hay.iter().rposition(|v| lookup_equal(x, v, wild)) } else { hay.iter().position(|v| lookup_equal(x, v, wild)) }
+    if reverse { hay.iter().rposition(|v| eq(x, v, wild)) } else { hay.iter().position(|v| eq(x, v, wild)) }
 }
 
 /// Approximate match of VLOOKUP, HLOOKUP, LOOKUP and MATCH: the position of the largest entry
@@ -247,7 +253,7 @@ fn xsearch(x: &Value, hay: &[Value], match_mode: i64, search_mode: i64) -> R<Opt
         });
     }
     let reverse = search_mode == -1;
-    if let Some(p) = find_exact(x, hay, match_mode == 2, reverse) {
+    if let Some(p) = find_exact_by(x, hay, match_mode == 2, reverse, lookup_equal_blank_zero) {
         return Ok(Some(p));
     }
     if match_mode == 0 || match_mode == 2 {
@@ -666,6 +672,20 @@ mod tests {
         close(ev("XLOOKUP", vec![av(tv("")), av(hay), av(out)]), 7.0);
         // Only the empty text matches a blank: a real value still does not.
         assert!(matches!(ev("MATCH", vec![av(tv("x")), av(arr(vec![vec![Value::Empty]])), n(0.0)]), Value::Error(CellError::NA)));
+    }
+
+    #[test]
+    fn xlookup_reads_a_blank_as_a_zero_but_match_does_not() {
+        // `XLOOKUP($Y10, O:O, Q:Q, , 0, 1)` with an empty Y10 reads as a lookup for 0, and the
+        // blank of the vector answers it. `MATCH` looking for 0 walks past blanks (it answers 3
+        // for `MATCH(0, {blank, blank, 0}, 0)`), and 67,194 cells of the report that settled this
+        // depend on the difference.
+        let blank_zero = arr(vec![vec![Value::Empty], vec![nv(0.0)], vec![nv(5.0)]]);
+        let out = arr(vec![vec![nv(7.0)], vec![nv(8.0)], vec![nv(9.0)]]);
+        close(ev("XLOOKUP", vec![av(nv(0.0)), av(blank_zero.clone()), av(out)]), 7.0);
+        let blanks_only = arr(vec![vec![Value::Empty], vec![Value::Empty]]);
+        close(ev("MATCH", vec![av(nv(0.0)), av(blank_zero.clone()), av(nv(0.0))]), 2.0);
+        assert!(matches!(ev("MATCH", vec![av(nv(0.0)), av(blanks_only), av(nv(0.0))]), Value::Error(CellError::NA)));
     }
 
     #[test]

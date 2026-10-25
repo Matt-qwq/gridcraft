@@ -315,6 +315,19 @@ pub(crate) fn wildcard_find(pattern: &str, text: &str, start: usize) -> Option<u
 
 /// Exact-or-wildcard equality used by MATCH/VLOOKUP/XLOOKUP exact modes: text with wildcards
 /// matches by pattern (only when `wild`), otherwise values compare case-insensitively.
+/// `XLOOKUP`'s exact search: a blank counts as a zero, so a lookup of a blank cell (`XLOOKUP($Y10,
+/// O:O, Q:Q, , 0, 1)` with an empty `Y10`) finds a blank of the vector. The other lookups must not
+/// do this. On the 1.28 GB report this rule turns 2,463 cells whose Excel answer is `0` (blank
+/// looked up in a column that holds blanks) into the right answer, and applying it to `MATCH` as
+/// well turns 67,194 cells whose Excel answer is `#N/A` (`MATCH(<blank>, C:C, 0)` over a column with
+/// no blanks in its used range) into the wrong one. 159 cells remain, all of the form "blank looked
+/// up in a whole column with no blank in its used range": those cache `0`, and 276 cells of exactly
+/// that shape in the same workbook cache `#N/A`, so one of the two groups is stale cached work and
+/// the range we keep (the used one) is the one that costs a blank read, not a million of them.
+pub(crate) fn lookup_equal_blank_zero(needle: &Value, hay: &Value, wild: bool) -> bool {
+    lookup_equal(needle, hay, wild) || matches!((needle, hay), (Value::Number(n), Value::Empty) | (Value::Empty, Value::Number(n)) if *n == 0.0)
+}
+
 pub(crate) fn lookup_equal(needle: &Value, hay: &Value, wild: bool) -> bool {
     match (needle, hay) {
         (Value::Text(p), Value::Text(t)) => {
