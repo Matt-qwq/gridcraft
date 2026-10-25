@@ -91,7 +91,7 @@ to check our files, and Windows machines with the reported GPU drivers.
 Baseline, measured 2026-10-25 on the deployable build, on the machine the work is done on (8
 threads, loaded): a **118 MB report of 31,709,565 cells** opens in **1.9 s** without the interface,
 holds **191 MiB** of model (**6.0 bytes a cell**) and **549 MB** of working set, and **saves in
-10.8 s**; a full recalculation of it takes 3.7 s. A **1.28 GB** workbook of 220,715 cells opens in
+10.8 s**; a full recalculation of it takes 3.7 s. (`open` was 4.1 s on 10-24.) A **1.28 GB** workbook of 220,715 cells opens in
 3.8 s. (On 10-24 the same report opened in 4.1 s and the 1.28 GB one in 5.2 s; the read path, the
 row fitting and the recalculation are what moved.) An empty window is 293 MB of that working set —
 GPU driver and interface, not data.
@@ -140,13 +140,21 @@ Three findings, each from measuring rather than guessing:
 |---|---|
 | A cell's own `r=` is parsed by a tight loop instead of the general address parser (one per cell) | read 2.2 → 1.9 s |
 | `fit_imported_rows` skips a workbook whose styles can never grow a row (no wrap, no larger font) | open 3.0 → 1.9 s |
-| — | open, all told: **4.1 → 1.9 s**; the 1.28 GB report 5.2 → 3.8 s |
+| The rows region scanned instead of walked event by event (590 MiB/s against 226) | open 1.9 → 1.7 s |
+| — | open, all told: **4.1 → 1.7 s**; the 1.28 GB report 5.2 → 3.8 s |
 
 The row fitting was the surprise: it walked every cell of every sheet and called `auto_row_height`
 per row on every open, and for a file whose styles cannot make a row taller it could not change
-anything. The remaining 1.9 s is the decode itself: the XML event loop runs at 226 MiB/s a thread
-and our per-cell callback adds about 2.5× that, so a hand-written scanner for the row/cell subset is
-the next lever if opening gets attention again.
+anything.
+
+The decode's XML walk was the next one: a generic event per tag runs at 226 MiB/s a thread, and a
+worksheet has one tag per cell. `crates/xlsx/src/rows.rs` now scans the rows region itself —
+`memchr` for `<`, a name and attribute loop, text straight into the buffers — at **590 MiB/s**
+(measured by `examples/scan_probe.rs` on a 255 MiB sheet, same shape as the report's). The general
+walker is kept as `parse_general` and a differential test holds the two against each other on
+attribute order, quoting, entities, inline strings, comments, CDATA, prefixed names, a row that never
+closes, and the forty-row mixed fixture. Open **1.9 → 1.7 s** for the 118 MB report; the scanner is
+2.6× faster but the per-cell work now dominates, which is where the next second is.
 
 ### M17 — Block statistics (zone maps) · 8–12 h
 
@@ -342,7 +350,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
-| 2026-10-25 | minor | Open path: a fast cell-reference parse and no row fitting when a workbook's styles cannot grow a row — a 118 MB report opens in 1.9 s instead of 4.1, the 1.28 GB one in 3.8 instead of 5.2 |
+| 2026-10-25 | minor | Open path: a fast cell-reference parse, no row fitting when a workbook's styles cannot grow a row, and a hand-written row scanner (590 MiB/s against the general walker's 226) — a 118 MB report opens in 1.7 s instead of 4.1, the 1.28 GB one in 3.8 instead of 5.2 |
 | 2026-10-24 | minor | `MAX`/`MIN` fold references (105 → 47 ms a million cells); a block no formula can change is built once a pass and shared, and text-key columns get an exact-match index: a full recalculation of the 1.28 GB report 8.5 → 3.7 s |
 | 2026-10-24 | minor | Parquet export landed (M21's write half): 26M cells to 8.5 MB in ~2.6 s, verified against pyarrow |
 | 2026-10-24 | minor | M17 re-scoped after measuring: whole-column references are already clipped, and `SUM`/`COUNT`/`AVERAGE` now fold the stored pages (154/286/414 → 52/50/53 ms a million cells); the layout cost behind the rest is written into M19 |

@@ -20,6 +20,7 @@ mod phonetic_tests;
 mod pivot_tests;
 mod richdata_tests;
 mod roundtrip;
+mod rows_scanner;
 mod shape_text_rtl;
 mod shared_media;
 mod shared_ranges;

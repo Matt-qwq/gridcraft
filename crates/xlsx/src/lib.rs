@@ -26,7 +26,9 @@ mod passthrough;
 mod pivot;
 mod read;
 mod richdata;
-mod rows;
+/// The worksheet row scanner. Public for the benchmark in `examples/scan_probe.rs`; not an API.
+#[doc(hidden)]
+pub mod rows;
 mod sheet_read;
 mod sheet_write;
 mod styles;

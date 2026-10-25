@@ -207,7 +207,82 @@ impl Pool {
     }
 }
 
+/// Builds the element a fragment of XML starts with (`<is>…</is>` in a cell). The row scanner
+/// finds the fragment's span and leaves the tree to the general parser, so an inline string with
+/// runs, phonetics or an unusual nesting reads exactly as it always did.
+pub(crate) fn element_fragment(xml: &[u8]) -> Option<El> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut stack: Vec<El> = Vec::new();
+    let mut text = String::new();
+    loop {
+        let event = reader.read_event_into(&mut buf).ok()?;
+        match event {
+            Event::Start(e) => {
+                if stack.len() >= MAX_DEPTH {
+                    return None;
+                }
+                stack.push(start_el(&mut Pool::default(), &e));
+            }
+            Event::Empty(e) => {
+                let el = start_el(&mut Pool::default(), &e);
+                match stack.last_mut() {
+                    Some(parent) => parent.children.push(el),
+                    // A self-closing root: the fragment is done.
+                    None => return Some(el),
+                }
+            }
+            Event::End(_) => {
+                let el = stack.pop()?;
+                match stack.last_mut() {
+                    Some(parent) => parent.children.push(el),
+                    None => return Some(el),
+                }
+            }
+            Event::Text(t) => {
+                text.clear();
+                if let Ok(v) = t.xml_content(XmlVersion::Explicit1_0) {
+                    text.push_str(&v);
+                }
+                if let Some(el) = stack.last_mut() {
+                    el.text.push_str(&text);
+                }
+            }
+            Event::CData(t) => {
+                text.clear();
+                text.push_str(&String::from_utf8_lossy(&t));
+                if let Some(el) = stack.last_mut() {
+                    el.text.push_str(&text);
+                }
+            }
+            Event::GeneralRef(r) => {
+                text.clear();
+                match r.resolve_char_ref() {
+                    Ok(Some(c)) => text.push(c),
+                    _ => {
+                        let name = String::from_utf8_lossy(&r).into_owned();
+                        match named_entity(&name) {
+                            Some(c) => text.push(c),
+                            None => {
+                                text.push('&');
+                                text.push_str(&name);
+                                text.push(';');
+                            }
+                        }
+                    }
+                }
+                if let Some(el) = stack.last_mut() {
+                    el.text.push_str(&text);
+                }
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 /// One element built without a pool: the cold path (`<sheetData>` has its own decoder).
+#[cfg(test)]
 pub(crate) fn element(e: &BytesStart<'_>) -> El {
     let mut pool = Pool::default();
     start_el(&mut pool, e)

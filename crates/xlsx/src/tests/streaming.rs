@@ -67,7 +67,7 @@ fn assert_same(a: &Sheet, b: &Sheet, what: &str) {
 
 /// Rows with values, strings, styles and the two kinds of reference-less cell, plus the settings
 /// that live outside `<sheetData>`.
-fn mixed_body(rows: u32) -> String {
+pub(super) fn streaming_body(rows: u32) -> String {
     let mut s = String::from(
         r#"<sheetPr><tabColor rgb="FF00B050"/></sheetPr><sheetViews><sheetView workbookViewId="0"><pane xSplit="1" ySplit="2" topLeftCell="B3" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols><col min="2" max="3" width="27.5" customWidth="1"/></cols><sheetData>"#,
     );
@@ -90,7 +90,7 @@ fn mixed_body(rows: u32) -> String {
 
 #[test]
 fn chunked_and_streamed_reads_match_a_whole_one() {
-    let body = mixed_body(400);
+    let body = streaming_body(400);
     let strings: Vec<&str> = vec!["zero", "one", "two"];
     let sst: Vec<String> = strings.iter().map(|s| format!("<si><t>{s}</t></si>")).collect();
     let parts: Vec<(&str, &str)> = vec![("xl/sharedStrings.xml", "")];
@@ -109,7 +109,7 @@ fn chunked_and_streamed_reads_match_a_whole_one() {
 
 #[test]
 fn the_settings_around_the_rows_survive_chunking() {
-    let body = mixed_body(60);
+    let body = streaming_body(60);
     let whole_sheet = sheet_of(&body, whole());
     for (plan, what) in [(chunked(), "chunked"), (streamed(), "streamed")] {
         let sheet = sheet_of(&body, plan);
