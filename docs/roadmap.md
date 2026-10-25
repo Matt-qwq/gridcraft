@@ -274,6 +274,20 @@ its kinds, payloads and bitmaps in one stripe each would make the same walk sequ
 model by ~90 MiB (the per-row headers are 58 MiB of 191), and make paging a single copy instead of
 a thousand. It touches every read and write path, so it is a phase of its own, before or with M19.
 
+**Where to start, exactly.** `crates/model/src/store.rs`:
+
+| today | stripe |
+|---|---|
+| `Band.rows: Vec<(u32, Row)>`, `Row { first, bits: Vec<u64>, kinds: Runs, payloads: Vec<u16>, styles: Runs, extras }` | `Band.rows: Vec<BandRow>` (`key`, `start`, `cols`) plus four band-level `Vec`s — `bits`, `kinds`, `payloads`, `styles` — with `Row` becoming a slice index |
+| `Row::kind_at/payloads[i]/style_at/col_at/index_of/rank_before/column_span` (line 254 onwards) | the same names on `BandRow` + `&Band`, reading the stripes |
+| `put_row` (676) builds the row's four vectors | appends to the band's stripes and records the range |
+| `take`/`remove_at`/`set_formula`/`set_array` (732) shift one row's vectors | shift within the band's stripes (still one row's worth of bytes) |
+| `same_as`, `packed_bytes`, `Clone` | iterate the stripes |
+
+Acceptance: the 28 `gridcraft-model` tests, the three `packed_tests` (including the differential
+`packed_walk_matches_iter_range`), `cell_digest` = `f5b186062e525ec8` on the report, and
+`cell_probe`'s packing number (59 ns a cell today, ~20 expected) against the same 255 MiB sheet.
+
 **Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
 document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
 An LRU budget (default a few hundred MB) decides what stays.
@@ -401,6 +415,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-25 | minor | The band-stripe round is written down to the functions it changes, with its acceptance tests |
 | 2026-10-25 | minor | `put_row` in one pass (packing 68 → 59 ns a cell, open 1.69 → 1.55 s) |
 | 2026-10-25 | minor | The zip container is written by us now, so the parts compress on several threads: deflate 1.76 → 1.18 s, a save 4.2 → 3.7 s, every part verified to unpack to the same bytes with Python's `zipfile` |
 | 2026-10-25 | minor | Parallel sheet XML tried and reverted: the file was byte identical and the formatting 3× faster, but the serial walk that the shared-string table forces is 60% of the cost, so the second pass ate the gain |
