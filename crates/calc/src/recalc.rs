@@ -445,6 +445,24 @@ struct PassHost<'a> {
 }
 
 impl<'a> PassHost<'a> {
+    /// Whether a spill produced by this pass lies over `range`.
+    fn spills_into(&self, sheet: usize, range: RangeRef) -> bool {
+        self.spills.iter().any(|((s, anchor), arr)| {
+            if *s != sheet {
+                return false;
+            }
+            let end = CellRef::new(
+                anchor.row.saturating_add((arr.rows as u32).saturating_sub(1)),
+                anchor.col.saturating_add((arr.cols as u32).saturating_sub(1)),
+            );
+            let spilled = RangeRef::new(*anchor, end);
+            spilled.start.row <= range.end.row
+                && range.start.row <= spilled.end.row
+                && spilled.start.col <= range.end.col
+                && range.start.col <= spilled.end.col
+        })
+    }
+
     fn new(wb: &'a Workbook, exprs: &'a HashMap<Key, std::sync::Arc<Expr>>, rng: &'a mut u64, now: f64) -> Self {
         PassHost {
             wb,
@@ -797,10 +815,10 @@ impl Host for PassHost<'_> {
         self.wb.sheet(sheet).map(|s| s.value(c)).unwrap_or_default()
     }
     fn range_array(&mut self, sheet: usize, range: RangeRef) -> Option<std::sync::Arc<Array>> {
-        // A block can only be reused while nothing that writes can change it: no formula cell
-        // inside it (those are recalculated), no spill inside it, and no spill produced by this
-        // pass anywhere on the sheet (a later formula could spill into it).
-        if !self.spills.is_empty() {
+        // A block can only be reused while nothing that writes can change it: no formula cell in
+        // it still to be worked out, no spill inside it, and no spill this pass has already
+        // produced over it.
+        if self.spills_into(sheet, range) {
             return None;
         }
         if let Some(hit) = self.blocks.get(&(sheet, range)) {
