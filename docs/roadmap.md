@@ -237,7 +237,7 @@ is two sequential CPU loops and nothing else:
 
 | phase | time | what would move it |
 |---|---|---|
-| XML generation (`sheet4` 1.53 s, `sheet3` 0.50, `sheet2` 0.22) | **2.25 s** | rows are independent — but the shared-string table is filled as the cells are written, so the generation cannot run on several threads until the table is filled in a pass of its own, in the same order. Then `write_cell` needs a read-only table, the cell-picture table (`vm=`) needs the same treatment, and the `dynamic_arrays` flag becomes a per-chunk result. |
+| XML generation (`sheet4` 1.53 s, `sheet3` 0.50, `sheet2` 0.22) | **2.25 s** | rows are independent — but `write_cell` mutates `Out` in four places, so the generation cannot run on several threads until each is either filled in a pass of its own (in the same order) or turned into a per-chunk result: `out.sst.index(t)` (line 892), `out.cell_pictures.index(picture)` (813), `out.dynamic_arrays = true` (841) and `out.needs_calc` (879). The first two need a `slot()` read path and a prefill pass over the merged row/cell order; the last two return from the chunk and are OR-ed. An attempt at this got as far as the two `slot()` methods and stopped: half a refactor of the writer is worse than none. |
 | deflate (`sheet4` 1.15 s, `sheet3` 0.41, `sheet2` 0.19) | **1.76 s** | `zip::write::ZipWriter` compresses while it writes; parallelising this needs a writer that takes pre-compressed parts, which is a zip writer of our own. |
 | everything else (workbook, styles, theme, the zip directory) | ~0.2 s | — |
 
