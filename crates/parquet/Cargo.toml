@@ -1,0 +1,22 @@
+[package]
+name = "gridcraft-parquet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GridCraft's Parquet export: a sheet as a typed, columnar file DuckDB, pandas and Spark read"
+
+[lints]
+workspace = true
+
+[dependencies]
+gridcraft-core.workspace = true
+gridcraft-model.workspace = true
+thiserror.workspace = true
+# The reference Apache implementation, without `arrow`: this crate only writes columns, so the
+# arrow compatibility layer and every compression codec are off. Compiling it is the alternative
+# to hand-writing Thrift metadata for a format three other tools will read.
+parquet = { version = "56", default-features = false, features = ["snap"] }
+
+[dev-dependencies]
+# Reading back in tests: `parquet`'s reader takes its own `Bytes` buffer.
+bytes = "1"

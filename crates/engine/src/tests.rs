@@ -2312,6 +2312,41 @@ fn saving_an_opened_semicolon_csv_keeps_semicolons() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// `file.exportParquet` writes a typed columnar file for the active sheet, and `saveAs` with a
+/// `.parquet` name goes through the same writer.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn exporting_a_sheet_as_parquet_types_its_columns() {
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("gridcraft-parquet-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let mut s = s();
+    for (cell, input) in [("A1", "id"), ("B1", "units"), ("C1", "note"), ("A2", "1"), ("B2", "2.5"), ("C2", "x"), ("A3", "4")] {
+        s.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+    }
+    let path = dir.join("export.parquet");
+    let out = s.execute("file.exportParquet", json!({"path": path})).unwrap();
+    assert_eq!(out["rows"], 2);
+    assert_eq!(out["columns"][0], json!({"name": "id", "type": "INT64"}));
+    assert_eq!(out["columns"][1], json!({"name": "units", "type": "DOUBLE"}));
+    assert_eq!(out["columns"][2], json!({"name": "note", "type": "STRING"}));
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..4], b"PAR1");
+    assert_eq!(&bytes[bytes.len() - 4..], b"PAR1");
+
+    // Save As reaches the same writer.
+    let saved = dir.join("saved.parquet");
+    s.execute("file.saveAs", json!({"path": saved})).unwrap();
+    assert_eq!(&std::fs::read(&saved).unwrap()[..4], b"PAR1");
+
+    // A name without the extension gets one.
+    let bare = dir.join("bare");
+    let out = s.execute("file.exportParquet", json!({"path": bare, "header": false})).unwrap();
+    assert_eq!(out["path"], json!(format!("{}.parquet", bare.display())));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A workbook whose B1 is `=[1]Sheet1!A1`, linked to `link` (an external relationship target).
 fn linked_workbook(link: &str) -> Vec<u8> {
     use std::io::{Cursor, Write};

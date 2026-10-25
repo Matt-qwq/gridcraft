@@ -868,6 +868,7 @@ fn export(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome) {
     for (fmt, icon, title, detail) in [
         ("csv", Icon::TextColumns, "CSV (Comma delimited)", "Save the active sheet as comma-separated text."),
         ("html", Icon::Link, "Web Page (.html)", "Save the workbook as a web page."),
+        ("parquet", Icon::FormatTable, "Parquet (.parquet)", "Save the active sheet as a typed columnar file for DuckDB, pandas and Spark."),
     ] {
         if action_row(ui, icon, lang.tr(title), lang.tr(detail)).clicked() && export_as(app, fmt) {
             out.close = true;
@@ -885,6 +886,7 @@ pub fn export_as(app: &mut SheetApp, fmt: &str) -> bool {
         "pdf" => "file.exportPdf",
         "csv" => "file.exportCsv",
         "html" => "file.exportHtml",
+        "parquet" => "file.exportParquet",
         _ => return false,
     };
     let title = app.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());

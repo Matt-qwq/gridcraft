@@ -19,6 +19,8 @@ pub enum FileKind {
     Tsv,
     Json,
     Html,
+    /// A sheet as a typed, columnar file (export only).
+    Parquet,
 }
 
 impl FileKind {
@@ -33,6 +35,7 @@ impl FileKind {
             "tsv" | "tab" | "txt" => FileKind::Tsv,
             "json" | "scjson" => FileKind::Json,
             "html" | "htm" => FileKind::Html,
+            "parquet" | "pq" => FileKind::Parquet,
             _ => return None,
         })
     }
@@ -287,6 +290,12 @@ pub fn save_bytes_as(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8
         FileKind::Tsv => wb.sheet(sheet).map(|sh| csv(wb, sh, b'\t')).transpose().map(Option::unwrap_or_default),
         FileKind::Json => serde_json::to_vec_pretty(wb).map_err(|e| EngineError::Other(e.to_string())),
         FileKind::Html => to_html(wb, sheet).map(String::into_bytes),
+        FileKind::Parquet => match wb.sheet(sheet) {
+            Some(sh) => gridcraft_parquet::export_sheet(sh, gridcraft_parquet::Options::default())
+                .map(|(bytes, _)| bytes)
+                .map_err(|e| EngineError::Other(e.to_string())),
+            None => Ok(Vec::new()),
+        },
     }
 }
 

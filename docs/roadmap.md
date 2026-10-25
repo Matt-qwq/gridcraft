@@ -83,7 +83,7 @@ to check our files, and Windows machines with the reported GPU drivers.
 | M18 | Vectorized aggregation kernels | planned |
 | M19 | Cold paging: bands leave memory when unused | planned |
 | M20 | Append-style structural edits (segments, no whole-sheet shifts) | planned |
-| M21 | Parquet / Arrow interchange and linked tables | planned |
+| M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading and linked tables remain |
 | M22 | A native working format (decision needed) | undecided |
 
 ## Large workbooks: what big-data engineering offers a spreadsheet
@@ -210,6 +210,21 @@ regression" exist.
 
 ### M21 — Parquet and Arrow interchange, linked tables · 20–30 h
 
+**Landed (the export half, 10-24).** `file.exportParquet` writes the active sheet (or a `range`) as
+Parquet: a column with only whole numbers becomes `INT64`, numbers `DOUBLE`, `TRUE`/`FALSE`
+`BOOLEAN`, and anything else `STRING`; blanks are nulls, errors are their text, Snappy-compressed,
+one row group per million cells. It is written with the Apache `parquet` crate (`crates/parquet`,
+L2, wasm-clean) rather than by hand — the metadata is Thrift.
+
+Measured on the 118 MB report: its 26M-cell sheet exports in ~2.6 s (on top of a 3.2 s open) to
+**8.5 MB**, and `pyarrow` — a different implementation — reads it back with the same schema, the
+same row count, and the same per-column sums as our own `SUM` (展现量 17,950,607; 花费 551,889.98;
+总成交金额 3,070,965.57). A pandas `groupby` over 289 主体ID takes under a second: the query this
+was for.
+
+What remains of M21 is the read half — opening a Parquet file, and a linked table that reads row
+groups lazily — which needs M19.
+
 **Scope.** Export a sheet or table to Parquet (and to Arrow IPC); open a Parquet file as a sheet;
 `data.linkParquet` for a read-only linked table whose row groups map one-to-one onto bands and are
 read lazily.
@@ -289,6 +304,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
+| 2026-10-24 | minor | Parquet export landed (M21's write half): 26M cells to 8.5 MB in ~2.6 s, verified against pyarrow |
 | 2026-10-24 | minor | M17 re-scoped after measuring: whole-column references are already clipped, and `SUM`/`COUNT`/`AVERAGE` now fold the stored pages (154/286/414 → 52/50/53 ms a million cells); the layout cost behind the rest is written into M19 |
 | 2026-10-11 | minor | PivotTable calculated fields landed |
 | 2026-10-10 | minor | Current focus and M15 updated for the 10-10 merges |

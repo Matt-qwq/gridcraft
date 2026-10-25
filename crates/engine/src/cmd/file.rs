@@ -15,6 +15,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
         cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
+        cmd!(
+            noundo "file.exportParquet",
+            "Export as Parquet",
+            ["File", "Export"],
+            None,
+            "{path, sheet?, header?: bool = true, range?} — the sheet (or the range) as a typed columnar file for DuckDB, pandas and Spark: whole numbers become INT64, other numbers DOUBLE, TRUE/FALSE BOOLEAN, everything else STRING, blanks nulls",
+            has_doc,
+            export_parquet
+        ),
         cmd!("file.properties", "Properties", ["File"], None, "{title?, subject?, author?, company?, keywords?, description?}", has_doc, properties),
         cmd!(
             query "file.options",
@@ -194,6 +203,30 @@ fn export(s: &mut Session, p: &Json, ext: &str) -> Result<Json> {
     let bytes = crate::io::save_bytes(&wb, &target)?;
     crate::io::write_file(&target, &bytes)?;
     Ok(json!({"path": target, "bytes": bytes.len()}))
+}
+
+/// `file.exportParquet`: the sheet as a Parquet file, typed by what its columns hold.
+fn export_parquet(s: &mut Session, p: &Json) -> Result<Json> {
+    let path = str_param(p, "path").ok_or_else(|| bad("file.exportParquet", "missing `path`"))?.to_string();
+    let sheet = target_sheet(s, p)?;
+    let range = match str_param(p, "range") {
+        Some(text) => Some(RangeRef::parse(text).ok_or_else(|| bad("file.exportParquet", "`range` is not a range"))?),
+        None => None,
+    };
+    let header = bool_param(p, "header").unwrap_or(true);
+    let (bytes, report) = {
+        let d = s.doc()?;
+        let sh = d.wb.sheet(sheet).ok_or_else(|| bad("file.exportParquet", "no such sheet"))?;
+        gridcraft_parquet::export_sheet(sh, gridcraft_parquet::Options { header, range }).map_err(|e| bad("file.exportParquet", e.to_string()))?
+    };
+    let target = if path.to_ascii_lowercase().ends_with(".parquet") { path } else { format!("{path}.parquet") };
+    crate::io::write_file(&target, &bytes)?;
+    Ok(json!({
+        "path": target,
+        "bytes": bytes.len(),
+        "rows": report.rows,
+        "columns": report.columns.iter().map(|(name, kind)| json!({"name": name, "type": kind.as_str()})).collect::<Vec<_>>(),
+    }))
 }
 
 fn properties(s: &mut Session, p: &Json) -> Result<Json> {
