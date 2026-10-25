@@ -75,6 +75,11 @@ pub trait Host {
     fn used_range(&mut self, sheet: usize) -> Option<RangeRef> {
         self.workbook().sheet(sheet).and_then(|s| s.used_range())
     }
+    /// The position of a text needle in a block the host has indexed (see
+    /// [`gridcraft_functions::Ctx::exact_text_position`]); `None` to scan instead.
+    fn exact_text_position(&mut self, _hay: &Arc<Array>, _needle: &str, _reverse: bool) -> Option<Option<usize>> {
+        None
+    }
     /// The block already built, when the host can share one: a workbook that looks up the same
     /// table from eighty thousand rows reads it once a pass instead of eighty thousand times.
     /// `None` means "read it with `range_values`".
@@ -111,6 +116,9 @@ struct FnCtx<'a, 'h> {
 }
 
 impl Ctx for FnCtx<'_, '_> {
+    fn exact_text_position(&mut self, hay: &Arc<Array>, needle: &str, reverse: bool) -> Option<Option<usize>> {
+        self.ev.host.exact_text_position(hay, needle, reverse)
+    }
     fn date_system(&self) -> gridcraft_core::DateSystem {
         self.ev.host.workbook().date_system
     }

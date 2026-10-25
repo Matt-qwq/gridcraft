@@ -160,11 +160,15 @@ for numeric columns only. Rollback is a one-line switch in the band builder.
 
 - `MAX` and `MIN` fold a reference the way `SUM` already did: 105 → 47 ms over a million cells.
 - A block of the sheet that this pass can no longer change is built once and shared
-  (`Host::range_array`) — no formula in it still to be worked out, no spill over it. On the 1.28 GB
-  report the full recalculation went **8.5 → 3.9 s** (a pass counts; 79,552 formulas of which 23,400
-  are actually evaluated). The first cut of this guard refused to cache anything on a sheet where a
-  `FILTER` had spilled, which is every sheet of that report: narrowing it to "a spill *over this
-  block*" is what made the difference, 8.1 → 3.9 s.
+  (`Host::range_array`) — no formula in it still to be worked out, no spill over it. Two cuts of
+  this guard were wrong and the measurement said so both times: refusing to cache anything on a
+  sheet where a `FILTER` had spilled disabled it on every sheet of that report, and treating a
+  formula the pass isn't evaluating as "not settled" kept every lookup table unshared.
+- A text-key column the pass reads more than once is indexed (case-folded, first and last position)
+  so an exact `MATCH` is a lookup instead of a scan of two thousand keys: 0.6 s of that report's
+  recalculation.
+
+Together: full recalculation of the 1.28 GB report **8.5 → 3.7 s**.
 
 **Measured, worth keeping.** Only 23,400 of the report's 79,552 formulas are evaluated per pass, and
 the function calls inside them total ~1.1 s (`IFERROR(INDEX(…MATCH…MATCH))`; a `MATCH` over 2,000
@@ -321,7 +325,7 @@ Needs the owner's call, not an agent's.
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
-| 2026-10-24 | minor | `MAX`/`MIN` fold references (105 → 47 ms a million cells); a block no formula can change is built once a pass and shared, taking a full recalculation of the 1.28 GB report 8.5 → 3.9 s |
+| 2026-10-24 | minor | `MAX`/`MIN` fold references (105 → 47 ms a million cells); a block no formula can change is built once a pass and shared, and text-key columns get an exact-match index: a full recalculation of the 1.28 GB report 8.5 → 3.7 s |
 | 2026-10-24 | minor | Parquet export landed (M21's write half): 26M cells to 8.5 MB in ~2.6 s, verified against pyarrow |
 | 2026-10-24 | minor | M17 re-scoped after measuring: whole-column references are already clipped, and `SUM`/`COUNT`/`AVERAGE` now fold the stored pages (154/286/414 → 52/50/53 ms a million cells); the layout cost behind the rest is written into M19 |
 | 2026-10-11 | minor | PivotTable calculated fields landed |

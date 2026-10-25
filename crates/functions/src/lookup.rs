@@ -200,7 +200,7 @@ fn lookup(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     }
 }
 
-fn match_fn(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
+fn match_fn(args: &[Arg], c: &mut dyn Ctx) -> R<Value> {
     let x = needle(args, 0)?;
     let av = &arg(args, 1)?.value;
     if let Value::Error(e) = av {
@@ -208,6 +208,18 @@ fn match_fn(args: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     }
     let hay = vector(&as_array(av)).ok_or(CellError::NA)?;
     let mt = opt_num(args, 2, 1.0)?;
+    // An exact text search over a block the host has indexed, which is what a lookup table gets
+    // read through a thousand times. Everything else (wildcards, blanks, numbers, approximate
+    // matches) keeps the scan, whose semantics it would be easy to get subtly wrong.
+    if mt == 0.0
+        && let Value::Text(t) = &x
+        && !t.is_empty()
+        && !has_wildcards(t)
+        && let Value::Array(shared) = av
+        && let Some(found) = c.exact_text_position(shared, t, false)
+    {
+        return found.map(|p| Value::Number((p + 1) as f64)).ok_or(CellError::NA);
+    }
     let pos = if mt == 0.0 {
         find_exact(&x, &hay, true, false)
     } else if mt > 0.0 {
@@ -686,6 +698,29 @@ mod tests {
         let blanks_only = arr(vec![vec![Value::Empty], vec![Value::Empty]]);
         close(ev("MATCH", vec![av(nv(0.0)), av(blank_zero.clone()), av(nv(0.0))]), 2.0);
         assert!(matches!(ev("MATCH", vec![av(nv(0.0)), av(blanks_only), av(nv(0.0))]), Value::Error(CellError::NA)));
+    }
+
+    /// `MATCH` over a text key column: the cases a lookup index must answer exactly as a scan does.
+    #[test]
+    fn match_over_text_keys() {
+        let keys = arr(vec![vec![tv("AB")], vec![tv("ab")], vec![tv("Ab")], vec![Value::Empty], vec![tv("stra\u{df}e")], vec![tv("STRASSE")]]);
+        let m = |needle: Value| ev("MATCH", vec![av(needle.clone()), rf(keys.clone()), n(0.0)]);
+        // Case-insensitive, and the first of the duplicates wins.
+        close(m(tv("ab")), 1.0);
+        close(m(tv("aB")), 1.0);
+        // Case folding is per character, as `compare_text` folds: the sharp s is not "ss", so
+        // "strasse" is the sixth entry (which is spelled with a double s), not the fifth.
+        close(m(tv("strasse")), 6.0);
+        close(m(tv("stra\u{df}e")), 5.0);
+        close(m(tv("STRASSE")), 6.0);
+        // An empty needle matches the blank cell (the rule `lookup_equal` carries for `""`); a
+        // non-empty one never matches a blank.
+        close(m(tv("")), 4.0);
+        assert!(matches!(m(tv("nope")), Value::Error(CellError::NA)));
+        // A wildcard needle takes the scan path and still matches.
+        close(m(tv("a*")), 1.0);
+        // Numbers keep the scan; a number never matches text.
+        assert!(matches!(m(nv(1.0)), Value::Error(CellError::NA)));
     }
 
     #[test]

@@ -111,6 +111,13 @@ pub trait Ctx {
     fn computed_criterion(&mut self, _row: usize, _col: usize, _db: &Array, _record: usize) -> Option<bool> {
         None
     }
+    /// The position of a non-empty text needle matched exactly in a shared block, when the host
+    /// keeps an index for that block: `Some(None)` means "not there", `None` means "no index, scan
+    /// it". A reporting sheet looks its table up once a row; scanning 2,000 keys a row is what a
+    /// recalculation spends its time on.
+    fn exact_text_position(&mut self, _hay: &std::sync::Arc<Array>, _needle: &str, _reverse: bool) -> Option<Option<usize>> {
+        None
+    }
     /// For GROUPBY/PIVOTBY: whether their function argument is a LAMBDA (its value is then not used).
     fn has_lambda(&self) -> bool {
         false

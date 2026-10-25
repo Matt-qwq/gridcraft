@@ -385,6 +385,49 @@ impl Default for Calc {
     }
 }
 
+/// Text keys a block may hold before the pass stops indexing it (and all blocks together): an
+/// index costs ~60 bytes a key.
+const MAX_INDEXED_TEXT_VALUES: usize = 200_000;
+const MAX_INDEXED_TEXT_VALUES_TOTAL: usize = 2_000_000;
+
+/// Case-folded text → the first and last position holding it.
+///
+/// Case folding follows `compare_text` exactly (per character, `char::to_lowercase`), because a
+/// key that folded differently would answer where a scan would not. Numbers, blanks and errors are
+/// not indexed: a non-empty text needle can only match a text entry, so leaving them out cannot
+/// lose a match.
+struct TextIndex {
+    positions: HashMap<String, (u32, u32)>,
+}
+
+impl TextIndex {
+    fn build(values: &[Value]) -> Self {
+        let mut positions: HashMap<String, (u32, u32)> = HashMap::with_capacity_and_hasher(values.len().min(1024), Default::default());
+        for (i, value) in values.iter().enumerate() {
+            let Value::Text(t) = value else { continue };
+            if t.is_empty() {
+                continue;
+            }
+            match positions.entry(fold(t)) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().1 = i as u32,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((i as u32, i as u32));
+                }
+            }
+        }
+        Self { positions }
+    }
+
+    fn position(&self, needle: &str, reverse: bool) -> Option<usize> {
+        self.positions.get(&fold(needle)).map(|(first, last)| if reverse { *last as usize } else { *first as usize })
+    }
+}
+
+/// The case folding `compare_text` compares with, as a key.
+fn fold(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
+
 /// The largest single block the pass keeps built and shared. A lookup table is small; a whole
 /// column read as an array is not, and rebuilding it is cheaper than holding it.
 const MAX_CACHED_BLOCK_CELLS: usize = 4_000_000;
@@ -406,6 +449,10 @@ struct PassHost<'a> {
     /// thousand lookups read the same few columns; rebuilding each block costs ~100 µs a formula.
     blocks: HashMap<(usize, RangeRef), std::sync::Arc<Array>>,
     block_cells: usize,
+    /// Text-key indexes per shared block, keyed by the block's address. The block itself is held
+    /// here so its address stays unique while the index exists.
+    text_indexes: HashMap<usize, Option<(std::sync::Arc<Array>, std::sync::Arc<TextIndex>)>>,
+    indexed_values: usize,
     rng: &'a mut u64,
     now: f64,
     cycle: bool,
@@ -474,6 +521,8 @@ impl<'a> PassHost<'a> {
             used: HashMap::default(),
             blocks: HashMap::default(),
             block_cells: 0,
+            text_indexes: HashMap::default(),
+            indexed_values: 0,
             rng,
             now,
             cycle: false,
@@ -814,6 +863,21 @@ impl Host for PassHost<'_> {
         }
         self.wb.sheet(sheet).map(|s| s.value(c)).unwrap_or_default()
     }
+    fn exact_text_position(&mut self, hay: &std::sync::Arc<Array>, needle: &str, reverse: bool) -> Option<Option<usize>> {
+        let key = std::sync::Arc::as_ptr(hay) as *const () as usize;
+        if let Some(slot) = self.text_indexes.get(&key) {
+            return slot.as_ref().map(|(_, index)| index.position(needle, reverse));
+        }
+        if hay.data.len() > MAX_INDEXED_TEXT_VALUES || self.indexed_values.saturating_add(hay.data.len()) > MAX_INDEXED_TEXT_VALUES_TOTAL {
+            self.text_indexes.insert(key, None);
+            return None;
+        }
+        let index = std::sync::Arc::new(TextIndex::build(&hay.data));
+        self.indexed_values += hay.data.len();
+        self.text_indexes.insert(key, Some((std::sync::Arc::clone(hay), std::sync::Arc::clone(&index))));
+        Some(index.position(needle, reverse))
+    }
+
     fn range_array(&mut self, sheet: usize, range: RangeRef) -> Option<std::sync::Arc<Array>> {
         // A block can only be reused while nothing that writes can change it: no formula cell in
         // it still to be worked out, no spill inside it, and no spill this pass has already
@@ -838,8 +902,13 @@ impl Host for PassHost<'_> {
         // so the block is as fixed as a block of constants, and the next formula that reads it
         // gets the same array. That is the shape of a reporting sheet: eighty thousand lookups
         // into one small table whose own few formulas were worked out on the first read.
-        let stable =
-            !self.iterate && sh.cells.formula_cells(range).all(|c| self.results.contains_key(&(sheet, c)) && !self.pending.contains(&(sheet, c)));
+        // A formula cell is settled when this pass has already worked it out, or when the pass is
+        // not working it out at all (it keeps the value the file or the last calculation gave it).
+        let stable = !self.iterate
+            && sh.cells.formula_cells(range).all(|c| {
+                let k = (sheet, c);
+                self.results.contains_key(&k) || !self.exprs.contains_key(&k)
+            });
         if !stable {
             return None;
         }
