@@ -46,12 +46,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   220k-cell workbook lives in 237 MiB), but no cold paging yet — the stripes are what makes a band
   one copy to page out; the per-band value dictionaries still cost full price when values do not
   repeat;
-  structural edits still shift every cell below them; 159 cells still differ from Excel's cached
-  values on the 1.28 GB report, all `IFERROR(XLOOKUP(...))` over whole columns where a blank is
-  involved (cached 0, we give the fallback) — whole-column references themselves are already
-  clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms), so
-  that is lookup semantics, not a scan; a 100k-dependent edit costs 223–251 ms against the 100 ms
-  gate (a full recalculation is 267 ms, single-threaded).
+  structural edits still shift every cell below them; whole-column references are already clipped
+  (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms); a
+  100k-dependent edit costs 223–251 ms against the 100 ms gate (a full recalculation is 267 ms,
+  single-threaded). The 159 cells that still differ from the cached values of the 1.28 GB report are
+  Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the same workbook
+  cache `#N/A` — not a calculation difference.
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
   (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
@@ -204,7 +204,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-26 | minor | §2: whole-column references are already clipped (21.5 ms for `SUM(A:A)` over a million cells); 159 XLOOKUP-over-blank cells differ from Excel; a 100k-dependent edit measures 223–251 ms |
+| 2026-10-26 | minor | §2: whole-column references are already clipped (21.5 ms for `SUM(A:A)` over a million cells); a 100k-dependent edit measures 223–251 ms; the 159 remaining cells are Excel's stale cache, not a difference |
 | 2026-10-26 | minor | §2: the stripes' report numbers and a 100M-cell measurement (2.4 GB on a unique-key export against ~490 MiB extrapolated at report density); `packed_breakdown` no longer counts two dictionaries twice |
 | 2026-10-20 | minor | §11: the Japanese catalog covers the dialogs, messages and menus — 943 keys (~43%), matching the pt-BR coverage; a test keeps the two catalogs in step |
 | 2026-10-17 | minor | §6: the five reports it tracked are closed and their PRs merged (#57, #133, #139, #140, #134; PRs #148, #155, #156, #157); the entry stays open for §15's oracle suite |

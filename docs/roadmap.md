@@ -224,11 +224,20 @@ is evaluator plumbing, and a full recalculation runs four to five passes — eac
 same formulas because `results` and `pending` start empty every pass. Making later passes incremental
 is the next real win here, and it is a change to `Calc::calculate`'s loop, not to a kernel.
 
-**Measured (10-26).** The case behind the <100 ms gate: 100,000 cells of `=$A$1*2`, then three
-edits of A1 — 223, 236 and 251 ms each, against 267 ms for a full recalculation. `cells_changed`
-already recalculates only the dependents, so the cost is the pass itself (~2.3 µs a formula: graph
-lookup, evaluation, storing the value), not the dependency walk. Whole-column references are not
-part of it: `SUM(A:A)` folds a million cells in 21.5 ms, and a ten-row used range in 0.0 ms.
+**Measured (10-26).** The case behind the <100 ms gate: cells of `=$A$1*2`, then an edit of A1.
+The cost is linear and about a microsecond a formula, so the gate sits at ~50,000 dependents today:
+
+| dependents | full recalc | edit A1 | a formula |
+|---|---|---|---|
+| 10,000 | 19 ms | 11 ms | 1.1 µs |
+| 25,000 | 59 ms | 37 ms | 1.5 µs |
+| 50,000 | 124 ms | **97 ms** | 1.9 µs |
+| 100,000 | 281 ms | **222 ms** | 2.2 µs |
+
+`cells_changed` already recalculates only the dependents, so the cost is the pass itself (graph
+lookup, evaluation, storing the value), not the dependency walk: a pass split across the machine's
+threads is the shape of the fix, and this table is its case. Whole-column references are not part of
+it: `SUM(A:A)` folds a million cells in 21.5 ms, and a ten-row used range in 0.0 ms.
 
 **Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
 band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
