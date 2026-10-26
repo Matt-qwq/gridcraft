@@ -3,11 +3,17 @@
 //! Cells live in bands of 64 rows, each band behind an `Arc`, so cloning a store (an undo
 //! snapshot) copies only the band pointers and editing a cell copies just its band.
 //!
-//! Inside a band a row is packed the way a worksheet is read and drawn: a presence bitmap over the
-//! columns the row touches, then one entry per stored cell in three parallel arrays — kind,
-//! payload, style — plus side tables for the two things a cell only rarely carries (a formula and
-//! an array value). A `Cell` struct costs 40 bytes; packed like this a cell costs about 11, which
-//! is the difference between a 30-million-cell sheet taking 1.6 GB and taking 400 MB.
+//! Inside a band the cells lie in four stripes — a presence bitmap over the columns a row touches,
+//! then one entry per stored cell in three parallel arrays (kind, payload, style) — plus side
+//! tables for the two things a cell only rarely carries (a formula and an array value). A `Cell`
+//! struct costs 40 bytes; packed like this a cell costs about 11, which is the difference between
+//! a 30-million-cell sheet taking 1.6 GB and taking 400 MB.
+//!
+//! The stripes are band-wide vectors with a slice per row, not per-row vectors. A row that owned
+//! its four arrays put four allocations behind every pointer, so reading a million single-cell
+//! rows chased four million of them at ~46 ns a cell against ~2 ns for the arithmetic, and the row
+//! header cost 108 bytes. Walking a stripe is sequential, the header is 48 bytes, and a page of a
+//! band is one copy instead of a thousand.
 //!
 //! Text is the one payload that does not fit in eight bytes, so a band keeps a table of the strings
 //! its rows use and the payload holds an index into it. Strings that arrive as the same `Arc` (as a
@@ -85,130 +91,209 @@ fn error_code(e: CellError) -> u64 {
     }
 }
 
-/// Runs of equal values over consecutive stored cells: `(value, length)` pairs in cell order.
-///
-/// A report formats a row in two or three runs — a date column, a block of numbers, a block of
-/// text — and its cells hold kinds in runs the same way, so a per-cell array is mostly repetition:
-/// two bytes a cell for the style, one for the kind. An entry here costs four bytes and covers a
-/// run, which measured on a 31.7M-cell report is 0.04 style runs and 0.18 kind runs a cell. The
-/// worst case, every cell its own run, costs a third more than the per-cell array.
-#[derive(Clone, Debug, Default)]
-struct Runs {
-    runs: Vec<(u16, u16)>,
+// The kinds and the styles of a band are runs of equal values over consecutive stored cells:
+// `(value, length)` pairs in cell order. A report formats a row in two or three runs — a date
+// column, a block of numbers, a block of text — and its cells hold kinds in runs the same way, so a
+// per-cell array is mostly repetition: two bytes a cell for the style, one for the kind. An entry
+// costs four bytes and covers a run, which measured on a 31.7M-cell report is 0.04 style runs and
+// 0.18 kind runs a cell. The worst case, every cell its own run, costs a third more than the
+// per-cell array.
+//
+// The runs live in the band's stripe, one slice per row (`at..at + len`), so the helpers below take
+// the slice they work on. A row's slice is its own: two neighbours that happen to hold the same
+// value keep two runs, because a row is what gets moved, paged and rebuilt.
+
+/// The values of a run slice, expanded: how many cells it covers.
+#[cfg(test)]
+fn runs_len(runs: &[(u16, u16)]) -> usize {
+    runs.iter().map(|(_, n)| *n as usize).sum()
 }
 
-impl Runs {
-    fn len(&self) -> usize {
-        self.runs.iter().map(|(_, n)| *n as usize).sum()
-    }
+/// The value of the `i`th cell of a run slice.
+fn runs_at(runs: &[(u16, u16)], i: usize) -> u16 {
+    runs_at_or(runs, i, 0)
+}
 
-    fn is_empty(&self) -> bool {
-        self.runs.is_empty()
-    }
-
-    fn at(&self, i: usize) -> u16 {
-        self.at_or(i, 0)
-    }
-
-    fn at_or(&self, i: usize, default: u16) -> u16 {
-        let mut left = i;
-        for (v, n) in &self.runs {
-            let n = *n as usize;
-            if left < n {
-                return *v;
-            }
-            left -= n;
+fn runs_at_or(runs: &[(u16, u16)], i: usize, default: u16) -> u16 {
+    let mut left = i;
+    for (v, n) in runs {
+        let n = *n as usize;
+        if left < n {
+            return *v;
         }
-        default
+        left -= n;
     }
+    default
+}
 
-    /// Gives back the growth slack: the runs of a row built from a file are final.
-    fn compact(&mut self) {
-        if self.runs.capacity() > self.runs.len() + self.runs.len() / 4 {
-            self.runs.shrink_to_fit();
+/// Appends a value at the end of the run slice that starts at `base`: it lengthens the last run
+/// when that run already holds the value, and never reaches into the run of the row before.
+fn run_push(runs: &mut Vec<(u16, u16)>, base: usize, value: u16) {
+    let extends = runs.len() > base && matches!(runs.last(), Some((last, n)) if *last == value && *n < u16::MAX);
+    if extends {
+        if let Some(last) = runs.last_mut() {
+            last.1 += 1;
+        }
+    } else {
+        runs.push((value, 1));
+    }
+}
+
+/// Merges run `idx` with its neighbours when they hold the same value, never across the slice
+/// `at..at + slice`, and returns the slice length after the runs that went away.
+fn runs_merge(runs: &mut Vec<(u16, u16)>, at: usize, slice: usize, idx: usize) -> usize {
+    let mut slice = slice;
+    for start in [idx, idx.saturating_sub(1)] {
+        let j = start;
+        while j >= at && j + 1 < at.saturating_add(slice) && runs.get(j).zip(runs.get(j + 1)).is_some_and(|(a, b)| a.0 == b.0) {
+            let n = runs[j + 1].1;
+            runs[j].1 = runs[j].1.saturating_add(n);
+            runs.remove(j + 1);
+            slice = slice.saturating_sub(1);
         }
     }
+    slice
+}
 
-    fn push(&mut self, v: u16) {
-        match self.runs.last_mut() {
-            Some((last, n)) if *last == v && *n < u16::MAX => *n += 1,
-            _ => self.runs.push((v, 1)),
-        }
-    }
-
-    fn grow(&mut self, i: usize, v: u16) {
-        let mut pos = 0usize;
-        for idx in 0..self.runs.len() {
-            let (rv, rn) = self.runs[idx];
-            let end = pos + rn as usize;
-            if i > end {
-                pos = end;
-                continue;
-            }
-            // Inserting a value a neighbouring run already holds is just a longer run.
-            if rv == v {
-                self.runs[idx].1 += 1;
-                return;
-            }
-            if i == pos {
-                self.runs.insert(idx, (v, 1));
-                self.merge(idx);
-                return;
-            }
-            let before = (i - pos) as u16;
-            let after = rn - before;
-            self.runs[idx].1 = before;
-            self.runs.insert(idx + 1, (v, 1));
-            if after > 0 {
-                self.runs.insert(idx + 2, (rv, after));
-            }
-            // The new run may sit next to one that already holds the same value.
-            self.merge(idx + 1);
-            return;
-        }
-        self.push(v);
-    }
-
-    fn shrink(&mut self, i: usize) {
-        let mut pos = 0usize;
-        for idx in 0..self.runs.len() {
-            let (_, rn) = self.runs[idx];
-            let end = pos + rn as usize;
-            if i < end {
-                self.runs[idx].1 -= 1;
-                if self.runs[idx].1 == 0 {
-                    self.runs.remove(idx);
-                    if idx > 0 {
-                        self.merge(idx - 1);
-                    }
-                } else {
-                    self.merge(idx);
-                }
-                return;
-            }
+/// Inserts `value` at cell `i` of the run slice `at..at + len`, and returns the slice's new length.
+fn runs_insert(runs: &mut Vec<(u16, u16)>, at: usize, len: usize, i: usize, value: u16) -> usize {
+    let mut slice = len;
+    let mut pos = 0usize;
+    let mut idx = at;
+    while idx < at + slice {
+        let (rv, rn) = match runs.get(idx) {
+            Some(&run) => run,
+            None => break,
+        };
+        let end = pos + rn as usize;
+        if i > end {
             pos = end;
+            idx += 1;
+            continue;
         }
+        // Extending a neighbouring run that already holds the value is just a longer run.
+        if rv == value {
+            runs[idx].1 += 1;
+            return slice;
+        }
+        if i == pos {
+            runs.insert(idx, (value, 1));
+            slice += 1;
+            return runs_merge(runs, at, slice, idx);
+        }
+        let before = (i - pos) as u16;
+        runs[idx].1 = before;
+        runs.insert(idx + 1, (value, 1));
+        slice += 1;
+        if rn > before {
+            runs.insert(idx + 2, (rv, rn - before));
+            slice += 1;
+        }
+        return runs_merge(runs, at, slice, idx + 1);
+    }
+    // Past the slice's last run: the new cell is the slice's last one.
+    runs.insert(at + slice, (value, 1));
+    slice += 1;
+    if slice > 1 {
+        return runs_merge(runs, at, slice, at + slice - 2);
+    }
+    slice
+}
+
+/// Removes cell `i` from the run slice `at..at + len`, and returns the slice's new length.
+fn runs_remove(runs: &mut Vec<(u16, u16)>, at: usize, len: usize, i: usize) -> usize {
+    let mut slice = len;
+    let mut pos = 0usize;
+    let mut idx = at;
+    while idx < at + slice {
+        let rn = match runs.get(idx) {
+            Some(&(_, n)) => n as usize,
+            None => break,
+        };
+        if i < pos + rn {
+            runs[idx].1 -= 1;
+            if runs[idx].1 == 0 {
+                runs.remove(idx);
+                slice -= 1;
+                if idx > at && slice > 0 {
+                    return runs_merge(runs, at, slice, idx - 1);
+                }
+            } else {
+                return runs_merge(runs, at, slice, idx);
+            }
+            return slice;
+        }
+        pos += rn;
+        idx += 1;
+    }
+    slice
+}
+
+/// Sets cell `i` of the run slice to `value`, and returns the slice's new length.
+fn runs_set(runs: &mut Vec<(u16, u16)>, at: usize, len: usize, i: usize, value: u16) -> usize {
+    if runs_at(runs.get(at..at.saturating_add(len)).unwrap_or(&[]), i) == value {
+        return len;
+    }
+    let len = runs_insert(runs, at, len, i, value);
+    // `runs_insert` put the new cell in its own run: drop the old one at i + 1.
+    runs_remove(runs, at, len, i + 1)
+}
+
+/// Walks one row's run slice while its cells are visited in order. A per-cell search from the
+/// row's first run would be quadratic in the runs a row holds, which is what a walk over a whole
+/// band pays.
+struct RunCursor<'a> {
+    runs: &'a [(u16, u16)],
+    idx: usize,
+    value: u16,
+    /// First cell of the next run.
+    end: usize,
+    default: u16,
+}
+
+impl<'a> RunCursor<'a> {
+    fn new(runs: &'a [(u16, u16)], default: u16) -> Self {
+        let (value, end) = runs.first().map_or((default, 0), |(v, n)| (*v, *n as usize));
+        RunCursor { runs, idx: 0, value, end, default }
     }
 
-    fn set(&mut self, i: usize, v: u16) {
-        if self.at(i) == v {
-            return;
-        }
-        self.grow(i, v);
-        // `grow` put the new cell in its own run: drop the old one at i + 1.
-        self.shrink(i + 1);
-    }
-
-    /// Merges run `idx` with its neighbours when they hold the same value.
-    fn merge(&mut self, idx: usize) {
-        for j in [idx, idx.saturating_sub(1)] {
-            while j + 1 < self.runs.len() && self.runs[j].0 == self.runs[j + 1].0 {
-                let n = self.runs[j + 1].1;
-                self.runs[j].1 += n;
-                self.runs.remove(j + 1);
+    /// The value at cell `i`. Cells must be asked for in order (`i` never goes back).
+    fn at(&mut self, i: usize) -> u16 {
+        while i >= self.end {
+            self.idx += 1;
+            match self.runs.get(self.idx) {
+                Some(&(v, n)) => {
+                    self.value = v;
+                    self.end += n as usize;
+                }
+                None => return self.default,
             }
         }
+        self.value
     }
+}
+
+/// `v[at..at + n]`, empty when the range runs off the end: a stripe's offsets and its rows are
+/// built together, so this only guards against a bug becoming a panic.
+fn slice<T>(v: &[T], at: u32, n: u32) -> &[T] {
+    v.get(at as usize..(at as usize).saturating_add(n as usize)).unwrap_or(&[])
+}
+
+fn insert_at<T>(v: &mut Vec<T>, at: usize, x: T) {
+    let at = at.min(v.len());
+    v.insert(at, x);
+}
+
+fn drop_at<T>(v: &mut Vec<T>, at: usize) {
+    if at < v.len() {
+        v.remove(at);
+    }
+}
+
+fn drop_slice<T>(v: &mut Vec<T>, at: usize, n: usize) {
+    let lo = at.min(v.len());
+    let hi = at.saturating_add(n).min(v.len());
+    v.drain(lo..hi);
 }
 
 /// The two things a cell only rarely carries: a formula, and an array value.
@@ -223,47 +308,65 @@ struct RowExtras {
     wide: Vec<u64>,
 }
 
-/// One row of a band: a bitmap of the columns it touches plus one entry per stored cell.
+/// One row of a band: the row number, and where that row's cells sit in the band's four stripes.
+///
+/// This used to own the bitmap and the three cell arrays. It is an index now, so the row header is
+/// 48 bytes instead of 108 and the cells of one band follow each other in memory.
 #[derive(Clone, Debug, Default)]
-struct Row {
-    /// Column of bit 0, always a multiple of 64 so the bitmap grows by whole words.
+struct BandRow {
+    /// Row within the band.
+    key: u32,
+    /// Column of bit 0 of the bitmap, always a multiple of 64 so the bitmap grows by whole words.
     first: u32,
-    bits: Vec<u64>,
-    /// The kind of each stored cell, in runs: a row is mostly a block of numbers and a block of
-    /// text.
-    kinds: Runs,
-    /// A `u16` per stored cell: an index into the band's number or text table, a boolean, an error
-    /// code — or, for the rare wide kinds, an index into `extras.wide`.
-    payloads: Vec<u16>,
-    /// Index into the band's style dictionary, in runs: a report formats a row in two or three.
-    styles: Runs,
+    /// First bitmap word in `Band::bits`, and how many words this row spans.
+    bits_at: u32,
+    words: u32,
+    /// First cell in `Band::payloads`, and in the `Band::kinds` and `Band::styles` run stripes.
+    cells_at: u32,
+    kinds_at: u32,
+    styles_at: u32,
+    /// How many stored cells this row holds, and how many runs each stripe gives them.
+    cells: u32,
+    kind_runs: u32,
+    style_runs: u32,
     /// Held out of line: a row with neither a formula nor an array pays nothing for them.
     extras: Option<Box<RowExtras>>,
 }
 
-impl Row {
+impl BandRow {
     fn is_empty(&self) -> bool {
-        self.kinds.is_empty() && self.extras.is_none()
+        self.cells == 0 && self.extras.is_none()
+    }
+
+    fn bits<'a>(&self, band: &'a Band) -> &'a [u64] {
+        slice(&band.bits, self.bits_at, self.words)
+    }
+
+    fn kind_runs<'a>(&self, band: &'a Band) -> &'a [(u16, u16)] {
+        slice(&band.kinds, self.kinds_at, self.kind_runs)
+    }
+
+    fn style_runs<'a>(&self, band: &'a Band) -> &'a [(u16, u16)] {
+        slice(&band.styles, self.styles_at, self.style_runs)
+    }
+
+    /// The kind of the `i`th stored cell.
+    fn kind_at(&self, band: &Band, i: usize) -> u8 {
+        runs_at_or(self.kind_runs(band), i, u16::from(EMPTY)) as u8
     }
 
     /// The style of the `i`th stored cell.
-    fn style_at(&self, i: usize) -> u16 {
-        self.styles.at(i)
+    fn style_at(&self, band: &Band, i: usize) -> u16 {
+        runs_at(self.style_runs(band), i)
     }
 
-    fn kind_at(&self, i: usize) -> u8 {
-        self.kinds.at_or(i, u16::from(EMPTY)) as u8
+    /// The payload of the `i`th stored cell.
+    fn payload_at(&self, band: &Band, i: usize) -> u16 {
+        band.payloads.get(self.cells_at as usize + i).copied().unwrap_or(0)
     }
 
-    /// Puts a payload that does not fit `u16` in the side table and returns its index there.
-    fn push_wide(&mut self, value: u64) -> u16 {
-        let extras = self.extras.get_or_insert_with(Default::default);
-        extras.wide.push(value);
-        (extras.wide.len() - 1) as u16
-    }
-
-    fn wide_at(&self, i: usize) -> u64 {
-        let slot = self.payloads[i] as usize;
+    fn wide_at(&self, band: &Band, i: usize) -> u64 {
+        let slot = self.payload_at(band, i) as usize;
         self.extras.as_ref().and_then(|e| e.wide.get(slot).copied()).unwrap_or(0)
     }
 
@@ -282,37 +385,39 @@ impl Row {
     }
 
     /// Number of stored cells before `bit` of `word`.
-    fn rank(&self, word: usize, bit: u32) -> usize {
+    fn rank(&self, band: &Band, word: usize, bit: u32) -> usize {
+        let bits = self.bits(band);
         let mut n = 0usize;
-        for w in &self.bits[..word] {
+        for w in bits.get(..word).unwrap_or(&[]) {
             n += w.count_ones() as usize;
         }
-        n + (self.bits[word] & ((1u64 << bit) - 1)).count_ones() as usize
+        let w = bits.get(word).copied().unwrap_or(0);
+        n + (w & ((1u64 << bit) - 1)).count_ones() as usize
     }
 
     /// Number of stored cells strictly before `col`.
-    fn rank_before(&self, col: u32) -> usize {
+    fn rank_before(&self, band: &Band, col: u32) -> usize {
         let Some(slot) = col.checked_sub(self.first) else { return 0 };
         let word = (slot / 64) as usize;
-        if word >= self.bits.len() {
-            return self.kinds.len();
+        if word >= self.words as usize {
+            return self.cells as usize;
         }
-        self.rank(word, slot % 64)
+        self.rank(band, word, slot % 64)
     }
 
     /// Index into the dense arrays for `col`, when the row stores a cell there.
-    fn index_of(&self, col: u32) -> Option<usize> {
+    fn index_of(&self, band: &Band, col: u32) -> Option<usize> {
         let slot = col.checked_sub(self.first)?;
         let word = (slot / 64) as usize;
         let bit = slot % 64;
-        let w = *self.bits.get(word)?;
-        (w & (1u64 << bit) != 0).then(|| self.rank(word, bit))
+        let w = *self.bits(band).get(word)?;
+        (w & (1u64 << bit) != 0).then(|| self.rank(band, word, bit))
     }
 
     /// The column of the `i`th stored cell.
-    fn col_at(&self, i: usize) -> u32 {
+    fn col_at(&self, band: &Band, i: usize) -> u32 {
         let mut seen = 0usize;
-        for (word, bits) in self.bits.iter().enumerate() {
+        for (word, bits) in self.bits(band).iter().enumerate() {
             let count = bits.count_ones() as usize;
             if seen + count <= i {
                 seen += count;
@@ -333,34 +438,14 @@ impl Row {
     }
 
     fn columns(&self) -> u32 {
-        self.bits.len() as u32 * 64
-    }
-
-    /// Grows the bitmap to cover `col`, keeping `first` word-aligned.
-    fn cover(&mut self, col: u32) {
-        if self.bits.is_empty() {
-            self.first = col / 64 * 64;
-            self.bits.push(0);
-            return;
-        }
-        if col < self.first {
-            let words = ((self.first - col) as usize).div_ceil(64);
-            for _ in 0..words {
-                self.bits.insert(0, 0);
-            }
-            self.first -= words as u32 * 64;
-        }
-        let need = ((col - self.first) / 64 + 1) as usize;
-        if need > self.bits.len() {
-            self.bits.resize(need, 0);
-        }
+        self.words * 64
     }
 
     /// First and last stored column.
-    fn column_span(&self) -> Option<(u32, u32)> {
+    fn column_span(&self, band: &Band) -> Option<(u32, u32)> {
         let mut first = None;
         let mut last = None;
-        for (i, w) in self.bits.iter().enumerate() {
+        for (i, w) in self.bits(band).iter().enumerate() {
             if *w == 0 {
                 continue;
             }
@@ -416,23 +501,25 @@ impl Row {
             }
         }
     }
-
-    fn remove_at(&mut self, i: usize, col: u32) {
-        self.kinds.shrink(i);
-        self.payloads.remove(i);
-        self.styles.shrink(i);
-        let slot = col - self.first;
-        let word = (slot / 64) as usize;
-        self.bits[word] &= !(1u64 << (slot % 64));
-    }
 }
 
-/// The rows of one band, plus the two tables their packed cells index into.
+/// The cells of one band, striped: the presence bitmaps, kinds, payloads and styles all live in one
+/// vector each, a row being a slice of all four.
 #[derive(Clone, Debug, Default)]
 struct Band {
-    /// `(row in band, row)`, sorted: 64 rows of ~116 bytes each, where a `BTreeMap`'s leaves sit
-    /// three quarters full and cost some forty bytes a row for the privilege.
-    rows: Vec<(u32, Row)>,
+    /// Sorted by row: 64 rows of 48 bytes each, where a `BTreeMap`'s leaves sit three quarters full
+    /// and cost some forty bytes a row for the privilege.
+    rows: Vec<BandRow>,
+    /// The presence bitmaps, 64 columns a word, one slice per row.
+    bits: Vec<u64>,
+    /// The kind of each stored cell, in runs; one slice per row.
+    kinds: Vec<(u16, u16)>,
+    /// The style of each stored cell, in runs; one slice per row.
+    styles: Vec<(u16, u16)>,
+    /// A `u16` per stored cell, in the same order as the kinds and styles stripes: an index into
+    /// the band's number or text table, a boolean, an error code — or, for the rare wide kinds, an
+    /// index into the row's `extras.wide`.
+    payloads: Vec<u16>,
     /// The distinct numbers of this band, in the order they were seen; a `NUMBER` payload is an
     /// index into it.
     numbers: Vec<f64>,
@@ -443,7 +530,8 @@ struct Band {
     /// per band. A band holds a handful of texts: a sorted vector beats a hash map's bookkeeping at
     /// that size, which is why the number table (hundreds of entries) is a hash and this is not.
     text_index: Vec<(usize, u32)>,
-    styles: Vec<StyleId>,
+    /// The distinct styles of this band; the `styles` stripe holds indexes into it.
+    style_ids: Vec<StyleId>,
 }
 
 /// Mixes the bits of a double into a slot index.
@@ -454,38 +542,192 @@ fn number_hash(bits: u64) -> usize {
 }
 
 impl Band {
-    fn row(&self, key: u32) -> Option<&Row> {
-        self.rows.binary_search_by_key(&key, |(k, _)| *k).ok().map(|i| &self.rows[i].1)
+    fn row_index(&self, key: u32) -> Option<usize> {
+        self.rows.binary_search_by_key(&key, |r| r.key).ok()
     }
 
-    fn row_mut(&mut self, key: u32) -> Option<&mut Row> {
-        match self.rows.binary_search_by_key(&key, |(k, _)| *k) {
-            Ok(i) => Some(&mut self.rows[i].1),
-            Err(_) => None,
+    fn row(&self, key: u32) -> Option<&BandRow> {
+        self.row_index(key).map(|i| &self.rows[i])
+    }
+
+    /// The index of the row's entry, adding an empty row — its slices at the end of each stripe —
+    /// when it isn't there yet.
+    fn row_or_insert(&mut self, key: u32) -> usize {
+        match self.rows.binary_search_by_key(&key, |r| r.key) {
+            Ok(i) => i,
+            Err(i) => {
+                let row = BandRow {
+                    key,
+                    bits_at: self.bits.len() as u32,
+                    cells_at: self.payloads.len() as u32,
+                    kinds_at: self.kinds.len() as u32,
+                    styles_at: self.styles.len() as u32,
+                    ..Default::default()
+                };
+                self.rows.insert(i, row);
+                i
+            }
         }
     }
 
-    /// The row's cell, adding an empty row when it isn't there yet.
-    fn row_or_insert(&mut self, key: u32) -> &mut Row {
-        match self.rows.binary_search_by_key(&key, |(k, _)| *k) {
-            Ok(i) => &mut self.rows[i].1,
-            Err(i) => {
-                self.rows.insert(i, (key, Row::default()));
-                &mut self.rows[i].1
+    /// Drops a row together with the cells it holds, keeping every stripe contiguous.
+    fn clear_row_at(&mut self, at: usize) {
+        if at >= self.rows.len() {
+            return;
+        }
+        let row = self.rows.remove(at);
+        let (bits_at, words) = (row.bits_at as usize, row.words as usize);
+        let (cells_at, cells) = (row.cells_at as usize, row.cells as usize);
+        let (kinds_at, kinds) = (row.kinds_at as usize, row.kind_runs as usize);
+        let (styles_at, styles) = (row.styles_at as usize, row.style_runs as usize);
+        drop_slice(&mut self.bits, bits_at, words);
+        drop_slice(&mut self.payloads, cells_at, cells);
+        drop_slice(&mut self.kinds, kinds_at, kinds);
+        drop_slice(&mut self.styles, styles_at, styles);
+        // Rows whose slices sat beyond what was dropped move up. Slices never overlap, and a row
+        // built later may sit before one built earlier, so every remaining row is checked.
+        for r in &mut self.rows {
+            if r.bits_at as usize >= bits_at {
+                r.bits_at = r.bits_at.saturating_sub(words as u32);
+            }
+            if r.cells_at as usize >= cells_at {
+                r.cells_at = r.cells_at.saturating_sub(cells as u32);
+            }
+            if r.kinds_at as usize >= kinds_at {
+                r.kinds_at = r.kinds_at.saturating_sub(kinds as u32);
+            }
+            if r.styles_at as usize >= styles_at {
+                r.styles_at = r.styles_at.saturating_sub(styles as u32);
             }
         }
     }
 
     fn remove_row(&mut self, key: u32) {
-        if let Ok(i) = self.rows.binary_search_by_key(&key, |(k, _)| *k) {
-            self.rows.remove(i);
+        if let Some(i) = self.row_index(key) {
+            self.clear_row_at(i);
         }
     }
 
-    /// Gives back what building the band over-allocated: the rows, and the number index that only
-    /// adding cells needs.
+    /// Moves the stripe offsets of every row but the one at `at` when a slice changed size.
+    /// Each argument is `(where the change happened, how many entries it added or removed)`.
+    fn shift_offsets(&mut self, at: usize, bits: (u32, i32), cells: (u32, i32), kinds: (u32, i32), styles: (u32, i32)) {
+        for (i, r) in self.rows.iter_mut().enumerate() {
+            if i == at {
+                continue;
+            }
+            if bits.1 != 0 && r.bits_at >= bits.0 {
+                r.bits_at = r.bits_at.saturating_add_signed(bits.1);
+            }
+            if cells.1 != 0 && r.cells_at >= cells.0 {
+                r.cells_at = r.cells_at.saturating_add_signed(cells.1);
+            }
+            if kinds.1 != 0 && r.kinds_at >= kinds.0 {
+                r.kinds_at = r.kinds_at.saturating_add_signed(kinds.1);
+            }
+            if styles.1 != 0 && r.styles_at >= styles.0 {
+                r.styles_at = r.styles_at.saturating_add_signed(styles.1);
+            }
+        }
+    }
+
+    /// Grows the bitmap of the row at `at` to cover `col`, keeping `first` word-aligned, and opens
+    /// the stripes up for the words that adds.
+    fn cover(&mut self, at: usize, col: u32) {
+        let (first, words) = (self.rows[at].first, self.rows[at].words);
+        if words == 0 {
+            self.rows[at].first = col / 64 * 64;
+            let bits_at = self.rows[at].bits_at;
+            insert_at(&mut self.bits, bits_at as usize, 0);
+            self.rows[at].words = 1;
+            self.shift_offsets(at, (bits_at, 1), (0, 0), (0, 0), (0, 0));
+            return;
+        }
+        let mut left = 0usize;
+        if col < first {
+            left = ((first - col) as usize).div_ceil(64);
+        }
+        let cover = first.saturating_add(words.saturating_mul(64));
+        let right = if col >= cover { ((col - cover) / 64 + 1) as usize } else { 0 };
+        if left == 0 && right == 0 {
+            return;
+        }
+        let bits_at = self.rows[at].bits_at as usize;
+        let added = (left + right) as u32;
+        if left > 0 {
+            for _ in 0..left {
+                insert_at(&mut self.bits, bits_at, 0);
+            }
+            self.rows[at].first = first - left as u32 * 64;
+        }
+        for _ in 0..right {
+            let end = bits_at + left + words as usize;
+            insert_at(&mut self.bits, end, 0);
+        }
+        self.rows[at].words = words + added;
+        self.shift_offsets(at, (bits_at as u32, added as i32), (0, 0), (0, 0), (0, 0));
+    }
+
+    /// Puts a stored cell at cell index `i` of the row at `at`, opening the stripes up for it.
+    fn insert_cell(&mut self, at: usize, i: usize, col: u32, kind: u8, payload: u16, style: u16) {
+        let (bits_at, first) = (self.rows[at].bits_at, self.rows[at].first);
+        let (cells_at, old_cells, kinds_at, old_kinds) =
+            (self.rows[at].cells_at, self.rows[at].cells, self.rows[at].kinds_at, self.rows[at].kind_runs);
+        let (styles_at, old_styles) = (self.rows[at].styles_at, self.rows[at].style_runs);
+        let kind_runs = runs_insert(&mut self.kinds, kinds_at as usize, old_kinds as usize, i, u16::from(kind));
+        let style_runs = runs_insert(&mut self.styles, styles_at as usize, old_styles as usize, i, style);
+        insert_at(&mut self.payloads, cells_at as usize + i, payload);
+        // `cover` has already made room for the bit.
+        let slot = col.wrapping_sub(first);
+        if let Some(w) = self.bits.get_mut(bits_at as usize + (slot / 64) as usize) {
+            *w |= 1u64 << (slot % 64);
+        }
+        self.shift_offsets(
+            at,
+            (bits_at, 0),
+            (cells_at, 1),
+            (kinds_at, kind_runs as i32 - old_kinds as i32),
+            (styles_at, style_runs as i32 - old_styles as i32),
+        );
+        let row = &mut self.rows[at];
+        row.cells = old_cells + 1;
+        row.kind_runs = kind_runs as u32;
+        row.style_runs = style_runs as u32;
+    }
+
+    /// Drops the stored cell at index `i` of the row at `at`.
+    fn remove_cell(&mut self, at: usize, i: usize, col: u32) {
+        let (bits_at, first) = (self.rows[at].bits_at, self.rows[at].first);
+        let (cells_at, old_cells, kinds_at, old_kinds) =
+            (self.rows[at].cells_at, self.rows[at].cells, self.rows[at].kinds_at, self.rows[at].kind_runs);
+        let (styles_at, old_styles) = (self.rows[at].styles_at, self.rows[at].style_runs);
+        let kind_runs = runs_remove(&mut self.kinds, kinds_at as usize, old_kinds as usize, i);
+        let style_runs = runs_remove(&mut self.styles, styles_at as usize, old_styles as usize, i);
+        drop_at(&mut self.payloads, cells_at as usize + i);
+        let slot = col.wrapping_sub(first);
+        if let Some(w) = self.bits.get_mut(bits_at as usize + (slot / 64) as usize) {
+            *w &= !(1u64 << (slot % 64));
+        }
+        self.shift_offsets(
+            at,
+            (bits_at, 0),
+            (cells_at, -1),
+            (kinds_at, kind_runs as i32 - old_kinds as i32),
+            (styles_at, style_runs as i32 - old_styles as i32),
+        );
+        let row = &mut self.rows[at];
+        row.cells = old_cells.saturating_sub(1);
+        row.kind_runs = kind_runs as u32;
+        row.style_runs = style_runs as u32;
+    }
+
+    /// Gives back what building the band over-allocated: the stripes, and the number index that
+    /// only adding cells needs.
     fn finish(&mut self) {
         self.rows.shrink_to_fit();
+        self.bits.shrink_to_fit();
+        self.kinds.shrink_to_fit();
+        self.styles.shrink_to_fit();
+        self.payloads.shrink_to_fit();
         self.drop_number_slots();
     }
 
@@ -595,11 +837,11 @@ impl Band {
     }
 
     fn style_slot(&mut self, s: StyleId) -> u16 {
-        if let Some(i) = self.styles.iter().position(|x| *x == s) {
+        if let Some(i) = self.style_ids.iter().position(|x| *x == s) {
             return i as u16;
         }
-        self.styles.push(s);
-        (self.styles.len() - 1) as u16
+        self.style_ids.push(s);
+        (self.style_ids.len() - 1) as u16
     }
 
     fn text(&self, payload: u64) -> Arc<str> {
@@ -607,26 +849,33 @@ impl Band {
     }
 
     fn style(&self, slot: u16) -> StyleId {
-        self.styles.get(slot as usize).copied().unwrap_or(StyleId::DEFAULT)
+        self.style_ids.get(slot as usize).copied().unwrap_or(StyleId::DEFAULT)
+    }
+
+    /// Puts a payload that does not fit `u16` in the row's side table and returns its index there.
+    fn push_wide(&mut self, at: usize, value: u64) -> u16 {
+        let extras = self.rows[at].extras.get_or_insert_with(Default::default);
+        extras.wide.push(value);
+        (extras.wide.len() - 1) as u16
     }
 
     /// Rebuilds the `Cell` at `col` from the packed row.
-    fn cell_at(&self, row: &Row, i: usize, col: u32) -> Cell {
-        let payload = row.payloads[i];
-        let value = match row.kind_at(i) {
+    fn cell_at(&self, row: &BandRow, i: usize, col: u32) -> Cell {
+        let payload = row.payload_at(self, i);
+        let value = match row.kind_at(self, i) {
             NUMBER => Value::Number(self.number(payload)),
-            NUMBER_WIDE => Value::Number(f64::from_bits(row.wide_at(i))),
+            NUMBER_WIDE => Value::Number(f64::from_bits(row.wide_at(self, i))),
             TEXT => Value::Text(self.text(u64::from(payload))),
-            TEXT_WIDE => Value::Text(self.text(row.wide_at(i))),
+            TEXT_WIDE => Value::Text(self.text(row.wide_at(self, i))),
             BOOL => Value::Bool(payload != 0),
             ERROR => Value::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value)),
             ARRAY => match row.arrays().binary_search_by_key(&col, |(c, _)| *c) {
-                Ok(j) => Value::Array(row.arrays()[j].1.clone()),
+                Ok(j) => row.arrays().get(j).map_or(Value::Empty, |(_, a)| Value::Array(a.clone())),
                 Err(_) => Value::Empty,
             },
             _ => Value::Empty,
         };
-        Cell { value, formula: row.formula_at(col).cloned(), style: self.style(row.style_at(i)) }
+        Cell { value, formula: row.formula_at(col).cloned(), style: self.style(row.style_at(self, i)) }
     }
 
     /// Stores `cell` at `col`; a blank cell is removed instead. Text and style slots are resolved
@@ -640,39 +889,50 @@ impl Band {
             _ => None,
         };
         let formula = cell.formula.clone();
-        let row = self.row_or_insert(row_key);
-        row.cover(col);
-        let existing = row.index_of(col);
-        row.set_formula(col, if blank { None } else { formula.as_ref() });
-        row.set_array(col, if blank { None } else { array.as_ref() });
+        let at = self.row_or_insert(row_key);
+        self.cover(at, col);
+        let existing = self.rows[at].index_of(self, col);
+        self.rows[at].set_formula(col, if blank { None } else { formula.as_ref() });
+        self.rows[at].set_array(col, if blank { None } else { array.as_ref() });
         let payload = match payload {
             Payload::Small(p) => p,
-            Payload::Wide(v) => row.push_wide(v),
+            Payload::Wide(v) => self.push_wide(at, v),
         };
         match existing {
-            Some(i) if blank => row.remove_at(i, col),
+            Some(i) if blank => self.remove_cell(at, i, col),
             Some(i) => {
-                row.kinds.set(i, u16::from(kind));
-                row.payloads[i] = payload;
-                row.styles.set(i, style);
+                let (kinds_at, old_kinds) = (self.rows[at].kinds_at, self.rows[at].kind_runs);
+                let kind_runs = runs_set(&mut self.kinds, kinds_at as usize, old_kinds as usize, i, u16::from(kind));
+                let (styles_at, old_styles) = (self.rows[at].styles_at, self.rows[at].style_runs);
+                let style_runs = runs_set(&mut self.styles, styles_at as usize, old_styles as usize, i, style);
+                let slot = self.rows[at].cells_at as usize + i;
+                if let Some(p) = self.payloads.get_mut(slot) {
+                    *p = payload;
+                }
+                self.shift_offsets(
+                    at,
+                    (0, 0),
+                    (0, 0),
+                    (kinds_at, kind_runs as i32 - old_kinds as i32),
+                    (styles_at, style_runs as i32 - old_styles as i32),
+                );
+                self.rows[at].kind_runs = kind_runs as u32;
+                self.rows[at].style_runs = style_runs as u32;
             }
             None if !blank => {
-                let i = row.rank_before(col);
-                row.kinds.grow(i, u16::from(kind));
-                row.payloads.insert(i, payload);
-                row.styles.grow(i, style);
-                let slot = col - row.first;
-                row.bits[(slot / 64) as usize] |= 1u64 << (slot % 64);
+                let i = self.rows[at].rank_before(self, col);
+                self.insert_cell(at, i, col, kind, payload, style);
             }
             None => {}
         }
-        if row.is_empty() {
-            self.remove_row(row_key);
+        if self.rows[at].is_empty() {
+            self.clear_row_at(at);
         }
     }
 
-    /// Builds a whole row at once, from cells already sorted by column. Every array is sized
-    /// once, so there is no growth slack to give back and no insert-per-cell shifting.
+    /// Builds a whole row at once, from cells already sorted by column. The row's slices are
+    /// appended to the band's stripes, so there is no growth slack to give back and no
+    /// insert-per-cell shifting.
     fn put_row(&mut self, row_key: u32, cells: &mut Vec<(u32, Cell)>) {
         // One pass: the cells arrive sorted by column, so the bitmap can be sized from the first
         // and last non-blank ones and the row built as it is walked. This used to collect a
@@ -686,14 +946,18 @@ impl Band {
             }
         };
         let last = cells.iter().rev().find(|(_, cell)| !cell.is_blank()).map(|(col, _)| *col).unwrap_or(first);
-        let words = ((last - first) / 64 + 1) as usize;
-        let mut bits = vec![0u64; words];
-        let mut kinds = Runs::default();
-        let mut payloads = Vec::with_capacity(cells.len());
-        let mut styles = Runs::default();
+        let words = (last - first) / 64 + 1;
+        // A row that is being replaced goes first: dropping it moves the stripes' ends.
+        if let Some(at) = self.row_index(row_key) {
+            self.clear_row_at(at);
+        }
+        let (bits_at, cells_at) = (self.bits.len() as u32, self.payloads.len() as u32);
+        let (kinds_at, styles_at) = (self.kinds.len() as u32, self.styles.len() as u32);
+        self.bits.resize(self.bits.len() + words as usize, 0);
         let mut formulas: Vec<(u32, Arc<Formula>)> = Vec::new();
         let mut arrays: Vec<(u32, Arc<gridcraft_core::Array>)> = Vec::new();
         let mut wide: Vec<u64> = Vec::new();
+        let mut stored = 0u32;
         for (col, cell) in cells.drain(..) {
             if cell.is_blank() {
                 continue;
@@ -706,38 +970,52 @@ impl Band {
             if let Value::Array(a) = &cell.value {
                 arrays.push((col, a.clone()));
             }
-            let slot = col - first;
-            bits[(slot / 64) as usize] |= 1u64 << (slot % 64);
-            kinds.push(u16::from(kind));
-            payloads.push(match payload {
+            let slot = col.wrapping_sub(first);
+            if let Some(w) = self.bits.get_mut(bits_at as usize + (slot / 64) as usize) {
+                *w |= 1u64 << (slot % 64);
+            }
+            run_push(&mut self.kinds, kinds_at as usize, u16::from(kind));
+            run_push(&mut self.styles, styles_at as usize, style);
+            let payload = match payload {
                 Payload::Small(p) => p,
                 Payload::Wide(v) => {
                     wide.push(v);
                     (wide.len() - 1) as u16
                 }
-            });
-            styles.push(style);
+            };
+            self.payloads.push(payload);
+            stored += 1;
         }
         let extras =
             if formulas.is_empty() && arrays.is_empty() && wide.is_empty() { None } else { Some(Box::new(RowExtras { formulas, arrays, wide })) };
-        kinds.compact();
-        styles.compact();
-        let row = Row { first, bits, kinds, payloads, styles, extras };
-        match self.rows.binary_search_by_key(&row_key, |(k, _)| *k) {
-            Ok(i) => self.rows[i].1 = row,
-            Err(i) => self.rows.insert(i, (row_key, row)),
+        let row = BandRow {
+            key: row_key,
+            first,
+            bits_at,
+            words,
+            cells_at,
+            kinds_at,
+            styles_at,
+            cells: stored,
+            kind_runs: self.kinds.len() as u32 - kinds_at,
+            style_runs: self.styles.len() as u32 - styles_at,
+            extras,
+        };
+        match self.rows.binary_search_by_key(&row_key, |r| r.key) {
+            Ok(i) => self.rows[i] = row,
+            Err(i) => self.rows.insert(i, row),
         }
     }
 
     fn take(&mut self, row_key: u32, col: u32) -> Option<Cell> {
-        let i = self.row(row_key)?.index_of(col)?;
-        let cell = self.cell_at(self.row(row_key)?, i, col);
-        let row = self.row_mut(row_key)?;
-        row.set_formula(col, None);
-        row.set_array(col, None);
-        row.remove_at(i, col);
-        if row.is_empty() {
-            self.remove_row(row_key);
+        let at = self.row_index(row_key)?;
+        let i = self.rows[at].index_of(self, col)?;
+        let cell = self.cell_at(&self.rows[at], i, col);
+        self.rows[at].set_formula(col, None);
+        self.rows[at].set_array(col, None);
+        self.remove_cell(at, i, col);
+        if self.rows[at].is_empty() {
+            self.clear_row_at(at);
         }
         Some(cell)
     }
@@ -746,44 +1024,44 @@ impl Band {
     /// from different reads index different tables.
     fn same_as(&self, other: &Band) -> bool {
         self.rows.len() == other.rows.len()
-            && self.rows.iter().map(|(k, _)| k).eq(other.rows.iter().map(|(k, _)| k))
-            && self.rows.iter().all(|(k, a)| other.row(*k).is_some_and(|b| row_same_as(self, a, other, b)))
+            && self.rows.iter().map(|r| r.key).eq(other.rows.iter().map(|r| r.key))
+            && self.rows.iter().all(|a| other.row(a.key).is_some_and(|b| row_same_as(self, a, other, b)))
     }
 }
 
 /// True when two stored cells hold the same value, whatever slot their band gave it.
-fn same_value(a: &Band, ra: &Row, i: usize, b: &Band, rb: &Row, j: usize) -> bool {
-    if a.style(ra.style_at(i)) != b.style(rb.style_at(j)) {
+fn same_value(a: &Band, ra: &BandRow, i: usize, b: &Band, rb: &BandRow, j: usize) -> bool {
+    if a.style(ra.style_at(a, i)) != b.style(rb.style_at(b, j)) {
         return false;
     }
-    let (ka, kb) = (ra.kind_at(i), rb.kind_at(j));
-    let number = |band: &Band, row: &Row, kind: u8, i: usize| match kind {
-        NUMBER => band.number(row.payloads[i]).to_bits(),
-        _ => row.wide_at(i),
+    let (ka, kb) = (ra.kind_at(a, i), rb.kind_at(b, j));
+    let number = |band: &Band, row: &BandRow, kind: u8, i: usize| match kind {
+        NUMBER => band.number(row.payload_at(band, i)).to_bits(),
+        _ => row.wide_at(band, i),
     };
-    let text = |row: &Row, kind: u8, i: usize| match kind {
-        TEXT => u64::from(row.payloads[i]),
-        _ => row.wide_at(i),
+    let text = |band: &Band, row: &BandRow, kind: u8, i: usize| match kind {
+        TEXT => u64::from(row.payload_at(band, i)),
+        _ => row.wide_at(band, i),
     };
     match (ka, kb) {
         (NUMBER | NUMBER_WIDE, NUMBER | NUMBER_WIDE) => number(a, ra, ka, i) == number(b, rb, kb, j),
-        (TEXT | TEXT_WIDE, TEXT | TEXT_WIDE) => a.text(text(ra, ka, i)) == b.text(text(rb, kb, j)),
+        (TEXT | TEXT_WIDE, TEXT | TEXT_WIDE) => a.text(text(a, ra, ka, i)) == b.text(text(b, rb, kb, j)),
         // Arrays are compared by value where their column is known; here the position is enough.
         (ARRAY, ARRAY) => true,
-        _ => ka == kb && ra.payloads[i] == rb.payloads[j],
+        _ => ka == kb && ra.payload_at(a, i) == rb.payload_at(b, j),
     }
 }
 
-fn row_same_as(a: &Band, ra: &Row, b: &Band, rb: &Row) -> bool {
-    if ra.first != rb.first || ra.bits != rb.bits || ra.kinds.len() != rb.kinds.len() {
+fn row_same_as(a: &Band, ra: &BandRow, b: &Band, rb: &BandRow) -> bool {
+    if ra.first != rb.first || ra.bits(a) != rb.bits(b) || ra.cells != rb.cells {
         return false;
     }
-    for i in 0..ra.kinds.len() {
+    for i in 0..ra.cells as usize {
         if !same_value(a, ra, i, b, rb, i) {
             return false;
         }
     }
-    let texts = |row: &Row| -> Vec<(u32, String)> { row.formulas().iter().map(|(c, f)| (*c, f.text.clone())).collect() };
+    let texts = |row: &BandRow| -> Vec<(u32, String)> { row.formulas().iter().map(|(c, f)| (*c, f.text.clone())).collect() };
     texts(ra) == texts(rb)
 }
 
@@ -819,7 +1097,7 @@ impl BandBatch {
         });
         let band_row = row % BAND;
         let band = self.bands.entry(row / BAND).or_default();
-        if band.row(band_row).is_none_or(Row::is_empty) {
+        if band.row(band_row).is_none_or(BandRow::is_empty) {
             band.put_row(band_row, cells);
         } else {
             for (col, cell) in cells.drain(..) {
@@ -873,7 +1151,7 @@ impl PartialEq for CellStore {
 struct PackedRow<'a> {
     band: &'a Band,
     row: u32,
-    cells: &'a Row,
+    cells: &'a BandRow,
     col: u32,
     hi: u32,
     i: usize,
@@ -882,10 +1160,10 @@ struct PackedRow<'a> {
 impl Iterator for PackedRow<'_> {
     type Item = (CellRef, Cell);
     fn next(&mut self) -> Option<(CellRef, Cell)> {
-        while self.col <= self.hi && self.i < self.cells.kinds.len() {
+        while self.col <= self.hi && self.i < self.cells.cells as usize {
             let slot = self.col - self.cells.first;
             let word = (slot / 64) as usize;
-            let w = self.cells.bits.get(word).copied()?;
+            let w = *self.cells.bits(self.band).get(word)?;
             let masked = w & (!0u64 << (slot % 64));
             if masked == 0 {
                 self.col = self.cells.first + (word as u32 + 1) * 64;
@@ -904,13 +1182,13 @@ impl Iterator for PackedRow<'_> {
     }
 }
 
-fn packed_row<'a>(band: &'a Band, row: u32, cells: &'a Row, c0: u32, c1: u32) -> PackedRow<'a> {
-    let (lo, hi) = match cells.column_span() {
+fn packed_row<'a>(band: &'a Band, row: u32, cells: &'a BandRow, c0: u32, c1: u32) -> PackedRow<'a> {
+    let (lo, hi) = match cells.column_span(band) {
         Some(_) => (c0.max(cells.first), c1.min(cells.first.saturating_add(cells.columns()).saturating_sub(1))),
         None => (1, 0),
     };
     let col = lo.max(cells.first);
-    let i = cells.rank_before(col);
+    let i = cells.rank_before(band, col);
     PackedRow { band, row, cells, col, hi, i }
 }
 
@@ -931,13 +1209,13 @@ impl CellStore {
     pub fn get(&self, c: CellRef) -> Option<Cell> {
         let band = self.bands.get(&(c.row / BAND))?;
         let row = band.row(c.row % BAND)?;
-        let i = row.index_of(c.col)?;
+        let i = row.index_of(band, c.col)?;
         Some(band.cell_at(row, i, c.col))
     }
 
     /// True when the position holds a cell at all (a stored style counts).
     pub fn contains(&self, c: CellRef) -> bool {
-        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND)).and_then(|r| r.index_of(c.col)).is_some()
+        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND).map(|r| (b, r))).is_some_and(|(b, r)| r.index_of(b, c.col).is_some())
     }
 
     /// Stores a cell; a default (empty, unstyled) cell is removed instead.
@@ -961,7 +1239,7 @@ impl CellStore {
     /// a row needs its band's tables, so a reader that decodes rows on several threads builds them
     /// there and hands them over here. A band the store already holds is replaced.
     pub fn insert_batch(&mut self, batch: BandBatch) {
-        let count = |band: &Band| band.rows.iter().map(|(_, row)| row.kinds.len()).sum::<usize>();
+        let count = |band: &Band| band.rows.iter().map(|row| row.cells as usize).sum::<usize>();
         for (key, mut band) in batch.bands {
             // A batch is complete: give back what building it over-allocated.
             band.finish();
@@ -975,22 +1253,22 @@ impl CellStore {
             // tables, so they are rebuilt here rather than moved.
             let rows = std::mem::take(&mut band.rows);
             let target = Arc::make_mut(existing);
-            for (row_key, row) in rows {
-                let before = target.row(row_key).map_or(0, |r| r.kinds.len());
-                let mut cells: Vec<(u32, Cell)> = (0..row.kinds.len())
+            for row in rows {
+                let before = target.row(row.key).map_or(0, |r| r.cells as usize);
+                let mut cells: Vec<(u32, Cell)> = (0..row.cells as usize)
                     .map(|i| {
-                        let col = row.col_at(i);
+                        let col = row.col_at(&band, i);
                         (col, band.cell_at(&row, i, col))
                     })
                     .collect();
-                if before == 0 && target.row(row_key).is_none_or(Row::is_empty) {
-                    target.put_row(row_key, &mut cells);
+                if before == 0 && target.row(row.key).is_none_or(BandRow::is_empty) {
+                    target.put_row(row.key, &mut cells);
                 } else {
                     for (col, cell) in cells {
-                        target.put(row_key, col, cell);
+                        target.put(row.key, col, cell);
                     }
                 }
-                self.len += target.row(row_key).map_or(0, |r| r.kinds.len()) - before;
+                self.len += target.row(row.key).map_or(0, |r| r.cells as usize) - before;
             }
         }
         if self.building.is_none() {
@@ -1025,17 +1303,17 @@ impl CellStore {
         }
         let band = Arc::make_mut(self.bands.entry(key).or_default());
         // A row that isn't there yet — every row while a file opens — is built in one go: the
-        // arrays are sized once from the cells instead of grown cell by cell.
-        if band.row(band_row).is_none_or(Row::is_empty) {
-            let before = band.row(band_row).map_or(0, |r| r.kinds.len());
+        // stripes are extended once from the cells instead of grown cell by cell.
+        if band.row(band_row).is_none_or(BandRow::is_empty) {
+            let before = band.row(band_row).map_or(0, |r| r.cells as usize);
             band.put_row(band_row, cells);
-            let after = band.row(band_row).map_or(0, |r| r.kinds.len());
+            let after = band.row(band_row).map_or(0, |r| r.cells as usize);
             self.len = self.len + after - before;
         } else {
             for (col, cell) in cells.drain(..) {
-                let had = band.row(band_row).is_some_and(|r| r.index_of(col).is_some());
+                let had = band.row(band_row).is_some_and(|r| r.index_of(band, col).is_some());
                 band.put(band_row, col, cell);
-                let has = band.row(band_row).is_some_and(|r| r.index_of(col).is_some());
+                let has = band.row(band_row).is_some_and(|r| r.index_of(band, col).is_some());
                 match (had, has) {
                     (false, true) => self.len += 1,
                     (true, false) => self.len -= 1,
@@ -1080,12 +1358,9 @@ impl CellStore {
     /// The cells of `r` that carry a formula, in row-major order.
     pub fn formula_cells(&self, r: RangeRef) -> impl Iterator<Item = CellRef> + '_ {
         self.bands.range(r.start.row / BAND..=r.end.row / BAND).flat_map(move |(bk, band)| {
-            band.rows.iter().flat_map(move |(in_band, row)| {
-                let at_row = bk * BAND + *in_band;
-                row.extras
-                    .as_ref()
-                    .map(|e| e.formulas.as_slice())
-                    .unwrap_or_default()
+            band.rows.iter().flat_map(move |row| {
+                let at_row = bk * BAND + row.key;
+                row.formulas()
                     .iter()
                     .filter(move |(c, _)| at_row >= r.start.row && at_row <= r.end.row && *c >= r.start.col && *c <= r.end.col)
                     .map(move |(c, _)| CellRef::new(at_row, *c))
@@ -1097,8 +1372,8 @@ impl CellStore {
     /// value the file cached) or an array. Cheap next to reading the block: one check a row.
     pub fn has_owned_cells(&self, r: RangeRef) -> bool {
         self.bands.range(r.start.row / BAND..=r.end.row / BAND).any(|(bk, band)| {
-            band.rows.iter().any(|(in_band, row)| {
-                let at_row = bk * BAND + *in_band;
+            band.rows.iter().any(|row| {
+                let at_row = bk * BAND + row.key;
                 at_row >= r.start.row
                     && at_row <= r.end.row
                     && row.extras.as_ref().is_some_and(|e| {
@@ -1118,8 +1393,8 @@ impl CellStore {
     pub fn visit_packed(&self, r: RangeRef, f: &mut dyn FnMut(CellRef, Option<Packed<'_>>) -> bool) -> bool {
         let (r0, r1) = (r.start.row, r.end.row);
         for (bk, band) in self.bands.range(r0 / BAND..=r1 / BAND) {
-            for (in_band, row) in &band.rows {
-                let at_row = bk * BAND + *in_band;
+            for row in &band.rows {
+                let at_row = bk * BAND + row.key;
                 if at_row < r0 || at_row > r1 {
                     continue;
                 }
@@ -1134,8 +1409,9 @@ impl CellStore {
                 // A cell that carries a formula stores the value the file cached, which is not
                 // its value now: the evaluator owns it, so hand it over as `None`.
                 let formulas = row.extras.as_ref().map(|e| e.formulas.as_slice()).filter(|f| !f.is_empty());
-                let mut i = row.rank_before(lo);
-                'words: for (word, bits) in row.bits.iter().enumerate().skip(start_slot / 64) {
+                let mut i = row.rank_before(band, lo);
+                let mut kinds = RunCursor::new(row.kind_runs(band), u16::from(EMPTY));
+                'words: for (word, bits) in row.bits(band).iter().enumerate().skip(start_slot / 64) {
                     let mut w = *bits;
                     if word == start_slot / 64 {
                         w &= !((1u64 << (start_slot % 64)) - 1);
@@ -1151,19 +1427,20 @@ impl CellStore {
                             break 'words;
                         }
                         let has_formula = formulas.is_some_and(|f| f.binary_search_by_key(&col, |(c, _)| *c).is_ok());
+                        let payload = row.payload_at(band, index);
                         let packed = if has_formula {
                             None
                         } else {
-                            match row.kind_at(index) {
+                            match kinds.at(index) as u8 {
                                 // An empty slot is not a stored value (no value, a style at most),
                                 // and `iter_range` does not hand one out either.
                                 EMPTY => continue,
-                                NUMBER => Some(Packed::Number(band.number(row.payloads[index]))),
-                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(index)))),
-                                TEXT => band.texts.get(row.payloads[index] as usize).map(|t| Packed::Text(t)),
-                                TEXT_WIDE => band.texts.get(row.wide_at(index) as usize).map(|t| Packed::Text(t)),
-                                BOOL => Some(Packed::Bool(row.payloads[index] != 0)),
-                                ERROR => Some(Packed::Error(*ERRORS.get(row.payloads[index] as usize).unwrap_or(&CellError::Value))),
+                                NUMBER => Some(Packed::Number(band.number(payload))),
+                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(band, index)))),
+                                TEXT => band.texts.get(payload as usize).map(|t| Packed::Text(t)),
+                                TEXT_WIDE => band.texts.get(row.wide_at(band, index) as usize).map(|t| Packed::Text(t)),
+                                BOOL => Some(Packed::Bool(payload != 0)),
+                                ERROR => Some(Packed::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value))),
                                 _ => None,
                             }
                         };
@@ -1182,8 +1459,8 @@ impl CellStore {
         self.bands.range(r0 / BAND..=r1 / BAND).flat_map(move |(bk, band)| {
             band.rows
                 .iter()
-                .filter_map(move |(in_band, cells)| {
-                    let row = bk * BAND + *in_band;
+                .filter_map(move |cells| {
+                    let row = bk * BAND + cells.key;
                     (row >= r0 && row <= r1).then(|| packed_row(band, row, cells, r.start.col, r.end.col))
                 })
                 .flatten()
@@ -1193,7 +1470,7 @@ impl CellStore {
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
         self.bands
             .iter()
-            .flat_map(move |(bk, band)| band.rows.iter().flat_map(move |(in_band, cells)| packed_row(band, bk * BAND + *in_band, cells, 0, u32::MAX)))
+            .flat_map(move |(bk, band)| band.rows.iter().flat_map(move |cells| packed_row(band, bk * BAND + cells.key, cells, 0, u32::MAX)))
     }
 
     pub fn row(&self, row: u32, c0: u32, c1: u32) -> impl Iterator<Item = (u32, Cell)> + '_ {
@@ -1207,9 +1484,9 @@ impl CellStore {
         let mut r1 = 0u32;
         let mut c1 = 0u32;
         for (bk, band) in &self.bands {
-            for (row, cells) in &band.rows {
-                let Some((first, last)) = cells.column_span() else { continue };
-                let at = bk * BAND + row;
+            for cells in &band.rows {
+                let Some((first, last)) = cells.column_span(band) else { continue };
+                let at = bk * BAND + cells.key;
                 r0 = r0.min(at);
                 r1 = r1.max(at);
                 c0 = c0.min(first);
@@ -1228,10 +1505,10 @@ impl CellStore {
     /// than opening the file.
     pub fn formulas(&self) -> impl Iterator<Item = (CellRef, &Arc<Formula>, bool)> + '_ {
         self.bands.iter().flat_map(|(bk, band)| {
-            band.rows.iter().flat_map(move |(row, cells)| {
+            band.rows.iter().flat_map(move |cells| {
                 cells.formulas().iter().map(move |(col, f)| {
-                    let has_value = cells.index_of(*col).is_some_and(|i| cells.kind_at(i) != EMPTY);
-                    (CellRef::new(bk * BAND + *row, *col), f, has_value)
+                    let has_value = cells.index_of(band, *col).is_some_and(|i| cells.kind_at(band, i) != EMPTY);
+                    (CellRef::new(bk * BAND + cells.key, *col), f, has_value)
                 })
             })
         })
@@ -1239,7 +1516,7 @@ impl CellStore {
 
     /// A stored cell with a value or a formula (a style alone does not count).
     pub fn has(&self, c: CellRef) -> bool {
-        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND)).is_some_and(|row| row_has_value(row, c.col))
+        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND).map(|row| (b, row))).is_some_and(|(b, row)| row_has_value(b, row, c.col))
     }
 
     /// Last row (inclusive, capped at `cap`) of the maximal run of contiguous rows at or after
@@ -1252,9 +1529,9 @@ impl CellStore {
             let Some(band) = self.bands.get(&band_key) else { break };
             let mut advanced = false;
             let start = expect % BAND;
-            let first = band.rows.partition_point(|(k, _)| *k < start);
-            for (in_band, row) in &band.rows[first..] {
-                let at = band_key * BAND + *in_band;
+            let first = band.rows.partition_point(|r| r.key < start);
+            for row in &band.rows[first..] {
+                let at = band_key * BAND + row.key;
                 if at != expect || at > cap {
                     break;
                 }
@@ -1288,10 +1565,10 @@ impl CellStore {
             let band = k * BAND;
             let mut rows: Vec<u32> = Vec::new();
             if let Some(a) = a {
-                rows.extend(a.rows.iter().map(|(k, _)| *k));
+                rows.extend(a.rows.iter().map(|r| r.key));
             }
             if let Some(b) = b {
-                rows.extend(b.rows.iter().map(|(k, _)| *k));
+                rows.extend(b.rows.iter().map(|r| r.key));
             }
             rows.sort_unstable();
             rows.dedup();
@@ -1307,14 +1584,14 @@ impl CellStore {
                 cols.sort_unstable();
                 cols.dedup();
                 for col in cols {
-                    let x = a.and_then(|x| ra.and_then(|r| r.index_of(col).map(|i| (x, r, i))));
-                    let y = b.and_then(|y| rb.and_then(|r| r.index_of(col).map(|i| (y, r, i))));
+                    let x = a.and_then(|x| ra.and_then(|r| r.index_of(x, col).map(|i| (x, r, i))));
+                    let y = b.and_then(|y| rb.and_then(|r| r.index_of(y, col).map(|i| (y, r, i))));
                     let same = match (x, y) {
                         (None, None) => true,
                         (Some((xb, xr, xi)), Some((yb, yr, yi))) => {
-                            let arrays = |row: &Row| row.arrays().binary_search_by_key(&col, |(c, _)| *c).ok().map(|k| row.arrays()[k].1.clone());
+                            let arrays = |row: &BandRow| row.arrays().binary_search_by_key(&col, |(c, _)| *c).ok().map(|k| row.arrays()[k].1.clone());
                             same_value(xb, xr, xi, yb, yr, yi)
-                                && (xr.kind_at(xi) != ARRAY || arrays(xr) == arrays(yr))
+                                && (xr.kind_at(xb, xi) != ARRAY || arrays(xr) == arrays(yr))
                                 && xr.formula_at(col).map(|f| f.text.clone()) == yr.formula_at(col).map(|f| f.text.clone())
                         }
                         _ => false,
@@ -1336,20 +1613,18 @@ impl CellStore {
                 continue;
             }
             bytes += std::mem::size_of::<Band>();
-            for (_, row) in &band.rows {
-                bytes += std::mem::size_of::<Row>()
-                    + row.bits.len() * 8
-                    + row.kinds.runs.len() * 4
-                    + row.payloads.len() * 2
-                    + row.styles.runs.len() * 4
-                    + row.formulas().len() * (4 + std::mem::size_of::<Formula>())
-                    + row.arrays().len() * 8;
+            bytes += band.bits.capacity() * 8;
+            bytes += band.kinds.capacity() * 4;
+            bytes += band.payloads.capacity() * 2;
+            bytes += band.styles.capacity() * 4;
+            for row in &band.rows {
+                bytes += std::mem::size_of::<BandRow>() + row.formulas().len() * (4 + std::mem::size_of::<Formula>()) + row.arrays().len() * 8;
             }
             bytes += band.numbers.capacity() * 8 + band.number_slots.capacity() * 2;
             for t in &band.texts {
                 bytes += t.len() + std::mem::size_of::<Arc<str>>();
             }
-            for f in band.rows.iter().flat_map(|(_, r)| r.formulas().iter().map(|(_, f)| f)) {
+            for f in band.rows.iter().flat_map(|r| r.formulas().iter().map(|(_, f)| f)) {
                 bytes += f.text.len();
                 if let Some(expr) = &f.expr {
                     expr.walk(&mut |_| bytes += std::mem::size_of::<gridcraft_formula::Expr>());
@@ -1366,17 +1641,17 @@ impl CellStore {
         // rows, bits, kinds, payloads, styles, texts, formulas+arrays, bands
         let mut out = [0usize; 8];
         for band in self.bands.values() {
-            out[7] += size_of::<Band>() + band.texts.capacity() * size_of::<Arc<str>>() + band.styles.capacity() * size_of::<StyleId>();
+            out[7] += size_of::<Band>() + band.texts.capacity() * size_of::<Arc<str>>() + band.style_ids.capacity() * size_of::<StyleId>();
             out[7] += band.text_index.capacity() * size_of::<(usize, u32)>();
             out[7] += band.numbers.capacity() * size_of::<f64>() + band.number_slots.capacity() * size_of::<u16>();
-            out[6] += band.styles.capacity() * size_of::<StyleId>();
+            out[6] += band.style_ids.capacity() * size_of::<StyleId>();
             out[5] += band.texts.capacity() * size_of::<Arc<str>>();
-            out[0] += band.rows.capacity() * size_of::<(u32, Row)>();
-            for (_, row) in &band.rows {
-                out[1] += row.bits.capacity() * 8;
-                out[2] += row.kinds.runs.capacity() * 4;
-                out[3] += row.payloads.capacity() * 2;
-                out[4] += row.styles.runs.capacity() * 4;
+            out[0] += band.rows.capacity() * size_of::<BandRow>();
+            out[1] += band.bits.capacity() * size_of::<u64>();
+            out[2] += band.kinds.capacity() * size_of::<(u16, u16)>();
+            out[3] += band.payloads.capacity() * size_of::<u16>();
+            out[4] += band.styles.capacity() * size_of::<(u16, u16)>();
+            for row in &band.rows {
                 out[6] += row.extras.as_ref().map_or(0, |e| e.formulas.capacity() * (4 + 8) + e.arrays.capacity() * (4 + 8));
             }
         }
@@ -1443,20 +1718,20 @@ impl CellStore {
     }
 }
 
-fn row_has_value(row: &Row, col: u32) -> bool {
-    match row.index_of(col) {
-        Some(i) => row.kind_at(i) != EMPTY || row.formula_at(col).is_some(),
+fn row_has_value(band: &Band, row: &BandRow, col: u32) -> bool {
+    match row.index_of(band, col) {
+        Some(i) => row.kind_at(band, i) != EMPTY || row.formula_at(col).is_some(),
         None => false,
     }
 }
 
-impl Row {
+impl BandRow {
     fn value_nonempty(&self, band: &Band, col: u32) -> bool {
-        match self.index_of(col) {
-            Some(i) => match self.kind_at(i) {
+        match self.index_of(band, col) {
+            Some(i) => match self.kind_at(band, i) {
                 EMPTY => false,
-                TEXT => !band.text(u64::from(self.payloads[i])).is_empty(),
-                TEXT_WIDE => !band.text(self.wide_at(i)).is_empty(),
+                TEXT => !band.text(u64::from(self.payload_at(band, i))).is_empty(),
+                TEXT_WIDE => !band.text(self.wide_at(band, i)).is_empty(),
                 _ => true,
             },
             None => false,
@@ -1633,49 +1908,74 @@ mod tests {
             state ^= state << 17;
             (state % n.max(1)) as usize
         };
-        let mut runs = Runs::default();
+        let mut runs: Vec<(u16, u16)> = Vec::new();
         let mut plain: Vec<u16> = Vec::new();
         for step in 0..4_000 {
             let op = next(4);
             let value = next(3) as u16;
+            // One row, so the slice is the whole stripe.
+            let slice = runs.len();
             let mut did = String::new();
             match op {
                 0 => {
-                    runs.push(value);
+                    run_push(&mut runs, 0, value);
                     plain.push(value);
                 }
                 1 => {
                     let i = next(plain.len() as u64 + 1);
-                    runs.grow(i, value);
+                    let new = runs_insert(&mut runs, 0, slice, i, value);
+                    assert_eq!(new, runs.len());
                     plain.insert(i, value);
                     did = format!("insert({i}, {value})");
                 }
                 2 if !plain.is_empty() => {
                     let i = next(plain.len() as u64);
-                    runs.shrink(i);
+                    let new = runs_remove(&mut runs, 0, slice, i);
+                    assert_eq!(new, runs.len());
                     plain.remove(i);
                     did = format!("remove({i})");
                 }
                 3 if !plain.is_empty() => {
                     let i = next(plain.len() as u64);
-                    runs.set(i, value);
+                    let new = runs_set(&mut runs, 0, slice, i, value);
+                    assert_eq!(new, runs.len());
                     plain[i] = value;
                     did = format!("set({i}, {value})");
                 }
                 _ => {}
             }
-            assert_eq!(runs.len(), plain.len(), "step {step}: length");
+            assert_eq!(runs_len(&runs), plain.len(), "step {step}: length");
             if step % 25 == 0 {
                 for (i, v) in plain.iter().enumerate() {
-                    assert_eq!(runs.at(i), *v, "step {step}: at {i} of {plain:?}");
+                    assert_eq!(runs_at(&runs, i), *v, "step {step}: at {i} of {plain:?}");
                 }
             }
-            assert!(
-                runs.runs.windows(2).all(|w| w[0].0 != w[1].0),
-                "step {step} {did}: adjacent runs hold the same value: {:?} plain {plain:?}",
-                runs.runs
-            );
+            assert!(runs.windows(2).all(|w| w[0].0 != w[1].0), "step {step} {did}: adjacent runs hold the same value: {runs:?} plain {plain:?}");
         }
+    }
+
+    /// The runs of two rows share one stripe: a row must never merge into its neighbour's run, and
+    /// editing one row must leave the other's slice alone.
+    #[test]
+    fn runs_stay_inside_their_slice() {
+        let mut runs: Vec<(u16, u16)> = Vec::new();
+        run_push(&mut runs, 0, 7);
+        run_push(&mut runs, 0, 7);
+        let second = runs.len();
+        run_push(&mut runs, second, 7);
+        assert_eq!(runs, [(7, 2), (7, 1)], "a new row starts its own run");
+        // Two rows share one stripe: the first holds [3, 3, 4], the second [3, 3, 3].
+        let mut stripe: Vec<(u16, u16)> = vec![(3, 2), (4, 1), (3, 3)];
+        let first = runs_set(&mut stripe, 0, 2, 1, 4);
+        assert_eq!(first, 2);
+        assert_eq!(stripe, [(3, 1), (4, 2), (3, 3)], "the second row's slice is untouched");
+        assert_eq!(runs_len(&stripe[..2]), 3);
+        assert_eq!(runs_len(&stripe[2..]), 3);
+        // The second row now starts where the first one ends, and its runs merge with each other
+        // but never with the run the first row left beside them.
+        let second = runs_set(&mut stripe, 2, 1, 1, 4);
+        assert_eq!(second, 3);
+        assert_eq!(stripe, [(3, 1), (4, 2), (3, 1), (4, 1), (3, 1)]);
     }
 
     #[test]
@@ -1743,7 +2043,7 @@ mod tests {
         assert_eq!(s.len(), 128_000);
         // The band really did overflow: some cells index the number table, the rest are wide.
         let band = s.bands.get(&0).expect("band");
-        let kinds: Vec<u8> = band.rows.iter().flat_map(|(_, row)| (0..row.kinds.len()).map(|i| row.kind_at(i))).collect();
+        let kinds: Vec<u8> = band.rows.iter().flat_map(|row| (0..row.cells as usize).map(|i| row.kind_at(band, i))).collect();
         assert_eq!(kinds.iter().filter(|k| **k == NUMBER).count(), 65_535, "cells the table could hold");
         assert_eq!(kinds.iter().filter(|k| **k == NUMBER_WIDE).count(), 128_000 - 65_535, "cells that fell back");
         for row in 0..64u32 {
@@ -1774,5 +2074,121 @@ mod tests {
         assert!(s.get(c(2, 0)).is_some());
         s.shift_cols(0, 1);
         assert!(s.get(c(7, 1)).is_some());
+    }
+
+    /// A reader cuts its work at row boundaries, so two chunks can land in the same band: the
+    /// second batch is rebuilt against the band the store already holds.
+    #[test]
+    fn a_band_split_across_two_batches_keeps_both_halves() {
+        let mut s = CellStore::new();
+        for (from, to) in [(0u32, 40u32), (40, 80)] {
+            let mut batch = BandBatch::new();
+            for row in from..to {
+                let mut cells: Vec<(u32, Cell)> = (0..10u32).map(|c| (c, Cell::value(Value::Number((row * 100 + c) as f64)))).collect();
+                cells.push((20, Cell::value(Value::Text(Arc::from("shared")))));
+                batch.set_row(row, &mut cells);
+            }
+            s.insert_batch(batch);
+        }
+        assert_eq!(s.len(), 80 * 11);
+        assert_eq!(s.used_range().map(|r| r.a1()), Some("A1:U80".to_string()));
+        for row in 0..80u32 {
+            for col in 0..10u32 {
+                assert_eq!(s.get(c(row, col)).map(|x| x.value), Some(Value::Number((row * 100 + col) as f64)), "{row}:{col}");
+            }
+            assert_eq!(s.get(c(row, 20)).map(|x| x.value), Some(Value::Text(Arc::from("shared"))), "{row}:U");
+        }
+        check_stripes(&s);
+    }
+
+    /// The stripes are one vector each, so a bug shows up as a row whose slice points into the
+    /// middle of another's. Every band must account for every entry, exactly once.
+    fn check_stripes(s: &CellStore) {
+        for (bk, band) in &s.bands {
+            let ranges = |name: &str, len: usize, f: &dyn Fn(&BandRow) -> (u32, u32)| {
+                let mut v: Vec<(usize, usize)> = band
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        let (at, n) = f(r);
+                        (at as usize, n as usize)
+                    })
+                    .collect();
+                v.sort_unstable();
+                let mut end = 0;
+                for (at, n) in &v {
+                    assert_eq!(*at, end, "band {bk} {name}: a stripe has a hole or an overlap before {at}");
+                    end += n;
+                }
+                assert_eq!(end, len, "band {bk} {name}: the stripe holds {len} entries, its rows account for {end}");
+            };
+            ranges("bits", band.bits.len(), &|r| (r.bits_at, r.words));
+            ranges("payloads", band.payloads.len(), &|r| (r.cells_at, r.cells));
+            ranges("kinds", band.kinds.len(), &|r| (r.kinds_at, r.kind_runs));
+            ranges("styles", band.styles.len(), &|r| (r.styles_at, r.style_runs));
+            assert!(band.rows.windows(2).all(|w| w[0].key < w[1].key), "band {bk}: rows out of order");
+            for row in &band.rows {
+                assert_eq!(runs_len(row.kind_runs(band)), row.cells as usize, "band {bk} row {}: kinds", row.key);
+                assert_eq!(runs_len(row.style_runs(band)), row.cells as usize, "band {bk} row {}: styles", row.key);
+                let bits: usize = row.bits(band).iter().map(|w| w.count_ones() as usize).sum();
+                assert_eq!(bits, row.cells as usize, "band {bk} row {}: bitmap", row.key);
+                assert!(row.kind_runs(band).windows(2).all(|w| w[0].0 != w[1].0), "band {bk} row {}: same-valued runs", row.key);
+            }
+        }
+    }
+
+    /// A store built and edited cell by cell must agree with a plain map, and its stripes must stay
+    /// one contiguous run of slices — the layout is the thing this file is about, so the layout is
+    /// what the test checks, not only what it reads back.
+    #[test]
+    fn stripes_hold_exactly_the_cells_after_an_edit_soup() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n.max(1)) as u32
+        };
+        let mut s = CellStore::new();
+        let mut model: BTreeMap<(u32, u32), Value> = BTreeMap::new();
+        for step in 0..3_000 {
+            // Rows either side of two band boundaries; columns either side of a bitmap word and of
+            // the 64-column alignment, so the bitmap has to grow left and right.
+            let row = [0, 1, 62, 63, 64, 65, 127, 128][next(8) as usize % 8];
+            let col = [0, 1, 63, 64, 65, 127, 128, 200][next(8) as usize % 8];
+            let value = Value::Number((next(5) as i64 - 1) as f64);
+            match next(4) {
+                0 => {
+                    s.set(c(row, col), Cell::value(value.clone()));
+                    model.insert((row, col), value);
+                }
+                1 => {
+                    let gone = s.remove(c(row, col));
+                    assert_eq!(gone.map(|x| x.value), model.remove(&(row, col)), "{row}:{col}");
+                }
+                2 => {
+                    // A whole row at once, the way a file arrives.
+                    let mut cells: Vec<(u32, Cell)> = (0..4).map(|i| (col + i * 64, Cell::value(Value::Number((step * 7 + i) as f64)))).collect();
+                    s.set_row(row, &mut cells);
+                    for i in 0..4 {
+                        model.insert((row, col + i * 64), Value::Number((step * 7 + i) as f64));
+                    }
+                }
+                _ => {
+                    let text = Value::Text(Arc::from(format!("t{step}").as_str()));
+                    s.set(c(row, col), Cell::value(text.clone()));
+                    model.insert((row, col), text);
+                }
+            }
+            check_stripes(&s);
+        }
+        let got: Vec<((u32, u32), Value)> = s.iter().map(|(at, cell)| ((at.row, at.col), cell.value)).collect();
+        let want: Vec<((u32, u32), Value)> = model.iter().map(|(at, v)| (*at, v.clone())).collect();
+        assert_eq!(got, want);
+        assert_eq!(s.len(), model.len());
+        assert_eq!(s.iter().count(), model.len());
+        for ((row, col), v) in &model {
+            assert_eq!(s.get(c(*row, *col)).map(|cell| cell.value), Some(v.clone()), "{row}:{col}");
+        }
     }
 }

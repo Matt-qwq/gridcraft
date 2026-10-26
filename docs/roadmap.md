@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-24 · **Change:** major (large-workbook plan, M17–M22) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (M19's band stripes landed) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -274,19 +274,46 @@ its kinds, payloads and bitmaps in one stripe each would make the same walk sequ
 model by ~90 MiB (the per-row headers are 58 MiB of 191), and make paging a single copy instead of
 a thousand. It touches every read and write path, so it is a phase of its own, before or with M19.
 
-**Where to start, exactly.** `crates/model/src/store.rs`:
+**Landed (10-26): the stripes.** `crates/model/src/store.rs` builds a band the way it was
+blueprinted: `Band` holds `bits`, `kinds`, `payloads` and `styles` as four band-wide vectors with a
+slice per row, and `BandRow` is that slice — `key`, `first`, `bits_at`/`words`,
+`cells_at`/`cells`, `kinds_at`/`kind_runs`, `styles_at`/`style_runs` — 48 bytes where the four
+`Vec`s cost 108. `kind_at`, `style_at`, `payload_at`, `col_at`, `index_of`, `rank_before` and
+`column_span` take `&Band` and read the stripes; `put_row` appends to them; `put` and `take` insert
+and remove inside them and move every other row's offsets by what the change added; `finish` gives
+the slack back once a band is complete instead of once a row. The kinds and styles stay
+run-length encoded, as `(at, len)` slices of the same stripe, and the walks carry a `RunCursor` so a
+row's kinds cost one pass rather than one search a cell.
 
-| today | stripe |
-|---|---|
-| `Band.rows: Vec<(u32, Row)>`, `Row { first, bits: Vec<u64>, kinds: Runs, payloads: Vec<u16>, styles: Runs, extras }` | `Band.rows: Vec<BandRow>` (`key`, `start`, `cols`) plus four band-level `Vec`s — `bits`, `kinds`, `payloads`, `styles` — with `Row` becoming a slice index |
-| `Row::kind_at/payloads[i]/style_at/col_at/index_of/rank_before/column_span` (line 254 onwards) | the same names on `BandRow` + `&Band`, reading the stripes |
-| `put_row` (676) builds the row's four vectors | appends to the band's stripes and records the range |
-| `take`/`remove_at`/`set_formula`/`set_array` (732) shift one row's vectors | shift within the band's stripes (still one row's worth of bytes) |
-| `same_as`, `packed_bytes`, `Clone` | iterate the stripes |
+Measured on a 1,000,000-cell probe (20,000 rows × 50 columns, 20% text, a style every 7th cell), one
+machine, one profile, both stores built from the same tree:
 
-Acceptance: the 28 `gridcraft-model` tests, the three `packed_tests` (including the differential
-`packed_walk_matches_iter_range`), `cell_digest` = `f5b186062e525ec8` on the report, and
-`cell_probe`'s packing number (59 ns a cell today, ~20 expected) against the same 255 MiB sheet.
+| | per-row `Vec`s | stripes | |
+|---|---|---|---|
+| `set_row` (packing) | 56.2 ns/cell | **50.6** | −10% |
+| `BandBatch::set_row` | — | **49.3** | the reader's path |
+| `visit_packed` (a range scan) | 3.94 ns/cell | **2.86** | −27% |
+| `iter_range` | 13.3 ns/cell | **11.9** | −11% |
+| row headers | 2.40 MB | **0.96 MB** | −1.44 MB a million cells, ≈ −45 MiB on the report |
+| packed total | 9.32 B/cell | **7.83** | −16% |
+| `set` into an existing row | 422 ns | 429 | +2% — the band-wide shift |
+| `remove` one cell | 92 ns | 104 | +13%, the same shift |
+| clone (an undo snapshot) | 20.5 µs | 16.5 | −20% |
+
+The packing win is smaller than the 59 → 20–25 ns/cell this section hoped for, and the reason is
+worth keeping: of the 4 allocations a row used to make and give back, about 6 ns a cell went to them;
+the rest of packing is the column sort `set_row` does, `Cell` construction and the band's number
+hash, which a layout does not touch. The memory (−45 MiB on the report) and the range scan (−27%)
+are what the stripes buy, and the two write paths pay 2–13 ns for the shift — which is what paging
+was going to charge anyway.
+
+Verified with the model's 31 tests (including the differential `packed_walk_matches_iter_range` and a
+new `stripes_hold_exactly_the_cells_after_an_edit_soup`, which keeps a `BTreeMap` as the oracle and
+checks the stripe bookkeeping after each of 3,000 random edits), `gridcraft-xlsx`'s 262 and
+`gridcraft-engine`'s 396 that pass on this tree. **Not re-run:** `cell_digest` on the 118 MB report
+and `cell_probe`/`session_breakdown` — the `_gridcraft-bench` crates and the report files are not in
+this checkout (they went when the disk filled), so the trio of acceptance numbers that needs the
+report is still owed.
 
 **Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
 document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
@@ -414,6 +441,7 @@ Needs the owner's call, not an agent's.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | minor | M19's band stripes landed in `store.rs`: packing −10%, a range scan −27%, row headers 108 → 48 bytes (≈ −45 MiB on the report); the report-side acceptance numbers still owed |
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
 | 2026-10-25 | minor | The band-stripe round is written down to the functions it changes, with its acceptance tests |
 | 2026-10-25 | minor | `put_row` in one pass (packing 68 → 59 ns a cell, open 1.69 → 1.55 s) |

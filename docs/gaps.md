@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-20 · **Change:** minor (the Japanese catalog covers the dialogs, messages and menus) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (M19's band stripes; large-workbook entry) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -31,8 +31,13 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   while the last decodes; the write path walks the store once and compresses at level 3. The 118 MB
   report of 31,709,565 cells now opens in 4.1 s (6.1 s on the desktop) at 549 MB of working set and
   saves in 10.8 s; the 1.28 GB report opens in 5.2 s at 569 MB.
+- **Landed (10-26):** the store's rows are band-level stripes now (bitmaps, kinds, payloads and
+  styles one vector a band with a slice a row) instead of four vectors a row: a range scan costs
+  2.9 ns a cell instead of 3.9, the row headers halve (≈ −45 MiB on the report) and packing is 10%
+  cheaper; details and the A/B in [`roadmap.md`](roadmap.md#m19--cold-paging--6090-h).
 - **Missing:** multi-threaded recalc; 100k-dependent edit under 100 ms (was ~0.4 s); whole-sheet
-  operations bounded (#152, #151); memory still proportional to the file (no cold paging);
+  operations bounded (#152, #151); memory still proportional to the file (no cold paging — the
+  stripes are what makes a band one copy to page out);
   structural edits still shift every cell below them; whole-column references scan to row
   1,048,576 instead of the used range (2,463 cells differ from Excel's cached values on the 1.28 GB
   report).
