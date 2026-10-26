@@ -307,13 +307,21 @@ hash, which a layout does not touch. The memory (−45 MiB on the report) and th
 are what the stripes buy, and the two write paths pay 2–13 ns for the shift — which is what paging
 was going to charge anyway.
 
-Verified with the model's 31 tests (including the differential `packed_walk_matches_iter_range` and a
-new `stripes_hold_exactly_the_cells_after_an_edit_soup`, which keeps a `BTreeMap` as the oracle and
-checks the stripe bookkeeping after each of 3,000 random edits), `gridcraft-xlsx`'s 262 and
-`gridcraft-engine`'s 396 that pass on this tree. **Not re-run:** `cell_digest` on the 118 MB report
-and `cell_probe`/`session_breakdown` — the `_gridcraft-bench` crates and the report files are not in
-this checkout (they went when the disk filled), so the trio of acceptance numbers that needs the
-report is still owed.
+Then the report itself (the bench crates beside the fork, `_gridcraft-bench/`; a release build):
+
+| | before | after | |
+|---|---|---|---|
+| `cell_digest` on `real_117m.xlsx` | `f5b186062e525ec8` | **`f5b186062e525ec8`** | 4 sheets, 31,709,565 cells — unchanged |
+| 118 MB report: open | 1.55 s | **1.28** | −18% |
+| … its model | 191 MiB | **163** | −28 MiB (162.8 MiB of cells) |
+| … peak working set | — | **293** MiB | |
+| 1.28 GB report: open / live | 3.9 s / 238 MiB | **3.77 s / 237** | the packing win is CPU, so mostly flat |
+
+The open time moved more than the estimate expected, because packing is 10% of a loop that runs on
+eight threads: 0.27 s of the 1.55 s. Verified with the model's 31 tests (including the differential
+`packed_walk_matches_iter_range` and a new `stripes_hold_exactly_the_cells_after_an_edit_soup`,
+which keeps a `BTreeMap` as the oracle and checks the stripe bookkeeping after each of 3,000 random
+edits), `gridcraft-xlsx`'s 262 and `gridcraft-engine`'s 396.
 
 **Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
 document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
@@ -441,7 +449,7 @@ Needs the owner's call, not an agent's.
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-26 | minor | M19's band stripes landed in `store.rs`: packing −10%, a range scan −27%, row headers 108 → 48 bytes (≈ −45 MiB on the report); the report-side acceptance numbers still owed |
+| 2026-10-26 | minor | M19's band stripes landed in `store.rs`: packing −10%, a range scan −27%, row headers 108 → 48 bytes; on the 118 MB report, open 1.55 → 1.28 s and the model 191 → 163 MiB, `cell_digest` unchanged |
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
 | 2026-10-25 | minor | The band-stripe round is written down to the functions it changes, with its acceptance tests |
 | 2026-10-25 | minor | `put_row` in one pass (packing 68 → 59 ns a cell, open 1.69 → 1.55 s) |

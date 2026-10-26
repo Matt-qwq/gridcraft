@@ -33,8 +33,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   saves in 10.8 s; the 1.28 GB report opens in 5.2 s at 569 MB.
 - **Landed (10-26):** the store's rows are band-level stripes now (bitmaps, kinds, payloads and
   styles one vector a band with a slice a row) instead of four vectors a row: a range scan costs
-  2.9 ns a cell instead of 3.9, the row headers halve (≈ −45 MiB on the report) and packing is 10%
-  cheaper; details and the A/B in [`roadmap.md`](roadmap.md#m19--cold-paging--6090-h).
+  2.9 ns a cell instead of 3.9, packing is 10% cheaper, and the 118 MB report opens in 1.28 s
+  (1.55 s) holding 163 MiB of cells (191 MiB), digest unchanged; details and the A/B in
+  [`roadmap.md`](roadmap.md#m19--cold-paging--6090-h).
 - **Missing:** multi-threaded recalc; 100k-dependent edit under 100 ms (was ~0.4 s); whole-sheet
   operations bounded (#152, #151); memory still proportional to the file (no cold paging — the
   stripes are what makes a band one copy to page out);
