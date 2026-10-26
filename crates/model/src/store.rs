@@ -1638,14 +1638,14 @@ impl CellStore {
     /// not an exact figure: allocator rounding is not visible from here.
     pub fn packed_breakdown(&self) -> [usize; 8] {
         use std::mem::size_of;
-        // rows, bits, kinds, payloads, styles, texts, formulas+arrays, bands
+        // rows, bits, kinds, payloads, styles, texts, formulas+arrays+style ids, band overhead
+        // (the struct, the number table and its slots)
         let mut out = [0usize; 8];
         for band in self.bands.values() {
-            out[7] += size_of::<Band>() + band.texts.capacity() * size_of::<Arc<str>>() + band.style_ids.capacity() * size_of::<StyleId>();
-            out[7] += band.text_index.capacity() * size_of::<(usize, u32)>();
+            out[7] += size_of::<Band>();
             out[7] += band.numbers.capacity() * size_of::<f64>() + band.number_slots.capacity() * size_of::<u16>();
             out[6] += band.style_ids.capacity() * size_of::<StyleId>();
-            out[5] += band.texts.capacity() * size_of::<Arc<str>>();
+            out[5] += band.texts.capacity() * size_of::<Arc<str>>() + band.text_index.capacity() * size_of::<(usize, u32)>();
             out[0] += band.rows.capacity() * size_of::<BandRow>();
             out[1] += band.bits.capacity() * size_of::<u64>();
             out[2] += band.kinds.capacity() * size_of::<(u16, u16)>();
@@ -1656,6 +1656,12 @@ impl CellStore {
             }
         }
         out
+    }
+
+    /// How many bands the store holds: the unit paging will work in, and what tells a probe whether
+    /// a file's cells are sparse across rows or packed into a few.
+    pub fn band_count(&self) -> usize {
+        self.bands.len()
     }
 
     /// Bytes the packing itself holds (see [`packed_breakdown`](Self::packed_breakdown)).
