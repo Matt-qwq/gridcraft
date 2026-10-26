@@ -1,8 +1,6 @@
 //! Hostile and broken input: must return an error or warnings, never panic.
 
-use std::io::Write;
-
-use super::{make_zip, minimal};
+use super::{declaring, make_zip, minimal};
 use crate::{IoError, read_xlsx, write_xlsx};
 
 #[test]
@@ -107,17 +105,12 @@ fn deeply_nested_and_broken_xml() {
 
 #[test]
 fn zip_bomb_is_rejected() {
-    // A part that inflates beyond the per-part cap: 600 MB of zeros compresses very well, but
-    // building it takes a while, so test the cap via a declared size instead using a smaller
-    // stand-in limit check on the reader path.
-    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
-    z.start_file("xl/workbook.xml", opts).unwrap();
-    let chunk = vec![b' '; 1 << 20];
-    for _ in 0..520 {
-        z.write_all(&chunk).unwrap();
-    }
-    let bytes = z.finish().unwrap().into_inner();
+    // A part that declares more unpacked bytes than the per-part cap is refused on the declared
+    // size, before any of it is decompressed. The cap belongs to the process (GRIDCRAFT_MAX_PART_MB
+    // raises it for a trusted file), so the forged size follows it instead of hard-coding 512 MB.
+    let cap = crate::max_part();
+    let Ok(over) = u32::try_from(cap + 1) else { return };
+    let bytes = declaring(minimal("<sheetData/>", &[], "", ""), "xl/worksheets/sheet1.xml", over);
     assert!(bytes.len() < 10 << 20);
     assert!(matches!(read_xlsx(&bytes), Err(IoError::TooLarge(_))));
 }

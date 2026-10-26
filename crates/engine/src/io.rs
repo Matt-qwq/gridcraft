@@ -1209,21 +1209,28 @@ mod tests {
         let mut wb = Workbook::new();
         wb.sheet_mut(0).unwrap().set_value(CellRef::new(0, 0), gridcraft_core::Value::text("big"));
         let package = save_bytes(&wb, "big.xlsx").unwrap();
-        // The size reported in storytold/gridcraft#1242.
-        let msg = open_bytes("big.xlsx", &declaring(package.clone(), "xl/worksheets/sheet1.xml", 540_278_731)).unwrap_err().to_string();
+        // The cap belongs to the process (a trusted file raises it with GRIDCRAFT_MAX_PART_MB),
+        // so the sizes below follow the cap in force instead of hard-coding 512 MB.
+        let cap = gridcraft_xlsx::max_part();
+        let limit_mb = cap >> 20;
+        let declared_mb = limit_mb + 28;
+        let over_text = format!("{declared_mb} MB");
+        let limit_text = format!("{limit_mb} MB");
+        let (Ok(declared), Ok(just_over)) = (u32::try_from(cap + 28 * 1024 * 1024), u32::try_from(cap + 1)) else { return };
+        let msg = open_bytes("big.xlsx", &declaring(package.clone(), "xl/worksheets/sheet1.xml", declared)).unwrap_err().to_string();
         assert!(msg.starts_with("We can't open 'big.xlsx': "), "{msg}");
-        assert!(msg.contains("xl/worksheets/sheet1.xml") && msg.contains("515 MB") && msg.contains("512 MB"), "{msg}");
+        assert!(msg.contains("xl/worksheets/sheet1.xml") && msg.contains(&over_text) && msg.contains(&limit_text), "{msg}");
         assert!(msg.contains("several sheets") && msg.contains("CSV"), "{msg}");
         assert!(!msg.contains("bytes"), "{msg}");
         // Splitting sheets doesn't shrink the shared strings, which every sheet uses: only CSV helps.
-        let msg = open_bytes("big.xlsx", &declaring(package.clone(), "xl/sharedStrings.xml", 540_278_731)).unwrap_err().to_string();
-        assert!(msg.contains("xl/sharedStrings.xml") && msg.contains("515 MB") && msg.contains("CSV"), "{msg}");
+        let msg = open_bytes("big.xlsx", &declaring(package.clone(), "xl/sharedStrings.xml", declared)).unwrap_err().to_string();
+        assert!(msg.contains("xl/sharedStrings.xml") && msg.contains(&over_text) && msg.contains("CSV"), "{msg}");
         assert!(!msg.contains("several sheets"), "{msg}");
         // Just over the limit never reads as a size equal to it.
-        let msg = open_bytes("big.xlsx", &declaring(package, "xl/worksheets/sheet1.xml", 512 * 1024 * 1024 + 1)).unwrap_err().to_string();
-        assert!(msg.contains("more than 512 MB"), "{msg}");
+        let msg = open_bytes("big.xlsx", &declaring(package, "xl/worksheets/sheet1.xml", just_over)).unwrap_err().to_string();
+        assert!(msg.contains(&format!("more than {limit_mb} MB")), "{msg}");
         // A package that fails for another reason keeps its own error, oversized part or not.
-        let mut broken = declaring(save_bytes(&wb, "big.xlsx").unwrap(), "xl/worksheets/sheet1.xml", 540_278_731);
+        let mut broken = declaring(save_bytes(&wb, "big.xlsx").unwrap(), "xl/worksheets/sheet1.xml", declared);
         let at = central_entry(&broken, "xl/workbook.xml");
         broken[at + 46 + "xl/workbook.xml".len() - 1] = b'x';
         let msg = open_bytes("big.xlsx", &broken).unwrap_err().to_string();

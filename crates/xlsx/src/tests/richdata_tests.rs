@@ -5,7 +5,7 @@ use std::sync::Arc;
 use gridcraft_core::{CellError, CellRef, RangeRef, Value};
 use gridcraft_model::{Cell, CellPicture, Formula, Sheet, Workbook};
 
-use super::make_zip;
+use super::{declaring, make_zip};
 use crate::package::Package;
 use crate::{IoError, read_xlsx, write_xlsx};
 
@@ -239,27 +239,15 @@ fn hostile_image_bytes_and_dimensions_are_bounded() {
 
 /// Advertise a large decompressed size without allocating a large fixture. Package reads
 /// must reject the header before touching the (deliberately inconsistent) compressed data.
-fn oversized_entry(mut bytes: Vec<u8>, path: &str, size: u32) -> Vec<u8> {
-    let mut i = 0;
-    while i + 46 <= bytes.len() {
-        if bytes[i..].starts_with(b"PK\x01\x02") {
-            let len = usize::from(u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]));
-            if bytes.get(i + 46..i + 46 + len) == Some(path.as_bytes()) {
-                bytes[i + 24..i + 28].copy_from_slice(&size.to_le_bytes());
-                return bytes;
-            }
-        }
-        i += 1;
-    }
-    panic!("fixture entry not found");
-}
-
 #[test]
 fn picture_metadata_limits_and_relationship_read_errors_do_not_block_workbooks() {
     let mut parts = independent_parts(false);
     replace(&mut parts, "sheets/data.xml", "</sheetData>", "<row r=\"3\"><c r=\"C3\"><v>42</v></c></row></sheetData>");
-    let oversized_xml = oversized_entry(zip(&parts), "rich/values.xml", 16 * 1024 * 1024 + 1);
-    let broken_rels = oversized_entry(zip(&parts), "rich/_rels/images.xml.rels", 512 * 1024 * 1024 + 1);
+    let oversized_xml = declaring(zip(&parts), "rich/values.xml", 16 * 1024 * 1024 + 1);
+    // A relationship part over this process's per-part cap: skipped, never a reason not to open.
+    // The cap follows GRIDCRAFT_MAX_PART_MB, so the forged size has to follow it too.
+    let Ok(over) = u32::try_from(crate::max_part() + 1) else { return };
+    let broken_rels = declaring(zip(&parts), "rich/_rels/images.xml.rels", over);
     let (_, values) = parts.iter_mut().find(|(path, _)| path == "rich/values.xml").unwrap();
     *values = format!("<rvData count=\"100001\">{}</rvData>", "<rv/>".repeat(100_001)).into_bytes();
     for bytes in [oversized_xml, broken_rels, zip(&parts)] {

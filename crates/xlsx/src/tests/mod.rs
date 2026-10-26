@@ -44,6 +44,23 @@ pub fn make_zip(parts: &[(&str, &[u8])]) -> Vec<u8> {
     z.finish().unwrap().into_inner()
 }
 
+/// `bytes` with the entry at `path` declaring `size` unpacked bytes: the reader refuses a part on
+/// the declared size, so a part over a limit needs no real megabytes behind it.
+pub fn declaring(mut bytes: Vec<u8>, path: &str, size: u32) -> Vec<u8> {
+    let mut at = 0;
+    while at + 46 <= bytes.len() {
+        if bytes[at..].starts_with(b"PK\x01\x02") {
+            let len = usize::from(u16::from_le_bytes([bytes[at + 28], bytes[at + 29]]));
+            if bytes.get(at + 46..at + 46 + len) == Some(path.as_bytes()) {
+                bytes[at + 24..at + 28].copy_from_slice(&size.to_le_bytes());
+                return bytes;
+            }
+        }
+        at += 1;
+    }
+    panic!("fixture entry not found");
+}
+
 pub const CT: &str = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/></Types>"#;
 pub const ROOT_RELS: &str = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
 
