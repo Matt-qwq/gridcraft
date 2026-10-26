@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (M19's band stripes landed) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (100M cells measured; M19 acceptance split by data density) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -313,7 +313,7 @@ Then the report itself (the bench crates beside the fork, `_gridcraft-bench/`; a
 |---|---|---|---|
 | `cell_digest` on `real_117m.xlsx` | `f5b186062e525ec8` | **`f5b186062e525ec8`** | 4 sheets, 31,709,565 cells — unchanged |
 | 118 MB report: open | 1.55 s | **1.28** | −18% |
-| … its model | 191 MiB | **163** | −28 MiB (162.8 MiB of cells) |
+| … its model | 191 MiB | **155** | −36 MiB (154.9 MiB of cells; 162.8 was the breakdown counting two dictionaries twice) |
 | … peak working set | — | **293** MiB | |
 | 1.28 GB report: open / live | 3.9 s / 238 MiB | **3.77 s / 237** | the packing win is CPU, so mostly flat |
 
@@ -323,12 +323,39 @@ eight threads: 0.27 s of the 1.55 s. Verified with the model's 31 tests (includi
 which keeps a `BTreeMap` as the oracle and checks the stripe bookkeeping after each of 3,000 random
 edits), `gridcraft-xlsx`'s 262 and `gridcraft-engine`'s 396.
 
+**Measured (10-26) at 100 million cells.** Ten sheets of 1,048,576 × 10 cells — 104,857,600 cells,
+551 MiB of XLSX, built by `make_many.py` beside the fork — in a data-export shape: a unique id and
+an amount on every row, four text columns drawing on 255 values.
+
+| | |
+|---|---|
+| model | **2,404 MiB of cells (24.0 B/cell)**; live 2,411 MiB, peak 2,487 MiB |
+| open / reopen | 6.4 s / 6.6 s |
+| breakdown | row headers 481 MiB, kind stripe 201, payload stripe 201, style stripe 120, bitmaps 80, text table 640, number table and its slots 679, band structs and extras 4 |
+| bands | 163,840 |
+
+The difference from the report is not the layout but whether values repeat inside a band of 64 rows.
+The report's numbers repeat (6% distinct a band) and cost 4.9 B/cell; this export's do not, so each
+band pays its number table in full (4.3 KiB a band against ~385 distinct numbers) and its text table
+too (~7 KiB a band against 255 distinct texts: an `Arc` pointer and an index entry each). The
+dictionaries are 1,319 MiB of the 2.4 GB; the four stripes are 602, the row headers 481.
+
+So at the report's density 100M cells extrapolate to ~490 MiB — inside the acceptance — and at the
+export's density they are 2.4 GB, four times over it. The acceptance is met for report-shaped
+workbooks today and not for unique-key exports, which is what paging is for. Two break-evens are
+worth taking before it: a band whose numbers are nearly all distinct should keep them inline
+(`NUMBER_WIDE` exists, but its trigger is 65,535 distinct in a band, not cost), and the same for
+texts (`TEXT_WIDE`). Neither closes a 4× gap on its own.
+
 **Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
 document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
 An LRU budget (default a few hundred MB) decides what stays.
 
 **Acceptance.**
-- Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size.
+- Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size. Measured 10-26
+  at both densities: report-shaped data extrapolates to ~490 MiB and passes; a unique-key export
+  measures 2.4 GB and needs paging, or a dictionary break-even, to pass. Either way 100M cells is
+  the number to hold the phase to.
 - The 31.7M-cell report: open time within 15% of the 4.1 s baseline; paint and edit within 5%.
 - Digest unchanged after a cold-then-warm round trip of every sheet.
 - A spill file never outlives the document, and a crash leaves no half-written state that a reopen
@@ -453,6 +480,7 @@ Needs the owner's call, not an agent's.
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
 | 2026-10-25 | minor | The band-stripe round is written down to the functions it changes, with its acceptance tests |
 | 2026-10-25 | minor | `put_row` in one pass (packing 68 → 59 ns a cell, open 1.69 → 1.55 s) |
+| 2026-10-26 | minor | 100 million cells measured: 2.4 GB of model on a unique-key export (24 B/cell) against ~490 MiB extrapolated at report density; the two per-band dictionaries are 1.3 GB of it and paging is still the answer. `packed_breakdown` stops counting the text and style dictionaries twice (the report measures 155 MiB of cells, not 163) |
 | 2026-10-25 | minor | The zip container is written by us now, so the parts compress on several threads: deflate 1.76 → 1.18 s, a save 4.2 → 3.7 s, every part verified to unpack to the same bytes with Python's `zipfile` |
 | 2026-10-25 | minor | Parallel sheet XML tried and reverted: the file was byte identical and the formatting 3× faster, but the serial walk that the shared-string table forces is 60% of the cost, so the second pass ate the gain |
 | 2026-10-25 | minor | Save path measured: 2.25 s of XML and 1.76 s of deflate, with the two structural blockers (shared-string order, the zip writer) written down |

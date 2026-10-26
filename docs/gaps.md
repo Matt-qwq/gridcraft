@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (M19's band stripes; large-workbook entry) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured; the breakdown double count fixed) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -33,12 +33,19 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   saves in 10.8 s; the 1.28 GB report opens in 5.2 s at 569 MB.
 - **Landed (10-26):** the store's rows are band-level stripes now (bitmaps, kinds, payloads and
   styles one vector a band with a slice a row) instead of four vectors a row: a range scan costs
-  2.9 ns a cell instead of 3.9, packing is 10% cheaper, and the 118 MB report opens in 1.28 s
-  (1.55 s) holding 163 MiB of cells (191 MiB), digest unchanged; details and the A/B in
-  [`roadmap.md`](roadmap.md#m19--cold-paging--6090-h).
+  2.9 ns a cell instead of 3.9, packing is 10% cheaper, and the 118 MB report opens in 1.37 s
+  holding 155 MiB of cells (191 MiB), digest unchanged; details and the A/B in
+  [`roadmap.md`](roadmap.md#m19--cold-paging--6090-h). The 163 MiB first reported was the
+  breakdown counting the text and style dictionaries twice, now fixed.
+- **Measured (10-26) at 100 million cells:** a 551 MiB, 10-sheet export opens in 6.4 s and holds
+  2.4 GB (24 B/cell); its per-band dictionaries are 1.3 GB of that, because every id and amount is
+  distinct. Report-shaped data at the same count extrapolates to ~490 MiB. So the M19 acceptance
+  (≤ 600 MB) holds at report density and paging is what the unique-key export needs.
 - **Missing:** multi-threaded recalc; 100k-dependent edit under 100 ms (was ~0.4 s); whole-sheet
-  operations bounded (#152, #151); memory still proportional to the file (no cold paging — the
-  stripes are what makes a band one copy to page out);
+  operations bounded (#152, #151); memory proportional to the cells, never the file (the 1.28 GB,
+  220k-cell workbook lives in 237 MiB), but no cold paging yet — the stripes are what makes a band
+  one copy to page out; the per-band value dictionaries still cost full price when values do not
+  repeat;
   structural edits still shift every cell below them; whole-column references scan to row
   1,048,576 instead of the used range (2,463 cells differ from Excel's cached values on the 1.28 GB
   report).
@@ -194,6 +201,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | minor | §2: the stripes' report numbers and a 100M-cell measurement (2.4 GB on a unique-key export against ~490 MiB extrapolated at report density); `packed_breakdown` no longer counts two dictionaries twice |
 | 2026-10-20 | minor | §11: the Japanese catalog covers the dialogs, messages and menus — 943 keys (~43%), matching the pt-BR coverage; a test keeps the two catalogs in step |
 | 2026-10-17 | minor | §6: the five reports it tracked are closed and their PRs merged (#57, #133, #139, #140, #134; PRs #148, #155, #156, #157); the entry stays open for §15's oracle suite |
 | 2026-10-15 | minor | §13: Solver prepares reports before committing the solution, model and report sheets together; report refusal preserves the workbook and Undo/Redo (#1050) |
