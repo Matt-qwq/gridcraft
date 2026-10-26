@@ -424,6 +424,14 @@ pub enum ChartKind {
     Combo,
 }
 
+impl ChartKind {
+    /// The Office 2016 types a file keeps as a `chartex` part (`xl/charts/chartExN.xml`) rather than
+    /// a DrawingML chart part. They carry no classic style number, so reading one reports style 2.
+    pub fn is_chartex(self) -> bool {
+        matches!(self, Self::Histogram | Self::BoxWhisker | Self::Waterfall | Self::Funnel | Self::Treemap | Self::Sunburst)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LegendPos {
     None,

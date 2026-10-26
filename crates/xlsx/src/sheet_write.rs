@@ -560,7 +560,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         }
         for ch in &sheet.charts {
             out.charts += 1;
-            let rid = if crate::chartex::is_chartex(ch.kind) {
+            let rid = if ch.kind.is_chartex() {
                 let n = out.charts;
                 let xml = crate::chartex::write_chartex(wb, si, ch, &mut out.chart_names);
                 out.part(&format!("xl/charts/chartEx{n}.xml"), Some(crate::chartex::CT_CHARTEX), xml.into_bytes());

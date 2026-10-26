@@ -2834,6 +2834,9 @@ fn every_chart_kind_survives_xlsx() {
         let after = &s.doc().unwrap().wb.active().unwrap().charts[0];
         assert_eq!(after.kind, kind, "{t}");
         assert_eq!(after.title.as_deref(), Some("Week"), "{t}");
+        // Chartex kinds have no classic style number in the file, so a new one starts at the style
+        // its reader reports (2) rather than changing from 1 on the first save.
+        assert_eq!(after.style, before.style, "{t}");
         assert_eq!(after.series.len(), before.series.len(), "{t}");
         for (a, b) in after.series.iter().zip(&before.series) {
             assert_eq!((&a.name, &a.values, &a.color), (&b.name, &b.values, &b.color), "{t}");
@@ -2843,6 +2846,29 @@ fn every_chart_kind_survives_xlsx() {
             }
         }
     }
+}
+
+#[test]
+fn a_stock_chart_needs_three_or_four_series() {
+    use gridcraft_model::ChartKind;
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["", "High", "Low"], ["Mon", 14, 9], ["Tue", 15, 11]]})).unwrap();
+    // Two series cannot be written as a stock chart (the file format wants 3 or 4), so the command
+    // refuses instead of saving a line chart under the same name.
+    let err = s.execute("insert.chart", json!({"type": "stock", "range": "A1:C3"})).unwrap_err().to_string();
+    assert!(err.contains("3 or 4 columns"), "{err}");
+    assert!(s.doc().unwrap().wb.active().unwrap().charts.is_empty());
+    // Changing an existing chart to stock is checked before the edit, so it keeps its kind.
+    s.execute("insert.chart", json!({"type": "line", "range": "A1:C3"})).unwrap();
+    let err = s.execute("chart.set", json!({"type": "stock"})).unwrap_err().to_string();
+    assert!(err.contains("3 or 4 columns"), "{err}");
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().charts[0].kind, ChartKind::Line);
+    // Three columns of numbers (high, low, close) is a stock chart, and the file keeps the kind.
+    chart_data(&mut s);
+    s.execute("insert.chart", json!({"type": "stock", "range": "A1:E7"})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().charts[1].kind, ChartKind::Stock);
+    reopen(&mut s);
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().charts[1].kind, ChartKind::Stock);
 }
 
 #[test]

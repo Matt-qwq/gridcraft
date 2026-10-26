@@ -335,7 +335,7 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                     xfrm(&img.anchor, "a:xfrm")
                 );
             }
-            Obj::Chart(ch, rid) if crate::chartex::is_chartex(ch.kind) => {
+            Obj::Chart(ch, rid) if ch.kind.is_chartex() => {
                 // Chartex frames come with a fallback for readers that don't know them.
                 let (open, close) = anchor_open(sheet, &ch.anchor);
                 close_tag = close;

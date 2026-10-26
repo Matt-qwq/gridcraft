@@ -773,6 +773,7 @@ pub fn build_chart(s: &Session, p: &Json) -> Result<(usize, Chart)> {
     if series.is_empty() {
         return Err(EngineError::Other("Select data for the chart first.".into()));
     }
+    check_stock_series(kind, "insert.chart", series.len())?;
     scatter_x_from_first(kind, &mut series);
     let id = d.wb.next_object_id();
     let at = cell_param_on(s, p, "at", sheet)?.unwrap_or_else(|| CellRef::new(bounds.start.row, bounds.end.col + 2));
@@ -799,7 +800,7 @@ pub fn build_chart(s: &Session, p: &Json) -> Result<(usize, Chart)> {
         legend: if matches!(kind, ChartKind::Pie | ChartKind::Doughnut) { LegendPos::Right } else { LegendPos::Bottom },
         data_labels: false,
         gridlines: !matches!(kind, ChartKind::Pie | ChartKind::Doughnut | ChartKind::Treemap | ChartKind::Sunburst | ChartKind::Funnel),
-        style: 1,
+        style: if kind.is_chartex() { 2 } else { 1 },
         x_title: None,
         y_title: None,
         source: (areas.len() == 1).then(|| format!("{}!{}", gridcraft_formula::quote_sheet(&sh.name), bounds.a1())),
@@ -807,6 +808,19 @@ pub fn build_chart(s: &Session, p: &Json) -> Result<(usize, Chart)> {
         pivot: None,
     };
     Ok((sheet, chart))
+}
+
+/// A stock chart plots 3 or 4 series (high-low-close, open-high-low-close) and the file format has
+/// nothing smaller: the writer degrades anything else to a line chart, so refuse it at the command
+/// instead of letting the kind change on save.
+fn check_stock_series(kind: ChartKind, cmd: &str, count: usize) -> Result<()> {
+    if kind != ChartKind::Stock || (3..=4).contains(&count) {
+        return Ok(());
+    }
+    Err(bad(
+        cmd,
+        format!("A stock chart needs 3 or 4 columns of numbers (high, low, close, or open, high, low, close); the selection gives {count}."),
+    ))
 }
 
 fn insert_chart(s: &mut Session, p: &Json) -> Result<Json> {
@@ -831,6 +845,12 @@ fn find_chart(s: &Session, p: &Json) -> Result<(usize, usize)> {
 
 fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
     let (si, ci) = find_chart(s, p)?;
+    // Checked before the edit, so a refused change leaves the chart as it was.
+    if str_param(p, "type").is_some_and(|t| chart_kind(t, str_param(p, "subtype").unwrap_or("")) == ChartKind::Stock) {
+        let d = s.doc()?;
+        let count = d.wb.sheet(si).and_then(|sh| sh.charts.get(ci)).map_or(0, |c| c.series.len());
+        check_stock_series(ChartKind::Stock, "chart.set", count)?;
+    }
     let at = cell_param_on(s, p, "at", si)?;
     let quartiles = p
         .get("quartiles")

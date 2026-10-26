@@ -18,11 +18,6 @@ pub const CT_COLORS: &str = "application/vnd.ms-office.chartcolorstyle+xml";
 pub const REL_STYLE: &str = "http://schemas.microsoft.com/office/2011/relationships/chartStyle";
 pub const REL_COLORS: &str = "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle";
 
-/// Kinds written as chartex parts.
-pub fn is_chartex(k: ChartKind) -> bool {
-    matches!(k, ChartKind::Histogram | ChartKind::BoxWhisker | ChartKind::Waterfall | ChartKind::Funnel | ChartKind::Treemap | ChartKind::Sunburst)
-}
-
 /// The `mc:Choice` requirement for a kind's drawing frame: (prefix, namespace). Funnel charts
 /// came in a later revision of the format.
 pub fn requires(k: ChartKind) -> (&'static str, &'static str) {
