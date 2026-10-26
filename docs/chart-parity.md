@@ -1,6 +1,6 @@
 # Chart parity
 
-> **Last reviewed:** 2026-10-18 · **Last updated:** 2026-10-18 · **Change:** trivial (stale chart notes: stock/combo, treemap/sunburst, box and waterfall kinds survive XLSX round-trip; PRs #158 and #161 merged) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-26 · **Last updated:** 2026-10-26 · **Change:** minor (round-trip measured for all 25 kinds; stock selection refused; chartex style settled) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Excel's chart types and chart elements against GridCraft. Part of
 [target-app-parity.md](target-app-parity.md). **Breadth ~50%, ready ~30%, 40–60 h** (estimated).
@@ -26,9 +26,7 @@ Sources: `crates/model/src/features.rs` (`ChartKind`, `Chart`, `Series`), `crate
 | Treemap, Sunburst | 1 each | 2 of 2 | |
 | Histogram, Pareto | 2 | 1 of 2 | no Pareto |
 | Box & Whisker | 1 | 1 of 1 | exclusive (default) and inclusive quartiles per series; XLSX round-trip; `chart.set {quartiles}` changes all series |
-| Waterfall, Funnel | 2 | 2 of 2 | lose their kind in XLSX (PR #161) |
-| Box & Whisker | 1 | 1 of 1 | |
-| Waterfall, Funnel | 2 | 2 of 2 | |
+| Waterfall, Funnel | 2 | 2 of 2 | written as chartex parts (PR #161); kind survives a round-trip |
 | Filled map | 1 | 0 | needs geographic boundary data (licensing decision) |
 | Combo | custom combinations, secondary axis | yes (line on secondary axis) | |
 | **Total** | ~60 subtypes | **25 (~42%)** | usage-weighted breadth higher (~65%): column, bar, line, pie and scatter dominate |
@@ -54,8 +52,6 @@ Sources: `crates/model/src/features.rs` (`ChartKind`, `Chart`, `Series`), `crate
 | Chart sheets | yes | **kept, not editable**: not shown, and written back unchanged in their place on save (#727); left out when a sheet they plot is deleted or renamed. No F11 / Move Chart > New sheet |
 | Chart templates (`.crtx`) | yes | **missing** |
 | Recommended Charts | yes | dialog with recommendations from the data's shape (own heuristic) and an All Charts list, live previews (#215) |
-| Switch Row/Column, Select Data | yes | yes (Switch on charts read from files landed in #116) |
-| Recommended Charts | yes | partial (Insert ▸ Recommended) |
 | Switch Row/Column, Select Data | yes | yes (Switch on charts read from files landed in #116); Select Data dialog: data range, remove series, Horizontal (Category) Axis Labels (#287). No series add/edit or hidden/empty cell options |
 | Sparklines (line, column, win/loss, markers, axis) | yes | line, column, win/loss |
 | PivotCharts | yes | Insert ▸ PivotChart (`insert.pivotChart`): bound to a PivotTable's report, rebuilt on refresh and layout changes, `c:pivotSource` round trip; no field buttons, innermost category level only |
@@ -68,6 +64,19 @@ survive: anything else (axis scaling, label options, error bars, per-point forma
 extensions) is lost when GridCraft saves a workbook it opened. That is the main reason charts are
 **~30% ready**: a user who opens an Excel workbook with charts and saves it gets simpler charts
 back.
+
+**Measured (10-26).** Each of the 25 kinds created by `insert.chart`, saved, reopened and compared
+field by field (`_gridcraft-bench/chart_rt`). Kind, title, legend, data labels, gridlines, axis
+titles and every series' name, categories, values and colour survive. What still differs:
+
+| Difference after save and reopen | Why | Status |
+|---|---|---|
+| a stock chart of 2 series came back as a line chart | the format stores stock only for 3–4 series, and the writer had degraded the rest silently | **fixed**: `insert.chart` and `chart.set` refuse a stock chart without 3 or 4 columns |
+| histogram, waterfall, funnel, treemap, sunburst and box & whisker changed style 1 → 2 | they are chartex parts, which have no classic style number; reading one reports 2 | **fixed**: a chartex chart is created at style 2, so the first save changes nothing |
+| `source` is `None` after reopening | files don't carry the selection a chart was made from; Switch Row/Column rebuilds it from the series | by design |
+| a bubble chart's empty `bubble_sizes` reads back as its values | the writer fills the required bubble size from the values when no size column was given | by design (same picture) |
+| a combo chart's series carry no explicit `kind` until they are read back | the reader records the group each series was written as (column, then line) | by design (same picture) |
+| a histogram reads back without categories | a histogram bins its values; it has no category axis | by design |
 
 Series data, categories and names may refer to defined names, as dynamic (OFFSET) ranges do:
 Excel writes a workbook-scoped name as `[0]!Name` in `<c:f>`. GridCraft reads it as the bare
@@ -90,6 +99,7 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | minor | Round-trip measured across 25 kinds: a stock chart without 3–4 series is refused instead of saving as a line chart, chartex kinds no longer change style 1 → 2 on the first save; the rest of the diffs are representation or file-format limits, tabulated |
 | 2026-10-18 | trivial | Stale notes: stock/combo, treemap/sunburst, box and waterfall kinds survive XLSX round-trip (PRs #158, #161) |
 | 2026-10-16 | trivial | Series that refer to defined names (`[0]!Name`, `Sheet!Name`) resolve instead of showing `#NAME?`, and are saved qualified, as Excel needs (#1686) |
 | 2026-10-16 | minor | Box & whisker quartiles default to exclusive, honor each series on draw and XLSX round-trip; `chart.set {quartiles}` changes the method (#1453) |

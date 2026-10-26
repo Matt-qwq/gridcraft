@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured; the breakdown double count fixed) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured, recalc timings; the breakdown double count fixed) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -46,9 +46,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   220k-cell workbook lives in 237 MiB), but no cold paging yet — the stripes are what makes a band
   one copy to page out; the per-band value dictionaries still cost full price when values do not
   repeat;
-  structural edits still shift every cell below them; whole-column references scan to row
-  1,048,576 instead of the used range (2,463 cells differ from Excel's cached values on the 1.28 GB
-  report).
+  structural edits still shift every cell below them; 159 cells still differ from Excel's cached
+  values on the 1.28 GB report, all `IFERROR(XLOOKUP(...))` over whole columns where a blank is
+  involved (cached 0, we give the fallback) — whole-column references themselves are already
+  clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms), so
+  that is lookup semantics, not a scan; a 100k-dependent edit costs 223–251 ms against the 100 ms
+  gate (a full recalculation is 267 ms, single-threaded).
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
   (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
@@ -201,6 +204,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | minor | §2: whole-column references are already clipped (21.5 ms for `SUM(A:A)` over a million cells); 159 XLOOKUP-over-blank cells differ from Excel; a 100k-dependent edit measures 223–251 ms |
 | 2026-10-26 | minor | §2: the stripes' report numbers and a 100M-cell measurement (2.4 GB on a unique-key export against ~490 MiB extrapolated at report density); `packed_breakdown` no longer counts two dictionaries twice |
 | 2026-10-20 | minor | §11: the Japanese catalog covers the dialogs, messages and menus — 943 keys (~43%), matching the pt-BR coverage; a test keeps the two catalogs in step |
 | 2026-10-17 | minor | §6: the five reports it tracked are closed and their PRs merged (#57, #133, #139, #140, #134; PRs #148, #155, #156, #157); the entry stays open for §15's oracle suite |

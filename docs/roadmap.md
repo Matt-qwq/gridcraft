@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (100M cells measured; M19 acceptance split by data density) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (100M cells and 100k-dependents measured; M19 acceptance split by data density) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -223,6 +223,12 @@ text keys is 24 µs, a linear scan, which is what an unsorted exact match costs)
 is evaluator plumbing, and a full recalculation runs four to five passes — each re-evaluating the
 same formulas because `results` and `pending` start empty every pass. Making later passes incremental
 is the next real win here, and it is a change to `Calc::calculate`'s loop, not to a kernel.
+
+**Measured (10-26).** The case behind the <100 ms gate: 100,000 cells of `=$A$1*2`, then three
+edits of A1 — 223, 236 and 251 ms each, against 267 ms for a full recalculation. `cells_changed`
+already recalculates only the dependents, so the cost is the pass itself (~2.3 µs a formula: graph
+lookup, evaluation, storing the value), not the dependency walk. Whole-column references are not
+part of it: `SUM(A:A)` folds a million cells in 21.5 ms, and a ten-row used range in 0.0 ms.
 
 **Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
 band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
@@ -480,6 +486,7 @@ Needs the owner's call, not an agent's.
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
 | 2026-10-25 | minor | The band-stripe round is written down to the functions it changes, with its acceptance tests |
 | 2026-10-25 | minor | `put_row` in one pass (packing 68 → 59 ns a cell, open 1.69 → 1.55 s) |
+| 2026-10-26 | minor | M18 section gets the 100k-dependents measurement (223–251 ms an edit, 2.3 µs a formula) and the whole-column reference numbers (21.5 ms `SUM(A:A)` over a million cells, 0.0 ms on a ten-row used range) |
 | 2026-10-26 | minor | 100 million cells measured: 2.4 GB of model on a unique-key export (24 B/cell) against ~490 MiB extrapolated at report density; the two per-band dictionaries are 1.3 GB of it and paging is still the answer. `packed_breakdown` stops counting the text and style dictionaries twice (the report measures 155 MiB of cells, not 163) |
 | 2026-10-25 | minor | The zip container is written by us now, so the parts compress on several threads: deflate 1.76 → 1.18 s, a save 4.2 → 3.7 s, every part verified to unpack to the same bytes with Python's `zipfile` |
 | 2026-10-25 | minor | Parallel sheet XML tried and reverted: the file was byte identical and the formatting 3× faster, but the serial walk that the shared-string table forces is 60% of the cost, so the second pass ate the gain |
