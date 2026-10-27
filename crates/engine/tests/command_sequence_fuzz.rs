@@ -28,6 +28,7 @@
 //! - `GRIDCRAFT_FUZZ_SHRINK=1`: on failure, shrink the sequence to a minimal list of commands that
 //!   still fails the same way, printed as `execute` calls ready for a regression test.
 //! - `GRIDCRAFT_FUZZ_KEEP_GOING=1`: report every failing seed instead of stopping at the first.
+//! - `GRIDCRAFT_FUZZ_TRACE=1`: print each step before running it, so a hang names its command.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -41,7 +42,12 @@ use serde_json::{Value as Json, json};
 const SAMPLES: [&str; 3] = ["sales", "budget", "grades"];
 /// Episodes end (undo/redo checks, then a fresh history) before the engine's 100-step undo limit
 /// starts dropping the oldest entries.
+/// Most undo entries an episode may hold before the harness ends it and starts a fresh one.
 const EPISODE_UNDO_DEPTH: usize = 90;
+/// The session's undo history is capped at 128 MB and drops its oldest entries past that, which
+/// makes "undo all, redo all" inexact. End the episode well before the cap instead: a workbook
+/// whose steps retain 48 MB between them is past what the undo test is about.
+const EPISODE_UNDO_BYTES: usize = 48 * 1024 * 1024;
 /// Save and reload every this many steps (and at the end of every episode).
 const ROUNDTRIP_EVERY: usize = 10;
 /// The hidden defined name `formulas.watchWindow` keeps its list in.
@@ -163,15 +169,26 @@ fn report(seed: u64, steps: usize, sample: &str, sequence: &[Step], f: &Failure)
 }
 
 /// Generates and runs one seed's sequence; returns the sample, the steps run and the first failure.
+#[allow(clippy::disallowed_methods)] // the clock times traced steps; this test never runs on wasm
 fn run_seed(seed: u64, steps: usize) -> (&'static str, Vec<Step>, Option<Failure>) {
     let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) ^ 0x5EED);
     let sample = SAMPLES[(seed % SAMPLES.len() as u64) as usize];
     let mut h = Harness::new(sample);
     let mut sequence = Vec::new();
+    let trace = std::env::var_os("GRIDCRAFT_FUZZ_TRACE").is_some();
     for i in 0..steps {
         let (id, params) = generate(&mut rng, &h.s);
+        if trace {
+            eprintln!("{i} start {id} {params}");
+        }
+        let t = std::time::Instant::now();
+        let step = h.step(i, &id, &params);
+        if trace {
+            let undo = h.s.doc().map(|d| d.undo.len()).unwrap_or(0);
+            eprintln!("{i} done {:?} {id} undo={undo}", t.elapsed());
+        }
         sequence.push((id.clone(), params.clone()));
-        if let Err(f) = h.step(i, &id, &params) {
+        if let Err(f) = step {
             return (sample, sequence, Some(f));
         }
     }
@@ -272,7 +289,11 @@ impl Harness {
         if (i + 1).is_multiple_of(ROUNDTRIP_EVERY) {
             guarded(i, "xlsx roundtrip", || roundtrip_diff(&after))?;
         }
-        if self.s.doc().expect("document").undo.len() >= EPISODE_UNDO_DEPTH {
+        let over = {
+            let d = self.s.doc().expect("document");
+            d.undo.len() >= EPISODE_UNDO_DEPTH || d.undo.iter().map(|e| e.retained_bytes).sum::<usize>() > EPISODE_UNDO_BYTES
+        };
+        if over {
             self.end_episode(i)?;
         }
         Ok(())
@@ -292,6 +313,15 @@ impl Harness {
     /// and reload; the next episode starts from here with an empty history.
     fn end_episode(&mut self, i: usize) -> Result<(), Failure> {
         let end = self.wb();
+        if std::env::var_os("GRIDCRAFT_FUZZ_TRACE").is_some() {
+            let d = self.s.doc().expect("document");
+            eprintln!(
+                "episode ends at step {i}: {} undo, {} redo, base sheets {:?}",
+                d.undo.len(),
+                d.redo.len(),
+                self.base.sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+            );
+        }
         let mut n = 0;
         while !self.s.doc().expect("document").undo.is_empty() {
             if let Err(EngineError::Internal(_, msg)) = self.s.execute("edit.undo", json!({})) {
@@ -303,21 +333,30 @@ impl Harness {
             }
         }
         let undone = self.wb();
-        if let Some(diff) = workbook_diff(&self.base, &undone) {
+        // A history trimmed at the byte cap can no longer replay the whole episode, and the two
+        // comparisons below are then meaningless. The rest of the checks still run.
+        let trimmed = self.s.doc().expect("document").redo.len() < n;
+        if !trimmed && let Some(diff) = workbook_diff(&self.base, &undone) {
             return Err(fail(i, "undo", format!("undoing all {n} steps doesn't give back the starting workbook: {diff}")));
         }
         if watch_list(&end) != watch_list(&undone) {
             return Err(fail(i, "undo", format!("undoing all {n} steps changed the Watch Window list (not an edit)")));
         }
         self.check_state(i)?;
+        let have = self.s.doc().expect("document").redo.len();
         // Only the steps undone here: an `edit.undo {steps}` in the sequence may have left more.
         for _ in 0..n {
             if let Err(EngineError::Internal(_, msg)) = self.s.execute("edit.redo", json!({})) {
                 return Err(fail(i, "panic", format!("`edit.redo` panicked while redoing everything: {msg}")));
             }
         }
-        if let Some(diff) = workbook_diff(&end, &self.wb()) {
-            return Err(fail(i, "redo", format!("redoing all {n} steps doesn't give back the final workbook: {diff}")));
+        let left = self.s.doc().expect("document").redo.len();
+        if !trimmed && let Some(diff) = workbook_diff(&end, &self.wb()) {
+            return Err(fail(
+                i,
+                "redo",
+                format!("redoing all {n} steps (redo stack {have}, {left} left) doesn't give back the final workbook: {diff}"),
+            ));
         }
         self.check_state(i)?;
         guarded(i, "xlsx roundtrip", || roundtrip_diff(&end))?;
@@ -495,6 +534,8 @@ fn canonical(wb: &Workbook) -> Workbook {
         let sh = Arc::make_mut(sh);
         sh.view_active = CellRef::default();
         sh.view_top_left = CellRef::default();
+        // A view command (page layout, page break preview) is not content and is not undoable.
+        sh.view = gridcraft_engine::model::SheetViewMode::Normal;
     }
     wb
 }
@@ -525,11 +566,23 @@ fn workbook_diff(a: &Workbook, b: &Workbook) -> Option<String> {
             ]
             .into_iter()
             .find(|(_, d)| *d)
-            .map_or("other sheet properties", |(n, _)| n);
+            .map_or_else(|| differing_sheet_field(x, y), |(n, _)| n.to_string());
             return Some(format!("{}: {field} differ", x.name));
         }
     }
     Some("workbook-level properties (names, styles, settings) differ".into())
+}
+
+/// The first sheet field that differs, named the way the document JSON spells it.
+fn differing_sheet_field(x: &gridcraft_engine::model::Sheet, y: &gridcraft_engine::model::Sheet) -> String {
+    let (Ok(a), Ok(b)) = (serde_json::to_value(x), serde_json::to_value(y)) else { return "other sheet properties".into() };
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else { return "other sheet properties".into() };
+    for (key, value) in a {
+        if b.get(key) != Some(value) {
+            return key.clone();
+        }
+    }
+    "other sheet properties".into()
 }
 
 // ---------------------------------------------------------------- generation
