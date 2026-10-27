@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured, recalc timings; the breakdown double count fixed) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured; §10: fuzz soak, four spill-conflict seeds open) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -124,7 +124,20 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 ### 10. Crashes and freezes reported from the field (S)
 - **Evidence:** #120 (Intel UHD crash on Windows), #117 (error on close, macOS), #166 (freeze opening
   from Finder; PRs #164, #167), #76 (flashing on Windows 11), #130 (caught panic in table styles).
-- **Estimate:** 8–12 h plus an autosave/recovery soak.
+- **Landed (10-26): a 100-seed command-sequence soak.** 200 commands a seed in release build, every
+  invariant checked per step (`crates/engine/tests/command_sequence_fuzz.rs`). Found and fixed:
+  Merge Across of whole columns ran 1,048,576 merges and then re-scanned the sheet per row (a
+  freeze); a table's total row could grow into the next table; `data.subtotal` took a dozen undo
+  steps per group instead of one; a table column named with `!` was saved as a sheet-qualified
+  formula and came back changed. The harness now ends an episode before the 128 MB undo budget
+  trims it, traces steps with `GRIDCRAFT_FUZZ_TRACE`, and names the differing sheet field.
+- **Open (4 of 100 seeds), all dynamic-array conflicts:** a full recalculation resolves two
+  overlapping spills in a different order from the incremental one, so F9 changes a value
+  (`=SORT(F5:J10)` under a `=UNIQUE(...)` spill, 2-step repro), a fill into a spill area leaves
+  `#CIRC!` where a recalc gives 0 (2 steps), an XLSX save/reload turns a `#SPILL!` into `#VALUE!`,
+  and one seed references the Watch Window's sheet-scoped name. Each seed and its minimal replay is
+  in `plan/HANDOVER.md`; the fix is a deterministic conflict rule for overlapping spills.
+- **Estimate:** 8–12 h plus an autosave/recovery soak; 6–10 h of it is the spill-conflict rule.
 
 ## After beta
 
@@ -204,6 +217,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | minor | §10: 100-seed soak; Merge Across freeze, total-row overlap, Subtotal undo depth and a `!` column name fixed; four dynamic-array conflict seeds open with replays |
 | 2026-10-26 | minor | §2: whole-column references are already clipped (21.5 ms for `SUM(A:A)` over a million cells); a 100k-dependent edit measures 223–251 ms; the 159 remaining cells are Excel's stale cache, not a difference |
 | 2026-10-26 | minor | §2: the stripes' report numbers and a 100M-cell measurement (2.4 GB on a unique-key export against ~490 MiB extrapolated at report density); `packed_breakdown` no longer counts two dictionaries twice |
 | 2026-10-20 | minor | §11: the Japanese catalog covers the dialogs, messages and menus — 943 keys (~43%), matching the pt-BR coverage; a test keeps the two catalogs in step |
