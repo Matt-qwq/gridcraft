@@ -127,8 +127,12 @@ fn dynamic_spills_and_legacy_cse_keep_distinct_ranges() {
     // A legacy array's cached values are dropped on read: the formula fills its range on recalc (#156).
     assert!(sh.cell(at("A2")).is_none());
     assert_eq!(sh.cell(at("B1")).unwrap().formula.as_ref().unwrap().array, None);
+    // The cached values inside the spill become the spill map, not sheet cells that would block
+    // the array on the next recalculation; the anchor's `ref` gives the range back.
     assert!(sh.cell(at("B2")).is_none());
     assert!(sh.cell(at("B3")).is_none());
+    assert_eq!(sh.spill_ranges.get(&at("B1")), Some(&range("B1:B3")));
+    assert_eq!((sh.value(at("B2")), sh.value(at("B3"))), (Value::Number(2.0), Value::Number(3.0)));
     assert_eq!(sh.value(at("C1")), Value::Number(6.0));
 }
 

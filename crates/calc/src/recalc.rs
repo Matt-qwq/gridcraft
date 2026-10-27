@@ -428,20 +428,24 @@ fn fold(text: &str) -> String {
     text.chars().flat_map(char::to_lowercase).collect()
 }
 
-/// Arrays that own their cells when two spills want the same ones: everything already spilling,
-/// and every dynamic formula whose cached value is not `#SPILL!` (a file records the winner as a
-/// value and the loser as the error, which is how a reload keeps the same owner).
+/// Arrays that own their cells when two spills want the same ones: everything already spilling.
+/// The reader rebuilds that state from the file (an anchor's `ref` names the range it spilled
+/// into, and the values inside it are cached), so F9 after a reload keeps the same owner. A
+/// blocked array has no range and is deliberately absent: it must not be laid out before the
+/// owner that sits further down the sheet, or it would take the cells by row-major order.
 fn spill_owners(wb: &Workbook) -> HashSet<Key> {
     let mut owners: HashSet<Key> = HashSet::default();
     for (si, sh) in wb.sheets.iter().enumerate() {
         owners.extend(sh.spill_ranges.keys().map(|c| (si, *c)));
-        for (c, f, _) in sh.cells.formulas() {
-            if f.dynamic && !matches!(sh.value(c), Value::Error(CellError::Spill)) {
-                owners.insert((si, c));
-            }
-        }
     }
     owners
+}
+
+/// Whether `c` holds content of its own. A cell kept only for its formatting (a fill, a border,
+/// an empty value) does not: an array may spill over formatted cells, and a cell that was
+/// formatted while a spill covered it must not turn that spill into `#SPILL!` on the next pass.
+fn holds_content(sheet: &gridcraft_model::Sheet, c: CellRef) -> bool {
+    sheet.cells.get(c).is_some_and(|x| x.formula.is_some() || !x.value.is_empty())
 }
 
 /// The largest single block the pass keeps built and shared. A lookup table is small; a whole
@@ -609,7 +613,7 @@ fn spills_as_before(sheet: &gridcraft_model::Sheet, anchor: CellRef, range: Rang
         && range
             .iter()
             .enumerate()
-            .all(|(i, c)| c == anchor || (!sheet.cells.has(c) && sheet.spill.get(&c) == Some(arr.data.get(i).unwrap_or(&Value::Empty))))
+            .all(|(i, c)| c == anchor || (!holds_content(sheet, c) && sheet.spill.get(&c) == Some(arr.data.get(i).unwrap_or(&Value::Empty))))
 }
 
 impl PassHost<'_> {
@@ -1426,7 +1430,7 @@ impl Calc {
                     let range = RangeRef::new(k.1, end);
                     let blocked = end.row >= gridcraft_core::MAX_ROWS
                         || end.col >= gridcraft_core::MAX_COLS
-                        || range.iter().any(|c| c != k.1 && (sheet.cells.has(c) || sheet.spill.contains_key(&c)))
+                        || range.iter().any(|c| c != k.1 && (holds_content(sheet, c) || sheet.spill.contains_key(&c)))
                         || sheet.merges.iter().any(|m| m.intersects(&range))
                         || sheet.tables.iter().any(|t| t.range.contains(k.1));
                     if blocked {

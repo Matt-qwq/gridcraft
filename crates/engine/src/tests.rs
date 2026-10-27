@@ -4682,3 +4682,43 @@ fn html_export_without_pictures_or_charts_has_no_fixed_geometry() {
     let html = crate::io::to_html(&s.doc().unwrap().wb, 0).unwrap();
     assert!(!html.contains("<colgroup>") && !html.contains("table-layout") && !html.contains("<svg") && !html.contains("<img"), "{html}");
 }
+
+#[test]
+fn reopening_a_file_keeps_the_array_that_won_a_spill_contest() {
+    // K7 spills over L7:M10 and L2 wants the same cells: whichever was entered first keeps them
+    // and the other is #SPILL!. The file records the winner's range and its values, so opening it
+    // must not lay the arrays out in row-major order and hand the cells to the other one (found
+    // by the command-sequence fuzzer).
+    for (order, anchor) in [(["K7", "L2"], "K7"), (["L2", "K7"], "L2")] {
+        let mut s = self::s();
+        for cell in order {
+            let input = if cell == "K7" { "=SEQUENCE(4,3)" } else { "=SEQUENCE(9,3)" };
+            s.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+        }
+        let other = if anchor == "K7" { "L2" } else { "K7" };
+        assert_eq!(v(&s, anchor), Value::Number(1.0), "{order:?}");
+        assert_eq!(v(&s, other), Value::Error(gridcraft_core::CellError::Spill), "{order:?}");
+        reopen(&mut s);
+        assert_eq!(v(&s, anchor), Value::Number(1.0), "{order:?}, reopened");
+        assert_eq!(v(&s, other), Value::Error(gridcraft_core::CellError::Spill), "{order:?}, reopened");
+        s.execute("formulas.calculateNow", json!({})).unwrap();
+        assert_eq!(v(&s, anchor), Value::Number(1.0), "{order:?}, after F9");
+        assert_eq!(v(&s, other), Value::Error(gridcraft_core::CellError::Spill), "{order:?}, after F9");
+    }
+}
+
+#[test]
+fn reopening_a_file_keeps_a_spilled_array_that_reads_its_own_source() {
+    // #CIRC! at the anchor is not spilled state; the file caches it as 0 (`#CIRC!` is not an error
+    // code of the format) and opening has to find it again, not spill part of the source.
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["H1", "H2"], [1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "A2", "input": "=TRANSPOSE(A1:B6)"})).unwrap();
+    assert_eq!(v(&s, "A2"), Value::Error(gridcraft_core::CellError::Circ));
+    reopen(&mut s);
+    assert_eq!(v(&s, "A2"), Value::Error(gridcraft_core::CellError::Circ));
+    assert_eq!(v(&s, "B2"), Value::Number(2.0), "the source is not covered by a spill");
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(v(&s, "A2"), Value::Error(gridcraft_core::CellError::Circ));
+    assert_eq!(v(&s, "B2"), Value::Number(2.0));
+}

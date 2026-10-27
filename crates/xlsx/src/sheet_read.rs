@@ -30,9 +30,10 @@ struct Shared {
 struct RowState {
     next_row: u32,
     shared: HashMap<u32, Shared>,
-    /// Dynamic-array spill ranges and legacy array ranges: cached values inside them (other than
-    /// the anchor) are not stored, so the formula can fill them again.
-    dynamic: Vec<RangeRef>,
+    /// Legacy array ranges: cached values inside them (other than the anchor) are not stored, so
+    /// the formula fills them again on recalculation. Dynamic-array spills are not here: the file
+    /// keeps their values, which [`adopt_spills`] moves to the sheet's spill map afterwards.
+    derived: Vec<RangeRef>,
     dropped: u64,
     rows: u64,
     /// The row being read (0-based) and the next column when a `<c>` has no `r`.
@@ -111,6 +112,7 @@ pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: Re
         cx.warn(format!("sheet \"{name}\": {dropped} cells or rows outside the 1,048,576 × 16,384 grid were dropped"));
     }
     let _ = rows_read;
+    adopt_spills(&mut sheet);
 
     let mut fit_to_page = false;
     let mut column_assignments_left = MAX_COLUMN_ASSIGNMENTS;
@@ -394,6 +396,36 @@ fn read_cols(cx: &Ctx<'_>, e: &El, sheet: &mut Sheet, remaining: &mut u64) -> Re
     Ok(())
 }
 
+/// A dynamic array's spilled cells are cached in the file as ordinary cells, so a reader that
+/// doesn't know about spills still shows the values. They are derived state, not content: keep
+/// them in the sheet's spill map (where `Sheet::value` finds them), and only a stored cell for
+/// its formatting. A stored cell over every spilled value would make the array `#SPILL!` against
+/// its own output on the next recalculation.
+fn adopt_spills(sheet: &mut Sheet) {
+    // The anchors and ranges were recorded while the rows were decoded; the values are in the
+    // store now. A range whose cells were written out of document order still works here.
+    let spills: Vec<(CellRef, RangeRef)> = sheet.spill_ranges.iter().map(|(a, r)| (*a, *r)).collect();
+    for (anchor, range) in spills {
+        // Only cells the file actually stored: walking the whole range would cost its area, and a
+        // damaged anchor's `ref` can name the whole sheet.
+        let stored: Vec<CellRef> = sheet.cells.iter_range(range).map(|(c, _)| c).filter(|c| *c != anchor).collect();
+        for c in stored {
+            let Some(cell) = sheet.cells.get(c) else { continue };
+            if cell.formula.is_some() {
+                continue;
+            }
+            if !cell.value.is_empty() {
+                sheet.spill.insert(c, cell.value);
+            }
+            if cell.style == gridcraft_model::StyleId::DEFAULT {
+                sheet.cells.remove(c);
+            } else {
+                sheet.cells.set(c, Cell { value: Value::Empty, ..cell });
+            }
+        }
+    }
+}
+
 /// Reads the rows of a worksheet part into `sheet`, returning the rest of the document (views,
 /// columns, merges, tables…), the warnings in document order and the two counters.
 ///
@@ -534,6 +566,8 @@ struct DecodedCell {
     style: gridcraft_model::StyleId,
     cell: Option<Cell>,
     picture: Option<Arc<gridcraft_model::CellPicture>>,
+    /// For a dynamic array's anchor, the range the file says its result spilled into.
+    spill: Option<RangeRef>,
 }
 
 /// Rows decoded off one slice of the part: packed into bands on the thread that decoded them, with
@@ -1055,6 +1089,9 @@ fn cell_pos(st: &mut RowState, c: &crate::rows::CellAttrs<'_>) -> Option<CellRef
 fn cell(dc: &DecodeCtx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &crate::rows::CellAttrs<'_>, warn: &mut Vec<String>) {
     let Some(pos) = cell_pos(st, c) else { return };
     let Some(d) = decode_cell(dc, warn, st, c, pos) else { return };
+    if let Some(range) = d.spill {
+        sheet.spill_ranges.insert(pos, range);
+    }
     if let Some(picture) = d.picture {
         sheet.set_picture(d.at, picture);
         sheet.set_style(d.at, d.style);
@@ -1132,20 +1169,37 @@ fn decode_cell(dc: &DecodeCtx<'_>, warn: &mut Vec<String>, st: &mut RowState, c:
         if c.f.is_some() {
             warn.push("formula-generated cell pictures were imported as static pictures; their formulas were not retained".into());
         }
-        return Some(DecodedCell { at: pos, style, cell: None, picture: Some(picture) });
+        return Some(DecodedCell { at: pos, style, cell: None, picture: Some(picture), spill: None });
     }
     let dynamic = c.cm;
-    let formula = c.f.as_ref().and_then(|f| read_formula(warn, st, f, pos, dynamic));
-    let value = if formula.is_none() && st.dynamic.iter().any(|r| r.contains(pos) && r.start != pos) { Value::Empty } else { value };
-    Some(DecodedCell { at: pos, style, cell: Some(Cell { value, formula: formula.map(Arc::new), style }), picture: None })
+    let (formula, spill) = match c.f.as_ref().and_then(|f| read_formula(warn, st, f, pos, dynamic)) {
+        Some((fm, spill)) => (Some(fm), spill),
+        None => (None, None),
+    };
+    let value = if formula.is_none() && st.derived.iter().any(|r| r.contains(pos) && r.start != pos) { Value::Empty } else { value };
+    Some(DecodedCell { at: pos, style, cell: Some(Cell { value, formula: formula.map(Arc::new), style }), picture: None, spill })
 }
 
-fn read_formula(warn: &mut Vec<String>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
+/// The formula and, for a dynamic array that spills into more than its anchor, the file's `ref`
+/// range.
+fn read_formula(
+    warn: &mut Vec<String>,
+    st: &mut RowState,
+    f: &crate::rows::FormulaAttrs<'_>,
+    pos: CellRef,
+    dynamic: bool,
+) -> Option<(Formula, Option<RangeRef>)> {
     // Keep the file's dynamic-array mark, so saving never turns the formula into a legacy one.
-    read_formula_text(warn, st, f, pos, dynamic).map(|fm| Formula { dynamic, ..fm })
+    read_formula_text(warn, st, f, pos, dynamic).map(|(fm, spill)| (Formula { dynamic, ..fm }, spill))
 }
 
-fn read_formula_text(warn: &mut Vec<String>, st: &mut RowState, f: &crate::rows::FormulaAttrs<'_>, pos: CellRef, dynamic: bool) -> Option<Formula> {
+fn read_formula_text(
+    warn: &mut Vec<String>,
+    st: &mut RowState,
+    f: &crate::rows::FormulaAttrs<'_>,
+    pos: CellRef,
+    dynamic: bool,
+) -> Option<(Formula, Option<RangeRef>)> {
     let model = from_file(f.text.trim());
     let text = model.as_str();
     match f.kind.unwrap_or("normal") {
@@ -1154,20 +1208,23 @@ fn read_formula_text(warn: &mut Vec<String>, st: &mut RowState, f: &crate::rows:
             if !text.is_empty() {
                 let expr = gridcraft_formula::parse(text).ok();
                 st.shared.insert(si, Shared { anchor: pos, expr, text: text.to_string() });
-                Some(Formula::new(text))
+                Some((Formula::new(text), None))
             } else {
                 let Some(sh) = st.shared.get(&si) else {
                     warn.push("a shared formula refers to a missing master cell; kept the cached value".into());
                     return None;
                 };
-                Some(match &sh.expr {
-                    Some(e) => {
-                        let dr = pos.row as i64 - sh.anchor.row as i64;
-                        let dc = pos.col as i64 - sh.anchor.col as i64;
-                        Formula::from_expr(gridcraft_formula::adjust::shift_relative(e.clone(), dr, dc))
-                    }
-                    None => Formula::new(&sh.text),
-                })
+                Some((
+                    match &sh.expr {
+                        Some(e) => {
+                            let dr = pos.row as i64 - sh.anchor.row as i64;
+                            let dc = pos.col as i64 - sh.anchor.col as i64;
+                            Formula::from_expr(gridcraft_formula::adjust::shift_relative(e.clone(), dr, dc))
+                        }
+                        None => Formula::new(&sh.text),
+                    },
+                    None,
+                ))
             }
         }
         "array" => {
@@ -1176,13 +1233,16 @@ fn read_formula_text(warn: &mut Vec<String>, st: &mut RowState, f: &crate::rows:
             }
             let mut fm = Formula::new(text);
             let range = f.range.and_then(RangeRef::parse).unwrap_or(RangeRef::cell(pos));
+            if dynamic {
+                // The file names the range the result occupies; its inner cells are cached values
+                // that [`adopt_spills`] hands to the sheet after all rows are read.
+                return Some((fm, (!range.is_single()).then_some(range)));
+            }
             if !range.is_single() {
-                st.dynamic.push(range);
+                st.derived.push(range);
             }
-            if !dynamic {
-                fm.array = Some(range);
-            }
-            Some(fm)
+            fm.array = Some(range);
+            Some((fm, None))
         }
         "dataTable" => {
             warn.push("what-if data tables are not supported; kept their values".into());
@@ -1192,7 +1252,7 @@ fn read_formula_text(warn: &mut Vec<String>, st: &mut RowState, f: &crate::rows:
             if text.is_empty() {
                 None
             } else {
-                Some(Formula::new(text))
+                Some((Formula::new(text), None))
             }
         }
     }
