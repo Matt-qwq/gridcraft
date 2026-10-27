@@ -165,6 +165,21 @@ mod tests {
     }
 
     #[test]
+    fn struct_refs_with_a_bang_in_the_column_round_trip() {
+        // Found by the command-sequence fuzzer: a table column named `#SPILL!` became
+        // `'Table1[[#This Row],[''#SPILL'!]]` on save, because the file form is carried as a
+        // name and the name printer split it at the `!` as a sheet qualifier.
+        for f in ["Table1[@['#SPILL!]]", "Table1[[#This Row],['#SPILL!]]", "Table1[Wow!]", "Table1['Wow!']", "Sales[@Units]+1"] {
+            // The model keeps the shorthand form, so compare save/reopen with the canonical text.
+            let canon = from_file(f);
+            let file = to_file(&Formula::new(&canon));
+            assert_eq!(from_file(&file), canon, "{f} -> {canon} -> {file}");
+        }
+        assert_eq!(to_file(&Formula::new("Table1[@['#SPILL!]]")), "Table1[[#This Row],['#SPILL!]]");
+        assert_eq!(to_file(&Formula::new("Table1[Wow!]")), "Table1[Wow!]");
+    }
+
+    #[test]
     fn unbracketed_this_row_column() {
         assert_eq!(from_file("Sales[[#This Row],Units]*[[#This Row],Price]"), "Sales[@Units]*[@Price]");
     }

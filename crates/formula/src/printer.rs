@@ -178,9 +178,12 @@ fn write_expr(s: &mut String, e: &Expr, r1c1: Option<CellRef>) {
             Some(at) => s.push_str(&reference_r1c1(r, at)),
             None => s.push_str(&reference_a1(r)),
         },
+        // A sheet-qualified name is stored with the bare sheet name (`My Sheet!Total`): quote it
+        // so it parses back. A structured reference carried as a name (`Table1[[#This Row],[Col]]`,
+        // see `fmla::expr_to_file`) must not be split: its `!` belongs to a column name, and a
+        // defined name can never hold `[`.
         Expr::Name(n) => match n.rsplit_once('!') {
-            // A sheet-qualified name is stored with the bare sheet name (`My Sheet!Total`): quote it so it parses back.
-            Some((sheet, name)) => {
+            Some((sheet, name)) if !n.contains('[') => {
                 s.push_str(&quote_sheet(sheet));
                 s.push('!');
                 s.push_str(name);
