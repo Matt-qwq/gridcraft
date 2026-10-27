@@ -267,6 +267,11 @@ A full recalculation of the same sheet fell from 281–289 to 134–147 ms for t
 is still single-threaded and evaluated in row-major order: threading is the gate for sheets past
 ~200k dependents, not for the 100k case any more.
 
+Checked on the real report: `cell_digest real_117m.xlsx` is still `f5b186062e525ec8` over
+31,709,565 cells, and `recalc_check big_1281m.xlsx` still reports the same 159 cells whose cache
+Excel left stale (79,552 formulas; 0 cells only after recalc), with a warm open of 3.2 s and a full
+recalculation of 3.9–4.1 s — the same range as before this round, on a noisy machine.
+
 **Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
 band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
 `MIN`, `MAX`. The scalar evaluator stays the fallback for everything else; nothing changes about
