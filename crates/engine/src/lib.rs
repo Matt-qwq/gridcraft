@@ -323,6 +323,10 @@ pub struct Session {
     /// Measures cell text for AutoFit Column Width. Without it (CLI, MCP) AutoFit uses
     /// [`cmd::format::approx_text_width`].
     pub text_width: Option<TextWidth>,
+    /// How many commands are running. A command that works by calling others (`data.subtotal`
+    /// inserts rows and sets cells) is one user action: only the outermost one takes an undo
+    /// snapshot, which is also what keeps a 24-group Subtotal from filling the history.
+    command_depth: u32,
 }
 
 impl Session {
@@ -420,8 +424,11 @@ impl Session {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
         let before = self.active().map(|d| (d.uid, d.wb.clone(), d.selection.clone()));
+        let outer = self.command_depth == 0;
+        self.command_depth = self.command_depth.saturating_add(1);
         let params = if params.is_null() { Json::Object(Default::default()) } else { params };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)));
+        self.command_depth = self.command_depth.saturating_sub(1);
         let result = match result {
             Ok(r) => r,
             Err(p) => {
@@ -438,10 +445,11 @@ impl Session {
                 return Err(EngineError::Internal(id.to_string(), msg));
             }
         };
-        if spec.journal && result.is_ok() {
+        if outer && spec.journal && result.is_ok() {
             self.push_journal(id, cmd::journal_params(&params));
         }
-        if spec.undoable
+        if outer
+            && spec.undoable
             && let Some((uid, wb, sel)) = before
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)

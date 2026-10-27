@@ -1507,6 +1507,22 @@ mod tests {
     }
 
     #[test]
+    fn subtotal_is_one_undo_step_however_many_groups() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let values = json!([["Group", "Value"], ["East", 1], ["East", 2], ["West", 3], ["West", 4], ["North", 5], ["North", 6]]);
+        s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+        let before = s.doc().unwrap().wb.clone();
+        let undo_len = s.doc().unwrap().undo.len();
+        // Three groups mean twelve inner commands (rows, labels, formulas, bold, group); the user
+        // pressed Subtotal once, so one Ctrl+Z must take it all back.
+        s.execute("data.subtotal", json!({"range": "A1:B7", "groupBy": "A", "function": "sum", "columns": ["B"]})).unwrap();
+        assert_eq!(s.doc().unwrap().undo.len(), undo_len + 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(*s.doc().unwrap().wb, *before);
+    }
+
+    #[test]
     fn subtotal_honours_header_false() {
         // #131: with header:false the first data row was treated as a header and left out of its
         // group's subtotal and the grand total.
