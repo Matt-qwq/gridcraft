@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (the trust-track soak is green at 500 seeds; spilled arrays reopen from the file and nine soak findings are fixed) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (the 100k-dependent edit is 65–75 ms, inside the 100 ms gate, single-threaded) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -135,6 +135,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-27 | Recalc meets the 100k gate on one thread: an edit of A1 with 100,000 `=$A$1*2` cells is **65–75 ms**, down from 245 ms, and a full recalc of the same sheet 134–147 ms (was 281–289). The pass now reads parsed formulas and legacy array ranges from the dependency graph rather than rebuilding 100k cells, keeps one `Slot` per result (an empty value means in progress), writes values row-major through `CellStore::set_values` (no `Cell` built, no formula or style lookup), shares each row's `Arc<RowExtras>` when a band is copied for undo, charges undo from a cached `Formula::expr_bytes`, checks legacy arrays only at or above the lowest edited row, and reads a single-cell reference without an area vector. The evaluator is still single-threaded; threading is the gate past ~200k dependents |
 | 2026-10-27 | Trust track closed: a 500-seed command-sequence soak (200 commands each, 100,000 commands, release, 49 min) is green. Reopening a file now rebuilds each dynamic array's spill from the anchor's `ref` and its cached values instead of recalculating it, so a contested area keeps its owner; F9 prefers the arrays that actually spill and lets a grow-back owner reclaim its cells. A swallowed `#CIRC!` (COUNTIF over its own column) is explicit; `_sc_*` view-state names are invisible to formulas; table filters, blocked legacy arrays and merges cut by Insert/Delete Cells are handled; the harness tells a byte-capped undo history from an undo bug. Remaining caveat: the file can't cache `#SPILL!`/`#CALC!` or `#CIRC!` (still to verify the first with a licensed Excel) |
 | 2026-10-26 | Stability soak: 100 seeds × 200 commands in release found five real defects, four fixed here — Merge Across of whole columns froze on 1,048,576 merges, a table's total row could overlap another table, Insert Subtotals took a dozen undo steps per group, and a table column containing `!` was changed by save/reload. The fuzz harness now bounds episodes by undo bytes, traces steps and names the differing sheet field. Two more followed: a dynamic array that spills over its own source is now `#CIRC!` (it used to spill with some elements `#CIRC!`), and two arrays that contest cells keep their owner across F9. Three seeds remain, two of them about spilled arrays in files (repros in gaps §10 and plan/HANDOVER.md) |
 | 2026-10-26 | Charts: all 25 kinds created, saved and reopened (`_gridcraft-bench/chart_rt`); kind, title, legend, labels, gridlines, axis titles and every series' ranges survive. Two real losses fixed: a stock chart without 3–4 series is now refused instead of being written as a line chart, and histogram/waterfall/funnel/treemap/sunburst/box & whisker charts start at the style their chartex part reports instead of changing 1 → 2 on the first save. Recalc: a 100k-dependent edit is 223–251 ms (gate 100), a full pass 267 ms; whole-column references are already clipped — `SUM(A:A)` folds a million cells in 21.5 ms and a ten-row used range in 0.0 ms |
@@ -224,6 +225,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-27 | minor | 100k-dependent recalculation gate met single-threaded (245 → 65–75 ms; full recalc 281–289 → 134–147 ms); gaps §2 and roadmap M18 record the split |
 | 2026-10-26 | minor | Spill contests: self-spilling arrays are `#CIRC!`, F9 keeps the owner; gaps §10 down to three open seeds |
 | 2026-10-26 | minor | Stability soak in the progress log; gaps §10 records the four fixed defects and the four open spill-conflict seeds |
 | 2026-10-26 | minor | Chart round-trip measured for all 25 kinds (stock selection refused, chartex style settled); recalc and whole-column-reference timings |

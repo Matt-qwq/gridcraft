@@ -52,6 +52,11 @@ pub type Key = (usize, CellRef);
 struct Node {
     areas: Vec<Area>,
     dynamic: bool,
+    /// The parsed formula, shared with the cell: a pass reads it from here instead of rebuilding
+    /// the cell (which copies its value and both side tables) once per formula.
+    expr: Option<std::sync::Arc<Expr>>,
+    /// The range of a legacy (Ctrl+Shift+Enter) array formula, if this is its anchor.
+    legacy: Option<RangeRef>,
 }
 
 /// Ranges wider than this many columns go to the per-sheet wide index instead of per-column ones.
@@ -454,15 +459,25 @@ const MAX_CACHED_BLOCK_CELLS: usize = 4_000_000;
 /// All shared blocks together, at 24 bytes a value.
 const MAX_CACHED_BLOCK_CELLS_TOTAL: usize = 4_000_000;
 
+/// One formula's state in a pass: its value once calculated, `None` while it is being evaluated
+/// (which is what makes reading it a circular reference).
+#[derive(Clone, Debug, Default)]
+struct Slot {
+    value: Option<Value>,
+}
+
 struct PassHost<'a> {
     wb: &'a Workbook,
     /// The dependency graph as it stands at the start of the pass: an array's own references,
     /// for the self-overlap check.
     graph: &'a Graph,
     exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
-    results: HashMap<Key, Value>,
-    pending: HashSet<Key>,
-    in_progress: HashSet<Key>,
+    /// The anchors of legacy array formulas in this pass (usually none).
+    legacy: &'a HashMap<Key, RangeRef>,
+    results: HashMap<Key, Slot>,
+    /// Formulas whose slot has no value yet. Zero for all of a row-major pass, which is when the
+    /// "is it already being evaluated?" hash lookup can be skipped.
+    in_flight: usize,
     /// New spills found during the pass: anchor → array.
     spills: HashMap<Key, std::sync::Arc<Array>>,
     /// Used range per sheet: the workbook doesn't change during a pass, and working it out walks
@@ -533,14 +548,21 @@ impl<'a> PassHost<'a> {
         })
     }
 
-    fn new(wb: &'a Workbook, graph: &'a Graph, exprs: &'a HashMap<Key, std::sync::Arc<Expr>>, rng: &'a mut u64, now: f64) -> Self {
+    fn new(
+        wb: &'a Workbook,
+        graph: &'a Graph,
+        exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
+        legacy: &'a HashMap<Key, RangeRef>,
+        rng: &'a mut u64,
+        now: f64,
+    ) -> Self {
         PassHost {
             wb,
             graph,
             exprs,
+            legacy,
             results: HashMap::with_capacity_and_hasher(exprs.len(), Default::default()),
-            pending: exprs.keys().copied().collect(),
-            in_progress: HashSet::default(),
+            in_flight: 0,
             spills: HashMap::default(),
             used: HashMap::default(),
             blocks: HashMap::default(),
@@ -662,25 +684,27 @@ impl PassHost<'_> {
     }
 
     fn compute(&mut self, k: Key) -> Value {
-        if let Some(v) = self.results.get(&k) {
+        if let Some(v) = self.results.get(&k).and_then(|s| s.value.as_ref()) {
             let v = v.clone();
             if self.iterate && self.tainted.contains(&k) {
                 self.taint = true;
             }
             return v;
         }
+        // A slot without a value is a formula being evaluated: reading it is a circular reference.
+        let running = self.in_flight > 0 && self.results.contains_key(&k);
         let Some(expr) = self.exprs.get(&k) else {
             return self.wb.sheet(k.0).map(|s| s.value(k.1)).unwrap_or_default();
         };
         if self.suspend.is_some() {
             // Unwinding to `calculate`: the value is thrown away. A formula read at the limit is
             // calculated with the suspended one, so the evaluations are not restarted for each.
-            if self.depth >= MAX_NESTED && !self.in_progress.contains(&k) && !self.waiting.contains(&k) {
+            if self.depth >= MAX_NESTED && !running && !self.waiting.contains(&k) {
                 self.also.push(k);
             }
             return Value::Error(CellError::Calc);
         }
-        if self.in_progress.contains(&k) || self.waiting.contains(&k) {
+        if running || (!self.waiting.is_empty() && self.waiting.contains(&k)) {
             self.cycle = true;
             if self.iterate {
                 return self.circular_read(k);
@@ -695,7 +719,8 @@ impl PassHost<'_> {
             self.suspend = Some(k);
             return Value::Error(CellError::Calc);
         }
-        self.in_progress.insert(k);
+        self.results.insert(k, Slot::default());
+        self.in_flight += 1;
         self.depth += 1;
         let outer_taint = std::mem::replace(&mut self.taint, false);
         if self.iterate {
@@ -709,7 +734,8 @@ impl PassHost<'_> {
         if self.suspend.is_some() {
             // Abandoned: `calculate` evaluates this formula again once the one it needs is done.
             self.depth -= 1;
-            self.in_progress.remove(&k);
+            self.results.remove(&k);
+            self.in_flight = self.in_flight.saturating_sub(1);
             self.abandoned.push(k);
             if self.iterate {
                 self.stack.pop();
@@ -718,14 +744,12 @@ impl PassHost<'_> {
             return Value::Error(CellError::Calc);
         }
         // A legacy array formula fills the range it was entered in.
-        let legacy = self.wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula).and_then(|f| f.array);
+        let legacy = if self.legacy.is_empty() { None } else { self.legacy.get(&k).copied() };
         let v = match legacy {
             Some(range) => fit_to_range(v, range),
             None => v,
         };
         self.depth -= 1;
-        self.in_progress.remove(&k);
-        self.pending.remove(&k);
         if self.iterate {
             self.stack.pop();
             if self.taint {
@@ -773,7 +797,8 @@ impl PassHost<'_> {
             }
             _ => v,
         };
-        self.results.insert(k, v.clone());
+        self.results.insert(k, Slot { value: Some(v.clone()) });
+        self.in_flight = self.in_flight.saturating_sub(1);
         v
     }
 
@@ -813,8 +838,7 @@ impl PassHost<'_> {
         let max_passes = u32::try_from(MAX_ITERATION_WORK / again.len().max(1)).unwrap_or(u32::MAX).max(1);
         let mut passes = 1u32;
         while passes < max_iterations.min(max_passes) && !self.converged(max_change) {
-            self.prev = again.iter().filter_map(|k| self.results.remove(k).map(|v| (*k, v))).collect();
-            self.pending = set.clone();
+            self.prev = again.iter().filter_map(|k| self.results.remove(k).and_then(|s| s.value).map(|v| (*k, v))).collect();
             self.spills.retain(|a, _| !set.contains(a));
             for k in &again {
                 self.calculate(*k);
@@ -828,7 +852,7 @@ impl PassHost<'_> {
     /// logical and error values: not at all).
     fn converged(&self, max_change: f64) -> bool {
         self.members.iter().all(|k| {
-            let Some(new) = self.results.get(k) else { return true };
+            let Some(new) = self.results.get(k).and_then(|s| s.value.as_ref()) else { return true };
             match (new, &self.previous(*k)) {
                 (Value::Number(a), Value::Number(b)) => {
                     let d = (a - b).abs();
@@ -870,7 +894,7 @@ impl Host for PassHost<'_> {
     }
     fn spill_range(&mut self, sheet: usize, anchor: CellRef) -> Option<RangeRef> {
         let k = (sheet, anchor);
-        if !(self.pending.contains(&k) || self.results.contains_key(&k)) {
+        if !self.exprs.contains_key(&k) {
             return self.wb.sheet(sheet)?.spill_ranges.get(&anchor).copied();
         }
         // Recalculated in this pass: its new array, unless something blocks it (#SPILL!).
@@ -890,7 +914,7 @@ impl Host for PassHost<'_> {
     }
     fn cell_value(&mut self, sheet: usize, c: CellRef) -> Value {
         let k = (sheet, c);
-        if self.pending.contains(&k) || self.results.contains_key(&k) {
+        if self.exprs.contains_key(&k) {
             return self.compute(k);
         }
         // A cell covered by a spill computed in this pass.
@@ -951,7 +975,7 @@ impl Host for PassHost<'_> {
         let stable = !self.iterate
             && sh.cells.formula_cells(range).all(|c| {
                 let k = (sheet, c);
-                self.results.contains_key(&k) || !self.exprs.contains_key(&k)
+                self.results.get(&k).is_some_and(|s| s.value.is_some()) || !self.exprs.contains_key(&k)
             });
         if !stable {
             return None;
@@ -1154,9 +1178,9 @@ impl Calc {
         self.graph = Graph::default();
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, f, _) in sheet.cells.formulas() {
-                if let Some(e) = f.expr() {
+                if let Some(e) = f.expr_arc() {
                     let (areas, dynamic) = precedents(wb, si, &e);
-                    self.graph.insert((si, c), Node { areas, dynamic });
+                    self.graph.insert((si, c), Node { areas, dynamic, expr: Some(e), legacy: f.array });
                 }
             }
         }
@@ -1229,10 +1253,11 @@ impl Calc {
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
         for &k in changed {
             let formula = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.clone());
-            match formula.and_then(|f| f.expr()) {
-                Some(e) => {
+            let parsed = formula.as_ref().and_then(|f| f.expr_arc().map(|e| (e, f.array)));
+            match parsed {
+                Some((e, legacy)) => {
                     let (areas, dynamic) = precedents(wb, k.0, &e);
-                    self.graph.insert(k, Node { areas, dynamic });
+                    self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy });
                 }
                 None => {
                     self.graph.remove(k);
@@ -1360,17 +1385,25 @@ impl Calc {
             }
             // Row-major order is a good topological guess; on-demand evaluation fixes the rest.
             dirty.sort_by_key(|(s, c)| (*s, c.row, c.col));
+            // The graph already holds each formula's parsed expression (and the range of a
+            // legacy array): the pass reads them from there instead of rebuilding 100k cells.
             let mut exprs: HashMap<Key, std::sync::Arc<Expr>> = HashMap::with_capacity_and_hasher(dirty.len(), Default::default());
+            let mut legacy: HashMap<Key, RangeRef> = HashMap::default();
             for k in &dirty {
-                if let Some(e) = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula).and_then(|f| f.expr_arc()) {
-                    exprs.insert(*k, e);
+                if let Some(node) = self.graph.nodes.get(k) {
+                    if let Some(e) = &node.expr {
+                        exprs.insert(*k, std::sync::Arc::clone(e));
+                    }
+                    if let Some(r) = node.legacy {
+                        legacy.insert(*k, r);
+                    }
                 }
             }
             let now = self.now();
             let mut rng = self.rng;
             let tp = prof_now();
             let (mut results, mut spills, cycles) = {
-                let mut host = PassHost::new(wb, &self.graph, &exprs, &mut rng, now);
+                let mut host = PassHost::new(wb, &self.graph, &exprs, &legacy, &mut rng, now);
                 host.iterate = wb.calc.iterative;
                 for k in &dirty {
                     host.calculate(*k);
@@ -1391,7 +1424,7 @@ impl Calc {
             // pass happened to compute them in (found by the command-sequence fuzzer).
             if !wb.calc.iterative && !cycles.is_empty() {
                 for k in &cycles {
-                    results.insert(*k, Value::Error(CellError::Circ));
+                    results.insert(*k, Slot { value: Some(Value::Error(CellError::Circ)) });
                     spills.remove(k);
                 }
             }
@@ -1404,19 +1437,38 @@ impl Calc {
             // Write back.
             let mut spill_changes: Vec<Key> = Vec::new();
             let mut freed: Vec<(usize, RangeRef)> = Vec::new();
-            for (k, v) in results {
-                let Some(sheet) = wb.sheet_mut(k.0) else { continue };
-                if let Some(mut cell) = sheet.cells.get(k.1)
-                    && cell.value != v
-                {
-                    cell.value = v;
-                    sheet.cells.set(k.1, cell);
+            let twr = prof_now();
+            // Row-major order: the results come out of a hash map, and walking bands in row order
+            // is what makes the write-back touch each band once instead of jumping between 1,563
+            // of them at random. Values only change, so the store rewrites the packed slot and
+            // nothing else (no `Cell` built, no formula or style looked up).
+            let mut values: Vec<(Key, Value)> = results.into_iter().filter_map(|(k, s)| s.value.map(|v| (k, v))).collect();
+            values.sort_unstable_by_key(|(k, _)| (k.0, k.1.row, k.1.col));
+            // One sheet at a time, so the sheet's cells are borrowed once rather than looked up
+            // per value (the values are sorted by sheet, row and column).
+            let mut start = 0;
+            while start < values.len() {
+                let si = values[start].0.0;
+                let end = values[start..].partition_point(|(k, _)| k.0 == si) + start;
+                if let Some(sheet) = wb.sheet_mut(si) {
+                    let mut batch: Vec<(CellRef, Value)> = values[start..end].iter().map(|(k, v)| (k.1, v.clone())).collect();
+                    sheet.cells.set_values(&mut batch);
                 }
+                start = end;
+            }
+            drop(values);
+            let two = prof_now();
+            if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
+                eprintln!("  write values {:.1} ms", two - twr);
             }
             // Arrays that held a spill before this pass lay out first, so a contested area keeps
             // its owner; everything else follows in row-major order.
-            let ordered: Vec<Key> =
-                dirty.iter().copied().filter(|k| prefer.contains(k)).chain(dirty.iter().copied().filter(|k| !prefer.contains(k))).collect();
+            let any_spills = !spills.is_empty() || wb.sheets.iter().any(|s| !s.spill_ranges.is_empty() || !s.spill.is_empty());
+            let ordered: Vec<Key> = if any_spills {
+                dirty.iter().copied().filter(|k| prefer.contains(k)).chain(dirty.iter().copied().filter(|k| !prefer.contains(k))).collect()
+            } else {
+                Vec::new()
+            };
             for k in &ordered {
                 let new = spills.get(k);
                 let Some(sheet) = wb.sheet_mut(k.0) else { continue };
@@ -1543,7 +1595,7 @@ impl Calc {
                 // Everything was already evaluated once; spill dependents need another pass.
             }
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
-                eprintln!("  write-back {:.1} ms", prof_now() - tw);
+                eprintln!("  spills {:.1} ms, write-back {:.1} ms", prof_now() - two, prof_now() - tw);
             }
             spill_changes.sort_by_key(|(s, c)| (*s, c.row, c.col));
             spill_changes.dedup();
@@ -1577,9 +1629,10 @@ pub fn evaluate(wb: &Workbook, sheet: usize, at: CellRef, formula: &str) -> Valu
 
 pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> Value {
     let exprs = HashMap::default();
+    let legacy = HashMap::default();
     let graph = Graph::default();
     let mut rng = 0x1234_5678_9ABC_DEF0u64;
-    let mut host = PassHost::new(wb, &graph, &exprs, &mut rng, now_serial());
+    let mut host = PassHost::new(wb, &graph, &exprs, &legacy, &mut rng, now_serial());
     let mut ev = Evaluator::new(&mut host, sheet, at);
     ev.value(expr)
 }
@@ -1827,10 +1880,11 @@ pub(crate) mod tests {
         }
         let mut rng = 1u64;
         let graph = Graph::default();
-        let mut host = PassHost::new(&wb, &graph, &exprs, &mut rng, 0.0);
+        let legacy = HashMap::default();
+        let mut host = PassHost::new(&wb, &graph, &exprs, &legacy, &mut rng, 0.0);
         host.calculate((0, CellRef::parse("A1").unwrap()));
         let total = (WIDTH * (WIDTH + 1)) as f64;
-        assert_eq!(host.results.get(&(0, CellRef::parse("A1").unwrap())), Some(&Value::Number(total + 63.0)));
+        assert_eq!(host.results.get(&(0, CellRef::parse("A1").unwrap())).and_then(|s| s.value.as_ref()), Some(&Value::Number(total + 63.0)));
         assert!(host.cycles.is_empty());
         assert!(host.suspensions <= 3, "{} suspensions", host.suspensions);
     }
@@ -1850,7 +1904,8 @@ pub(crate) mod tests {
         // being calculated under it.
         let mut rng = 1u64;
         let graph = Graph::default();
-        let mut host = PassHost::new(wb, &graph, &exprs, &mut rng, 0.0);
+        let legacy = HashMap::default();
+        let mut host = PassHost::new(wb, &graph, &exprs, &legacy, &mut rng, 0.0);
 
         let mut seen = Vec::new();
         host.visit_range(0, range, &mut |v| {

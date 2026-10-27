@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-27 · **Change:** minor (trust-track soak closed: 500 seeds green; the large-workbook track is next) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-27 · **Change:** minor (the 100k-dependent recalculation gate is met single-threaded: 65–75 ms against 100; M18 records what moved it) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -235,9 +235,37 @@ The cost is linear and about a microsecond a formula, so the gate sits at ~50,00
 | 100,000 | 281 ms | **222 ms** | 2.2 µs |
 
 `cells_changed` already recalculates only the dependents, so the cost is the pass itself (graph
-lookup, evaluation, storing the value), not the dependency walk: a pass split across the machine's
-threads is the shape of the fix, and this table is its case. Whole-column references are not part of
-it: `SUM(A:A)` folds a million cells in 21.5 ms, and a ten-row used range in 0.0 ms.
+lookup, evaluation, storing the value), not the dependency walk. Whole-column references are not part
+of it: `SUM(A:A)` folds a million cells in 21.5 ms, and a ten-row used range in 0.0 ms.
+
+**Landed (10-27): the gate is met, single-threaded.** Same harness (`_gridcraft-bench/formula_bench`,
+release), same machine, before and after this round:
+
+At **100,000 dependents**: full recalc **134–147 ms** (was 281–289) and an edit of A1 **65–75 ms**
+(was 245), **0.65–0.75 µs a formula** (was 2.5); the 50,000-dependents edit is ~33–49 ms.
+
+- The pass reads each formula's parsed expression and legacy array range from the dependency graph
+  (`Node::expr`, `Node::legacy`), where `rebuild`/`cells_changed` already put them, instead of
+  rebuilding every cell for `expr_arc()`: the pass's `exprs` map is built in ~5.5 ms (was ~25).
+  `results` is one `Slot` per formula whose empty value *is* the in-progress state — done and being
+  evaluated are a single lookup, and an `in_flight` counter lets a top-level pass skip the cycle
+  lookup entirely; the `pending` set is gone because the expression map says what is left.
+- Write-back sorts the results row-major and calls `CellStore::set_values`, which rewrites the packed
+  value slot in place and leaves the formula and style alone; a kind run moves only when the kind
+  changes (number → number does not). A band copied for undo shares each row's `Arc<RowExtras>`
+  (formulas and arrays) with the current workbook, which took the band-copy part of the write-back
+  from ~17 ms to ~0. Of the 66 ms, 37.6 is evaluation, 13.7 write-back, 5.4 the expression map, 4.5
+  the dependency closure, 2.2 undo accounting.
+- Undo accounting charges a formula's AST from `Formula::expr_bytes`, counted once when the formula
+  is parsed, instead of walking every formula of every band an edit touched: 22 → 2 ms.
+- `check_arrays` diffs first and looks for legacy array anchors only at or above the lowest edited
+  row: a row-1 edit on a 100k-formula sheet scans one formula instead of 100,000 (6.2 → 0.2 ms).
+- The evaluator reads a single-cell reference straight from the host (no one-area `Vec`) and folds a
+  one-operator binary without allocating the left-chain work list.
+
+A full recalculation of the same sheet fell from 281–289 to 134–147 ms for the same reasons. A pass
+is still single-threaded and evaluated in row-major order: threading is the gate for sheets past
+~200k dependents, not for the 100k case any more.
 
 **Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
 band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
@@ -509,6 +537,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-27 | minor | The 100k-dependent edit gate is met single-threaded: 245 → 65–75 ms (full recalculation 281–289 → 134–147 ms) by reading parsed formulas and legacy ranges from the graph, one `Slot` per result (in-progress is an empty value), row-major `CellStore::set_values`, `Arc<RowExtras>` band copies, cached `Formula::expr_bytes` for undo accounting, a diff-first `check_arrays`, and single-cell/one-operator fast paths in the evaluator |
 | 2026-10-27 | minor | The trust-track soak is closed: 500 seeds × 200 commands (100,000 commands, release, 49 min) are green. Reopening a file rebuilds spilled arrays from the anchor's `ref` and cached values (a contested area keeps its owner), F9 prefers real spill owners and lets a grow-back owner reclaim its cells, swallowed `#CIRC!` stays explicit, `_sc_*` view-state names are invisible to formulas, table filters and blocked legacy arrays round-trip, and Insert/Delete Cells refuses to cut a merge. The format's `#SPILL!`/`#CALC!`-as-`#VALUE!` cache is still to verify on a licensed Excel |
 | 2026-10-26 | minor | M19's band stripes landed in `store.rs`: packing −10%, a range scan −27%, row headers 108 → 48 bytes; on the 118 MB report, open 1.55 → 1.28 s and the model 191 → 163 MiB, `cell_digest` unchanged |
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |

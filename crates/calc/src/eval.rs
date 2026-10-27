@@ -172,6 +172,24 @@ impl<'h> Evaluator<'h> {
 
     /// Evaluates to a value (references are dereferenced; multi-cell → array).
     pub fn value(&mut self, e: &Expr) -> Value {
+        // A single-cell reference is by far the most common leaf (`=A1*2`, `=IF(B1>0,…)`): read
+        // the cell directly instead of building an area vector and dereferencing it. The result
+        // is exactly what `deref(Ev::R(areas))` gives for one single-cell area.
+        if let Expr::Ref(r) = e
+            && let range = r.range()
+            && range.is_single()
+        {
+            let sheet = match &r.sheet {
+                SheetSel::Current => Some(self.sheet),
+                other => match self.resolve_sheet(other) {
+                    Ok(sheets) => sheets.first().copied().filter(|_| sheets.len() == 1),
+                    Err(_) => None,
+                },
+            };
+            if let Some(sheet) = sheet {
+                return self.host.cell_value(sheet, range.start);
+            }
+        }
         let ev = self.eval(e);
         self.deref(ev)
     }
@@ -545,6 +563,13 @@ impl<'h> Evaluator<'h> {
                 }
             }
             _ => {
+                // The common shape is one operator over two terms: no chain to fold, so no work
+                // list to allocate.
+                let chained = matches!(a, Expr::Binary(o, _, _) if !matches!(o, BinOp::Range | BinOp::Union | BinOp::Intersect));
+                if !chained {
+                    let (x, y) = (self.value(a), self.value(b));
+                    return Ev::V(binary_values(op, &x, &y, self.host.workbook().date_system));
+                }
                 // A long chain such as A1+A2+…+A500 nests to the left: fold it in a loop instead
                 // of one level of recursion per operator (past the depth limit it was #CALC!).
                 let mut rest = vec![(op, b)];

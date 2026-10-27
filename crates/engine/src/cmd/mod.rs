@@ -431,18 +431,33 @@ fn check_arrays(old: &Workbook, new: &Workbook) -> Result<()> {
         if std::sync::Arc::ptr_eq(sh, after) {
             continue;
         }
+        // What changed, before looking for arrays: most commits change one cell (or only
+        // formatting), and `diff` shares every band it did not touch.
+        let changed: Vec<CellRef> = sh
+            .cells
+            .diff(&after.cells)
+            .into_iter()
+            .filter(|c| after.cell(*c).is_some_and(|x| x.formula.is_some() || !x.value.is_empty()) && !same_content(sh.cell(*c), after.cell(*c)))
+            .collect();
+        if changed.is_empty() {
+            continue;
+        }
+        // An array anchors at its top-left cell, so only anchors at or above the lowest edit can
+        // own a changed cell: a 100k-formula sheet whose first row was edited scans one formula,
+        // not a hundred thousand (formulas are yielded in row order).
+        let max_row = changed.iter().map(|c| c.row).max().unwrap_or(u32::MAX);
         // The anchors of multi-cell legacy (Ctrl+Shift+Enter) arrays; their other cells are
         // derived from the formula. A blocked array (no spilled values) still owns them.
-        let anchors: Vec<CellRef> =
-            sh.cells.formulas().filter_map(|(c, f, _)| f.array.filter(|r| !r.is_single() && r.start == c).map(|_| c)).collect();
+        let anchors: Vec<CellRef> = sh
+            .cells
+            .formulas()
+            .take_while(|(c, _, _)| c.row <= max_row)
+            .filter_map(|(c, f, _)| f.array.filter(|r| !r.is_single() && r.start == c).map(|_| c))
+            .collect();
         if anchors.is_empty() {
             continue;
         }
-        for c in sh.cells.diff(&after.cells) {
-            let filled = after.cell(c).is_some_and(|x| x.formula.is_some() || !x.value.is_empty());
-            if !filled || same_content(sh.cell(c), after.cell(c)) {
-                continue;
-            }
+        for c in changed {
             // The anchor still holds its array (replacing the whole array, anchor included, is
             // fine) and the edited cell is inside the range it occupies now.
             let in_array = anchors

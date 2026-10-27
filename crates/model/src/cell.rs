@@ -14,6 +14,10 @@ pub struct Formula {
     pub text: String,
     #[serde(skip)]
     pub expr: Option<Arc<Expr>>,
+    /// Bytes the parsed expression tree holds, counted when it is parsed. The undo budget reads
+    /// this instead of walking the tree of every formula in every band an edit touched.
+    #[serde(skip)]
+    pub expr_bytes: u32,
     /// Legacy array formula (Ctrl+Shift+Enter) covering this range; the formula lives in the
     /// top-left cell.
     pub array: Option<RangeRef>,
@@ -31,12 +35,12 @@ impl Formula {
     pub fn new(text: &str) -> Formula {
         let body = text.strip_prefix('=').unwrap_or(text);
         match gridcraft_formula::parse(body) {
-            Ok(e) => Formula { text: gridcraft_formula::print(&e), expr: Some(Arc::new(e)), array: None, dynamic: false },
-            Err(_) => Formula { text: body.to_string(), expr: None, array: None, dynamic: false },
+            Ok(e) => Formula { text: gridcraft_formula::print(&e), expr_bytes: expr_bytes(&e), expr: Some(Arc::new(e)), array: None, dynamic: false },
+            Err(_) => Formula { text: body.to_string(), expr: None, expr_bytes: 0, array: None, dynamic: false },
         }
     }
     pub fn from_expr(e: Expr) -> Formula {
-        Formula { text: gridcraft_formula::print(&e), expr: Some(Arc::new(e)), array: None, dynamic: false }
+        Formula { text: gridcraft_formula::print(&e), expr_bytes: expr_bytes(&e), expr: Some(Arc::new(e)), array: None, dynamic: false }
     }
     /// The parsed expression, re-parsing after deserialization.
     pub fn expr(&self) -> Option<Expr> {
@@ -46,6 +50,13 @@ impl Formula {
     pub fn expr_arc(&self) -> Option<Arc<Expr>> {
         self.expr.clone().or_else(|| gridcraft_formula::parse(&self.text).ok().map(Arc::new))
     }
+}
+
+/// Bytes an expression tree holds, node by node (the same figure [`Formula`] keeps).
+fn expr_bytes(e: &Expr) -> u32 {
+    let mut bytes = 0u32;
+    e.walk(&mut |_| bytes = bytes.saturating_add(std::mem::size_of::<Expr>() as u32));
+    bytes
 }
 
 /// A static picture stored as cell content, independent of floating drawing anchors.

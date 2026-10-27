@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (§10: the 500-seed soak is green; spilled arrays reopen from the file and nine soak findings are fixed) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (§2: the 100k-dependent edit gate is met at 65–75 ms; a full recalculation of the same sheet is 134–147 ms) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -41,17 +41,25 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   2.4 GB (24 B/cell); its per-band dictionaries are 1.3 GB of that, because every id and amount is
   distinct. Report-shaped data at the same count extrapolates to ~490 MiB. So the M19 acceptance
   (≤ 600 MB) holds at report density and paging is what the unique-key export needs.
-- **Missing:** multi-threaded recalc; 100k-dependent edit under 100 ms (was ~0.4 s); whole-sheet
+- **Landed (10-27): the 100k-dependent edit gate.** An edit of A1 with 100,000 `=$A$1*2` cells costs
+  **65–75 ms** against the 100 ms gate (was 245 ms; a full recalculation of the same sheet fell from
+  281–289 to 134–147 ms), single-threaded, 0.65–0.75 µs a formula. The pass reads parsed formulas and
+  legacy array ranges from the dependency graph instead of rebuilding 100k cells, keeps one `Slot`
+  per result (in-progress is an empty value), writes values row-major through
+  `CellStore::set_values`, shares each row's `Arc<RowExtras>` in a band copied for undo, charges undo
+  from a cached `Formula::expr_bytes`, diffs before looking for legacy array anchors, and reads a
+  single-cell reference without an area vector. Details and the phase split in
+  [`roadmap.md`](roadmap.md#m18--vectorized-aggregation-kernels--3045-h).
+- **Missing:** multi-threaded recalc (the next gate is sheets past ~200k dependents); whole-sheet
   operations bounded (#152, #151); memory proportional to the cells, never the file (the 1.28 GB,
   220k-cell workbook lives in 237 MiB), but no cold paging yet — the stripes are what makes a band
   one copy to page out; the per-band value dictionaries still cost full price when values do not
   repeat;
   structural edits still shift every cell below them; whole-column references are already clipped
-  (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms); a
-  100k-dependent edit costs 223–251 ms against the 100 ms gate (a full recalculation is 267 ms,
-  single-threaded). The 159 cells that still differ from the cached values of the 1.28 GB report are
-  Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the same workbook
-  cache `#N/A` — not a calculation difference.
+  (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms). The 159
+  cells that still differ from the cached values of the 1.28 GB report are Excel's stale cache — 276
+  cells of the same `IFERROR(XLOOKUP(...))` shape in the same workbook cache `#N/A` — not a
+  calculation difference.
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
   (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
@@ -156,9 +164,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   `#VALUE!`, following the claim that Excel refuses those error codes; **needs verification on a
   licensed Excel**) or `#CIRC!` (written as 0). A *literal* `#SPILL!` pasted as a value therefore
   comes back `#VALUE!`; formulas and spilled values are recalculated and agree.
-- **Next:** the trust track's soak is closed; the large-workbook track comes next (multi-threaded
-  and incremental recalculation, 100k dependents at 222 ms against the 100 ms gate).
-  Replays and details in `plan/HANDOVER.md`.
+- **Next:** the trust track's soak is closed and the 100k-dependent recalculation gate is met
+  single-threaded (65–75 ms against 100, gaps §2); multi-threaded recalculation for sheets past
+  ~200k dependents is the next large-workbook task. Replays and details in `plan/HANDOVER.md`.
 - **Estimate:** 12–16 h for this soak and its fixes; done.
 ## After beta
 
@@ -238,6 +246,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-27 | minor | §2: the 100k-dependent edit gate is met single-threaded (245 → 65–75 ms; full recalculation 281–289 → 134–147 ms) by reading formulas and legacy ranges from the graph, one result slot, row-major value writes, shared row extras, cached AST byte counts and a diff-first array check; §10 next step is multi-threaded recalc |
 | 2026-10-26 | minor | §10: self-spilling arrays are `#CIRC!` and a contested spill keeps its owner across F9; three seeds remain, two of them the file side of spilled arrays |
 | 2026-10-26 | minor | §10: 100-seed soak; Merge Across freeze, total-row overlap, Subtotal undo depth and a `!` column name fixed; four dynamic-array conflict seeds open with replays |
 | 2026-10-26 | minor | §2: whole-column references are already clipped (21.5 ms for `SUM(A:A)` over a million cells); a 100k-dependent edit measures 223–251 ms; the 159 remaining cells are Excel's stale cache, not a difference |

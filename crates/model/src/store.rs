@@ -329,8 +329,10 @@ struct BandRow {
     cells: u32,
     kind_runs: u32,
     style_runs: u32,
-    /// Held out of line: a row with neither a formula nor an array pays nothing for them.
-    extras: Option<Box<RowExtras>>,
+    /// Held out of line and shared: a band copied for a value edit (an undo snapshot keeps the
+    /// old one) shares the formulas and arrays of every row that did not change, instead of
+    /// copying one small vector per row.
+    extras: Option<Arc<RowExtras>>,
 }
 
 impl BandRow {
@@ -465,17 +467,17 @@ impl BandRow {
     fn set_formula(&mut self, col: u32, formula: Option<&Arc<Formula>>) {
         match formula {
             Some(f) => {
-                let e = self.extras.get_or_insert_with(Default::default);
+                let e = Arc::make_mut(self.extras.get_or_insert_with(Default::default));
                 match e.formulas.binary_search_by_key(&col, |(c, _)| *c) {
                     Ok(i) => e.formulas[i].1 = f.clone(),
                     Err(i) => e.formulas.insert(i, (col, f.clone())),
                 }
             }
             None => {
-                if let Some(e) = &mut self.extras
+                if let Some(e) = self.extras.as_mut()
                     && let Ok(i) = e.formulas.binary_search_by_key(&col, |(c, _)| *c)
                 {
-                    e.formulas.remove(i);
+                    Arc::make_mut(e).formulas.remove(i);
                 }
                 self.drop_unused_extras();
             }
@@ -485,17 +487,17 @@ impl BandRow {
     fn set_array(&mut self, col: u32, array: Option<&Arc<gridcraft_core::Array>>) {
         match array {
             Some(a) => {
-                let e = self.extras.get_or_insert_with(Default::default);
+                let e = Arc::make_mut(self.extras.get_or_insert_with(Default::default));
                 match e.arrays.binary_search_by_key(&col, |(c, _)| *c) {
                     Ok(i) => e.arrays[i].1 = a.clone(),
                     Err(i) => e.arrays.insert(i, (col, a.clone())),
                 }
             }
             None => {
-                if let Some(e) = &mut self.extras
+                if let Some(e) = self.extras.as_mut()
                     && let Ok(i) = e.arrays.binary_search_by_key(&col, |(c, _)| *c)
                 {
-                    e.arrays.remove(i);
+                    Arc::make_mut(e).arrays.remove(i);
                 }
                 self.drop_unused_extras();
             }
@@ -854,7 +856,7 @@ impl Band {
 
     /// Puts a payload that does not fit `u16` in the row's side table and returns its index there.
     fn push_wide(&mut self, at: usize, value: u64) -> u16 {
-        let extras = self.rows[at].extras.get_or_insert_with(Default::default);
+        let extras = Arc::make_mut(self.rows[at].extras.get_or_insert_with(Default::default));
         extras.wide.push(value);
         (extras.wide.len() - 1) as u16
     }
@@ -930,6 +932,37 @@ impl Band {
         }
     }
 
+    /// Replaces the value of a stored cell, keeping its formula and style. Returns false when no
+    /// cell is stored at `col` (a result has nowhere to go there). Saves what [`put`](Self::put)
+    /// costs for a cell that only changes value: nothing is constructed, no formula or style slot
+    /// is looked up, and the row already holds every stripe entry.
+    fn set_value(&mut self, row_key: u32, col: u32, value: &Value) -> bool {
+        let Some(at) = self.row_index(row_key) else { return false };
+        let Some(i) = self.rows[at].index_of(self, col) else { return false };
+        let (kind, payload) = self.payload(value);
+        let payload = match payload {
+            Payload::Small(p) => p,
+            Payload::Wide(v) => self.push_wide(at, v),
+        };
+        let slot = self.rows[at].cells_at as usize + i;
+        if let Some(p) = self.payloads.get_mut(slot) {
+            *p = payload;
+        }
+        // Most results keep their kind (`=A1*2` stays a number): the run stripe need not move.
+        if self.rows[at].kind_at(self, i) != kind {
+            let (kinds_at, old_kinds) = (self.rows[at].kinds_at, self.rows[at].kind_runs);
+            let kind_runs = runs_set(&mut self.kinds, kinds_at as usize, old_kinds as usize, i, u16::from(kind));
+            self.shift_offsets(at, (0, 0), (0, 0), (kinds_at, kind_runs as i32 - old_kinds as i32), (0, 0));
+            self.rows[at].kind_runs = kind_runs as u32;
+        }
+        match value {
+            Value::Array(a) => self.rows[at].set_array(col, Some(a)),
+            _ if self.rows[at].arrays().iter().any(|(c, _)| *c == col) => self.rows[at].set_array(col, None),
+            _ => {}
+        }
+        true
+    }
+
     /// Builds a whole row at once, from cells already sorted by column. The row's slices are
     /// appended to the band's stripes, so there is no growth slack to give back and no
     /// insert-per-cell shifting.
@@ -987,7 +1020,7 @@ impl Band {
             stored += 1;
         }
         let extras =
-            if formulas.is_empty() && arrays.is_empty() && wide.is_empty() { None } else { Some(Box::new(RowExtras { formulas, arrays, wide })) };
+            if formulas.is_empty() && arrays.is_empty() && wide.is_empty() { None } else { Some(Arc::new(RowExtras { formulas, arrays, wide })) };
         let row = BandRow {
             key: row_key,
             first,
@@ -1273,6 +1306,33 @@ impl CellStore {
         }
         if self.building.is_none() {
             self.building = self.bands.keys().next_back().copied();
+        }
+    }
+
+    /// Replaces the value of a cell that is already stored, keeping its formula and style. Returns
+    /// false when nothing is stored there.
+    ///
+    /// A recalculation only changes values, but [`set`](Self::set) rebuilds the whole `Cell` (and
+    /// takes the store's bands apart) for each one; at 100k results that is most of the write-back.
+    pub fn set_value(&mut self, c: CellRef, value: &Value) -> bool {
+        let Some(band) = self.bands.get_mut(&(c.row / BAND)) else { return false };
+        Arc::make_mut(band).set_value(c.row % BAND, c.col, value)
+    }
+
+    /// Replaces the values of cells that already exist. `values` must be sorted in row-major
+    /// order (the order a recalculation writes them in), so each band is looked up once.
+    pub fn set_values(&mut self, values: &mut [(CellRef, Value)]) {
+        let mut i = 0;
+        while i < values.len() {
+            let key = values[i].0.row / BAND;
+            let end = values[i..].partition_point(|(c, _)| c.row / BAND == key) + i;
+            if let Some(band) = self.bands.get_mut(&key) {
+                let band = Arc::make_mut(band);
+                for (c, v) in &values[i..end] {
+                    band.set_value(c.row % BAND, c.col, v);
+                }
+            }
+            i = end;
         }
     }
 
@@ -1609,7 +1669,8 @@ impl CellStore {
     pub fn retained_bytes_against(&self, newer: &CellStore) -> usize {
         let mut bytes = 0usize;
         for (key, band) in &self.bands {
-            if newer.bands.get(key).is_some_and(|b| Arc::ptr_eq(b, band)) {
+            let next = newer.bands.get(key);
+            if next.is_some_and(|b| Arc::ptr_eq(b, band)) {
                 continue;
             }
             bytes += std::mem::size_of::<Band>();
@@ -1618,17 +1679,27 @@ impl CellStore {
             bytes += band.payloads.capacity() * 2;
             bytes += band.styles.capacity() * 4;
             for row in &band.rows {
-                bytes += std::mem::size_of::<BandRow>() + row.formulas().len() * (4 + std::mem::size_of::<Formula>()) + row.arrays().len() * 8;
+                bytes += std::mem::size_of::<BandRow>();
+                // A value edit copies the band but shares each row's extras with the newer store;
+                // those formulas and arrays are live anyway, not storage the snapshot keeps.
+                let shared = next.and_then(|b| b.row(row.key)).is_some_and(|n| match (&row.extras, &n.extras) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                });
+                if shared {
+                    continue;
+                }
+                bytes += row.formulas().len() * (4 + std::mem::size_of::<Formula>()) + row.arrays().len() * 8;
+                for f in row.formulas().iter().map(|(_, f)| f) {
+                    // The parsed tree's size is counted when the formula is parsed: walking every
+                    // formula of every band an edit touched was most of what an undo entry cost.
+                    bytes += f.text.len() + f.expr_bytes as usize;
+                }
             }
             bytes += band.numbers.capacity() * 8 + band.number_slots.capacity() * 2;
             for t in &band.texts {
                 bytes += t.len() + std::mem::size_of::<Arc<str>>();
-            }
-            for f in band.rows.iter().flat_map(|r| r.formulas().iter().map(|(_, f)| f)) {
-                bytes += f.text.len();
-                if let Some(expr) = &f.expr {
-                    expr.walk(&mut |_| bytes += std::mem::size_of::<gridcraft_formula::Expr>());
-                }
             }
         }
         bytes
@@ -2009,6 +2080,56 @@ mod tests {
         s.set(c(5, 0), Cell::value(99.0.into()));
         assert_eq!(snap.get(c(5, 0)).unwrap().value, Value::Number(5.0));
         assert_eq!(s.get(c(5, 0)).unwrap().value, Value::Number(99.0));
+    }
+
+    #[test]
+    fn set_value_keeps_what_the_cell_is() {
+        let mut s = CellStore::new();
+        let styled = Cell { value: Value::Number(1.0), formula: Some(std::sync::Arc::new(Formula::new("=1+1"))), style: StyleId(3) };
+        s.set(c(0, 0), styled);
+        s.set(c(0, 1), Cell::value(Value::Number(2.0)));
+        assert!(s.set_value(c(0, 0), &Value::Text("changed".into())));
+        let cell = s.get(c(0, 0)).unwrap();
+        assert_eq!(cell.value, Value::Text("changed".into()));
+        assert_eq!(cell.formula.as_ref().map(|f| f.text.as_str()), Some("1+1"));
+        assert_eq!(cell.style, StyleId(3), "a value write keeps the cell's formatting");
+        assert_eq!(s.len(), 2);
+        // A cell that isn't stored gets no value (and is not created).
+        assert!(!s.set_value(c(9, 9), &Value::Number(5.0)));
+        assert!(s.get(c(9, 9)).is_none());
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn set_values_writes_in_row_order() {
+        let mut s = CellStore::new();
+        let mut values: Vec<(CellRef, Value)> = Vec::new();
+        for r in (0..200).rev() {
+            s.set(c(r, 4), Cell::formula(Formula::new("=1+1")));
+            values.push((c(r, 4), Value::Number(r as f64)));
+        }
+        values.sort_unstable_by_key(|(c, _)| (c.row, c.col));
+        s.set_values(&mut values);
+        for r in 0..200 {
+            assert_eq!(s.get(c(r, 4)).unwrap().value, Value::Number(r as f64));
+        }
+        assert_eq!(s.len(), 200);
+    }
+
+    /// A band copied for a value edit shares the formulas of its rows; changing one formula in
+    /// the copy must not change the snapshot's.
+    #[test]
+    fn formula_extras_are_shared_until_changed() {
+        let mut s = CellStore::new();
+        s.set(c(0, 0), Cell::formula(Formula::new("=1+1")));
+        s.set(c(0, 1), Cell::formula(Formula::new("=2+2")));
+        let mut copy = s.clone();
+        copy.set_value(c(0, 0), &Value::Number(7.0));
+        copy.set(c(0, 1), Cell::formula(Formula::new("=5+5")));
+        let text = |store: &CellStore, at| store.get(at).and_then(|x| x.formula).map(|f| f.text.clone());
+        assert_eq!(text(&s, c(0, 1)).as_deref(), Some("2+2"));
+        assert_eq!(text(&copy, c(0, 1)).as_deref(), Some("5+5"));
+        assert_eq!(text(&s, c(0, 0)).as_deref(), Some("1+1"));
     }
 
     #[test]
