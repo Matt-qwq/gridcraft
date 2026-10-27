@@ -278,8 +278,23 @@ impl Workbook {
         }
         Ok(())
     }
+    /// The prefix of GridCraft's own hidden names, which store view state (the Watch Window
+    /// list, custom views, scripts, scenarios) rather than workbook data.
+    const PRIVATE_NAME_PREFIX: &str = "_sc_";
+
+    /// Whether `name` is one of GridCraft's private state names. Formulas never see them: that
+    /// state is not cell content and survives undo (the Watch Window list isn't an edit), so a
+    /// formula reading it could keep a stale value when the name came or went (found by the
+    /// command-sequence fuzzer). The prefix is reserved for the app's own names.
+    pub fn is_private_name(name: &str) -> bool {
+        name.get(..Self::PRIVATE_NAME_PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(Self::PRIVATE_NAME_PREFIX))
+    }
+
     /// Finds a defined name visible from `sheet`: sheet scope first, then workbook scope.
     pub fn name(&self, name: &str, sheet: usize) -> Option<&DefinedName> {
+        if Self::is_private_name(name) {
+            return None;
+        }
         self.names
             .iter()
             .find(|n| n.scope == Some(sheet) && n.name.eq_ignore_ascii_case(name))
@@ -398,6 +413,22 @@ mod tests {
         let mut value: serde_json::Value = serde_json::from_str(&json).expect("value");
         value.as_object_mut().expect("an object").remove("phonetics");
         assert!(serde_json::from_value::<Workbook>(value).expect("older JSON").phonetics.is_empty());
+    }
+
+    #[test]
+    fn private_state_names_are_invisible_to_formulas() {
+        let mut wb = Workbook::new();
+        let defined = |name: &str| DefinedName { name: name.into(), scope: None, formula: "\"[]\"".into(), comment: String::new(), hidden: true };
+        wb.names.push(defined("_sc_watch"));
+        wb.names.push(defined("_SC_SCRIPTS"));
+        assert!(wb.name("_sc_watch", 0).is_none());
+        assert!(wb.name("_SC_WATCH", 0).is_none());
+        assert!(wb.name("_sc_scripts", 0).is_none());
+        wb.names.push(DefinedName { name: "Rate".into(), scope: None, formula: "0.2".into(), comment: String::new(), hidden: false });
+        assert!(wb.name("rate", 0).is_some());
+        assert!(Workbook::is_private_name("_sc_"));
+        assert!(!Workbook::is_private_name("_sc"));
+        assert!(!Workbook::is_private_name("Score"));
     }
 
     #[test]

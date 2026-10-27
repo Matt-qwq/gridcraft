@@ -4684,6 +4684,23 @@ fn html_export_without_pictures_or_charts_has_no_fixed_geometry() {
 }
 
 #[test]
+fn a_formula_never_reads_the_watch_list() {
+    // The Watch Window list is view state kept in a hidden `_sc_watch` name. It survives undo
+    // (deleting it is not an edit), so a formula that read it would keep a stale value when the
+    // name came or went (found by the command-sequence fuzzer). Private names are invisible to
+    // formulas: the reference is `#NAME?` before and after, and a full recalc agrees.
+    let mut s = s();
+    s.execute("formulas.watchWindow", json!({"add": "C12:E15"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C3", "input": "=SUM(_sc_watch)"})).unwrap();
+    assert_eq!(v(&s, "C3"), Value::Error(gridcraft_core::CellError::Name));
+    s.execute("formulas.deleteName", json!({"name": "_sc_watch"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(v(&s, "C3"), Value::Error(gridcraft_core::CellError::Name));
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(v(&s, "C3"), Value::Error(gridcraft_core::CellError::Name));
+}
+
+#[test]
 fn reopening_a_file_keeps_the_array_that_won_a_spill_contest() {
     // K7 spills over L7:M10 and L2 wants the same cells: whichever was entered first keeps them
     // and the other is #SPILL!. The file records the winner's range and its values, so opening it
