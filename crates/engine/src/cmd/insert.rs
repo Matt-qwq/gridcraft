@@ -371,6 +371,21 @@ fn table_flag(s: &mut Session, p: &Json, which: &str) -> Result<Json> {
     let on = bool_param(p, "on");
     edit(s, |cx| {
         let sh = cx.sheet_mut(si)?;
+        if which == "totals" {
+            // The total row takes the strip below the table: refuse when another table is there,
+            // before anything changes (a table that grows into its neighbour is an invalid file).
+            let Some(t) = sh.tables.get(ti) else { return Ok(Json::Null) };
+            if on.unwrap_or(!t.totals_row) && !t.totals_row {
+                let row = t.range.end.row.saturating_add(1);
+                if row >= MAX_ROWS {
+                    return Err(EngineError::Other("There's no room below the table for the total row.".into()));
+                }
+                let strip = RangeRef::new(CellRef::new(row, t.range.start.col), CellRef::new(row, t.range.end.col));
+                if sh.tables.iter().enumerate().any(|(i, o)| i != ti && o.range.intersects(&strip)) {
+                    return Err(EngineError::Other("A table can't overlap another table.".into()));
+                }
+            }
+        }
         let Some(t) = sh.tables.get_mut(ti) else { return Ok(Json::Null) };
         match which {
             "totals" => {
@@ -1773,6 +1788,23 @@ mod tests {
         let other = s.execute("cell.get", json!({"sheet": "Two", "cell": "A1"})).unwrap();
         assert_eq!(other["formula"], "=Sheet1!A3");
         assert_eq!(other["value"], json!(20.0));
+    }
+
+    #[test]
+    fn a_total_row_cannot_run_into_another_table() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["A", "B"], [1, 2], [3, 4]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B3", "name": "Grades"})).unwrap();
+        s.execute("range.setValues", json!({"range": "A4", "values": [["C", "D"]]})).unwrap();
+        s.execute("insert.table", json!({"range": "A4:B4", "name": "Sales"})).unwrap();
+        // The total row would take row 4, which is T2's header.
+        let err = s.execute("table.totalRow", json!({"table": "Grades", "on": true})).unwrap_err().to_string();
+        assert!(err.contains("overlap"), "{err}");
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        let t1 = sh.tables.iter().find(|t| t.name == "Grades").unwrap();
+        assert_eq!(t1.range, RangeRef::parse("A1:B3").unwrap());
+        assert!(!t1.totals_row);
     }
 
     #[test]
