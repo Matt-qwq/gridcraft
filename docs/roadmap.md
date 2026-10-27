@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (100M cells and 100k-dependents measured; M19 acceptance split by data density) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (M22 deferred with triggers; 100M cells and 100k-dependents measured) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -84,7 +84,7 @@ to check our files, and Windows machines with the reported GPU drivers.
 | M19 | Cold paging: bands leave memory when unused | planned |
 | M20 | Append-style structural edits (segments, no whole-sheet shifts) | planned |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading and linked tables remain |
-| M22 | A native working format (decision needed) | undecided |
+| M22 | A native working format | deferred with four measured triggers (10-26) |
 
 ## Large workbooks: what big-data engineering offers a spreadsheet
 
@@ -427,15 +427,33 @@ read lazily.
 capability: the data goes to the tools that already do it well, instead of a spreadsheet growing
 one.
 
-### M22 — A native working format (undecided) · 60–100 h
+### M22 — A native working format · deferred, with triggers (10-26)
 
 **Scope.** A block-based, append-friendly primary format that opens by mapping instead of parsing,
 saves incrementally, and has no 1,048,576-row ceiling; `.xlsx` becomes the import/export format.
 
-**Why it is not scheduled.** It contradicts the standing decision against a custom binary format.
+**Decision (10-26, owner: defer).** The condition for building it is that a native format be good
+enough to trade interoperability for *and* `.xlsx` bad enough to need trading. Neither holds on the
+measurements: the 31.7M-cell report opens in 1.37 s at 155 MiB, the 100M-cell export in 6.4 s, and
+no real workbook has hit the row or column cap in a case a sheet split cannot solve. A second format
+also costs a second write path forever, while `.xlsx` read and write stay a beta gate either way.
+It is reconsidered when one of these is measured:
+
+| Trigger | Threshold |
+|---|---|
+| Cold paging's spill file needs to be self-describing, versioned, crash-safe and randomly patchable | at M19's acceptance — the spill is then a format whether or not it is called one |
+| AutoSave of a 100M-cell workbook takes more than 2 s a save | an incremental save has to buy most of that back |
+| Real workbooks hit 1,048,576 rows or 16,384 columns and cannot be split | three independent cases |
+| Open time is dominated by parts the document does not need (shared strings, other sheets) | more than half of it, and streaming cannot skip them |
+
+If a trigger fires, the default shape is **one native container (blocks plus a manifest) with
+`.xlsx` as the import/export format**, not a replacement for it: interoperability is the product's
+floor, and "more than a million rows" is better served by M21's Parquet/Arrow export (20–30 h) than
+by a private format (60–100 h).
+
+**Why it was never scheduled.** It contradicts the standing decision against a custom binary format.
 That decision was about a *cache* (rebuildable, worthless without the file); a primary format is a
 different trade — speed and size against interoperability, and against every tool that reads xlsx.
-Needs the owner's call, not an agent's.
 
 ### Order, and why
 
@@ -495,6 +513,7 @@ Needs the owner's call, not an agent's.
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
 | 2026-10-25 | minor | The band-stripe round is written down to the functions it changes, with its acceptance tests |
 | 2026-10-25 | minor | `put_row` in one pass (packing 68 → 59 ns a cell, open 1.69 → 1.55 s) |
+| 2026-10-26 | minor | M22 decided: deferred, with four measured triggers and one native container plus `.xlsx` import/export as the shape if one fires; the measurements behind it (1.37 s / 155 MiB for the report, 6.4 s for 100M cells, no row-cap case) are cited |
 | 2026-10-26 | minor | M18 section gets the 100k-dependents measurement (223–251 ms an edit, 2.3 µs a formula) and the whole-column reference numbers (21.5 ms `SUM(A:A)` over a million cells, 0.0 ms on a ten-row used range) |
 | 2026-10-26 | minor | 100 million cells measured: 2.4 GB of model on a unique-key export (24 B/cell) against ~490 MiB extrapolated at report density; the two per-band dictionaries are 1.3 GB of it and paging is still the answer. `packed_breakdown` stops counting the text and style dictionaries twice (the report measures 155 MiB of cells, not 163) |
 | 2026-10-25 | minor | The zip container is written by us now, so the parts compress on several threads: deflate 1.76 → 1.18 s, a save 4.2 → 3.7 s, every part verified to unpack to the same bytes with Python's `zipfile` |
