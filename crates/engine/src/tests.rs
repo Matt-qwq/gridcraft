@@ -2061,6 +2061,24 @@ fn part_of_a_legacy_array_cant_be_changed() {
 }
 
 #[test]
+fn a_blocked_legacy_array_still_owns_its_cells() {
+    // A multi-cell array that cannot spill (a merge inside it) has no spilled values to notice,
+    // so editing one of its cells used to be allowed; the file then dropped the value on open
+    // because the array still covered the cell (found by the command-sequence fuzzer).
+    let mut s = s();
+    s.execute("home.mergeCells", json!({"range": "C1:D1"})).unwrap();
+    s.execute("selection.set", json!({"range": "A1:C3"})).unwrap();
+    s.execute("cell.set", json!({"input": "=1", "array": true})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Error(gridcraft_core::CellError::Spill));
+    let e = s.execute("range.setValues", json!({"range": "B2", "values": [[9]]})).unwrap_err();
+    assert!(e.to_string().contains("part of an array"), "{e}");
+    assert!(v(&s, "B2").is_empty(), "the refused edit changed nothing");
+    reopen(&mut s);
+    assert_eq!(v(&s, "A1"), Value::Error(gridcraft_core::CellError::Spill));
+    assert!(v(&s, "B2").is_empty(), "the cell stayed with the array after reopening");
+}
+
+#[test]
 fn create_names_from_selection() {
     let names = |s: &Session| -> Vec<(String, String)> {
         let mut v: Vec<_> = s.doc().unwrap().wb.names.iter().map(|n| (n.name.clone(), n.formula.clone())).collect();
