@@ -120,6 +120,10 @@ pub struct DocState {
     /// user trusts it in this session (`automate.trustScripts`); one with no scripts starts
     /// trusted, since any script it gains later was written here.
     pub scripts_trusted: bool,
+    /// History entries the byte cap has dropped in this document (either stack). Undoing or
+    /// redoing everything then stops short of the state it started from, which the fuzz harness
+    /// has to know to compare fairly.
+    pub history_dropped: u64,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -148,8 +152,9 @@ fn history_retained_bytes(older: &Workbook, newer: &Workbook) -> usize {
     bytes
 }
 
-fn push_history(history: &mut Vec<HistoryEntry>, label: String, wb: Arc<Workbook>, next: &Workbook, selection: Selection) {
-    push_history_with_budget(history, label, wb, next, selection, UNDO_BYTES_LIMIT);
+/// Pushes an undo entry, dropping the oldest ones past the byte budget; returns how many went.
+fn push_history(history: &mut Vec<HistoryEntry>, label: String, wb: Arc<Workbook>, next: &Workbook, selection: Selection) -> usize {
+    push_history_with_budget(history, label, wb, next, selection, UNDO_BYTES_LIMIT)
 }
 
 fn push_history_with_budget(
@@ -159,14 +164,17 @@ fn push_history_with_budget(
     next: &Workbook,
     selection: Selection,
     byte_budget: usize,
-) {
+) -> usize {
     let retained_bytes = history_retained_bytes(&wb, next);
     history.push(HistoryEntry { label, wb, selection, retained_bytes });
     let mut total = history.iter().fold(0usize, |sum, entry| sum.saturating_add(entry.retained_bytes));
+    let mut dropped = 0;
     // Always preserve the latest action, even if that one edit exceeds the budget.
     while history.len() > 1 && (history.len() > UNDO_LIMIT || total > byte_budget) {
         total = total.saturating_sub(history.remove(0).retained_bytes);
+        dropped += 1;
     }
+    dropped
 }
 
 impl DocState {
@@ -191,6 +199,7 @@ impl DocState {
             unlocked_ranges: vec![],
             content_kind: None,
             scripts_trusted,
+            history_dropped: 0,
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -454,7 +463,7 @@ impl Session {
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
-            push_history(&mut d.undo, spec.label.trim_end_matches('…').to_string(), wb, &d.wb, sel);
+            d.history_dropped += push_history(&mut d.undo, spec.label.trim_end_matches('…').to_string(), wb, &d.wb, sel) as u64;
             d.redo.clear();
             d.revision += 1;
         }

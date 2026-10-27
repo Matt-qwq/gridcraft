@@ -657,7 +657,7 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
         label = e.label.clone();
         d.wb = e.wb;
         d.selection = e.selection;
-        crate::push_history(&mut d.redo, label.clone(), cur_wb, &d.wb, cur_selection);
+        d.history_dropped += crate::push_history(&mut d.redo, label.clone(), cur_wb, &d.wb, cur_selection) as u64;
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
@@ -677,7 +677,7 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
         label = e.label.clone();
         d.wb = e.wb;
         d.selection = e.selection;
-        crate::push_history(&mut d.undo, label.clone(), cur_wb, &d.wb, cur_selection);
+        d.history_dropped += crate::push_history(&mut d.undo, label.clone(), cur_wb, &d.wb, cur_selection) as u64;
     }
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
