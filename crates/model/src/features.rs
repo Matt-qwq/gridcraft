@@ -104,6 +104,12 @@ impl Table {
         }
         Some(RangeRef::new(CellRef::new(r0, self.range.start.col), CellRef::new(r1, self.range.end.col)))
     }
+    /// The range an AutoFilter covers: the header row through the last data row; a totals row is
+    /// excluded, as the table part's `<autoFilter ref>` spells it.
+    pub fn filter_range(&self) -> RangeRef {
+        let end = if self.totals_row { self.range.end.row.saturating_sub(1) } else { self.range.end.row };
+        RangeRef::new(self.range.start, CellRef::new(end.max(self.range.start.row), self.range.end.col))
+    }
     pub fn header_range(&self) -> Option<RangeRef> {
         self.header_row.then(|| RangeRef::new(self.range.start, CellRef::new(self.range.start.row, self.range.end.col)))
     }

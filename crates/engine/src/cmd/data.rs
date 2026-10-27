@@ -547,8 +547,26 @@ fn install_filter(s: &mut Session, p: &Json) -> Result<Json> {
             r = RangeRef::new(r.start, CellRef::new(below, r.end.col));
         }
     }
+    // A sheet AutoFilter may not overlap a table (the file has nowhere to put it), so a filter
+    // over a table becomes the table's own filter range: header row through the last data row,
+    // without the totals row. The table part carries the criteria, and the header gets its
+    // dropdown back.
+    let table = s
+        .doc()?
+        .wb
+        .sheet(sheet)
+        .and_then(|sh| sh.tables.iter().find(|t| t.header_row && t.range.intersects(&r)).map(|t| (t.name.clone(), t.filter_range())));
+    if let Some((_, tr)) = &table {
+        r = *tr;
+    }
     edit(s, |cx| {
-        cx.sheet_mut(sheet)?.autofilter = Some(AutoFilter { range: r, criteria: vec![] });
+        let sh = cx.sheet_mut(sheet)?;
+        if let Some((name, _)) = &table
+            && let Some(t) = sh.tables.iter_mut().find(|t| t.name == *name)
+        {
+            t.filter_button = true;
+        }
+        sh.autofilter = Some(AutoFilter { range: r, criteria: vec![] });
         Ok(json!({"filter": true, "range": r.a1()}))
     })
 }

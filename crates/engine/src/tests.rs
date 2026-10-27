@@ -4684,6 +4684,32 @@ fn html_export_without_pictures_or_charts_has_no_fixed_geometry() {
 }
 
 #[test]
+fn a_table_filter_survives_a_save_and_reload() {
+    // A sheet AutoFilter may not overlap a table, so the table part is the only place its
+    // criteria can go. On opening, the table's filter is the sheet's active filter again: the
+    // rows it hides count as filtered by SUBTOTAL, and the dropdown shows the selected values.
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "B2", "values": [["Name", "Qty"], ["a", 1], ["b", 2], ["c", 3], ["d", -1]]})).unwrap();
+    s.execute("insert.table", json!({"range": "B2:C6", "header": true, "name": "T"})).unwrap();
+    s.execute("cell.set", json!({"cell": "E1", "input": "=SUBTOTAL(9,T[Qty])"})).unwrap();
+    assert_eq!(v(&s, "E1"), Value::Number(5.0));
+    s.execute("data.filterBy", json!({"column": "C", "custom": {"op": ">", "value": "0"}})).unwrap();
+    let hidden = |s: &Session| s.doc().unwrap().wb.active().unwrap().is_row_hidden(5);
+    let filtered = |s: &Session| s.doc().unwrap().wb.active().unwrap().is_row_filtered(5);
+    assert!(hidden(&s) && filtered(&s), "the -1 row is hidden by the filter");
+    assert_eq!(v(&s, "E1"), Value::Number(6.0));
+    reopen(&mut s);
+    assert!(hidden(&s) && filtered(&s), "the filter (not a hand-hidden row) came back");
+    assert_eq!(v(&s, "E1"), Value::Number(6.0), "after reopening");
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(v(&s, "E1"), Value::Number(6.0), "after F9");
+    let d = s.doc().unwrap();
+    let sh = d.wb.active().unwrap();
+    assert!(sh.autofilter.is_none(), "the table part carries the filter");
+    assert!(!sh.tables[0].filter.is_empty(), "the criteria came back on the table");
+}
+
+#[test]
 fn a_column_count_that_reads_its_own_cells_is_circular() {
     // `=COUNTIF(I:I,">0")` in a cell of column I reads its own cell. The read returns #CIRC!, but
     // COUNTIF ignores non-matching values, so the result used to be a number that depended on the
