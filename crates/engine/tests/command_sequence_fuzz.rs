@@ -237,6 +237,9 @@ struct Harness {
     s: Session,
     /// The workbook at the start of the current episode (what undoing everything gives back).
     base: Arc<Workbook>,
+    /// `DocState::history_dropped` when the episode started: past that value the byte cap has
+    /// dropped entries, so undoing everything can no longer reach `base`.
+    dropped_at_start: u64,
 }
 
 fn fail(step: usize, kind: &'static str, what: impl Into<String>) -> Failure {
@@ -260,7 +263,7 @@ impl Harness {
         let mut s = Session::new();
         s.execute("file.new", json!({"sample": sample})).expect("sample opens");
         let base = s.doc().expect("document").wb.clone();
-        Harness { s, base }
+        Harness { s, base, dropped_at_start: 0 }
     }
 
     fn wb(&self) -> Arc<Workbook> {
@@ -334,8 +337,10 @@ impl Harness {
         }
         let undone = self.wb();
         // A history trimmed at the byte cap can no longer replay the whole episode, and the two
-        // comparisons below are then meaningless. The rest of the checks still run.
-        let trimmed = self.s.doc().expect("document").redo.len() < n;
+        // comparisons below are then meaningless. The rest of the checks still run. A redo stack
+        // shorter than the steps undone catches a failed redo; the dropped counter catches
+        // entries the cap removed *before* the episode ended, which the redo length cannot.
+        let trimmed = self.s.doc().expect("document").redo.len() < n || self.s.doc().expect("document").history_dropped > self.dropped_at_start;
         if !trimmed && let Some(diff) = workbook_diff(&self.base, &undone) {
             return Err(fail(i, "undo", format!("undoing all {n} steps doesn't give back the starting workbook: {diff}")));
         }
@@ -364,6 +369,7 @@ impl Harness {
         d.undo.clear();
         d.redo.clear();
         self.base = d.wb.clone();
+        self.dropped_at_start = d.history_dropped;
         Ok(())
     }
 
@@ -556,6 +562,8 @@ fn canonical(wb: &Workbook) -> Workbook {
         sh.view_top_left = CellRef::default();
         // A view command (page layout, page break preview) is not content and is not undoable.
         sh.view = gridcraft_engine::model::SheetViewMode::Normal;
+        // Split (not undoable) shows its split as frozen panes; a view setting is not content.
+        sh.freeze = None;
     }
     wb
 }
