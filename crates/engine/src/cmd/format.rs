@@ -607,11 +607,34 @@ fn orientation(s: &mut Session, p: &Json) -> Result<Json> {
     apply_style(s, p, |st| st.align.rotation = angle)
 }
 
+/// Most rows Merge Across will merge in one call. Whole-column selections are clipped to the used
+/// range first (an empty row has nothing to merge), and past this many rows the command refuses
+/// instead of spending a million merge ranges on a selection that large.
+const MAX_MERGE_ACROSS_ROWS: u32 = 100_000;
+
+/// The last row Merge Across touches for `r`: the selection stops at the sheet's used range, so
+/// `F:G` on a two-row sheet merges two rows, not 1,048,576.
+fn across_last_row(r: RangeRef, used_end: Option<u32>) -> u32 {
+    used_end.map_or(r.start.row, |end| end.max(r.start.row)).min(r.end.row)
+}
+
 fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
     let ranges = target_ranges(s, p)?;
     let how =
         if how == "center" && s.doc()?.wb.sheet(sheet).is_some_and(|sh| ranges.iter().all(|r| sh.merges.contains(r))) { "unmerge" } else { how };
+    if how == "across" {
+        // Checked before the edit, so a refused selection leaves the sheet as it was.
+        let d = s.doc()?;
+        let used_end = d.wb.sheet(sheet).and_then(|sh| sh.used_range()).map(|u| u.end.row);
+        let rows: u64 = ranges.iter().map(|r| u64::from(across_last_row(*r, used_end) - r.start.row) + 1).sum();
+        if rows > u64::from(MAX_MERGE_ACROSS_ROWS) {
+            return Err(bad(
+                "home.mergeAcross",
+                format!("Merge Across over {rows} rows would make that many merged cells; select at most {MAX_MERGE_ACROSS_ROWS} rows."),
+            ));
+        }
+    }
     edit(s, |cx| {
         let mut touched = Vec::new();
         // Areas whose merging changes: a merged cell blocks a dynamic array's spill.
@@ -623,7 +646,8 @@ fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
             match how {
                 "unmerge" => {}
                 "across" => {
-                    for row in r.start.row..=r.end.row {
+                    let used_end = sh.used_range().map(|u| u.end.row);
+                    for row in r.start.row..=across_last_row(*r, used_end) {
                         let m = RangeRef::new(CellRef::new(row, r.start.col), CellRef::new(row, r.end.col));
                         if !m.is_single() {
                             sh.merges.push(m);
@@ -659,11 +683,17 @@ fn merge(s: &mut Session, p: &Json, how: &str) -> Result<Json> {
                 }
             }
         }
-        // Spills over the areas, and blocked ones that could reach them, are evaluated again.
+        // Spills over the areas, and blocked ones that could reach them, are evaluated again. The
+        // blocked scan is one pass over the areas' bounding box, not one per area: Merge Across of
+        // a many-row selection would otherwise walk the sheet once per row (a hang the fuzzer found).
         let sh = cx.sheet_mut(sheet)?;
         for a in &areas {
             touched.extend(sh.spill_ranges.iter().filter(|(_, r)| r.intersects(a)).map(|(anchor, _)| (sheet, *anchor)));
-            let reach = RangeRef::new(CellRef::new(0, 0), a.end);
+        }
+        let reach_end =
+            areas.iter().fold(None::<CellRef>, |acc, a| Some(acc.map_or(a.end, |e| CellRef::new(e.row.max(a.end.row), e.col.max(a.end.col)))));
+        if let Some(end) = reach_end {
+            let reach = RangeRef::new(CellRef::new(0, 0), end);
             let blocked = sh
                 .cells
                 .iter_range(reach)
@@ -1241,6 +1271,23 @@ mod tests {
         assert_eq!(v(&mut s, "B1"), Json::Null);
         assert_eq!(v(&mut s, "B2"), Json::Null);
         assert_eq!(v(&mut s, "D1"), json!(4.0));
+    }
+
+    #[test]
+    fn merge_across_of_whole_columns_stops_at_the_used_range() {
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2], [3, 4]]})).unwrap();
+        // F:G used to merge all 1,048,576 rows, which the fuzzer found as a hang.
+        s.execute("home.mergeAcross", json!({"range": "F:G"})).unwrap();
+        let merges = s.doc().unwrap().wb.active().unwrap().merges.clone();
+        assert_eq!(merges.len(), 2, "{merges:?}");
+        assert!(merges.iter().all(|m| (m.start.col, m.end.col, m.end.row) == (5, 6, m.start.row)), "{merges:?}");
+        // A used range past the cap is refused, and the refusal leaves the sheet alone.
+        s.execute("cell.set", json!({"cell": "A200000", "input": "1"})).unwrap();
+        let err = s.execute("home.mergeAcross", json!({"range": "B:C"})).unwrap_err().to_string();
+        assert!(err.contains("at most"), "{err}");
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().merges.len(), 2);
     }
 
     #[test]
