@@ -454,15 +454,25 @@ fn structure_problem(wb: &Workbook, sel: &gridcraft_engine::Selection) -> Option
     None
 }
 
-fn same_value(a: &Value, b: &Value) -> bool {
+fn same_value(a: &Value, b: &Value, file: bool) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => x == y || (x.is_nan() && y.is_nan()),
+        // What the file format cannot store: `#SPILL!`/`#CALC!` are cached as `#VALUE!` and
+        // `#CIRC!` as 0 (see the writer; Excel refuses those error codes in cached values). A
+        // full recalc must still agree exactly; only the save/reload comparison is tolerant.
+        (Value::Error(a), Value::Error(b)) if file => {
+            let file_value = |e: &gridcraft_core::CellError| matches!(e, gridcraft_core::CellError::Value);
+            let unrepresentable = |e: &gridcraft_core::CellError| matches!(e, gridcraft_core::CellError::Spill | gridcraft_core::CellError::Calc);
+            a == b || (unrepresentable(a) && file_value(b)) || (unrepresentable(b) && file_value(a))
+        }
+        (Value::Error(gridcraft_core::CellError::Circ), Value::Number(n)) if file => *n == 0.0,
+        (Value::Number(n), Value::Error(gridcraft_core::CellError::Circ)) if file => *n == 0.0,
         _ => a == b,
     }
 }
 
 /// The first cell whose displayed value (own value or spilled) differs between two workbooks.
-fn value_diff(a: &Workbook, b: &Workbook, what: &str) -> Option<String> {
+fn value_diff(a: &Workbook, b: &Workbook, what: &str, file: bool) -> Option<String> {
     for (x, y) in a.sheets.iter().zip(&b.sheets) {
         let mut keys: BTreeSet<CellRef> = BTreeSet::new();
         for s in [x, y] {
@@ -471,7 +481,7 @@ fn value_diff(a: &Workbook, b: &Workbook, what: &str) -> Option<String> {
         }
         for c in keys {
             let (va, vb) = (x.value(c), y.value(c));
-            if !same_value(&va, &vb) {
+            if !same_value(&va, &vb, file) {
                 let f = x
                     .cell(c)
                     .and_then(|c| c.formula)
@@ -497,7 +507,7 @@ fn recalc_diff(wb: &Workbook) -> Result<(), String> {
     }
     let mut fresh = wb.clone();
     Calc::new().recalc_all(&mut fresh);
-    value_diff(wb, &fresh, "a full recalc").map_or(Ok(()), Err)
+    value_diff(wb, &fresh, "a full recalc", false).map_or(Ok(()), Err)
 }
 
 fn normalized_formula(f: &Formula) -> String {
@@ -524,7 +534,7 @@ fn roundtrip_diff(wb: &Workbook) -> Result<(), String> {
         }
     }
     if wb.calc.mode == CalcMode::Automatic && !wb.calc.iterative {
-        value_diff(wb, &back, "an XLSX save and reload").map_or(Ok(()), Err)?;
+        value_diff(wb, &back, "an XLSX save and reload", true).map_or(Ok(()), Err)?;
     }
     Ok(())
 }
