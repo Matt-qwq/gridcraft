@@ -2061,6 +2061,21 @@ fn part_of_a_legacy_array_cant_be_changed() {
 }
 
 #[test]
+fn inserting_cells_across_a_merged_range_is_refused() {
+    // A merge over whole rows extends past the E:H band the shift moves: moving the band and
+    // leaving the rest would leave two overlapping merges (found by the command-sequence fuzzer).
+    let mut s = s();
+    s.execute("home.mergeCells", json!({"range": "22:24"})).unwrap();
+    s.execute("home.mergeCenter", json!({"range": "F19:F20"})).unwrap();
+    let e = s.execute("home.insertCells", json!({"range": "E8:H11", "shift": "down"})).unwrap_err();
+    assert!(e.to_string().to_lowercase().contains("merged cell"), "{e}");
+    let sh = s.doc().unwrap();
+    let sh = sh.wb.active().unwrap();
+    assert_eq!(sh.merges.len(), 2);
+    assert!(!sh.merges[0].intersects(&sh.merges[1]), "{:?}", sh.merges);
+}
+
+#[test]
 fn a_blocked_legacy_array_still_owns_its_cells() {
     // A multi-cell array that cannot spill (a merge inside it) has no spilled values to notice,
     // so editing one of its cells used to be allowed; the file then dropped the value on open

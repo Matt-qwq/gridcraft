@@ -492,6 +492,9 @@ fn insert_cells(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
     if let Some(sh) = s.doc()?.wb.sheet(sheet) {
         check_table_shift(sh, &e)?;
+        if cuts_a_merge(sh, &e) {
+            return Err(EngineError::Other("Cannot change part of a merged cell.".into()));
+        }
         // Refuse to push data off the sheet: cells in the last `width`/`height` positions would be dropped.
         let doomed = if shift == "right" {
             RangeRef::new(CellRef::new(r.start.row, r.start.col.max(MAX_COLS.saturating_sub(r.width()))), CellRef::new(r.end.row, MAX_COLS - 1))
@@ -532,6 +535,9 @@ fn delete_cells(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
     if let Some(sh) = s.doc()?.wb.sheet(sheet) {
         check_table_shift(sh, &e)?;
+        if cuts_a_merge(sh, &e) {
+            return Err(EngineError::Other("Cannot change part of a merged cell.".into()));
+        }
     }
     let left = shift == "left";
     let out = edit(s, |cx| {
@@ -1006,6 +1012,28 @@ pub(crate) fn map_range(r: RangeRef, e: &Edit) -> Option<RangeRef> {
         gridcraft_formula::Expr::Ref(r) => Some(r.range()),
         _ => None,
     }
+}
+
+/// Whether shoving the cells of `e` sideways or down would cut a merged area in two: part of it
+/// would move with the shifted band and the rest would not. Excel refuses such an edit, and keeping
+/// both halves at their old coordinates would leave two merges overlapping (found by the
+/// command-sequence fuzzer: a merge over whole rows, cells inserted over a few of its columns).
+fn cuts_a_merge(sh: &Sheet, e: &Edit) -> bool {
+    let (axis, range) = match *e {
+        Edit::InsertCells { axis, range } | Edit::DeleteCells { axis, range } => (axis, range),
+        _ => return false,
+    };
+    sh.merges.iter().any(|m| {
+        let (lo, hi, mlo, mhi, mstart, mend, at) = match axis {
+            Axis::Rows => (range.start.col, range.end.col, m.start.col, m.end.col, m.start.row, m.end.row, range.start.row),
+            Axis::Cols => (range.start.row, range.end.row, m.start.row, m.end.row, m.start.col, m.end.col, range.start.col),
+        };
+        if mlo > hi || mhi < lo || mend < at {
+            return false;
+        }
+        // Partly inside the shifted band, or entirely inside but crossing the insertion line.
+        mlo < lo || mhi > hi || (mstart < at && mend >= at)
+    })
 }
 
 /// Shifts what Insert/Delete Cells moves along with the cells: merged areas, conditional
