@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured; §10: fuzz soak, four spill-conflict seeds open) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured; §10: fuzz soak, two spill rules fixed, three seeds open) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -131,13 +131,22 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   steps per group instead of one; a table column named with `!` was saved as a sheet-qualified
   formula and came back changed. The harness now ends an episode before the 128 MB undo budget
   trims it, traces steps with `GRIDCRAFT_FUZZ_TRACE`, and names the differing sheet field.
-- **Open (4 of 100 seeds), all dynamic-array conflicts:** a full recalculation resolves two
-  overlapping spills in a different order from the incremental one, so F9 changes a value
-  (`=SORT(F5:J10)` under a `=UNIQUE(...)` spill, 2-step repro), a fill into a spill area leaves
-  `#CIRC!` where a recalc gives 0 (2 steps), an XLSX save/reload turns a `#SPILL!` into `#VALUE!`,
-  and one seed references the Watch Window's sheet-scoped name. Each seed and its minimal replay is
-  in `plan/HANDOVER.md`; the fix is a deterministic conflict rule for overlapping spills.
-- **Estimate:** 8–12 h plus an autosave/recovery soak; 6–10 h of it is the spill-conflict rule.
+- **Fixed (10-26, same soak):** an array that spills over its own source (`=TRANSPOSE(J23:L28)`
+  in J24) was laid out anyway, with some elements `#CIRC!`; it is now `#CIRC!` at the anchor, as a
+  formula that reads a cell it writes. And two arrays whose areas overlap kept their cells across
+  F9 instead of being re-laid out in row-major order (`=SEQUENCE(7,4)` at K7 beside `=SEQUENCE(6,5)`
+  at L2).
+- **Open (3 of 100 seeds), all the same file-format limit:** spilled arrays are derived state, and
+  opening a file clears them and recalculates every dynamic anchor, so who won a contested area and
+  which spilled element was `#CIRC!` are decided again — a blocked anchor is cached as `#VALUE!`
+  (the writer maps `#SPILL!`/`#CALC!`, which Excel refuses in cached values), so the file cannot say
+  it either. One seed is unrelated: `=SUM(_sc_watch)` over the Watch Window's sheet-scoped name is
+  `#VALUE!` in memory and `#NAME?` after F9. Replays in `plan/HANDOVER.md`.
+- **Next for this entry:** reconstruct a dynamic array's spill on read from the anchor's `ref` and
+  the interior values instead of clearing and recalculating it on open (4–6 h), then the name seed.
+  Details and replays in `plan/HANDOVER.md`.
+- **Estimate:** 8–12 h plus an autosave/recovery soak; 4–6 h of it is the file side of spilled
+  arrays.
 
 ## After beta
 
@@ -217,6 +226,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-26 | minor | §10: self-spilling arrays are `#CIRC!` and a contested spill keeps its owner across F9; three seeds remain, two of them the file side of spilled arrays |
 | 2026-10-26 | minor | §10: 100-seed soak; Merge Across freeze, total-row overlap, Subtotal undo depth and a `!` column name fixed; four dynamic-array conflict seeds open with replays |
 | 2026-10-26 | minor | §2: whole-column references are already clipped (21.5 ms for `SUM(A:A)` over a million cells); a 100k-dependent edit measures 223–251 ms; the 159 remaining cells are Excel's stale cache, not a difference |
 | 2026-10-26 | minor | §2: the stripes' report numbers and a 100M-cell measurement (2.4 GB on a unique-key export against ~490 MiB extrapolated at report density); `packed_breakdown` no longer counts two dictionaries twice |
