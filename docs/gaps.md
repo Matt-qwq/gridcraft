@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-26 · **Change:** minor (§2: 100 million cells measured; §10: fuzz soak, two spill rules fixed, three seeds open) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (§10: the 500-seed soak is green; spilled arrays reopen from the file and nine soak findings are fixed) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -136,18 +136,30 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   formula that reads a cell it writes. And two arrays whose areas overlap kept their cells across
   F9 instead of being re-laid out in row-major order (`=SEQUENCE(7,4)` at K7 beside `=SEQUENCE(6,5)`
   at L2).
-- **Open (3 of 100 seeds), all the same file-format limit:** spilled arrays are derived state, and
-  opening a file clears them and recalculates every dynamic anchor, so who won a contested area and
-  which spilled element was `#CIRC!` are decided again — a blocked anchor is cached as `#VALUE!`
-  (the writer maps `#SPILL!`/`#CALC!`, which Excel refuses in cached values), so the file cannot say
-  it either. One seed is unrelated: `=SUM(_sc_watch)` over the Watch Window's sheet-scoped name is
-  `#VALUE!` in memory and `#NAME?` after F9. Replays in `plan/HANDOVER.md`.
-- **Next for this entry:** reconstruct a dynamic array's spill on read from the anchor's `ref` and
-  the interior values instead of clearing and recalculating it on open (4–6 h), then the name seed.
-  Details and replays in `plan/HANDOVER.md`.
-- **Estimate:** 8–12 h plus an autosave/recovery soak; 4–6 h of it is the file side of spilled
-  arrays.
-
+- **Fixed (10-27): a 500-seed soak is green.** 200 commands a seed (100,000 commands, release,
+  49 minutes) over the three samples, every invariant checked per step. The three open seeds from
+  the 100-seed run are gone: on read, a dynamic anchor's `ref` is rebuilt into `spill_ranges` and
+  the cached interior values become the spill map, not cells that block the array, so a reload
+  keeps the array that won a contested area; F9 prefers the anchors that actually spill, and an
+  owner that grows back after a spill it reads is laid out later reclaims its cells. `#SPILL!`/
+  `#CALC!` cached as `#VALUE!` is compared as what the file can store, not as a changed value.
+  The `_sc_*` names (Watch Window list, custom views, scripts, scenarios) are view state and
+  formulas can no longer resolve them. Further seeds found and fixed: a formula that reads its own
+  cell through a range and swallows the `#CIRC!` (`COUNTIF` over its own column) is `#CIRC!`
+  instead of a number that depended on evaluation order; a filter installed over a selection that
+  covers a table is narrowed to the table's filter range, so its criteria reach the table part and
+  SUBTOTAL still skips the hidden rows after opening; a multi-cell legacy array that cannot spill
+  still refuses edits of its cells; Insert/Delete Cells that would cut a merged area in two is
+  refused; the harness tells a byte-capped (trimmed) undo history from a real undo bug, and
+  ignores view-only freeze in undo comparisons.
+- **Remaining caveat:** the file format cannot cache `#SPILL!`/`#CALC!` (GridCraft writes
+  `#VALUE!`, following the claim that Excel refuses those error codes; **needs verification on a
+  licensed Excel**) or `#CIRC!` (written as 0). A *literal* `#SPILL!` pasted as a value therefore
+  comes back `#VALUE!`; formulas and spilled values are recalculated and agree.
+- **Next:** the trust track's soak is closed; the large-workbook track comes next (multi-threaded
+  and incremental recalculation, 100k dependents at 222 ms against the 100 ms gate).
+  Replays and details in `plan/HANDOVER.md`.
+- **Estimate:** 12–16 h for this soak and its fixes; done.
 ## After beta
 
 ### 11. No localization at all (L)

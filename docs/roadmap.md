@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-26 · **Change:** minor (M22 deferred with triggers; 100M cells and 100k-dependents measured) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-27 · **Change:** minor (trust-track soak closed: 500 seeds green; the large-workbook track is next) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -509,6 +509,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-27 | minor | The trust-track soak is closed: 500 seeds × 200 commands (100,000 commands, release, 49 min) are green. Reopening a file rebuilds spilled arrays from the anchor's `ref` and cached values (a contested area keeps its owner), F9 prefers real spill owners and lets a grow-back owner reclaim its cells, swallowed `#CIRC!` stays explicit, `_sc_*` view-state names are invisible to formulas, table filters and blocked legacy arrays round-trip, and Insert/Delete Cells refuses to cut a merge. The format's `#SPILL!`/`#CALC!`-as-`#VALUE!` cache is still to verify on a licensed Excel |
 | 2026-10-26 | minor | M19's band stripes landed in `store.rs`: packing −10%, a range scan −27%, row headers 108 → 48 bytes; on the 118 MB report, open 1.55 → 1.28 s and the model 191 → 163 MiB, `cell_digest` unchanged |
 | 2026-10-24 | major | Large-workbook plan: M17 zone maps, M18 vectorized kernels, M19 cold paging, M20 append-style edits, M21 Parquet/Arrow, M22 native format (undecided); baseline numbers from the 10-24 build |
 | 2026-10-25 | minor | The band-stripe round is written down to the functions it changes, with its acceptance tests |
