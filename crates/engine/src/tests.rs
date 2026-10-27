@@ -4684,6 +4684,30 @@ fn html_export_without_pictures_or_charts_has_no_fixed_geometry() {
 }
 
 #[test]
+fn a_column_count_that_reads_its_own_cells_is_circular() {
+    // `=COUNTIF(I:I,">0")` in a cell of column I reads its own cell. The read returns #CIRC!, but
+    // COUNTIF ignores non-matching values, so the result used to be a number that depended on the
+    // order the pass computed the column in (and F9 gave a different one). It is a circular
+    // reference, and stays explicit (found by the command-sequence fuzzer).
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "H1", "values": [[163, 101], [null, 159]]})).unwrap();
+    // The fill's origin is the selection, so a whole-column reference stays in its own column.
+    s.execute("selection.set", json!({"range": "I:I"})).unwrap();
+    s.execute("range.fill", json!({"input": "=COUNTIF(I:I,\">0\")", "range": "G8:I15"})).unwrap();
+    // A formula that reads a loop cell sees the #CIRC! too, before and after F9.
+    s.execute("cell.set", json!({"cell": "G14", "input": "=I12*J18"})).unwrap();
+    for row in 8..=15 {
+        assert_eq!(v(&s, &format!("I{row}")), Value::Error(gridcraft_core::CellError::Circ), "I{row}");
+    }
+    assert_eq!(v(&s, "G14"), Value::Error(gridcraft_core::CellError::Circ));
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    for row in 8..=15 {
+        assert_eq!(v(&s, &format!("I{row}")), Value::Error(gridcraft_core::CellError::Circ), "I{row} after F9");
+    }
+    assert_eq!(v(&s, "G14"), Value::Error(gridcraft_core::CellError::Circ), "G14 after F9");
+}
+
+#[test]
 fn a_formula_never_reads_the_watch_list() {
     // The Watch Window list is view state kept in a hidden `_sc_watch` name. It survives undo
     // (deleting it is not an edit), so a formula that read it would keep a stale value when the

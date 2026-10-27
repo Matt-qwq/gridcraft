@@ -1351,6 +1351,9 @@ impl Calc {
     fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool, prefer: &HashSet<Key>) {
         let mut dynamic_again = !self.graph.dynamic.is_empty();
         self.last_recalc_cells = 0;
+        // Every loop the rounds met: a later round evaluates only its dependents, so the cells
+        // that were re-entered are remembered for the UI and `Calc::circular`.
+        let mut found_cycles: Vec<Key> = Vec::new();
         for _round in 0..8 {
             if dirty.is_empty() {
                 break;
@@ -1366,7 +1369,7 @@ impl Calc {
             let now = self.now();
             let mut rng = self.rng;
             let tp = prof_now();
-            let (results, spills, cycles) = {
+            let (mut results, mut spills, cycles) = {
                 let mut host = PassHost::new(wb, &self.graph, &exprs, &mut rng, now);
                 host.iterate = wb.calc.iterative;
                 for k in &dirty {
@@ -1381,12 +1384,23 @@ impl Calc {
                 (host.results, host.spills, host.cycles)
             };
             self.rng = rng;
+            // A formula that read its own cell is circular even when the function swallowed the
+            // #CIRC! the read returned (`COUNTIF` over a column that holds its own formula counts
+            // the other cells and ignores the error). Excel shows 0 with a warning; we keep it
+            // explicit. Without this the loop's cells hold values that depend on the order the
+            // pass happened to compute them in (found by the command-sequence fuzzer).
+            if !wb.calc.iterative && !cycles.is_empty() {
+                for k in &cycles {
+                    results.insert(*k, Value::Error(CellError::Circ));
+                    spills.remove(k);
+                }
+            }
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
                 eprintln!("  eval {} formulas {:.1} ms", results.len(), prof_now() - tp);
             }
             let tw = prof_now();
             self.last_recalc_cells += results.len();
-            self.circular = cycles;
+            found_cycles.extend(cycles.iter().copied());
             // Write back.
             let mut spill_changes: Vec<Key> = Vec::new();
             let mut freed: Vec<(usize, RangeRef)> = Vec::new();
@@ -1474,6 +1488,18 @@ impl Calc {
                     freed.push((k.0, o));
                 }
             }
+            // A formula that read one of the loop's cells before they were marked #CIRC! holds a
+            // value computed from what the cell happened to show then; it is evaluated again so
+            // it sees the #CIRC! a full recalculation would have given it.
+            let mut cycle_changes: Vec<Key> = Vec::new();
+            for k in &cycles {
+                self.graph.dependents(k.0, k.1, &mut cycle_changes);
+            }
+            // The loop's own cells are not evaluated again: they would compute a number from the
+            // other cells and their dependents would read it before this pass could mark them
+            // #CIRC! again. Their value is already written.
+            let cyclic: HashSet<Key> = cycles.iter().copied().collect();
+            spill_changes.extend(cycle_changes.into_iter().filter(|k| !cyclic.contains(k)));
             // Formulas with references only known while evaluating (INDIRECT, OFFSET) may have read
             // a spill area before it was laid out: they are evaluated once more.
             if dynamic_again && !spills.is_empty() {
@@ -1503,8 +1529,13 @@ impl Calc {
             if spill_changes.is_empty() {
                 break;
             }
-            dirty = self.dirty_closure(wb, &spill_changes);
+            let mut next = self.dirty_closure(wb, &spill_changes);
+            next.retain(|k| !cyclic.contains(k));
+            dirty = next;
         }
+        found_cycles.sort_unstable_by_key(|(s, c)| (*s, c.row, c.col));
+        found_cycles.dedup();
+        self.circular = found_cycles;
     }
 }
 
