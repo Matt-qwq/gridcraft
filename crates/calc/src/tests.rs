@@ -1799,3 +1799,20 @@ fn a_dynamic_array_of_one_value_still_anchors_a_spill() {
     t.set("E11", "=ROWS(D1#)");
     assert_eq!(t.get("E11"), Value::Error(CellError::Ref));
 }
+
+#[test]
+fn an_array_that_owned_its_cells_gets_them_back_when_it_grows_after_f9() {
+    // K8 reads another array's spill (A13:C15). A full recalculation computes K8 before that spill
+    // is laid out, so K8 first shrinks to one cell; I9 then takes K9. When A13 spills and K8 grows
+    // back to K8:K10, K8 must get K9 back (it owned it before the pass) and leave I9 #SPILL!.
+    let mut t = T::new();
+    t.set("A13", "=SEQUENCE(3,3)");
+    t.set("K8", "=UNIQUE(C13:C17)");
+    t.set("I9", "=SEQUENCE(1,3)");
+    assert_eq!((t.num("K8"), t.num("K10")), (3.0, 9.0));
+    assert_eq!(t.get("I9"), Value::Error(CellError::Spill));
+    t.calc.recalc_all(&mut t.wb);
+    assert_eq!((t.num("K8"), t.num("K10")), (3.0, 9.0));
+    assert_eq!(t.get("I9"), Value::Error(CellError::Spill));
+    assert_eq!(t.get("K9"), Value::Number(6.0));
+}

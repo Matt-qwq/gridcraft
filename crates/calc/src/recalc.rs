@@ -1438,6 +1438,27 @@ impl Calc {
                     }
                     sheet.spill_ranges.remove(&k.1);
                 }
+                // An array that owned its cells before the pass may grow back into cells another
+                // array took in an earlier round, after that array was laid out (this pass only
+                // learns the new shape now). The owner gets them back: the other array follows in
+                // the layout order and is blocked if it still wants them.
+                if prefer.contains(k) {
+                    let evicted: Vec<(CellRef, RangeRef)> = sheet
+                        .spill_ranges
+                        .iter()
+                        .filter(|(anchor, _)| **anchor != k.1 && !prefer.contains(&(k.0, **anchor)))
+                        .map(|(anchor, range)| (*anchor, *range))
+                        .collect();
+                    for (anchor, range) in evicted {
+                        for c in range.iter() {
+                            sheet.spill.remove(&c);
+                        }
+                        sheet.spill_ranges.remove(&anchor);
+                        // It has to re-evaluate: the cells it took are gone, and it is either
+                        // blocked now or spills somewhere else.
+                        spill_changes.push((k.0, anchor));
+                    }
+                }
                 let mut changed_range = old;
                 if let Some(arr) = new {
                     let end = CellRef::new(k.1.row.saturating_add(arr.rows as u32 - 1), k.1.col.saturating_add(arr.cols as u32 - 1));
