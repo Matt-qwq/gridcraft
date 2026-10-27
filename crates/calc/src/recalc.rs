@@ -428,6 +428,22 @@ fn fold(text: &str) -> String {
     text.chars().flat_map(char::to_lowercase).collect()
 }
 
+/// Arrays that own their cells when two spills want the same ones: everything already spilling,
+/// and every dynamic formula whose cached value is not `#SPILL!` (a file records the winner as a
+/// value and the loser as the error, which is how a reload keeps the same owner).
+fn spill_owners(wb: &Workbook) -> HashSet<Key> {
+    let mut owners: HashSet<Key> = HashSet::default();
+    for (si, sh) in wb.sheets.iter().enumerate() {
+        owners.extend(sh.spill_ranges.keys().map(|c| (si, *c)));
+        for (c, f, _) in sh.cells.formulas() {
+            if f.dynamic && !matches!(sh.value(c), Value::Error(CellError::Spill)) {
+                owners.insert((si, c));
+            }
+        }
+    }
+    owners
+}
+
 /// The largest single block the pass keeps built and shared. A lookup table is small; a whole
 /// column read as an array is not, and rebuilding it is cheaper than holding it.
 const MAX_CACHED_BLOCK_CELLS: usize = 4_000_000;
@@ -436,6 +452,9 @@ const MAX_CACHED_BLOCK_CELLS_TOTAL: usize = 4_000_000;
 
 struct PassHost<'a> {
     wb: &'a Workbook,
+    /// The dependency graph as it stands at the start of the pass: an array's own references,
+    /// for the self-overlap check.
+    graph: &'a Graph,
     exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
     results: HashMap<Key, Value>,
     pending: HashSet<Key>,
@@ -510,9 +529,10 @@ impl<'a> PassHost<'a> {
         })
     }
 
-    fn new(wb: &'a Workbook, exprs: &'a HashMap<Key, std::sync::Arc<Expr>>, rng: &'a mut u64, now: f64) -> Self {
+    fn new(wb: &'a Workbook, graph: &'a Graph, exprs: &'a HashMap<Key, std::sync::Arc<Expr>>, rng: &'a mut u64, now: f64) -> Self {
         PassHost {
             wb,
+            graph,
             exprs,
             results: HashMap::with_capacity_and_hasher(exprs.len(), Default::default()),
             pending: exprs.keys().copied().collect(),
@@ -543,6 +563,18 @@ impl<'a> PassHost<'a> {
             taint: false,
         }
     }
+}
+
+/// Whether spilling `a` at `k` would write cells that `k`'s own formula reads. Reading a cell the
+/// same formula writes is a circular reference (Excel: `#CIRC!`), not a conflict with anything
+/// else: `=TRANSPOSE(A1:B6)` in A2 spills over part of its own source. A range that only touches
+/// the anchor is the anchor reading itself, which the graph's cycle detection already refuses.
+fn reads_own_spill(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool {
+    let Some(node) = host.graph.nodes.get(&(sheet, anchor)) else { return false };
+    let end =
+        CellRef::new(anchor.row.saturating_add((a.rows as u32).saturating_sub(1)), anchor.col.saturating_add((a.cols as u32).saturating_sub(1)));
+    let range = RangeRef::new(anchor, end);
+    node.areas.iter().any(|area| area.sheet == sheet && area.range.intersects(&range))
 }
 
 /// Whether an array result at `k` can't spill: it is in a table, or its area runs off the sheet,
@@ -722,7 +754,15 @@ impl PassHost<'_> {
             v => v,
         };
         // An array that can't spill is #SPILL! for the formulas evaluated after it in this pass too.
+        // One that spills over its own source is circular: no layout, `#CIRC!`.
         let v = match self.spills.get(&k) {
+            Some(a) if reads_own_spill(self, k, a) => {
+                self.spills.remove(&k);
+                if self.cycle_seen.insert(k) {
+                    self.cycles.push(k);
+                }
+                Value::Error(CellError::Circ)
+            }
             Some(a) if spill_blocked(self, k, a) => {
                 self.spills.remove(&k);
                 Value::Error(CellError::Spill)
@@ -1122,6 +1162,7 @@ impl Calc {
     /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
     pub fn recalc_all(&mut self, wb: &mut Workbook) {
         self.rebuild(wb);
+        let prefer = spill_owners(wb);
         // Spills are laid out again from the formulas where they are now (a structural edit moves
         // or deletes the formulas, not the values they spilled).
         for i in 0..wb.sheets.len() {
@@ -1133,7 +1174,7 @@ impl Calc {
             }
         }
         let all: Vec<Key> = self.graph.nodes.keys().copied().collect();
-        self.run(wb, all, true);
+        self.run(wb, all, true, &prefer);
     }
 
     /// Recalculates what a freshly opened workbook needs, and nothing else.
@@ -1176,7 +1217,7 @@ impl Calc {
         if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
             eprintln!("  open: rebuild {rebuild_ms:.1} ms, {} seeds, {} stale ({} ms)", seeds.len(), stale.len(), prof_now() - ts);
         }
-        self.run(wb, stale, true);
+        self.run(wb, stale, true, &HashSet::default());
     }
 
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
@@ -1215,7 +1256,7 @@ impl Calc {
         if wb.calc.mode == CalcMode::Manual {
             // Only the edited formulas themselves are evaluated.
             let own: Vec<Key> = changed.iter().copied().filter(|k| self.graph.nodes.contains_key(k)).collect();
-            self.run(wb, own, false);
+            self.run(wb, own, false, &HashSet::default());
             return;
         }
         let mut seeds: Vec<Key> = changed.to_vec();
@@ -1263,7 +1304,7 @@ impl Calc {
         let dirty = self.dirty_closure(wb, &seeds);
         let t1 = prof_now();
         let n = dirty.len();
-        self.run(wb, dirty, false);
+        self.run(wb, dirty, false, &HashSet::default());
         if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
             eprintln!("recalc: {} seeds, closure {} cells {:.1} ms, run {:.1} ms", seeds.len(), n, t1 - t0, prof_now() - t1);
         }
@@ -1303,7 +1344,7 @@ impl Calc {
     }
 
     /// Evaluates the dirty set and writes results (and spills) back.
-    fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool) {
+    fn run(&mut self, wb: &mut Workbook, mut dirty: Vec<Key>, full: bool, prefer: &HashSet<Key>) {
         let mut dynamic_again = !self.graph.dynamic.is_empty();
         self.last_recalc_cells = 0;
         for _round in 0..8 {
@@ -1322,7 +1363,7 @@ impl Calc {
             let mut rng = self.rng;
             let tp = prof_now();
             let (results, spills, cycles) = {
-                let mut host = PassHost::new(wb, &exprs, &mut rng, now);
+                let mut host = PassHost::new(wb, &self.graph, &exprs, &mut rng, now);
                 host.iterate = wb.calc.iterative;
                 for k in &dirty {
                     host.calculate(*k);
@@ -1354,7 +1395,11 @@ impl Calc {
                     sheet.cells.set(k.1, cell);
                 }
             }
-            for k in &dirty {
+            // Arrays that held a spill before this pass lay out first, so a contested area keeps
+            // its owner; everything else follows in row-major order.
+            let ordered: Vec<Key> =
+                dirty.iter().copied().filter(|k| prefer.contains(k)).chain(dirty.iter().copied().filter(|k| !prefer.contains(k))).collect();
+            for k in &ordered {
                 let new = spills.get(k);
                 let Some(sheet) = wb.sheet_mut(k.0) else { continue };
                 let old = sheet.spill_ranges.get(&k.1).copied();
@@ -1476,8 +1521,9 @@ pub fn evaluate(wb: &Workbook, sheet: usize, at: CellRef, formula: &str) -> Valu
 
 pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> Value {
     let exprs = HashMap::default();
+    let graph = Graph::default();
     let mut rng = 0x1234_5678_9ABC_DEF0u64;
-    let mut host = PassHost::new(wb, &exprs, &mut rng, now_serial());
+    let mut host = PassHost::new(wb, &graph, &exprs, &mut rng, now_serial());
     let mut ev = Evaluator::new(&mut host, sheet, at);
     ev.value(expr)
 }
@@ -1501,7 +1547,7 @@ pub(crate) mod tests {
     use gridcraft_core::{CellRef, RangeRef, Value};
     use gridcraft_model::{Cell, Formula, Workbook};
 
-    use super::{Calc, HashMap, Host, Intervals, Key, PassHost};
+    use super::{Calc, Graph, HashMap, Host, Intervals, Key, PassHost};
 
     /// xorshift64 for repeatable pseudo-random cases.
     fn rng(state: &mut u64) -> u64 {
@@ -1724,7 +1770,8 @@ pub(crate) mod tests {
             put(&mut wb, format!("B{r}"), format!("={r}*2"));
         }
         let mut rng = 1u64;
-        let mut host = PassHost::new(&wb, &exprs, &mut rng, 0.0);
+        let graph = Graph::default();
+        let mut host = PassHost::new(&wb, &graph, &exprs, &mut rng, 0.0);
         host.calculate((0, CellRef::parse("A1").unwrap()));
         let total = (WIDTH * (WIDTH + 1)) as f64;
         assert_eq!(host.results.get(&(0, CellRef::parse("A1").unwrap())), Some(&Value::Number(total + 63.0)));
@@ -1746,7 +1793,8 @@ pub(crate) mod tests {
         // of a real pass partway through; `visit_range` has to cope with the formulas it reads
         // being calculated under it.
         let mut rng = 1u64;
-        let mut host = PassHost::new(wb, &exprs, &mut rng, 0.0);
+        let graph = Graph::default();
+        let mut host = PassHost::new(wb, &graph, &exprs, &mut rng, 0.0);
 
         let mut seen = Vec::new();
         host.visit_range(0, range, &mut |v| {

@@ -472,7 +472,17 @@ fn value_diff(a: &Workbook, b: &Workbook, what: &str) -> Option<String> {
         for c in keys {
             let (va, vb) = (x.value(c), y.value(c));
             if !same_value(&va, &vb) {
-                let f = x.cell(c).and_then(|c| c.formula).map(|f| format!(" (formula ={})", f.text)).unwrap_or_default();
+                let f = x
+                    .cell(c)
+                    .and_then(|c| c.formula)
+                    .map(|f| format!(" (formula ={})", f.text))
+                    .or_else(|| {
+                        // A spilled cell: name the array it came from, which is what has a formula.
+                        let (anchor, _) = x.spill_ranges.iter().find(|(_, r)| r.contains(c))?;
+                        let f = x.cell(*anchor).and_then(|c| c.formula)?;
+                        Some(format!(" (spilled from {} ={})", anchor.a1(), f.text))
+                    })
+                    .unwrap_or_default();
                 return Some(format!("{}!{c}{f}: {va:?} in memory, {vb:?} after {what}", x.name));
             }
         }

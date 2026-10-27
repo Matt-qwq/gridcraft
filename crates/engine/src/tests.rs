@@ -2611,6 +2611,43 @@ fn structural_edits_move_spills_with_their_formula() {
 }
 
 #[test]
+fn a_full_recalc_leaves_a_contested_spill_with_the_array_that_owned_it() {
+    // Two arrays whose areas overlap: the one that got there first keeps the cells, the later one
+    // is #SPILL!. A full recalculation used to lay them out in row-major order instead, handing
+    // the cells to L2 and changing what K7 showed (found by the command-sequence fuzzer).
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "K7", "input": "=SEQUENCE(7,4)"})).unwrap();
+    s.execute("cell.set", json!({"cell": "L2", "input": "=SEQUENCE(6,5)"})).unwrap();
+    assert_eq!((v(&s, "K7"), v(&s, "L2")), (Value::Number(1.0), Value::Error(gridcraft_core::CellError::Spill)));
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!((v(&s, "K7"), v(&s, "L2")), (Value::Number(1.0), Value::Error(gridcraft_core::CellError::Spill)));
+    // The other order: the array entered first owns L2:Q7, and F9 keeps it there.
+    let mut s = self::s();
+    s.execute("cell.set", json!({"cell": "L2", "input": "=SEQUENCE(6,5)"})).unwrap();
+    s.execute("cell.set", json!({"cell": "K7", "input": "=SEQUENCE(7,4)"})).unwrap();
+    assert_eq!((v(&s, "L2"), v(&s, "K7")), (Value::Number(1.0), Value::Error(gridcraft_core::CellError::Spill)));
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!((v(&s, "L2"), v(&s, "K7")), (Value::Number(1.0), Value::Error(gridcraft_core::CellError::Spill)));
+}
+
+#[test]
+fn an_array_that_reads_its_own_spill_is_circular() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["H1", "H2"], [1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]})).unwrap();
+    // TRANSPOSE(A1:B6) at A2 would spill over A2:B6, which its own source reads: Excel calls that
+    // a circular reference, and the values it would write must not replace the source.
+    s.execute("cell.set", json!({"cell": "A2", "input": "=TRANSPOSE(A1:B6)"})).unwrap();
+    assert_eq!(v(&s, "A2"), Value::Error(gridcraft_core::CellError::Circ));
+    assert_eq!(v(&s, "B2"), Value::Number(2.0));
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(v(&s, "A2"), Value::Error(gridcraft_core::CellError::Circ));
+    // A formula away from its source still spills, and reads the #CIRC! the other cell holds.
+    s.execute("cell.set", json!({"cell": "D1", "input": "=TRANSPOSE(A1:B6)"})).unwrap();
+    assert_eq!((v(&s, "D1"), v(&s, "D2")), (Value::Text("H1".into()), Value::Text("H2".into())));
+    assert_eq!((v(&s, "E1"), v(&s, "E2")), (Value::Error(gridcraft_core::CellError::Circ), Value::Number(2.0)));
+}
+
+#[test]
 fn clearing_a_distant_blocker_unblocks_the_spill() {
     let mut s = s();
     s.execute("cell.set", json!({"cell": "A1", "input": "=SEQUENCE(100)"})).unwrap();
