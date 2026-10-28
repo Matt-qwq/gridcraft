@@ -1,8 +1,8 @@
 # GridCraft roadmap
 
-**Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
+**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~160–250 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (M20 row and column maps land: row insert 3.7 ms, column insert 9.8 ms on 1M×20 with no cell moves; compaction and line metadata remain) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** major (roadmap re-planned: large-workbook beta gate met; ordered waves, parallel plan and post-beta order set) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -26,7 +26,7 @@ This page is the summary. The detail is in:
 | **Ready for real work** | **~50%** | estimated from written weights (51.6); [target-app-parity.md](docs/target-app-parity.md) |
 | **Mainstream practitioner** | **~50%** | estimated: typical analyst/finance user, weekly features, × 0.90 interaction × 0.92 stability × 0.88 file exchange; [method](docs/target-app-parity.md#mainstream-practitioner) |
 | **Essentials user** | **~63%** | estimated: core features only, × 0.92 launch/stability × 0.95 clarity × 0.90 opening sent files; [method](docs/target-app-parity.md#essentials-user) |
-| Remaining to **beta** | **~160–240 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates) |
+| Remaining to **beta** | **~160–250 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met |
 | Remaining to **full parity** | **~700–1,100 Opus 5.5 agent-hours** | estimated; sum of the dimension rows below |
 
 | Audience | Ready % | Opus 5.5 agent wall-clock hours to ~95% | Work that dominates |
@@ -41,12 +41,16 @@ work; single features measured from PRs #66, #100, #101). Parallelism: the full 
 work splits ~65–70% across 4–6 agents by area; the essentials work is mostly small fixes plus one
 long `.xls` track, so about half parallelizes (≈30–50 wall-clock hours with three agents).
 
-Why alpha: all six core workflows in the [alpha gate](docs/roadmap.md#alpha-gate) pass end to end on macOS with save and reopen, and the core workflow works end to end (open an XLSX, enter formulas and data, format, sort
-and filter, chart, pivot, print to PDF, save XLSX), but users still hit blocking gaps on real
-files: 100 MB workbooks don't open (#175), there's no `.xls` (#121), Arabic and Devanagari text
-isn't shaped (Chinese text still reported in #142), charts lose their type and options on round trip, and
-nobody has yet confirmed that Excel opens our output without a repair prompt across a real
-corpus. Beta needs those closed (see [beta gates](docs/roadmap.md#beta-gates)).
+Why alpha: all six core workflows in the [alpha gate](docs/roadmap.md#alpha-gate) pass end to end
+on macOS with save and reopen, and the large-workbook beta gate is now met: 100M cells open with
+16.7 MiB live / 183 MiB peak, independent formulas recalculate on the machine's threads (100k edit
+20–25 ms), row and column structural edits are maps rather than cell moves, and whole-sheet data
+commands are bounded. The remaining beta work is evidence and fidelity: nobody has yet confirmed
+that Excel opens our output without a repair prompt across a real corpus (#1/#3), there is no
+`.xls` or password support (#7), Arabic/Devanagari/Thai text is not shaped and non-Latin PDF is
+weak (#5), charts lose options (#4), PivotTables lack slicers (#8), keyboard key tips remain (#9),
+and the stability soak is not final (#10). Beta needs those closed (see
+[beta gates](docs/roadmap.md#beta-gates)).
 
 The 2026-10-07 numbers (catalog 89%, "feature depth ~65%", "~215 h to full parity") were
 re-measured. Catalog and function counts held or rose; the depth and hours moved because of new
@@ -61,7 +65,7 @@ collaboration, mobile, AI).
 | Features (13 areas, table below) | ~59% (breadth ~75%) | 300–485 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | UI/UX fidelity | ~55% | 50–80 | [ui-parity.md](docs/ui-parity.md) |
 | File formats | ~50% | 80–120 | [file-format-parity.md](docs/file-format-parity.md) |
-| Performance | ~35% | 35–55 | [target-app-parity.md](docs/target-app-parity.md#performance) |
+| Performance | ~35% (conservative; gate met) | 20–35 | large-workbook gate met (100M cells 16.7 MiB live, 100k edit 20–25 ms, 1M rows, bounded commands); M20/M19 polish, zone maps and paging hardening remain; re-scored at beta exit. [target-app-parity.md](docs/target-app-parity.md#performance) |
 | Stability | ~60% | 15–25 | [gaps.md](docs/gaps.md) |
 | Localization | ~10% (ribbon in 6 languages) | 100–165 | [localization-parity.md](docs/localization-parity.md) |
 | Hardware (multi-core calc, GPU, pen, multi-window) | ~40% | 25–40 | [hardware-parity.md](docs/hardware-parity.md) |
@@ -116,25 +120,33 @@ Localized German formulas and numbers are in PR #163. Detail: [localization-pari
 
 Other shipped languages: 3 (Russian and German, menus only, ~12%; Dutch, menus, File view and dialog titles, ~24%).
 
-## Upcoming
+## Next (ordered, 2026-10-29)
 
-Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
-[docs/roadmap.md](docs/roadmap.md).
+The detailed queue with dependencies and the parallel plan is in
+[docs/roadmap.md#execution-queue](docs/roadmap.md#execution-queue). In order:
 
-1. **Land the open PR queue** (50 open PRs on 2026-10-10, many fixing listed gaps: recalc and spill
-   correctness, chart kind round-trip, CJK font fallback, macOS Finder open, German and Chinese
-   UI). Review and merge: 8–15 h.
-2. **XLSX fidelity on a real-world corpus**, with Excel opening our output without repair: 25–35 h.
-3. **Large workbooks and recalc speed**: 100 MB XLSX, 1M-row operations, paging and append-style edits: 40–60 h (multi-threaded recalc, bounded bulk commands, cold paging and the M20 row/column maps landed 10-27/28; compaction and line metadata remain).
-4. **Charts depth**: kinds and options round-trip, axes, trendlines, error bars: 25–35 h.
-5. **Text in every script** (CJK, Thai, Arabic, Devanagari) in cells and PDF: 12–20 h.
-6. **Legacy `.xls` import and password-protected workbooks**: 20–30 h.
-7. **Localization**: extend the catalog past the ribbon, then the twelve languages: 100–165 h.
+| Wave | Work | Hours | Notes |
+|---|---|---|---|
+| **0** | Close the base: M20 compaction, line-metadata map, mapped writes/logical diff/physical-column packed walk; M19 spill path, byte-budget LRU, flat-memory save/scan | **30–45** | Start now; no owner. Last large-workbook debt. |
+| **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
+| **1** | **XLSX corpus + Excel acceptance** (#1/#3) | 21–35 | **Owner: half a day in Excel.** The only external gate; start early. |
+| **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
+| **2** | Charts depth (#4) | 25–35 | Longest; start in parallel. |
+| **2b** | All-script text (#5) | 12–20 | Parallel. |
+| **2c** | Keyboard/key tips (#9) | 12–20 | Parallel; small UI. |
+| **3** | `.xls` + password-protected books (#7) | 28–42 | Independent; start in parallel once base is stable. |
+| **3b** | Pivot slicers/PivotCharts, Excel verification (#8) | 20–30 | After #1's Excel loop. |
+| **4** | **Beta exit**: gates green, full `cargo xtask ci`, corpus re-run, release | 8–12 | After 0–3b. |
+| **Post-beta** | M21 Parquet read/linked tables (20–30) · M17 zone maps (8–12) · localization (100–165) · Get & Transform/data model (60–100) · full charts/collaboration/mobile/AI · M22 only on a measured trigger | — | Not beta blockers. |
+
+Parallel plan: 4–6 agents, one integrator; owner does the Excel/corpus half-day. The old open-PR
+queue is no longer a separate wave; land/rebase any still-open PR into the gap it addresses.
 
 ## Progress log
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | Roadmap re-planned: wave 0 closes the M20/M19 base (30–45 h), wave 1 proves XLSX in Excel/corpus with the owner (21–35 h), then calc/text/keyboard/charts, `.xls`/encryption and Pivot slicers; beta exit is wave 4. Post-beta puts M21 read/linked tables, zone maps, localization and Get & Transform. M22 stays deferred. The old PR-queue wave is folded into the gap it addresses |
 | 2026-10-28 | M20's row and column halves land: `CellStore` keeps a logical→physical `RowMap`; `shift_rows` changes a segment list instead of moving cells, inserted rows allocate fresh physical keys on write, and reads/iteration/formulas/used range map through. **Insert one row above 1M×20 is 3.7 ms command / 35.8 ms commit, with 0 cells moved** (deleting the last row first to make room). `rewrite_all_formulas` no longer walks every cell to find no formulas, and `CellStore::iter` walks only bands that exist. The column sibling (`ColMap`) uses the same runs over the used width, allocates/reuses physical columns on write, and makes a column insert 9.8 ms command / 42.5 ms commit with no cell moved. Segment compaction, row line metadata and value writes on mapped sheets remain |
 | 2026-10-28 | M19 cold paging lands: completed bands are compressed into per-sheet `GPB1` page files (zlib) and decoded through a 4,096-band LRU; the engine pages packages over 200 MB, so the 55 MB 1M×10 sheet stays live. The **100M-cell export opens at 16.7 MiB live / 183.1 MiB peak** (was 1.91 GiB) with 729.5 MiB of compressed pages and its digest cell-for-cell unchanged; the **31.7M report stays live at 49.7 MiB and 1.47 s**. Page files die with the store, corrupt pages are refused; spill-beside-document and a byte budget remain |
 | 2026-10-28 | M19 starts on memory: a finished band drops the text pointer index (the text table stays; the first edit rebuilds the index), so the 100M-cell unique-key export falls from **2,411 to 1,911 MiB** live, its text tables from 640 to 301 MiB and the number-table slack is returned (band overhead 679 to 519 MiB); the 31.7M-cell report digest is unchanged. A text past the u16 slots now keeps its own slot in the row's wide table instead of the last text added. Cold paging is still what takes the remaining 1.9 GB under 600 MB |
@@ -230,6 +242,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | major | Roadmap re-planned after M19/M20: large-workbook beta gate met; wave 0 base (30–45 h), wave 1 XLSX/Excel (21–35 h, owner), waves 2–3 fidelity/formats, wave 4 beta exit; M21 post-beta, M22 deferred |
 | 2026-10-28 | major | M20 row+column maps (row insert 3.7 ms / 35.8 ms commit, column insert 9.8 ms / 42.5 ms on 1M×20, 0 cells moved; formula rewrite and iteration skip empty cells); gaps §2, roadmap M20 and progress log updated |
 | 2026-10-28 | major | M19 cold paging (compressed pages, LRU; 100M-cell export 16.7 MiB live / 183.1 MiB peak; digest unchanged); gaps §2, roadmap M19 and the progress log updated |
 | 2026-10-28 | minor | M19 memory step (text index dropped after a band is complete, number table shrunk; 100M-cell export 2,411 → 1,911 MiB live); gaps §2 and roadmap M19 updated |

@@ -1,20 +1,43 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** major (M20 row and column halves land: logical→physical maps; row insert 3.7 ms, column insert 9.8 ms on 1M×20, no cell moves; compaction/line metadata remain) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** major (roadmap re-planned after M19/M20: large-workbook beta gate met; execution queue, parallel plan and post-beta order set) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
 [`target-app-parity.md`](target-app-parity.md). Estimates are Opus 5.5 agent-hours.
 
-## Current focus
+## Current focus (2026-10-29)
 
-1. **Review and land the open PR queue** (50 PRs on 2026-10-10): recalc and spill fixes (#148,
-   #155, #156, #157), whole-sheet and large-range fixes (#151, #152, #153, #154), chart kinds
-   (#158, #161), macOS document open (#164, #167), German UI, numbers and formulas (#163),
-   15-digit comparison (#187). 8–15 h. Language work should extend the new `i18n` catalog past the
-   ribbon rather than add scattered literals.
-2. **XLSX on real files** (gaps #1, #3): corpus run plus Excel opening our output.
-3. **Large workbooks and multi-threaded recalc** (gap #2).
+**Stage: alpha, with the large-workbook beta gate met.** The 100M-cell export opens with 16.7 MiB
+live and 183 MiB peak (M19), row and column inserts/deletes change logical→physical maps instead of
+moving cells (M20), independent formulas recalculate on the machine's threads, and bulk data
+commands are bounded. What remains is a sequenced push to beta: finish the M20/M19 base, prove XLSX
+in Excel, then close the fidelity, format and interaction gates. The old open-PR queue is no longer
+the plan; if PRs are still open when picking up a gap, land/rebase them into that gap's task rather
+than scheduling a separate review wave.
+
+### Execution queue
+
+Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5 agent-hours.
+
+| Order | Work | Gap | Hours | Depends / notes |
+|---|---|---|---|---|
+| **0** | **Close the base**: M20 segment compaction; row line-metadata map; mapped `set_values`, logical `diff`, physical-column `visit_packed`; M19 spill-beside-document, byte-budget LRU, flat-memory save/scan | M20/M19 follow-up | **30–45** | Start now; no owner. This is the last large-workbook debt before beta evidence. |
+| **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
+| **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
+| **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
+| **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 25–35 | Longest gate; start early in parallel with 1. |
+| **2b** | All-script text: CJK fallback confirmation, Arabic/Devanagari/Thai shaping, bidi, non-Latin PDF | #5 | 12–20 | Parallel with 2. |
+| **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 12–20 | Parallel with 2; UI-heavy but small. |
+| **3** | `.xls` import and password-protected workbooks | #7 | 28–42 | Independent and long; start in parallel with 1–2 once the base is stable. |
+| **3b** | PivotTables: slicers, PivotCharts, Excel verification | #8 | 20–30 | After #1's Excel loop exists; needs #7's Excel-side practice less than it seems. |
+| **4** | **Beta exit**: stability soak, all gates green, full `cargo xtask ci`, docs, release, corpus re-run | all | 8–12 | After 0–3b. |
+| **Post-beta** | M21 Parquet read half and linked tables (20–30 h) · M17 zone maps (8–12 h) · localization, twelve languages (100–165 h) · Get & Transform/data model (60–100 h) · full chart depth, collaboration, mobile, AI · M22 only if a measured trigger fires | M17/M21/M22 | — | Not beta blockers. Keep the 100M/paging base stable; no native format before a trigger. |
+
+**Parallel plan.** With 4–6 agents: A owns wave 0 (M20/M19 base); B owns wave 1 (XLSX); C owns
+charts (wave 2); D owns text + keyboard (2b/2c); E owns `.xls`/encryption (3); the integrator owns
+stability, the beta gate table, and the release. The owner's Excel/corpus half-day is the critical
+external dependency; schedule it before wave 1 finishes.
 
 ## Alpha gate
 
@@ -25,38 +48,38 @@ workflow, would make GridCraft pre-alpha.
 | Core workflow | Works end to end? | Evidence | Hours to pass |
 |---|---|---|---|
 | Build a model: enter data and formulas, recalc, save XLSX, reopen | yes | 492 working functions, dynamic arrays, LET/LAMBDA, names, tables; XLSX round-trip tests (`crates/xlsx/src/tests/roundtrip.rs`). Edge-case bugs (#57 15-digit equality, stale spills #133/#139) give wrong results in specific cases, not in the workflow | 0 (fixes are beta work, gap #6) |
-| Open a colleague's XLSX, edit, save, hand it back | partial, not blocking | Typical workbooks open and save with cells, styles, CF, validation, tables, names and pivots; unmodelled parts are dropped with a warning (gap #3); Excel-side repair prompts unverified (gap #1); ~100 MB files fail (#175) | 0 for alpha (gaps #1–#3 are beta gates) |
+| Open a colleague's XLSX, edit, save, hand it back | yes for the workflow | Typical workbooks open and save with cells, styles, CF, validation, tables, names and pivots; large files now open (100M cells at 16.7 MiB live with cold paging); unmodelled parts are still dropped with a warning (gap #3) and Excel-side repair prompts are unverified (gap #1). These are beta gates, not alpha blockers | 0 for alpha (gaps #1–#3 are beta gates) |
 | Format and present: number formats, styles, conditional formatting, print or PDF | yes | Full number-format language, 47 cell styles, all CF kinds, Page Break Preview, PDF export and printing. PDF can't carry non-Latin text (gap #5) | 0 |
 | Analyze: sort, filter, tables, PivotTable | yes | Multi-level sort, AutoFilter, tables with totals, PivotTables with field list, layouts, grouping, refresh and XLSX round-trip. Calculated fields done; slicers missing (gap #8) | 0 |
 | Chart the data | partial, not blocking | Column, bar, line, pie, area, scatter, combo, histogram, box, waterfall, funnel, treemap, sunburst and stock charts are created, edited and survive save and reopen; trendlines are drawn; no axis options (gap #4) | 0 for alpha |
 | Import and export CSV | yes | Encoding and delimiter detection on read, CSV/TSV write; exports raw rather than displayed values (gap #19) | 0 |
 
 **Passes:** every core workflow works end to end on macOS with save and reopen; the two partial
-rows lose fidelity only on less common content (very large files, unmodelled parts, advanced
-chart kinds), which are beta gates, not alpha blockers. Ready for real work ~50% is inside the
-40–75% alpha band.
+rows lose fidelity only on less common content (unmodelled XLSX parts, advanced chart options),
+which are beta gates, not alpha blockers. Large files now open with cold paging. Ready for real
+work ~50% is inside the 40–75% alpha band.
 
 ## Beta gates
 
 Beta means: ~75% ready for real work, opens and saves XLSX reliably, remaining gaps are known bugs
 and edge features. Each gate links its gap.
 
-| Gate | Gap | Hours |
-|---|---|---|
-| XLSX proven on a real-world corpus; Excel opens our output without repair | #1 | 15–25 |
-| Unmodelled XLSX parts preserved on save | #3 | 10–15 |
-| 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | 25–40 |
-| Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | 25–35 |
-| Text in every script renders and exports | #5 | 12–20 |
-| Calculation correctness bugs closed; iterative calculation | #6 | 10–15 |
-| `.xls` import, password-protected workbooks | #7 | 28–42 |
-| PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | 20–30 |
-| Keyboard: key tips, shortcut audit, context menus | #9 | 12–20 |
-| Field crashes and freezes closed; autosave/recovery soak | #10 | 8–12 |
-| **Total** | | **~165–255 (≈160–240 after overlap with the PR queue)** |
+| Gate | Gap | Status (2026-10-29) | Hours left |
+|---|---|---|---|
+| XLSX proven on a real-world corpus; Excel opens our output without repair | #1 | **open**; owner needed | 15–25 |
+| Unmodelled XLSX parts preserved on save | #3 | **open**; do with #1 | 6–10 |
+| 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | **met 10-28** (M19/M20); M20/M19 polish in wave 0 | 0 for the gate; 30–45 polish |
+| Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **open**; longest gate | 25–35 |
+| Text in every script renders and exports | #5 | **open** | 12–20 |
+| Calculation correctness bugs closed; iterative calculation | #6 | **open** | 10–15 |
+| `.xls` import, password-protected workbooks | #7 | **open** | 28–42 |
+| PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
+| Keyboard: key tips, shortcut audit, context menus | #9 | **open** | 12–20 |
+| Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
+| **Total** | | gates #1, #3–#10 | **~136–209 + 30–45 base = ~160–250** |
 
-With 4–5 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
-to check our files, and Windows machines with the reported GPU drivers.
+With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
+to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
 
 ## Milestones
 
@@ -74,16 +97,16 @@ to check our files, and Windows machines with the reported GPU drivers.
 | M9 | Page layout & print | most; Page Layout view remains |
 | M10 | PivotTables, Solver, Analysis ToolPak | PivotTables in; slicers, Solver, ToolPak remain |
 | M11 | Automation (record actions, scripts) | done |
-| M12 | Performance, accessibility, i18n | partial; i18n not started |
+| M12 | Performance, accessibility, i18n | performance gate met (10-28); accessibility and i18n remain |
 | M13 | Release & polish | releases shipping (v0.2.0–v0.4.0, signed) |
-| M14 | **Beta gates** (table above) | not started as a milestone; parts in open PRs |
+| M14 | **Beta gates** (table above) | **in progress**: large-workbook gate met; execution queue below drives the rest |
 | M15 | Localization infrastructure and the twelve languages | started: ribbon catalog in ja, zh, ko, pt-BR, ru (#31, #104, #82); German in PR #163 |
 | M16 | Get & Transform, data model | not started |
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
-| M18 | Vectorized aggregation kernels | planned |
+| M18 | Vectorized aggregation kernels | landed (10-24/27): whole-column folds and recalc kernels; remaining work in gaps |
 | M19 | Cold paging: bands leave memory when unused | **landed (10-28)**: compressed pages + 4,096-band LRU; spill-beside-document, byte budget and save/scan remain |
-| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **row and column halves landed (10-28)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20; compaction, line metadata and mapped value writes remain |
-| M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading and linked tables remain |
+| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **row and column halves landed (10-28)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20; wave 0 closes compaction, line metadata and mapped value writes |
+| M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading/linked tables are post-beta (not a beta gate) |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
 
 ## Large workbooks: what big-data engineering offers a spreadsheet
@@ -572,7 +595,7 @@ to leave room and then inserting a row at 1:
 
 The 1M×10 case is 3.9 / 4.0 ms and 36.8 / 35.7 ms commit. A save/reopen test keeps the values and the
 shifted formula, and the model test checks the map, insertion into a gap, delete, iteration and JSON
-round trip. Full 412 engine tests, 43 model, 265 xlsx, 86 calc and release fuzz 100×200 stay green.
+round trip. Full 414 engine tests, 46 model, 265 xlsx, 86 calc and release fuzz 100×200 stay green.
 
 **Remaining.** Row line metadata (`Sheet.rows`) is still shifted as a BTreeMap (a workbook with a
 custom height on every row pays that); a compaction pass has not been written, so repeated
@@ -705,6 +728,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | major | Roadmap re-planned after M19/M20: current focus, execution queue, parallel plan, beta gate status and post-beta order set; large-workbook gate marked met and the old PR-queue wave folded into the gaps |
 | 2026-10-28 | minor | Bulk edits scan blocked arrays once for the union of the changed blocks (Remove Duplicates 1M×10 91 → 12 s, recalc 80 s → 1.4 s); Sort 1M×10 3.2 s, Fill Down 1M rows 1.45 s; `data.sort`/`removeDuplicates`/`setValues` share a 12M-cell cap, 1M×20 refused in 1.3 s; `CellStore::style` fast path |
 | 2026-10-28 | major | M20 row and column halves: `CellStore` keeps logical→physical `RowMap` and `ColMap`; inserts/deletes change maps instead of moving cells, gaps allocate physical keys on write, and reads/iteration/formulas/used range map. Row insert above 1M×20 3.7 ms / 35.8 ms commit, column insert 9.8 ms / 42.5 ms, 0 cells moved; formula rewrite and iteration stop walking every cell/empty row. Compaction, line metadata and mapped value writes remain |
 | 2026-10-28 | major | M19 cold paging: completed bands are compressed into per-sheet `GPB1` page files, loaded on read through a 4,096-band LRU; the engine pages packages over 200 MB. 100M-cell export: 16.7 MiB live / 183.1 MiB peak / 729.5 MiB compressed pages (11.58 s open), digest unchanged; 31.7M report: 49.7 MiB live, 1.47 s open. Remaining: spill beside document, byte budget, save/scan decode |

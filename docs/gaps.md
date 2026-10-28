@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (§2: M20 row and column maps land; row insert 3.7 ms, column insert 9.8 ms on 1M×20 with zero cell moves; compaction and line metadata remain) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-29 · **Change:** major (roadmap re-planned: large-workbook gate met; base polish is wave 0, XLSX/Excel wave 1, then fidelity and formats; M21 post-beta) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -101,9 +101,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
   (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
-- **Estimate:** the beta gate's recalc, edit-latency, 1M-row, bounded data-command and memory items
-  are met; append-style structural edits (M20) are the work beyond it, planned in
-  [`roadmap.md`](roadmap.md#large-workbooks-what-big-data-engineering-offers-a-spreadsheet).
+- **Status (10-29): the large-workbook beta gate is met.** Recalc, edit latency, 1M-row operations,
+  bounded data commands and memory all pass their targets; M19 cold paging and the M20 row/column
+  maps landed. Remaining work is base hardening, not capacity: M20 compaction/line metadata/mapped
+  value writes and M19 spill placement/byte budget/flat-memory save are wave 0 in
+  [`roadmap.md`](roadmap.md#execution-queue). The M21 Parquet read half is post-beta. The old
+  estimate is superseded by those waves.
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)
 - **Missing:** slicers and their caches, timelines, the data model, query tables attached to

@@ -1,6 +1,6 @@
 # Target-app parity: GridCraft vs Microsoft Excel
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (bulk whole-sheet commands are bounded: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, 12M-cell cap; no score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-29 · **Change:** minor (large-workbook beta gate met: 100M cells 16.7 MiB live, recalc threads, row/column maps; performance row kept conservative until beta exit) · **Target:** Microsoft Excel (Microsoft 365)
 
 This is the authoritative parity assessment. [`ROADMAP.md`](../ROADMAP.md) summarizes it,
 [`gaps.md`](gaps.md) lists every shortfall, and the area checklists hold the detail:
@@ -20,7 +20,7 @@ generated ribbon checklist is [`parity-checklist.md`](parity-checklist.md).
 | **Mainstream practitioner** | **~50%** | estimated; [method](#mainstream-practitioner) (69.5 depth × 0.90 × 0.92 × 0.88 = 50.6) |
 | **Essentials user** | **~63%** | estimated; [method](#essentials-user) (80.2 depth × 0.92 × 0.95 × 0.90 = 63.1) |
 | Stage | **alpha** | see [Stage](#stage) |
-| Remaining to beta | **~160–240 Opus 5.5 agent-hours** | estimated; [roadmap.md](roadmap.md#beta-gates) |
+| Remaining to beta | **~160–250 Opus 5.5 agent-hours** | estimated; [roadmap.md](roadmap.md#beta-gates); large-workbook gate met, base polish in wave 0 |
 | Remaining to full parity | **~700–1,100 Opus 5.5 agent-hours** | estimated; sum of the rows below |
 
 ### Readiness by audience
@@ -101,12 +101,12 @@ performance 8, stability 8, localization 4, hardware 2, platforms 2, ecosystem 2
 | Dimension | Weight | Ready | Hours | Evidence |
 |---|---|---|---|---|
 | Features | 45 | ~59% | 300–485 | Table above |
-| File formats | 15 | ~50% | 80–120 | XLSX read/write is broad but unproven on a real corpus and in Excel; XLSB and ODS are values-only import; no XLS, XML Spreadsheet 2003, SYLK, DIF, PRN; VBA dropped; 100 MB XLSX fails (#175). [file-format-parity.md](file-format-parity.md) |
+| File formats | 15 | ~50% | 80–120 | XLSX read/write is broad and large files now open (100M cells with cold paging) but output is unproven on a real corpus and in Excel; XLSB and ODS are values-only import; no XLS, XML Spreadsheet 2003, SYLK, DIF, PRN; VBA dropped. [file-format-parity.md](file-format-parity.md) |
 | UI/UX fidelity | 12 | ~55% | 50–80 | Excel-style ribbon, galleries, dialogs, formula bar, status bar; 59 commands with shortcuts vs Excel's 200+; key tips on part of the Home tab only; short context menu; single window. [ui-parity.md](ui-parity.md) |
-| Performance | 8 | ~35% | 35–55 | [Performance](#performance) |
+| Performance | 8 | ~35% (conservative; large-workbook gate met 10-28, re-scored at beta exit) | 20–35 | [Performance](#performance) |
 | Stability | 8 | ~60% | 15–25 | Never-crash rules enforced by lint, every command fuzzed with hostile params, random command sequences fuzzed against undo/redo, XLSX round-trip and full-recalc invariants, last-resort guard in `Session::execute`. Field reports: Windows Intel GPU crash (#120), error on close (#117), freeze opening from Finder (#166), screen flashing (#76) |
 | Localization | 4 | ~10% | 100–165 | Ribbon-only catalog in five languages (ja, zh, ko, pt-BR, ru; ~12% of strings each), CJK/Thai/Hebrew font fallback, no shaping or RTL. [localization-parity.md](localization-parity.md) |
-| Hardware | 2 | ~40% | 25–40 | GPU UI via wgpu; single-threaded calc; no pen pressure; one window. [hardware-parity.md](hardware-parity.md) |
+| Hardware | 2 | ~40% | 25–40 | GPU UI via wgpu; recalc uses up to 8 threads for independent formulas; no pen pressure; one window. [hardware-parity.md](hardware-parity.md) |
 | Platforms | 2 | ~80% | 30–60 | [Platforms](#platforms) |
 | Ecosystem / add-ins | 2 | ~10% | 25–40 | [Ecosystem and AI](#ecosystem-and-ai) |
 | AI features | 2 | ~15% | 30–50 | [Ecosystem and AI](#ecosystem-and-ai) |
@@ -146,7 +146,7 @@ Discounts for what still stops real work:
 |---|---|---|
 | Interaction fidelity | × 0.90 | 59 command shortcuts vs Excel's 200+; key tips only on part of the Home tab (#43); rectangular selection bug (#28); charts can't be resized (#190); one window (#162); missing horizontal scrollbar report (#176) |
 | Stability on real machines | × 0.92 | Never-crash lints, fuzzed commands and the `Session::execute` guard; but field reports of a startup crash on Intel UHD (#120), an error on close (#117), a freeze opening from Finder (#166) and screen flashing (#76) |
-| File exchange with Excel users | × 0.88 | Excel opening our output is unverified across features; unmodelled parts dropped on save; advanced chart kinds lose their type; 100 MB files fail (#175); `.xls` and encrypted files are refused with a clear message (#17) rather than opened. Harsher than a drawing app's discount because spreadsheets are exchanged constantly |
+| File exchange with Excel users | × 0.88 | Excel opening our output is unverified across features; unmodelled parts dropped on save; advanced chart kinds lose their type; `.xls` and encrypted files are refused with a clear message (#17) rather than opened. Large files now open (100M cells with cold paging), but the corpus/repair proof is gate #1. Harsher than a drawing app's discount because spreadsheets are exchanged constantly |
 
 **Mainstream practitioner: 69.5 × 0.90 × 0.92 × 0.88 = 50.6 → ~50%** (estimated). Unlike most
 apps it is not higher than the full number: GridCraft's breadth is wide (functions, formatting,
@@ -206,12 +206,14 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Recalc threads | up to 8 for independent formulas (native; wasm single-threaded) | all cores | measured (`crates/calc`): leaves wave by wave; arrays, volatile formulas and cycles stay sequential |
 | Edit → recalc, 100k dependents | **20–25 ms** (2026-10-27); target < 100 ms met | tens of ms | measured on the owner's machine, `_gridcraft-bench/formula_bench`, release: 65–75 ms before threading, 245 ms before the round; 1M dependents are 208–277 ms in `calcbench`; a full recalc of the 100k sheet is 89–114 ms |
 | Grid scrolling | virtualised, O(log n) geometry with custom row heights | smooth | measured in code |
-| Open a ~100 MB XLSX | fails (#175) | opens | user report |
+| Open a large workbook | 100M-cell / 551 MB export: **16.7 MiB live, 183 MiB peak**, 729 MiB compressed pages; 31.7M-cell / 118 MB report: 49.7 MiB live, 1.47 s | opens | measured 2026-10-28, `session_breakdown` / `cell_digest` |
+| Row / column structural insert | 1M×20: row **3.7 ms** command / 35.8 ms commit; column **9.8 ms** / 42.5 ms; zero cells moved | immediate | measured 2026-10-28, `gridcraft-cli` |
 | Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
-Work: streaming XLSX reader with shared-string and style dedup, multi-threaded recalc of
-independent chains (native only; WASM stays single-threaded), whole-column reference
-clamping, a `cargo xtask bench` with fixed workbooks so the numbers become measured.
+Work: M20/M19 polish (segment compaction, line metadata, mapped value writes, spill placement and
+byte budget, flat-memory save), then M17 zone maps and the M21 Parquet read half after beta. The
+old streaming/threading/whole-column items are landed; keep the measured workbooks and
+`cargo xtask bench` as the regression net.
 
 ## Platforms
 
@@ -241,10 +243,12 @@ Linux, BSD and RISC-V, where Excel doesn't run.
 ## Stage
 
 **Alpha.** All six core workflows in the [alpha gate](roadmap.md#alpha-gate) pass end to end on macOS with save and reopen (two pass with non-blocking fidelity loss). Core workflows exist end to end, but depth, fidelity and file compatibility are rough
-(ready ~50%, inside the 40–75% alpha band). Not beta: the main format, XLSX, has not been proven
-on real-world files or confirmed to open in Excel without repair, large files fail, `.xls` is
-missing and text in several scripts doesn't render. Distance to beta: ~25 points of readiness and
-~160–240 h, itemized in [roadmap.md](roadmap.md#beta-gates).
+(ready ~50%, inside the 40–75% alpha band). The large-workbook gate is met: 100M cells open with
+16.7 MiB live, 100k-dependent edits are 20–25 ms, and row/column structural maps are in. Not beta:
+XLSX has not been proven on real-world files or confirmed to open in Excel without repair, `.xls`
+is missing, charts/text/Pivot/keyboard gates remain, and the M20/M19 base still needs compaction,
+line metadata, spill placement and flat-memory save. Distance to beta: ~25 points of readiness and
+~160–250 h, itemized in [roadmap.md](roadmap.md#beta-gates).
 
 ## Effort and calibration
 
@@ -334,6 +338,7 @@ The inventory carried over from the 2026-10-07 ROADMAP.md, updated for what land
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | Large-workbook beta gate met: 100M cells 16.7 MiB live / 183 MiB peak with cold paging, 100k edit 20–25 ms, 1M rows, row and column structural maps; the performance readiness score is left conservative until M20/M19 polish closes and beta re-scores |
 | 2026-10-28 | minor | Whole-sheet operations: bulk edits scan blocked arrays once for the union of changed cells; Remove Duplicates on 1M×10 is 12 s (was 91), Sort 3.2 s, Fill Down 1M rows 1.45 s, and sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) |
 | 2026-10-27 | minor | Recalculation performance: independent formulas now run on up to eight threads (leaves wave by wave); the 100k-dependent edit is 20–25 ms end to end (was 65–75 single-threaded, 245 before the round) and 1M is 208–277 ms — the recalculation-threads and `< 100 ms` rows are updated |
 | 2026-10-27 | minor | Recalculation performance: the 100k-dependent edit is 65–75 ms (was 245) and a full recalc 134–147 ms (was 281–289), single-threaded — the `< 100 ms` target in the performance table is met |
