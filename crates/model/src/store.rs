@@ -1367,6 +1367,31 @@ impl RowMap {
         self.rebuild();
     }
 
+    /// Reclaims the map after cells have been removed: merges the runs the way [`rebuild`] does
+    /// and returns a single run from the origin to the identity fast path when this store has no
+    /// page that the shorter run would otherwise leave behind. A page can hold cells at physical
+    /// rows past the run; turning the map into an identity would make them readable again, so a
+    /// store with pages only resets a map that covers every row.
+    ///
+    /// [`rebuild`]: Self::rebuild
+    fn normalize(&mut self, reset_prefix: bool) {
+        if self.identity {
+            return;
+        }
+        self.rebuild();
+        let Some(segment) = self.segments.first().copied() else { return };
+        if self.segments.len() != 1 || segment.logical != 0 || segment.physical != 0 || segment.len == 0 {
+            return;
+        }
+        if !reset_prefix && segment.len < gridcraft_core::MAX_ROWS {
+            return;
+        }
+        self.identity = true;
+        self.segments.clear();
+        self.by_physical.clear();
+        self.next_physical = gridcraft_core::MAX_ROWS;
+    }
+
     /// Merges adjacent logical/physical runs and refreshes the inverse view.
     fn rebuild(&mut self) {
         let mut merged: Vec<RowSegment> = Vec::with_capacity(self.segments.len());
@@ -1571,6 +1596,35 @@ impl ColMap {
         }
         self.segments = out;
         self.rebuild();
+    }
+
+    /// Reclaims the map after cells have been removed: merges the runs, drops the free keys that
+    /// are mapped or past every physical column this map has handed out, and returns a single run
+    /// from the origin to the identity fast path when this store has no page that the shorter run
+    /// would otherwise leave behind. See [`RowMap::normalize`] for why pages bound the reset.
+    fn normalize(&mut self, reset_prefix: bool) {
+        if self.identity {
+            self.free.clear();
+            return;
+        }
+        self.rebuild();
+        let mut free = std::mem::take(&mut self.free);
+        free.sort_unstable();
+        free.dedup();
+        free.retain(|physical| *physical < self.next_physical && self.inverse(*physical).is_none());
+        self.free = free;
+        let Some(segment) = self.segments.first().copied() else { return };
+        if self.segments.len() != 1 || segment.logical != 0 || segment.physical != 0 || segment.len == 0 {
+            return;
+        }
+        if !reset_prefix && segment.len < gridcraft_core::MAX_COLS {
+            return;
+        }
+        self.identity = true;
+        self.segments.clear();
+        self.by_physical.clear();
+        self.free.clear();
+        self.next_physical = 0;
     }
 
     fn rebuild(&mut self) {
@@ -2771,6 +2825,88 @@ impl CellStore {
     pub fn take_range(&mut self, r: RangeRef) -> Vec<(CellRef, Cell)> {
         let keys: Vec<CellRef> = self.iter_range(r).map(|(c, _)| c).collect();
         keys.into_iter().filter_map(|c| self.remove(c).map(|cell| (c, cell))).collect()
+    }
+
+    /// Reclaims cells that no logical row or column can reach, and normalizes the maps.
+    ///
+    /// A structural edit changes the row/column map instead of moving cells, so a shift that is
+    /// not paired with a delete can leave cells at physical rows or columns whose inverse is gone.
+    /// Those cells are invisible to `get`, `iter` and `used_range` but still hold storage and
+    /// count in `len`. This walks the live bands only (never the sheet grid), drops each
+    /// unreachable cell and every band that empties, then merges the map runs, bounds the column
+    /// free list and returns a contiguous map to the identity fast path.
+    ///
+    /// Paged bands are deliberately left untouched: a page can hold cells at physical positions
+    /// no run covers, and this slice does not decode or rewrite pages. Those cells stay counted
+    /// (and unreadable) until a later pass compacts pages too; every mapped paged cell still reads
+    /// exactly as before. The second call is a no-op.
+    pub fn compact(&mut self) {
+        let keys: Vec<u32> = self.bands.keys().copied().collect();
+        let mut removed = 0usize;
+        for key in keys {
+            if self.bands.get(&key).is_some_and(|band| band.rows.is_empty()) {
+                self.bands.remove(&key);
+                continue;
+            }
+            // Look before copying: a band with nothing to reclaim keeps sharing its `Arc` with the
+            // undo snapshot, so a second pass (or a pass over a clean store) copies no band.
+            let (gone, clear_rows, drop_cells) = match self.bands.get(&key) {
+                Some(band) => Self::orphan_plan(band, key, &self.row_map, &self.col_map),
+                None => continue,
+            };
+            if gone == 0 {
+                continue;
+            }
+            let Some(band) = self.bands.get_mut(&key) else { continue };
+            let band = Arc::make_mut(band);
+            for row_key in clear_rows {
+                band.remove_row(row_key);
+            }
+            for (row_key, col) in drop_cells {
+                let _ = band.take(row_key, col);
+            }
+            removed = removed.saturating_add(gone);
+            if band.rows.is_empty() {
+                self.bands.remove(&key);
+            }
+        }
+        self.len = self.len.saturating_sub(removed);
+        // A page can hold a cell at a position the shortened run no longer covers; with no pages,
+        // a single run from the origin is identity for every cell the store still holds.
+        let reset_prefix = self.pages.is_empty();
+        self.row_map.normalize(reset_prefix);
+        self.col_map.normalize(reset_prefix);
+    }
+
+    /// The rows to clear and the cells to drop of one live band whose physical row or column has
+    /// no logical inverse: `(cells, rows, (row, column))`. Rows are visited by key, the cells of a
+    /// mapped row by position; the grid is never walked.
+    fn orphan_plan(band: &Band, key: u32, rows: &RowMap, cols: &ColMap) -> (usize, Vec<u32>, Vec<(u32, u32)>) {
+        let mut removed = 0usize;
+        let mut clear_rows: Vec<u32> = Vec::new();
+        let mut drop_cells: Vec<(u32, u32)> = Vec::new();
+        for row in &band.rows {
+            let physical = key.saturating_mul(BAND).saturating_add(row.key);
+            if rows.inverse(physical).is_none() {
+                removed = removed.saturating_add(row.cells as usize);
+                clear_rows.push(row.key);
+                continue;
+            }
+            // An identity column map maps every column in the grid; only a cell past the last grid
+            // column can be orphaned, so the per-cell walk is skipped for a row that stops short.
+            let scan = !cols.is_identity() || row.column_span(band).is_some_and(|(_, last)| last >= gridcraft_core::MAX_COLS);
+            if !scan {
+                continue;
+            }
+            for i in 0..row.cells as usize {
+                let col = row.col_at(band, i);
+                if cols.inverse(col).is_none() {
+                    removed = removed.saturating_add(1);
+                    drop_cells.push((row.key, col));
+                }
+            }
+        }
+        (removed, clear_rows, drop_cells)
     }
 
     /// Rows at or after `from` moved by `delta` (positive = down). This changes the row map, not
@@ -4271,6 +4407,211 @@ mod tests {
         assert_eq!(s.iter().count(), model.len());
         for ((row, col), v) in &model {
             assert_eq!(s.get(c(*row, *col)).map(|cell| cell.value), Some(v.clone()), "{row}:{col}");
+        }
+    }
+
+    #[test]
+    fn compact_reclaims_rows_with_no_logical_inverse() {
+        let mut s = CellStore::new();
+        for row in 0..10u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        s.set(c(2, 1), Cell { value: Value::Text(Arc::from("kept")), formula: Some(Arc::new(Formula::new("=A3"))), style: StyleId(4) });
+        let mut dynamic = Formula::new("=A1:A2*2");
+        dynamic.array = Some(RangeRef::parse("C4:D5").expect("range"));
+        dynamic.dynamic = true;
+        let array = Value::Array(Arc::new(gridcraft_core::Array::row(vec![Value::Number(1.0), Value::Number(2.0)])));
+        s.set(c(3, 2), Cell { value: array, formula: Some(Arc::new(dynamic)), style: StyleId(9) });
+        let before = s.len();
+        assert_eq!(before, 12);
+        let snapshot = s.clone();
+        // A direct model shift: unlike the engine's delete command, it does not clear the cells
+        // first, so the row that falls off the map stays in its band.
+        s.shift_rows(1, -1);
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let used = s.used_range();
+        assert_eq!(visible.len(), 11);
+        assert_eq!(s.len(), before, "the orphan is still counted before compaction");
+        s.compact();
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible, "mapped cells keep their content");
+        assert_eq!(s.used_range(), used, "the used range is unchanged");
+        assert_eq!(s.len(), visible.len(), "len now counts exactly the reachable cells");
+        assert_eq!(snapshot.len(), before, "the undo snapshot keeps its cells");
+        assert_eq!(snapshot.iter().count(), before);
+        assert!(s.len() < before);
+        assert_eq!(s.get(c(9, 0)), None, "the clipped row cannot be read");
+        let (len, bands, segments) = (s.len(), s.band_count(), s.row_map.segments.len());
+        s.compact();
+        assert_eq!((s.len(), s.band_count(), s.row_map.segments.len()), (len, bands, segments), "a second pass is a no-op");
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+    }
+
+    #[test]
+    fn compact_reclaims_columns_with_no_logical_inverse() {
+        let mut s = CellStore::new();
+        for col in 0..10u32 {
+            s.set(c(0, col), Cell::value(Value::Number(f64::from(col))));
+        }
+        let before = s.len();
+        s.shift_cols(1, -1);
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let used = s.used_range();
+        assert_eq!(visible.len(), 9);
+        assert_eq!(s.len(), before, "the orphan column is still counted before compaction");
+        s.compact();
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible, "mapped cells keep their content");
+        assert_eq!(s.used_range(), used, "the used range is unchanged");
+        assert_eq!(s.len(), visible.len(), "len now counts exactly the reachable cells");
+        assert!(s.len() < before);
+        assert_eq!(s.get(c(0, 9)), None, "the clipped column cannot be read");
+        assert_eq!(s.col_map.segments.len(), 1);
+        assert!(
+            s.col_map.free.iter().all(|physical| *physical < s.col_map.next_physical && s.col_map.inverse(*physical).is_none()),
+            "every free column is reusable and none is still mapped"
+        );
+        let (len, bands, free, segments) = (s.len(), s.band_count(), s.col_map.free.clone(), s.col_map.segments.len());
+        s.compact();
+        assert_eq!(
+            (s.len(), s.band_count(), s.col_map.free.clone(), s.col_map.segments.len()),
+            (len, bands, free, segments),
+            "a second pass is a no-op"
+        );
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+    }
+
+    #[test]
+    fn compact_bounds_the_column_free_list() {
+        let mut s = CellStore::new();
+        for col in 0..8u32 {
+            s.set(c(0, col), Cell::value(Value::Number(f64::from(col))));
+        }
+        s.shift_cols(1, -1);
+        assert_eq!(s.col_map.free, [0]);
+        // A stale key that is mapped, duplicates, and one past every physical column handed out.
+        s.col_map.free.extend([0, 0, 4, 4, 9999]);
+        s.compact();
+        assert_eq!(s.col_map.free, [0], "only an in-range, unmapped key survives");
+        assert_eq!(s.len(), 7);
+        s.compact();
+        assert_eq!(s.col_map.free, [0]);
+    }
+
+    #[test]
+    fn compact_reclaims_a_fragmented_store_and_restores_a_contiguous_map() {
+        let mut s = CellStore::new();
+        for col in 0..40u32 {
+            s.set(c(0, col), Cell::value(Value::Number(f64::from(col))));
+        }
+        let mut max_segments = s.col_map.segments.len();
+        for k in [8u32, 16, 24, 32] {
+            s.shift_cols(k, 1);
+            max_segments = max_segments.max(s.col_map.segments.len());
+        }
+        assert!(max_segments > 1, "repeated inserts fragment the map into several runs");
+        // A shift that is not paired with a delete leaves the cells of the dropped columns behind.
+        s.shift_cols(2, -1);
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let before_len = s.len();
+        let before_segments = s.col_map.segments.len();
+        assert!(before_len > visible.len(), "the dropped column is still stored");
+        s.compact();
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+        assert!(s.col_map.segments.len() <= before_segments, "compaction never adds a run");
+        assert_eq!(s.len(), visible.len(), "every unreachable cell is gone");
+        assert!(s.col_map.free.windows(2).all(|w| w[0] < w[1]), "the free list is deduplicated");
+        assert!(
+            s.col_map.free.iter().all(|physical| *physical < s.col_map.next_physical && s.col_map.inverse(*physical).is_none()),
+            "the free list is bounded to reusable, unmapped columns"
+        );
+        let (len, bands, free, segments) = (s.len(), s.band_count(), s.col_map.free.clone(), s.col_map.segments.len());
+        s.compact();
+        assert_eq!(
+            (s.len(), s.band_count(), s.col_map.free.clone(), s.col_map.segments.len()),
+            (len, bands, free, segments),
+            "a second pass is a no-op"
+        );
+
+        // A heal in the order the inserts were made leaves one contiguous run. The runs are
+        // already merged by the shift; compaction is what returns that run to the fast path.
+        let mut t = CellStore::new();
+        for col in 0..40u32 {
+            t.set(c(0, col), Cell::value(Value::Number(f64::from(col))));
+        }
+        for k in [8u32, 16, 24, 32] {
+            t.shift_cols(k, 1);
+        }
+        let fragmented = t.col_map.segments.len();
+        for k in [32u32, 24, 16, 8] {
+            t.shift_cols(k + 1, -1);
+        }
+        assert_eq!(t.col_map.segments.len(), 1, "a matched delete heals the insert (had {fragmented} runs)");
+        assert!(!t.col_map.is_identity());
+        let visible: Vec<(CellRef, Cell)> = t.iter().collect();
+        let before_segments = t.col_map.segments.len();
+        t.compact();
+        assert!(t.col_map.is_identity(), "a fully contiguous map returns to the fast path");
+        assert_eq!(t.col_map.segments.len(), 0);
+        assert!(t.col_map.segments.len() < before_segments, "the single run collapsed");
+        let after: Vec<(CellRef, Cell)> = t.iter().collect();
+        assert_eq!(after, visible);
+        t.compact();
+        assert!(t.col_map.is_identity());
+        assert_eq!(t.iter().collect::<Vec<_>>(), visible);
+    }
+
+    #[test]
+    fn compact_keeps_the_logical_cells_across_serialization() {
+        let mut s = CellStore::new();
+        for row in 0..5u32 {
+            s.set(c(row, 0), Cell { value: Value::Number(f64::from(row)), formula: None, style: StyleId(row % 3) });
+            s.set(c(row, 1), Cell::value(Value::Text(Arc::from(format!("r{row}").as_str()))));
+        }
+        s.set(c(2, 2), Cell { value: Value::Number(9.0), formula: Some(Arc::new(Formula::new("=A1+1"))), style: StyleId(7) });
+        // Direct shifts leave the first physical row and column behind.
+        s.shift_rows(1, -1);
+        s.shift_cols(1, -1);
+        s.compact();
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let positions: Vec<CellRef> = visible.iter().map(|(at, _)| *at).collect();
+        let len = s.len();
+        assert_eq!(len, visible.len());
+        let bytes = serde_json::to_vec(&s).expect("serialize");
+        let back: CellStore = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(back.len(), len);
+        assert_eq!(back.iter().map(|(at, _)| at).collect::<Vec<_>>(), positions);
+        assert_eq!(back, s, "the saved cells are the logical cells");
+    }
+
+    #[test]
+    fn compact_leaves_paged_bands_alone() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging());
+        assert!(s.paged_band_count() > 0);
+        let paged = s.paged_band_count();
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let len = s.len();
+        s.compact();
+        assert_eq!(s.paged_band_count(), paged, "no page is decoded or dropped");
+        assert_eq!(s.len(), len);
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+        for (at, cell) in &visible {
+            assert_eq!(s.get(*at).as_ref(), Some(cell));
+        }
+        // A shift leaves the page at physical row 0 unmapped. This slice does not reclaim paged
+        // cells, so it stays counted and unreadable; every mapped paged cell still reads.
+        s.shift_rows(1, -1);
+        let still_visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        assert_eq!(still_visible.len(), visible.len() - 1);
+        let len = s.len();
+        s.compact();
+        assert_eq!(s.paged_band_count(), paged);
+        assert_eq!(s.len(), len, "paged orphans are out of scope for this slice");
+        assert_eq!(s.iter().collect::<Vec<_>>(), still_visible);
+        for (at, cell) in &still_visible {
+            assert_eq!(s.get(*at).as_ref(), Some(cell));
         }
     }
 }
