@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M20 compaction at model level: `CellStore::compact()` reclaims live orphan rows/columns and normalizes row/column maps, with 6 new model tests (52 total); paged orphans and a save/idle caller remain |
 | 2026-10-29 | Roadmap re-planned: wave 0 closes the M20/M19 base (30–45 h), wave 1 proves XLSX in Excel/corpus with the owner (21–35 h), then calc/text/keyboard/charts, `.xls`/encryption and Pivot slicers; beta exit is wave 4. Post-beta puts M21 read/linked tables, zone maps, localization and Get & Transform. M22 stays deferred. The old PR-queue wave is folded into the gap it addresses |
 | 2026-10-28 | M20's row and column halves land: `CellStore` keeps a logical→physical `RowMap`; `shift_rows` changes a segment list instead of moving cells, inserted rows allocate fresh physical keys on write, and reads/iteration/formulas/used range map through. **Insert one row above 1M×20 is 3.7 ms command / 35.8 ms commit, with 0 cells moved** (deleting the last row first to make room). `rewrite_all_formulas` no longer walks every cell to find no formulas, and `CellStore::iter` walks only bands that exist. The column sibling (`ColMap`) uses the same runs over the used width, allocates/reuses physical columns on write, and makes a column insert 9.8 ms command / 42.5 ms commit with no cell moved. Segment compaction, row line metadata and value writes on mapped sheets remain |
 | 2026-10-28 | M19 cold paging lands: completed bands are compressed into per-sheet `GPB1` page files (zlib) and decoded through a 4,096-band LRU; the engine pages packages over 200 MB, so the 55 MB 1M×10 sheet stays live. The **100M-cell export opens at 16.7 MiB live / 183.1 MiB peak** (was 1.91 GiB) with 729.5 MiB of compressed pages and its digest cell-for-cell unchanged; the **31.7M report stays live at 49.7 MiB and 1.47 s**. Page files die with the store, corrupt pages are refused; spill-beside-document and a byte budget remain |
@@ -242,6 +243,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 compaction at model level (live orphan rows/columns, map normalization, 6 new tests; 52 model total); page-aware pass and caller remain |
 | 2026-10-29 | major | Roadmap re-planned after M19/M20: large-workbook beta gate met; wave 0 base (30–45 h), wave 1 XLSX/Excel (21–35 h, owner), waves 2–3 fidelity/formats, wave 4 beta exit; M21 post-beta, M22 deferred |
 | 2026-10-28 | major | M20 row+column maps (row insert 3.7 ms / 35.8 ms commit, column insert 9.8 ms / 42.5 ms on 1M×20, 0 cells moved; formula rewrite and iteration skip empty cells); gaps §2, roadmap M20 and progress log updated |
 | 2026-10-28 | major | M19 cold paging (compressed pages, LRU; 100M-cell export 16.7 MiB live / 183.1 MiB peak; digest unchanged); gaps §2, roadmap M19 and the progress log updated |

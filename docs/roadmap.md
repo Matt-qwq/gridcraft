@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M20 segment compaction; row line-metadata map; mapped `set_values`, logical `diff`, physical-column `visit_packed`; M19 spill-beside-document, byte-budget LRU, flat-memory save/scan | M20/M19 follow-up | **30–45** | Start now; no owner. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: M20 segment compaction (model half landed 10-29; page-aware pass and a caller remain); row line-metadata map; mapped `set_values`, logical `diff`, physical-column `visit_packed`; M19 spill-beside-document, byte-budget LRU, flat-memory save/scan | M20/M19 follow-up | **30–45** | Start now; no owner. This is the last large-workbook debt before beta evidence. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -105,7 +105,7 @@ to check our files (gate #1/#8), and Windows machines with the reported GPU driv
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | landed (10-24/27): whole-column folds and recalc kernels; remaining work in gaps |
 | M19 | Cold paging: bands leave memory when unused | **landed (10-28)**: compressed pages + 4,096-band LRU; spill-beside-document, byte budget and save/scan remain |
-| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **row and column halves landed (10-28)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20; wave 0 closes compaction, line metadata and mapped value writes |
+| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **row and column halves landed (10-28)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20; compaction landed at model level (10-29; page-aware pass and caller remain); wave 0 closes line metadata and mapped value writes |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading/linked tables are post-beta (not a beta gate) |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
 
@@ -595,14 +595,21 @@ to leave room and then inserting a row at 1:
 
 The 1M×10 case is 3.9 / 4.0 ms and 36.8 / 35.7 ms commit. A save/reopen test keeps the values and the
 shifted formula, and the model test checks the map, insertion into a gap, delete, iteration and JSON
-round trip. Full 414 engine tests, 46 model, 265 xlsx, 86 calc and release fuzz 100×200 stay green.
+round trip. Full 414 engine tests, 52 model, 265 xlsx, 86 calc and release fuzz 100×200 stay green.
+
+**Compaction (10-29).** `CellStore::compact()` walks only live bands, drops cells whose physical
+row or column has no logical inverse, removes emptied bands and exacts `len`; `RowMap::normalize`
+and `ColMap::normalize` merge runs, bound the column free list and return a contiguous map to the
+identity fast path. It is idempotent and leaves mapped cells unchanged; the new tests cover orphan
+rows/columns, fragmentation, free-list bounds, serialization and a paged store. It does not decode
+or rewrite pages yet: paged orphans stay counted and unreadable, and no engine/UI caller invokes
+`compact` yet. Model tests are now 52 (33 store tests), up from 46.
 
 **Remaining.** Row line metadata (`Sheet.rows`) is still shifted as a BTreeMap (a workbook with a
-custom height on every row pays that); a compaction pass has not been written, so repeated
-inserts/deletes can leave many small segments and orphan physical rows; `set_values` on a mapped
-sheet takes the value-at-a-time path because logical and physical rows are no longer ordered
-together; and `CellStore::diff` still compares physical cells (the engine skips array checks on
-structural commits). These are the next M20 slices.
+custom height on every row pays that); compaction needs a page-aware pass and a caller on save or
+idle; `set_values` on a mapped sheet takes the value-at-a-time path because logical and physical
+rows are no longer ordered together; and `CellStore::diff` still compares physical cells (the
+engine skips array checks on structural commits). These are the next M20 slices.
 
 **Acceptance (rows and columns).**
 - Insert one row above a 1M-row, 20-column sheet: **3.7 ms command / 35.8 ms commit**, below 50 ms;
@@ -728,6 +735,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 compaction at model level: `CellStore::compact` reclaims live orphan rows/columns and normalizes maps; 6 new model tests (52 total); page orphans and a save/idle caller remain |
 | 2026-10-29 | major | Roadmap re-planned after M19/M20: current focus, execution queue, parallel plan, beta gate status and post-beta order set; large-workbook gate marked met and the old PR-queue wave folded into the gaps |
 | 2026-10-28 | minor | Bulk edits scan blocked arrays once for the union of the changed blocks (Remove Duplicates 1M×10 91 → 12 s, recalc 80 s → 1.4 s); Sort 1M×10 3.2 s, Fill Down 1M rows 1.45 s; `data.sort`/`removeDuplicates`/`setValues` share a 12M-cell cap, 1M×20 refused in 1.3 s; `CellStore::style` fast path |
 | 2026-10-28 | major | M20 row and column halves: `CellStore` keeps logical→physical `RowMap` and `ColMap`; inserts/deletes change maps instead of moving cells, gaps allocate physical keys on write, and reads/iteration/formulas/used range map. Row insert above 1M×20 3.7 ms / 35.8 ms commit, column insert 9.8 ms / 42.5 ms, 0 cells moved; formula rewrite and iteration stop walking every cell/empty row. Compaction, line metadata and mapped value writes remain |
