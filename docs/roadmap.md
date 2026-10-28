@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-27 · **Change:** minor (the 100k-dependent recalculation gate is met single-threaded: 65–75 ms against 100; M18 records what moved it) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-27 · **Change:** minor (recalculation now uses the machine's threads for independent formulas: 100k edit 20–25 ms end to end, 1M 0.21–0.28 s; M18 records the split) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -263,14 +263,49 @@ At **100,000 dependents**: full recalc **134–147 ms** (was 281–289) and an e
 - The evaluator reads a single-cell reference straight from the host (no one-area `Vec`) and folds a
   one-operator binary without allocating the left-chain work list.
 
-A full recalculation of the same sheet fell from 281–289 to 134–147 ms for the same reasons. A pass
-is still single-threaded and evaluated in row-major order: threading is the gate for sheets past
-~200k dependents, not for the 100k case any more.
+A full recalculation of the same sheet fell from 281–289 to 134–147 ms for the same reasons.
 
-Checked on the real report: `cell_digest real_117m.xlsx` is still `f5b186062e525ec8` over
+**Landed (10-27, second round): independent formulas on the machine's threads.** An edit of A1 with
+100,000 `=$A$1*2` cells is now **20–25 ms** end to end (was 65–75 after the single-threaded round)
+and a full recalculation of that sheet **89–114 ms** (was 134–147).
+
+- `Calc::run` first evaluates **leaves** — formulas whose precedent blocks contain no formula the
+  pass is also recalculating — in up to eight shards, each with its own expression and result maps;
+  the shards return their values in row order, which is the write order. Writing a wave makes its
+  dependents leaves, so the pass repeats (up to 16 waves): a layered sheet parallelises level by
+  level. A formula with a whole-column precedent, a dynamic/volatile formula, an array or legacy
+  formula in the dirty set, or iterative calculation sends the whole pass to the sequential path; a
+  spill or cycle seen despite that rolls the parallel results back and disables the parallel path
+  until a formula changes.
+- `CellStore::set_values` writes a large batch (above 16k values, up to 4M) by cloning the touched
+  bands in workers and replacing them only when every worker finishes. On 1M formulas this took the
+  write-back from ~113 ms to ~55 ms.
+- The dependency closure reserves room for the first seed's dependents (a column of 1M formulas),
+  and write values are no longer re-sorted: the shards already produce row order.
+- `Graph` remembers which formulas may return arrays (`Node::may_spill`, computed once when the
+  formula is parsed) and which are legacy array anchors; the safety check is a set intersection, not
+  an AST walk per formula.
+
+Measured in `_gridcraft-bench/calcbench` (release, edit A1; `=$A$1`, `=$A$1*2`, `SUM($A$1:$B$1)`
+and `IF($A$1>0,1,2)`):
+
+| dependents | edit before | edit now |
+|---|---|---|
+| 100,000 | 31–36 ms | **17–23 ms** |
+| 200,000 | 86–150 ms | **35–42 ms** |
+| 500,000 | 244–404 ms | **100–132 ms** |
+| 1,000,000 | 517–843 ms | **208–277 ms** |
+
+A full recalculation of the 1M sheet fell from 1.1–1.8 s to 0.85–1.29 s; its graph rebuild dominates.
+The parallel path is not used on the 1.28 GB report (its `FILTER` is an array formula), and the
+report checks are unchanged: `cell_digest real_117m.xlsx` is still `f5b186062e525ec8` over
 31,709,565 cells, and `recalc_check big_1281m.xlsx` still reports the same 159 cells whose cache
-Excel left stale (79,552 formulas; 0 cells only after recalc), with a warm open of 3.2 s and a full
-recalculation of 3.9–4.1 s — the same range as before this round, on a noisy machine.
+Excel left stale (79,552 formulas; 0 cells only after recalc), with a warm open of 2.5 s and a full
+recalculation of 3.6 s.
+
+Remaining: dependent formulas that are not leaves (a chain, or a wave below the 16k threshold after
+the last wave) are still evaluated sequentially; a chain cannot be parallelised, and a wide array
+formula keeps its whole pass sequential by design.
 
 **Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
 band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
@@ -542,6 +577,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-27 | minor | Independent formulas recalculate on up to eight threads (wave by wave, leaves only; arrays/volatile/iterative stay sequential): 100k end-to-end edit 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; parallel band value writes (4M cap); `Node::may_spill` and graph safety sets |
 | 2026-10-27 | minor | The 100k-dependent edit gate is met single-threaded: 245 → 65–75 ms (full recalculation 281–289 → 134–147 ms) by reading parsed formulas and legacy ranges from the graph, one `Slot` per result (in-progress is an empty value), row-major `CellStore::set_values`, `Arc<RowExtras>` band copies, cached `Formula::expr_bytes` for undo accounting, a diff-first `check_arrays`, and single-cell/one-operator fast paths in the evaluator |
 | 2026-10-27 | minor | The trust-track soak is closed: 500 seeds × 200 commands (100,000 commands, release, 49 min) are green. Reopening a file rebuilds spilled arrays from the anchor's `ref` and cached values (a contested area keeps its owner), F9 prefers real spill owners and lets a grow-back owner reclaim its cells, swallowed `#CIRC!` stays explicit, `_sc_*` view-state names are invisible to formulas, table filters and blocked legacy arrays round-trip, and Insert/Delete Cells refuses to cut a merge. The format's `#SPILL!`/`#CALC!`-as-`#VALUE!` cache is still to verify on a licensed Excel |
 | 2026-10-26 | minor | M19's band stripes landed in `store.rs`: packing −10%, a range scan −27%, row headers 108 → 48 bytes; on the 118 MB report, open 1.55 → 1.28 s and the model 191 → 163 MiB, `cell_digest` unchanged |

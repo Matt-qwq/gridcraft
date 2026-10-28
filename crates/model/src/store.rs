@@ -39,6 +39,13 @@ use crate::style::StyleId;
 /// Rows per band: one undo snapshot shares bands this size, so an edit copies at most 64 rows.
 const BAND: u32 = 64;
 
+/// A value-only write this large is split across threads; below it the thread start costs more than
+/// the work. Above the ceiling the clone of every touched band would double too much of the model.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_WRITE_MIN: usize = 16_384;
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_WRITE_MAX_CELLS: usize = 4_000_000;
+
 /// What a payload holds, one byte per stored cell, in column order within the row.
 const NUMBER: u8 = 0;
 const TEXT: u8 = 1;
@@ -1322,6 +1329,18 @@ impl CellStore {
     /// Replaces the values of cells that already exist. `values` must be sorted in row-major
     /// order (the order a recalculation writes them in), so each band is looked up once.
     pub fn set_values(&mut self, values: &mut [(CellRef, Value)]) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if values.len() >= PARALLEL_WRITE_MIN && values.len() <= PARALLEL_WRITE_MAX_CELLS {
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
+            if threads > 1 {
+                self.set_values_parallel(values, threads);
+                return;
+            }
+        }
+        self.set_values_sequential(values);
+    }
+
+    fn set_values_sequential(&mut self, values: &[(CellRef, Value)]) {
         let mut i = 0;
         while i < values.len() {
             let key = values[i].0.row / BAND;
@@ -1333,6 +1352,57 @@ impl CellStore {
                 }
             }
             i = end;
+        }
+    }
+
+    /// The value-only write, split over threads when the batch is large. A band is independent of
+    /// every other (its numbers, texts and stripes are its own), so each worker clones the bands it
+    /// was given, applies their values and hands the new bands back; the store replaces them only
+    /// when every worker finished. The old bands stay with the undo snapshot.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_values_parallel(&mut self, values: &[(CellRef, Value)], threads: usize) {
+        let mut groups: Vec<(u32, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < values.len() {
+            let key = values[i].0.row / BAND;
+            let end = values[i..].partition_point(|(c, _)| c.row / BAND == key) + i;
+            groups.push((key, i, end));
+            i = end;
+        }
+        let bands = &self.bands;
+        let chunk = groups.len().div_ceil(threads);
+        let results: Vec<std::thread::Result<Vec<(u32, Arc<Band>)>>> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for part in groups.chunks(chunk) {
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::with_capacity(part.len());
+                    for &(key, start, end) in part {
+                        let Some(old) = bands.get(&key) else { continue };
+                        let mut band = (**old).clone();
+                        for (c, v) in &values[start..end] {
+                            band.set_value(c.row % BAND, c.col, v);
+                        }
+                        out.push((key, Arc::new(band)));
+                    }
+                    out
+                }));
+            }
+            handles.into_iter().map(|h| h.join()).collect()
+        });
+        let mut new_bands = Vec::with_capacity(groups.len());
+        for result in results {
+            match result {
+                Ok(part) => new_bands.extend(part),
+                // A worker panicked: nothing has reached the store yet, so the sequential path can
+                // still do the whole batch.
+                Err(_) => {
+                    self.set_values_sequential(values);
+                    return;
+                }
+            }
+        }
+        for (key, band) in new_bands {
+            self.bands.insert(key, band);
         }
     }
 
@@ -2114,6 +2184,25 @@ mod tests {
             assert_eq!(s.get(c(r, 4)).unwrap().value, Value::Number(r as f64));
         }
         assert_eq!(s.len(), 200);
+    }
+
+    /// The large-batch path (above `PARALLEL_WRITE_MIN`) copies bands in workers and replaces them
+    /// only after every worker finished; the old snapshot must keep its values.
+    #[test]
+    fn parallel_value_writes_keep_the_snapshot() {
+        let mut s = CellStore::new();
+        for r in 0..20_000u32 {
+            s.set(c(r, 9), Cell::formula(Formula::new("=$A$1*2")));
+        }
+        let snapshot = s.clone();
+        let mut values: Vec<(CellRef, Value)> = (0..20_000u32).map(|r| (c(r, 9), Value::Number(f64::from(r)))).collect();
+        s.set_values(&mut values);
+        for r in 0..20_000u32 {
+            assert_eq!(s.get(c(r, 9)).unwrap().value, Value::Number(f64::from(r)));
+            assert_eq!(snapshot.get(c(r, 9)).unwrap().value, Value::Empty);
+        }
+        assert_eq!(s.len(), 20_000);
+        assert_eq!(snapshot.len(), 20_000);
     }
 
     /// A band copied for a value edit shares the formulas of its rows; changing one formula in

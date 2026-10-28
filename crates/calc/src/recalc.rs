@@ -41,7 +41,7 @@ type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher
 type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
 
 use gridcraft_core::{Array, CellError, CellRef, RangeRef, Value};
-use gridcraft_formula::Expr;
+use gridcraft_formula::{Expr, UnOp};
 use gridcraft_model::{CalcMode, Workbook};
 
 use crate::eval::{Area, Evaluator, Host, precedents};
@@ -57,6 +57,9 @@ struct Node {
     expr: Option<std::sync::Arc<Expr>>,
     /// The range of a legacy (Ctrl+Shift+Enter) array formula, if this is its anchor.
     legacy: Option<RangeRef>,
+    /// The formula may return an array and therefore spill: it cannot be evaluated on a thread of
+    /// its own while other formulas are being laid out (the spill layout is a pass of its own).
+    may_spill: bool,
 }
 
 /// Ranges wider than this many columns go to the per-sheet wide index instead of per-column ones.
@@ -207,6 +210,10 @@ pub struct Graph {
     /// sheet → row intervals of wider ranges, with their columns: (first, last, dependent)
     wide_deps: HashMap<usize, Intervals<(u32, u32, Key)>>,
     dynamic: HashSet<Key>,
+    /// Formulas whose value may be an array (and so spill), and the anchors of legacy arrays.
+    /// A pass checks these against its dirty set: a dirty one means the pass cannot be split.
+    may_spill: HashSet<Key>,
+    legacy: HashSet<Key>,
     /// Range indexes changed since the last [`Graph::settle`].
     unsettled_cols: HashSet<(usize, u32)>,
     unsettled_wide: HashSet<usize>,
@@ -261,6 +268,12 @@ impl Graph {
         if node.dynamic {
             self.dynamic.insert(k);
         }
+        if node.may_spill {
+            self.may_spill.insert(k);
+        }
+        if node.legacy.is_some() {
+            self.legacy.insert(k);
+        }
         self.nodes.insert(k, node);
     }
 
@@ -288,6 +301,8 @@ impl Graph {
             }
         }
         self.dynamic.remove(&k);
+        self.may_spill.remove(&k);
+        self.legacy.remove(&k);
     }
 
     /// Tidies the range indexes changed by `insert`/`remove` (queries stay correct without it,
@@ -382,11 +397,25 @@ pub struct Calc {
     /// Cells whose formulas have errors from cycles.
     pub circular: Vec<Key>,
     pub last_recalc_cells: usize,
+    /// A parallel pass produced a spill or a cycle and was rolled back: keep passes sequential
+    /// until a formula changes, rather than paying for the same failed attempt every recalculation.
+    parallel_fallback: bool,
+    #[cfg(test)]
+    parallel_runs: usize,
 }
 
 impl Default for Calc {
     fn default() -> Self {
-        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0 }
+        Calc {
+            graph: Graph::default(),
+            rng: 0x9E37_79B9_7F4A_7C15,
+            fixed_now: None,
+            circular: vec![],
+            last_recalc_cells: 0,
+            parallel_fallback: false,
+            #[cfg(test)]
+            parallel_runs: 0,
+        }
     }
 }
 
@@ -1146,6 +1175,157 @@ impl Host for PassHost<'_> {
     }
 }
 
+/// Whether the formula may return an array (and so spill). The check is deliberately
+/// conservative and only used to keep such formulas out of the parallel pass; a miss falls back to
+/// a sequential pass when the pass actually produces a spill.
+///
+/// Functions that aggregate or look up a block and return one value are listed as scalar: their
+/// arguments are not walked, so `SUM(A1:A3)` stays parallel although its argument is a range.
+fn may_return_array(e: &Expr) -> bool {
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Array(_) => return true,
+            Expr::Ref(r) => {
+                if !r.range().is_single() {
+                    return true;
+                }
+            }
+            Expr::Unary(UnOp::Spill | UnOp::Trim(_), _) => return true,
+            Expr::Call(name, args) => {
+                if is_array_function(name) {
+                    return true;
+                }
+                if is_scalar_function(name) {
+                    continue;
+                }
+                stack.extend(args.iter());
+            }
+            Expr::Binary(_, a, b) => {
+                stack.push(b);
+                stack.push(a);
+            }
+            Expr::Unary(_, a) | Expr::Paren(a) => stack.push(a),
+            Expr::Invoke(..) => return true,
+            Expr::Name(_) | Expr::Struct(_) => return true,
+            Expr::Missing | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
+        }
+    }
+    false
+}
+
+/// Functions that can return an array of their own.
+fn is_array_function(name: &str) -> bool {
+    matches!(
+        name,
+        "FILTER"
+            | "SORT"
+            | "SORTBY"
+            | "UNIQUE"
+            | "SEQUENCE"
+            | "RANDARRAY"
+            | "TRANSPOSE"
+            | "TAKE"
+            | "DROP"
+            | "VSTACK"
+            | "HSTACK"
+            | "TOROW"
+            | "TOCOL"
+            | "WRAPROWS"
+            | "WRAPCOLS"
+            | "EXPAND"
+            | "CHOOSEROWS"
+            | "CHOOSECOLS"
+            | "TEXTSPLIT"
+            | "MAP"
+            | "SCAN"
+            | "MAKEARRAY"
+            | "BYROW"
+            | "BYCOL"
+            | "MMULT"
+            | "MINVERSE"
+            | "MUNIT"
+            | "FREQUENCY"
+            | "LINEST"
+            | "TREND"
+            | "GROWTH"
+            | "LOGEST"
+            | "GROUPBY"
+            | "PIVOTBY"
+    )
+}
+
+/// Functions that take a block but return one value (or a reference to one): a range argument to
+/// one of these does not make the formula an array formula. A function that can also lift over an
+/// array (`INDEX`, `XLOOKUP`) is listed here; if it does return an array, the pass falls back to
+/// the sequential path when it sees the spill.
+fn is_scalar_function(name: &str) -> bool {
+    matches!(
+        name,
+        "SUM"
+            | "SUMIF"
+            | "SUMIFS"
+            | "SUMX2MY2"
+            | "SUMX2PY2"
+            | "SUMXMY2"
+            | "SUMPRODUCT"
+            | "COUNT"
+            | "COUNTA"
+            | "COUNTBLANK"
+            | "COUNTIF"
+            | "COUNTIFS"
+            | "AVERAGE"
+            | "AVERAGEIF"
+            | "AVERAGEIFS"
+            | "MIN"
+            | "MAX"
+            | "MEDIAN"
+            | "MODE"
+            | "MODE.SNGL"
+            | "PRODUCT"
+            | "STDEV"
+            | "STDEVP"
+            | "STDEV.S"
+            | "STDEV.P"
+            | "VAR"
+            | "VARP"
+            | "VAR.S"
+            | "VAR.P"
+            | "MATCH"
+            | "XMATCH"
+            | "LOOKUP"
+            | "VLOOKUP"
+            | "HLOOKUP"
+            | "XLOOKUP"
+            | "INDEX"
+            | "IFERROR"
+            | "IFNA"
+            | "ROW"
+            | "COLUMN"
+            | "ROWS"
+            | "COLUMNS"
+            | "AREAS"
+            | "SHEET"
+            | "SHEETS"
+            | "CELL"
+            | "INFO"
+            | "TEXTJOIN"
+            | "CONCAT"
+            | "CONCATENATE"
+            | "TEXT"
+            | "VALUE"
+            | "DATE"
+            | "DATEVALUE"
+            | "TIME"
+            | "TIMEVALUE"
+            | "SUBTOTAL"
+            | "AGGREGATE"
+            | "AND"
+            | "OR"
+            | "XOR"
+    )
+}
+
 /// True when evaluating the formula can change on its own: `NOW`, `TODAY`, `RAND`, `OFFSET`…
 /// Walking the parsed expression is cheap next to evaluating it, and a cell that reads one of these
 /// must be recalculated on open even though the file carries a value for it.
@@ -1159,6 +1339,204 @@ fn is_volatile(e: &Expr) -> bool {
         }
     });
     found
+}
+
+/// Independent formulas a pass needs before splitting across threads: below this, starting
+/// threads and building one expression map per thread costs more than the pass.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_MIN: usize = 16_384;
+
+/// Largest precedent block a leaf may read and still be a parallel candidate. A formula reading a
+/// whole column is left to the sequential pass rather than checking a million cells for a dirty
+/// precedent.
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_LEAF_CELLS: u64 = 256;
+
+#[cfg(not(target_arch = "wasm32"))]
+struct Shard {
+    values: Vec<(Key, Value)>,
+    clean: bool,
+}
+
+/// Writes values back without sorting: the caller guarantees row-major order.
+fn write_values_ordered(wb: &mut Workbook, values: &[(Key, Value)]) {
+    let mut start = 0;
+    while start < values.len() {
+        let si = values[start].0.0;
+        let end = values[start..].partition_point(|(k, _)| k.0 == si) + start;
+        if let Some(sheet) = wb.sheet_mut(si) {
+            let mut batch: Vec<(CellRef, Value)> = values[start..end].iter().map(|(k, v)| (k.1, v.clone())).collect();
+            sheet.cells.set_values(&mut batch);
+        }
+        start = end;
+    }
+}
+
+/// Writes values back in row-major order. One sheet at a time, so the sheet's cells are borrowed
+/// once rather than looked up per value; the store rewrites the packed value slot in place.
+fn write_values(wb: &mut Workbook, mut values: Vec<(Key, Value)>) {
+    values.sort_unstable_by_key(|(k, _)| (k.0, k.1.row, k.1.col));
+    write_values_ordered(wb, &values);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Calc {
+    /// Evaluates the independent leaf formulas of `dirty` on the machine's threads and writes their
+    /// values, removing them from `dirty`. Returns false, changing nothing, when the pass is not
+    /// safe to split or too small to pay for it.
+    ///
+    /// A formula is a leaf when none of its precedent blocks holds a formula this pass is also
+    /// recalculating. Leaves cannot cycle with each other, and because the whole pass is refused
+    /// when any dirty formula is dynamic, may spill or is a legacy array, the shards share only
+    /// stored values. Each shard scans its slice of the dirty set, evaluates its leaves with its own
+    /// expression and result maps, and returns them in row order; the values are merged and written
+    /// in that order.
+    fn try_parallel(&mut self, wb: &mut Workbook, dirty: &mut Vec<Key>) -> bool {
+        if self.parallel_fallback || dirty.len() < PARALLEL_MIN || wb.calc.iterative {
+            return false;
+        }
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
+        if threads < 2 {
+            return false;
+        }
+        let dirty_set: HashSet<Key> = dirty.iter().copied().collect();
+        // A dynamic or array formula can read or write cells the static graph does not name; leave
+        // the whole pass to the sequential path if one is being recalculated. The graph keeps these
+        // sets small (they are formulas that can spill or are volatile), so checking them costs a
+        // handful of lookups, not a scan of every formula.
+        let intersects = |set: &HashSet<Key>| {
+            if set.len() <= dirty_set.len() { set.iter().any(|k| dirty_set.contains(k)) } else { dirty_set.iter().any(|k| set.contains(k)) }
+        };
+        if intersects(&self.graph.dynamic) || intersects(&self.graph.may_spill) || intersects(&self.graph.legacy) {
+            return false;
+        }
+        let chunk = dirty.len().div_ceil(threads);
+        let now = self.now();
+        let seed = self.rng;
+        let graph = &self.graph;
+        let wb_ref: &Workbook = wb;
+        let dirty_set = &dirty_set;
+        let started = prof_now();
+        let shards: Vec<std::thread::Result<Shard>> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (ti, part) in dirty.chunks(chunk).enumerate() {
+                handles.push(scope.spawn(move || {
+                    let mut local: Vec<Key> = Vec::new();
+                    for &k in part {
+                        let Some(node) = graph.nodes.get(&k) else { continue };
+                        let mut leaf = true;
+                        for area in &node.areas {
+                            if area.range.count() > PARALLEL_LEAF_CELLS {
+                                leaf = false;
+                                break;
+                            }
+                            for c in area.range.iter() {
+                                if dirty_set.contains(&(area.sheet, c)) {
+                                    leaf = false;
+                                    break;
+                                }
+                            }
+                            if !leaf {
+                                break;
+                            }
+                        }
+                        if leaf && node.expr.is_some() {
+                            local.push(k);
+                        }
+                    }
+                    if local.is_empty() {
+                        return Shard { values: Vec::new(), clean: true };
+                    }
+                    let mut exprs: HashMap<Key, std::sync::Arc<Expr>> = HashMap::with_capacity_and_hasher(local.len(), Default::default());
+                    let mut legacy: HashMap<Key, RangeRef> = HashMap::default();
+                    for &k in &local {
+                        if let Some(node) = graph.nodes.get(&k) {
+                            if let Some(e) = &node.expr {
+                                exprs.insert(k, std::sync::Arc::clone(e));
+                            }
+                            if let Some(r) = node.legacy {
+                                legacy.insert(k, r);
+                            }
+                        }
+                    }
+                    let mut rng = seed ^ (ti as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let mut host = PassHost::new(wb_ref, graph, &exprs, &legacy, &mut rng, now);
+                    host.iterate = false;
+                    for &k in &local {
+                        host.calculate(k);
+                    }
+                    let clean = host.spills.is_empty()
+                        && host.cycles.is_empty()
+                        && !host.cycle
+                        && host.suspend.is_none()
+                        && host.abandoned.is_empty()
+                        && host.also.is_empty()
+                        && host.waiting.is_empty()
+                        && host.tainted.is_empty()
+                        && host.members.is_empty()
+                        && host.depth == 0;
+                    // Keep the local order: the values then concatenate into a row-major list.
+                    let values: Vec<(Key, Value)> =
+                        local.iter().filter_map(|k| host.results.get(k).and_then(|s| s.value.as_ref()).map(|v| (*k, v.clone()))).collect();
+                    let clean = clean && values.len() == local.len();
+                    Shard { values, clean }
+                }));
+            }
+            handles.into_iter().map(|h| h.join()).collect()
+        });
+        let eval_ms = prof_now() - started;
+        let total: usize = shards.iter().filter_map(|r| r.as_ref().ok()).map(|s| s.values.len()).sum();
+        if total < PARALLEL_MIN {
+            return false;
+        }
+        let mut values = Vec::with_capacity(total);
+        for shard in shards {
+            match shard {
+                Ok(shard) if shard.clean => values.extend(shard.values),
+                _ => {
+                    self.parallel_fallback = true;
+                    return false;
+                }
+            }
+        }
+        if values.len() != total {
+            self.parallel_fallback = true;
+            return false;
+        }
+        let write_started = prof_now();
+        write_values_ordered(wb, &values);
+        let write_ms = prof_now() - write_started;
+        // Remove the candidates from `dirty` in one linear merge: each shard's candidates are a
+        // subsequence of its slice of the (row-major) dirty list, and `values` is in that order.
+        let mut vi = 0;
+        let mut remaining = Vec::with_capacity(dirty.len() - total);
+        for part in dirty.chunks(chunk) {
+            for &k in part {
+                if vi < values.len() && values[vi].0 == k {
+                    vi += 1;
+                } else {
+                    remaining.push(k);
+                }
+            }
+        }
+        *dirty = remaining;
+        self.last_recalc_cells += total;
+        #[cfg(test)]
+        {
+            self.parallel_runs += 1;
+        }
+        if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
+            eprintln!("  parallel {total} formulas on {threads} threads: eval {eval_ms:.1} ms, write {write_ms:.1} ms");
+        }
+        true
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Calc {
+    fn try_parallel(&mut self, _wb: &mut Workbook, _dirty: &mut Vec<Key>) -> bool {
+        false
+    }
 }
 
 impl Calc {
@@ -1175,12 +1553,13 @@ impl Calc {
 
     /// Rebuilds the graph from scratch.
     pub fn rebuild(&mut self, wb: &Workbook) {
+        self.parallel_fallback = false;
         self.graph = Graph::default();
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, f, _) in sheet.cells.formulas() {
                 if let Some(e) = f.expr_arc() {
                     let (areas, dynamic) = precedents(wb, si, &e);
-                    self.graph.insert((si, c), Node { areas, dynamic, expr: Some(e), legacy: f.array });
+                    self.graph.insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill: may_return_array(&e) });
                 }
             }
         }
@@ -1250,6 +1629,7 @@ impl Calc {
 
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        self.parallel_fallback = false;
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
         for &k in changed {
             let formula = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.clone());
@@ -1257,7 +1637,8 @@ impl Calc {
             match parsed {
                 Some((e, legacy)) => {
                     let (areas, dynamic) = precedents(wb, k.0, &e);
-                    self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy });
+                    let may_spill = may_return_array(&e);
+                    self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy, may_spill });
                 }
                 None => {
                     self.graph.remove(k);
@@ -1348,6 +1729,10 @@ impl Calc {
             }
             let mut deps = Vec::new();
             self.graph.dependents(k.0, k.1, &mut deps);
+            // One seed (the cell every formula reads) can name a million dependents: reserve once
+            // instead of growing the set and queue through a dozen rehashes.
+            seen.reserve(deps.len());
+            queue.reserve(deps.len());
             for d in deps {
                 if seen.insert(d) {
                     queue.push_back(d);
@@ -1385,6 +1770,24 @@ impl Calc {
             }
             // Row-major order is a good topological guess; on-demand evaluation fixes the rest.
             dirty.sort_by_key(|(s, c)| (*s, c.row, c.col));
+            // Independent leaves are the common shape of a large sheet (a column of `=A1*2`);
+            // evaluate them on the machine's threads before the sequential pass takes the rest.
+            // Writing them makes their dependents leaves too, so repeat while each wave is large
+            // enough to pay for the threads (a layered sheet parallelises level by level).
+            if _round == 0 {
+                // A layered sheet can have many waves; after a handful the remaining formulas are
+                // cheaper to take in one sequential pass than to rescan again and again.
+                let mut waves = 0;
+                while waves < 16 && self.try_parallel(wb, &mut dirty) {
+                    waves += 1;
+                    if dirty.is_empty() {
+                        break;
+                    }
+                }
+                if dirty.is_empty() {
+                    break;
+                }
+            }
             // The graph already holds each formula's parsed expression (and the range of a
             // legacy array): the pass reads them from there instead of rebuilding 100k cells.
             let mut exprs: HashMap<Key, std::sync::Arc<Expr>> = HashMap::with_capacity_and_hasher(dirty.len(), Default::default());
@@ -1442,21 +1845,8 @@ impl Calc {
             // is what makes the write-back touch each band once instead of jumping between 1,563
             // of them at random. Values only change, so the store rewrites the packed slot and
             // nothing else (no `Cell` built, no formula or style looked up).
-            let mut values: Vec<(Key, Value)> = results.into_iter().filter_map(|(k, s)| s.value.map(|v| (k, v))).collect();
-            values.sort_unstable_by_key(|(k, _)| (k.0, k.1.row, k.1.col));
-            // One sheet at a time, so the sheet's cells are borrowed once rather than looked up
-            // per value (the values are sorted by sheet, row and column).
-            let mut start = 0;
-            while start < values.len() {
-                let si = values[start].0.0;
-                let end = values[start..].partition_point(|(k, _)| k.0 == si) + start;
-                if let Some(sheet) = wb.sheet_mut(si) {
-                    let mut batch: Vec<(CellRef, Value)> = values[start..end].iter().map(|(k, v)| (k.1, v.clone())).collect();
-                    sheet.cells.set_values(&mut batch);
-                }
-                start = end;
-            }
-            drop(values);
+            let values: Vec<(Key, Value)> = results.into_iter().filter_map(|(k, s)| s.value.map(|v| (k, v))).collect();
+            write_values(wb, values);
             let two = prof_now();
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
                 eprintln!("  write values {:.1} ms", two - twr);
@@ -1856,6 +2246,109 @@ pub(crate) mod tests {
         deps.clear();
         calc.graph.dependents(1, CellRef::parse("A2").unwrap(), &mut deps);
         assert_eq!(deps, vec![at("DA9"), at("DA9")]);
+    }
+
+    /// `n` rows of `text` in column J, with A1 = 1 and B1 = 2 as inputs. Above the parallel
+    /// threshold, every row is an independent leaf.
+    fn leaf_book(n: u32, text: &str) -> Workbook {
+        let mut wb = Workbook::new();
+        if let Some(sh) = wb.sheet_mut(0) {
+            sh.cells.set(CellRef::new(0, 0), Cell::value(Value::Number(1.0)));
+            sh.cells.set(CellRef::new(0, 1), Cell::value(Value::Number(2.0)));
+            for r in 0..n {
+                sh.cells.set(CellRef::new(r, 9), Cell::formula(Formula::new(text)));
+            }
+        }
+        wb
+    }
+
+    fn can_parallel() -> bool {
+        std::thread::available_parallelism().is_ok_and(|n| n.get() > 1)
+    }
+
+    fn column_j(wb: &Workbook, n: u32) -> Vec<Value> {
+        (0..n).map(|r| wb.sheet(0).unwrap().value(CellRef::new(r, 9))).collect()
+    }
+
+    #[test]
+    fn independent_leaves_recalc_on_threads() {
+        let n = 17_000u32;
+        let mut wb = leaf_book(n, "=$A$1*2");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        if can_parallel() {
+            assert!(calc.parallel_runs > 0, "the parallel path did not run");
+        }
+        assert!(column_j(&wb, n).iter().all(|v| *v == Value::Number(2.0)));
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 0), Cell::value(Value::Number(10.0)));
+        calc.cells_changed(&mut wb, &[(0, CellRef::new(0, 0))]);
+        if can_parallel() {
+            assert!(calc.parallel_runs > 1, "the edit did not run the parallel path");
+        }
+        assert!(column_j(&wb, n).iter().all(|v| *v == Value::Number(20.0)));
+    }
+
+    #[test]
+    fn independent_range_leaves_recalc_on_threads() {
+        let n = 17_000u32;
+        let mut wb = leaf_book(n, "=SUM($A$1:$B$1)");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        if can_parallel() {
+            assert!(calc.parallel_runs > 0, "the parallel path did not run");
+        }
+        assert!(column_j(&wb, n).iter().all(|v| *v == Value::Number(3.0)));
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 0), Cell::value(Value::Number(4.0)));
+        calc.cells_changed(&mut wb, &[(0, CellRef::new(0, 0))]);
+        assert!(column_j(&wb, n).iter().all(|v| *v == Value::Number(6.0)));
+    }
+
+    /// Writing the first wave makes the next layer independent: the pass repeats, so a layered
+    /// sheet parallelises level by level rather than falling back to one sequential pass.
+    #[test]
+    fn a_second_wave_parallelises_after_the_first() {
+        let n = 17_000u32;
+        let mut wb = leaf_book(n, "=$A$1*2");
+        if let Some(sh) = wb.sheet_mut(0) {
+            for r in 0..n {
+                sh.cells.set(CellRef::new(r, 10), Cell::formula(Formula::new(&format!("=J{}+1", r + 1))));
+            }
+        }
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        if can_parallel() {
+            assert!(calc.parallel_runs >= 2, "the second wave did not run on threads");
+        }
+        for r in 0..n {
+            assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(r, 9)), Value::Number(2.0));
+            assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(r, 10)), Value::Number(3.0));
+        }
+    }
+
+    #[test]
+    fn a_dynamic_formula_keeps_the_pass_sequential() {
+        let n = 17_000u32;
+        let mut wb = leaf_book(n, "=$A$1*2");
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 10), Cell::formula(Formula::new("=RAND()")));
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(calc.parallel_runs, 0, "a volatile formula must keep the pass sequential");
+        assert!(column_j(&wb, n).iter().all(|v| *v == Value::Number(2.0)));
+        assert!(matches!(wb.sheet(0).unwrap().value(CellRef::new(0, 10)), Value::Number(_)));
+    }
+
+    #[test]
+    fn an_array_formula_keeps_the_pass_sequential() {
+        let n = 17_000u32;
+        let mut wb = leaf_book(n, "=$A$1*2");
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(1, 0), Cell::value(Value::Number(2.0)));
+        wb.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 10), Cell::formula(Formula::new("=A1:A2")));
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(calc.parallel_runs, 0, "an array formula must keep the pass sequential");
+        assert!(column_j(&wb, n).iter().all(|v| *v == Value::Number(2.0)));
+        assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(0, 10)), Value::Number(1.0));
+        assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(1, 10)), Value::Number(2.0));
     }
 
     /// A formula at the nesting limit reading thousands of formulas not calculated yet suspends the
