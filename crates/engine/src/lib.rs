@@ -148,6 +148,13 @@ fn history_retained_bytes(older: &Workbook, newer: &Workbook) -> usize {
         let empty = gridcraft_model::CellStore::new();
         let next = newer.sheets.get(index).map_or(&empty, |next| &next.cells);
         bytes = bytes.saturating_add(sheet.cells.retained_bytes_against(next));
+        // Line metadata is chunked the same way: a snapshot shares every chunk the next state did
+        // not touch, and a sheet with a million formatted rows is charged its unshared chunks.
+        let empty_rows = gridcraft_model::LineMap::new(gridcraft_model::LineAxis::Rows);
+        let empty_cols = gridcraft_model::LineMap::new(gridcraft_model::LineAxis::Cols);
+        let next_sheet = newer.sheets.get(index);
+        bytes = bytes.saturating_add(sheet.rows.retained_bytes_against(next_sheet.map_or(&empty_rows, |next| &next.rows)));
+        bytes = bytes.saturating_add(sheet.cols.retained_bytes_against(next_sheet.map_or(&empty_cols, |next| &next.cols)));
     }
     bytes
 }

@@ -142,15 +142,13 @@ fn shift_sheet_features(sh: &mut Sheet, axis: Axis, at: u32, count: u32, insert:
         .chain(sh.shapes.iter().map(|o| &o.anchor))
         .map(|a| anchor_corner(sh, a))
         .collect();
-    // Line info.
+    // Line info. The entries live under physical ids now, so a structural edit only moves the
+    // logical→physical runs; the deleted lines' entries are dropped by `delete_lines`.
     let lines = if axis == Axis::Rows { &mut sh.rows } else { &mut sh.cols };
-    let old = std::mem::take(lines);
-    for (k, v) in old {
-        if let Some(n) = map_line(k)
-            && n < if axis == Axis::Rows { MAX_ROWS } else { MAX_COLS }
-        {
-            lines.insert(n, v);
-        }
+    if insert {
+        lines.insert_lines(at, count);
+    } else {
+        lines.delete_lines(at, count);
     }
     sh.merges = sh.merges.iter().filter_map(|m| map_range(*m)).filter(|m| !m.is_single()).collect();
     for cf in sh.cond_formats.iter_mut() {
@@ -300,10 +298,9 @@ fn insert_lines(s: &mut Session, p: &Json, axis: Axis) -> Result<Json> {
             if at > 0 {
                 let prev = if axis == Axis::Rows { sh.rows.get(&(at - 1)).copied() } else { sh.cols.get(&(at - 1)).copied() };
                 if let Some(info) = prev {
-                    for i in at..at + count {
-                        let map = if axis == Axis::Rows { &mut sh.rows } else { &mut sh.cols };
-                        map.insert(i, gridcraft_model::LineInfo { hidden: false, outline: 0, collapsed: false, ..info });
-                    }
+                    let info = gridcraft_model::LineInfo { hidden: false, outline: 0, collapsed: false, ..info };
+                    let map = if axis == Axis::Rows { &mut sh.rows } else { &mut sh.cols };
+                    map.insert_range(at, count, &info);
                 }
             }
         }

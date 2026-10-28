@@ -1085,7 +1085,7 @@ fn filter_top10_two_criteria_on_one_column() {
         ];
     }
     s.execute("data.reapply", json!({})).unwrap();
-    let hidden: Vec<u32> = s.active().unwrap().wb.sheet(0).unwrap().rows.iter().filter(|(_, r)| r.hidden).map(|(k, _)| *k).collect();
+    let hidden: Vec<u32> = s.active().unwrap().wb.sheet(0).unwrap().rows.iter().filter(|(_, r)| r.hidden).map(|(k, _)| k).collect();
     // Rows are 0-based: values 1, 2 and 5 sit on rows 1, 2 and 5.
     assert_eq!(hidden, vec![1, 2, 5]);
 }
@@ -4875,4 +4875,207 @@ fn reopening_a_file_keeps_a_spilled_array_that_reads_its_own_source() {
     s.execute("formulas.calculateNow", json!({})).unwrap();
     assert_eq!(v(&s, "A2"), Value::Error(gridcraft_core::CellError::Circ));
     assert_eq!(v(&s, "B2"), Value::Number(2.0));
+}
+
+// ---------------------------------------------------------------- line metadata through physical ids
+
+/// A sheet's line metadata as logical entries, the way the document format stores it.
+fn line_entries(map: &gridcraft_model::LineMap) -> Vec<(u32, gridcraft_model::LineInfo)> {
+    map.iter().map(|(line, info)| (line, *info)).collect()
+}
+
+/// The entries a file keeps: a line that is entirely default has nothing to write, so the format
+/// drops it (a mapped line map and an identity one read back the same either way).
+fn stored_line_entries(map: &gridcraft_model::LineMap) -> Vec<(u32, gridcraft_model::LineInfo)> {
+    line_entries(map).into_iter().filter(|(_, info)| *info != gridcraft_model::LineInfo::default()).collect()
+}
+
+#[test]
+fn inserted_lines_inherit_the_line_before_and_reset_group_state() {
+    let mut s = s();
+    s.execute("home.rowHeight", json!({"rows": "2:2", "height": 40})).unwrap();
+    s.execute("home.rowHeight", json!({"rows": "3:3", "height": 70})).unwrap();
+    s.execute("home.bold", json!({"range": "2:2"})).unwrap();
+    s.execute("home.columnWidth", json!({"cols": "B:B", "width": 120})).unwrap();
+    s.execute("home.columnWidth", json!({"cols": "C:C", "width": 200})).unwrap();
+    s.execute("home.bold", json!({"range": "B:B"})).unwrap();
+    {
+        // The line above the insert is grouped, hidden and collapsed; the inserted line must not
+        // copy those three (Excel's "Format Same As Above" brings the format, not the group).
+        let wb = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb);
+        let sh = wb.sheet_mut(0).unwrap();
+        let row = sh.rows.entry(1).or_default();
+        row.hidden = true;
+        row.outline = 2;
+        row.collapsed = true;
+        let col = sh.cols.entry(1).or_default();
+        col.hidden = true;
+        col.outline = 2;
+        col.collapsed = true;
+    }
+    let (above, below, left, right) = {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        (*sh.rows.get(&1).unwrap(), *sh.rows.get(&2).unwrap(), *sh.cols.get(&1).unwrap(), *sh.cols.get(&2).unwrap())
+    };
+    s.execute("home.insertRows", json!({"rows": "3:3"})).unwrap();
+    s.execute("home.insertColumns", json!({"cols": "C:C"})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        assert_eq!(sh.rows.get(&0), None, "row 1 had nothing to inherit");
+        assert_eq!(sh.rows.get(&1), Some(&above), "the line above is untouched");
+        let row = *sh.rows.get(&2).unwrap();
+        assert_eq!(row.size, Some(40.0), "the inserted row takes the height above");
+        assert!(row.custom, "and the user-set flag");
+        assert_eq!(row.style, above.style, "and the row format");
+        assert!(!row.hidden && row.outline == 0 && !row.collapsed, "group state is reset: {row:?}");
+        assert_eq!(sh.rows.get(&3), Some(&below), "the row that was below kept its own metadata");
+        let col = *sh.cols.get(&2).unwrap();
+        assert_eq!(col.size, Some(120.0), "the inserted column takes the width to its left");
+        assert_eq!(col.style, left.style);
+        assert!(!col.hidden && col.outline == 0 && !col.collapsed, "group state is reset: {col:?}");
+        assert_eq!(sh.cols.get(&3), Some(&right), "the column that was right of it kept its own metadata");
+    }
+    // Inserting at the top has no line before it: the new line stays bare.
+    let mut s = self::s();
+    s.execute("home.rowHeight", json!({"rows": "1:1", "height": 40})).unwrap();
+    s.execute("home.insertRows", json!({"rows": "1:1"})).unwrap();
+    let d = s.doc().unwrap();
+    let sh = d.wb.active().unwrap();
+    assert!(sh.rows.get(&0).is_none(), "row 1 at the top inherits nothing");
+    assert_eq!(sh.rows.get(&1).and_then(|i| i.size), Some(40.0), "and the old row 1 moved down");
+}
+
+#[test]
+fn deleted_lines_drop_their_metadata_and_shift_the_rest() {
+    let mut s = s();
+    for (lines, height) in [("2:2", 30.0), ("3:3", 50.0), ("4:4", 70.0)] {
+        s.execute("home.rowHeight", json!({"rows": lines, "height": height})).unwrap();
+    }
+    for (lines, width) in [("B:B", 100.0), ("C:C", 200.0), ("D:D", 300.0)] {
+        s.execute("home.columnWidth", json!({"cols": lines, "width": width})).unwrap();
+    }
+    s.execute("home.hideRows", json!({"rows": "5:5"})).unwrap();
+    assert_eq!(line_entries(&s.doc().unwrap().wb.active().unwrap().rows).len(), 4);
+
+    s.execute("home.deleteRows", json!({"rows": "3:3"})).unwrap();
+    s.execute("home.deleteColumns", json!({"cols": "B:B"})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        // Row index 2 (height 50) was deleted; the row below moved up with its own height.
+        assert_eq!(sh.rows.get(&2).and_then(|i| i.size), Some(70.0), "row 3 took the deleted row's place");
+        assert!(sh.rows.get(&3).is_some_and(|i| i.hidden), "the hidden row moved up too");
+        assert!(sh.rows.get(&4).is_none(), "nothing is left below it");
+        assert_eq!(sh.rows.len(), 3);
+        // Column B was deleted; C and D moved left.
+        assert_eq!((sh.cols.get(&1).and_then(|i| i.size), sh.cols.get(&2).and_then(|i| i.size)), (Some(200.0), Some(300.0)));
+        assert!(sh.cols.get(&3).is_none());
+        assert_eq!(sh.cols.len(), 2);
+        assert_eq!((sh.col_width(1), sh.col_width(2)), (200.0, 300.0), "the sheet draws the shifted widths");
+    }
+}
+
+#[test]
+fn undo_restores_line_metadata_after_structural_edits() {
+    let mut s = s();
+    s.execute("home.rowHeight", json!({"rows": "2:3", "height": 40})).unwrap();
+    s.execute("home.hideRows", json!({"rows": "5:5"})).unwrap();
+    s.execute("home.columnWidth", json!({"cols": "B:C", "width": 120})).unwrap();
+    s.execute("home.hideColumns", json!({"cols": "E:E"})).unwrap();
+    let (rows, cols) = {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        (line_entries(&sh.rows), line_entries(&sh.cols))
+    };
+
+    s.execute("home.insertRows", json!({"rows": "2:4"})).unwrap();
+    s.execute("home.insertColumns", json!({"cols": "B:B"})).unwrap();
+    let inserted = {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        (line_entries(&sh.rows), line_entries(&sh.cols))
+    };
+    assert_ne!(inserted.0, rows);
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        assert_eq!((line_entries(&sh.rows), line_entries(&sh.cols)), (rows.clone(), cols.clone()), "undo restores the metadata exactly");
+    }
+    s.execute("edit.redo", json!({})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        assert_eq!((line_entries(&sh.rows), line_entries(&sh.cols)), inserted, "redo restores it too");
+    }
+
+    let before_delete = inserted.clone();
+    s.execute("home.deleteRows", json!({"rows": "3:3"})).unwrap();
+    s.execute("home.deleteColumns", json!({"cols": "B:B"})).unwrap();
+    let deleted = {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        (line_entries(&sh.rows), line_entries(&sh.cols))
+    };
+    assert_ne!(deleted.0, before_delete.0);
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        assert_eq!((line_entries(&sh.rows), line_entries(&sh.cols)), before_delete, "undo restores a deleted line's metadata");
+    }
+    s.execute("edit.redo", json!({})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        assert_eq!((line_entries(&sh.rows), line_entries(&sh.cols)), deleted, "redo deletes it again");
+    }
+}
+
+#[test]
+fn moved_columns_take_their_metadata_along_and_undo_puts_it_back() {
+    let mut s = s();
+    for (col, width) in [("A:A", 50.0), ("B:B", 60.0), ("C:C", 70.0), ("D:D", 80.0)] {
+        s.execute("home.columnWidth", json!({"cols": col, "width": width})).unwrap();
+    }
+    let before = line_entries(&s.doc().unwrap().wb.active().unwrap().cols);
+    s.execute("sheet.moveColumns", json!({"cols": "B:C", "before": 0})).unwrap();
+    let widths = |s: &Session| (0..4).map(|c| s.doc().unwrap().wb.active().unwrap().col_width(c)).collect::<Vec<f32>>();
+    assert_eq!(widths(&s), [60.0, 70.0, 50.0, 80.0], "B:C moved before A with their widths");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(widths(&s), [50.0, 60.0, 70.0, 80.0]);
+    assert_eq!(line_entries(&s.doc().unwrap().wb.active().unwrap().cols), before, "undo restores the column metadata");
+}
+
+#[test]
+fn a_mapped_sheet_saves_and_reopens_with_its_line_metadata() {
+    let mut s = s();
+    s.execute("home.rowHeight", json!({"rows": "2:3", "height": 40})).unwrap();
+    s.execute("home.hideRows", json!({"rows": "4:4"})).unwrap();
+    s.execute("home.columnWidth", json!({"cols": "B:C", "width": 120})).unwrap();
+    s.execute("home.hideColumns", json!({"cols": "D:D"})).unwrap();
+    // A structural edit moves the metadata onto a non-identity line map, which is what the file
+    // has to flatten back to logical lines.
+    s.execute("home.insertRows", json!({"rows": "2:2"})).unwrap();
+    s.execute("home.insertColumns", json!({"cols": "B:B"})).unwrap();
+    let (rows, cols) = {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        (stored_line_entries(&sh.rows), stored_line_entries(&sh.cols))
+    };
+    assert!(!rows.is_empty() && !cols.is_empty());
+    reopen(&mut s);
+    let (back_rows, back_cols) = {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        (stored_line_entries(&sh.rows), stored_line_entries(&sh.cols))
+    };
+    assert_eq!(back_rows, rows, "row metadata after an XLSX round trip");
+    assert_eq!(back_cols, cols, "column metadata after an XLSX round trip");
 }

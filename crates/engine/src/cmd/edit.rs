@@ -764,9 +764,9 @@ fn slide_together(wb: &gridcraft_model::Workbook, sheet: usize, areas: &[RangeRe
     dst.comments.retain(|c, _| !block.contains(*c));
     dst.merges.retain(|m| !m.intersects(&block));
     if across {
-        dst.cols.retain(|c, _| !(block.start.col..=block.end.col).contains(c));
+        dst.cols.remove_range(block.start.col, block.width());
     } else {
-        dst.rows.retain(|r, _| !(block.start.row..=block.end.row).contains(r));
+        dst.rows.remove_range(block.start.row, block.height());
     }
     let mut next = if across { anchor.col } else { anchor.row };
     for a in &sorted {
@@ -1709,7 +1709,7 @@ fn format_painter(s: &mut Session, p: &Json) -> Result<Json> {
                             cx.wb
                                 .sheet(dest_sheet)
                                 .into_iter()
-                                .flat_map(|sh| sh.rows.iter().filter(|(_, i)| i.style.is_some()).map(|(r, _)| CellRef::new(*r, line))),
+                                .flat_map(|sh| sh.rows.iter().filter(|(_, i)| i.style.is_some()).map(|(r, _)| CellRef::new(r, line))),
                         );
                     }
                     let sh = cx.sheet_mut(dest_sheet)?;

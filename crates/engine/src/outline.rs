@@ -3,9 +3,7 @@
 //! Show / Hide Detail commands act on them. Summary rows sit below their detail and summary
 //! columns right of it (Excel's defaults; the model has no setting for the other way round).
 
-use std::collections::BTreeMap;
-
-use gridcraft_model::LineInfo;
+use gridcraft_model::LineMap;
 
 /// The deepest outline level XLSX allows.
 pub const MAX_LEVEL: u8 = 7;
@@ -32,12 +30,12 @@ impl OutlineGroup {
 }
 
 /// The deepest outline level used by these lines (0 = no outline).
-pub fn max_level(lines: &BTreeMap<u32, LineInfo>) -> u8 {
+pub fn max_level(lines: &LineMap) -> u8 {
     lines.values().map(|l| l.outline.min(MAX_LEVEL)).max().unwrap_or(0)
 }
 
 /// Every group, ordered by where it ends (inner groups before the group around them).
-pub fn groups(lines: &BTreeMap<u32, LineInfo>) -> Vec<OutlineGroup> {
+pub fn groups(lines: &LineMap) -> Vec<OutlineGroup> {
     let mut out = Vec::new();
     // Open group per level (index level - 1): start line and whether all its lines are hidden.
     let mut open: [Option<(u32, bool)>; MAX_LEVEL as usize] = [None; MAX_LEVEL as usize];
@@ -51,7 +49,7 @@ pub fn groups(lines: &BTreeMap<u32, LineInfo>) -> Vec<OutlineGroup> {
             }
         }
     };
-    for (&i, info) in lines.iter().filter(|(_, l)| l.outline > 0) {
+    for (i, info) in lines.iter().filter(|(_, l)| l.outline > 0) {
         let level = info.outline.min(MAX_LEVEL);
         match prev {
             // A gap ends every group.
@@ -74,16 +72,17 @@ pub fn groups(lines: &BTreeMap<u32, LineInfo>) -> Vec<OutlineGroup> {
 }
 
 /// The group at `level` that holds `line`.
-pub fn group_at(lines: &BTreeMap<u32, LineInfo>, line: u32, level: u8) -> Option<OutlineGroup> {
+pub fn group_at(lines: &LineMap, line: u32, level: u8) -> Option<OutlineGroup> {
     groups(lines).into_iter().find(|g| g.level == level && g.contains(line))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gridcraft_model::LineInfo;
 
-    fn lines(spec: &[(u32, u8, bool)]) -> BTreeMap<u32, LineInfo> {
-        spec.iter().map(|&(i, outline, hidden)| (i, LineInfo { outline, hidden, ..Default::default() })).collect()
+    fn lines(spec: &[(u32, u8, bool)]) -> LineMap {
+        LineMap::from_rows(spec.iter().map(|&(i, outline, hidden)| (i, LineInfo { outline, hidden, ..Default::default() })).collect())
     }
 
     #[test]
@@ -123,11 +122,14 @@ mod tests {
     }
 
     #[test]
-    fn deepest_level_and_last_line_do_not_overflow() {
-        let l = lines(&[(u32::MAX - 1, 9, false), (u32::MAX, 7, false)]);
+    fn deepest_level_at_the_last_lines_does_not_overflow() {
+        let last = gridcraft_core::MAX_ROWS - 1;
+        let l = lines(&[(last - 1, 9, false), (last, 7, false)]);
         let g = groups(&l);
         assert_eq!(g.len(), 7);
-        assert!(g.iter().all(|g| g.start == u32::MAX - 1 && g.end == u32::MAX));
-        assert_eq!(g[0].summary(), u32::MAX);
+        assert!(g.iter().all(|g| g.start == last - 1 && g.end == last));
+        assert_eq!(g[0].summary(), last + 1);
+        // A summary line past the largest line saturates rather than overflowing.
+        assert_eq!(OutlineGroup { level: 1, start: u32::MAX, end: u32::MAX, collapsed: false }.summary(), u32::MAX);
     }
 }

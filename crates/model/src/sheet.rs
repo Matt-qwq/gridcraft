@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cell::{Cell, CellPicture};
 use crate::features::*;
+use crate::line::LineMap;
 use crate::store::CellStore;
 use crate::style::{Color, StyleId};
 
@@ -62,8 +63,10 @@ pub struct Sheet {
     /// Anchor → spill range.
     #[serde(skip)]
     pub spill_ranges: BTreeMap<CellRef, RangeRef>,
-    pub cols: BTreeMap<u32, LineInfo>,
-    pub rows: BTreeMap<u32, LineInfo>,
+    #[serde(default = "crate::line::default_cols", deserialize_with = "crate::line::deserialize_cols")]
+    pub cols: LineMap,
+    #[serde(default = "crate::line::default_rows", deserialize_with = "crate::line::deserialize_rows")]
+    pub rows: LineMap,
     /// Default column width and row height in pixels at 96 dpi (a file stores row heights in points).
     pub default_col_width: f32,
     pub default_row_height: f32,
@@ -131,8 +134,8 @@ impl Sheet {
             cell_pictures: BTreeMap::new(),
             spill: BTreeMap::new(),
             spill_ranges: BTreeMap::new(),
-            cols: BTreeMap::new(),
-            rows: BTreeMap::new(),
+            cols: LineMap::cols(),
+            rows: LineMap::rows(),
             default_col_width: DEFAULT_COL_WIDTH,
             default_row_height: DEFAULT_ROW_HEIGHT,
             merges: vec![],
@@ -318,8 +321,7 @@ impl Sheet {
     /// Y offset (points) of the top of `row`.
     pub fn row_top(&self, row: u32) -> f64 {
         let mut y = row as f64 * self.default_row_height as f64;
-        for (r, info) in self.rows.range(..row) {
-            let _ = r;
+        for (_, info) in self.rows.range(..row) {
             let h = if info.hidden { 0.0 } else { info.size.unwrap_or(self.default_row_height) };
             y += h as f64 - self.default_row_height as f64;
         }
@@ -371,12 +373,12 @@ pub struct LineIndex {
 }
 
 impl LineIndex {
-    pub fn new(custom: &BTreeMap<u32, LineInfo>, default: f32, max: u32) -> LineIndex {
+    pub fn new(custom: &LineMap, default: f32, max: u32) -> LineIndex {
         let default = default as f64;
         let mut lines = Vec::with_capacity(custom.len());
         let mut pos = 0.0;
         let mut prev = 0u32;
-        for (&line, info) in custom {
+        for (line, info) in custom.iter() {
             pos += (line - prev) as f64 * default;
             let size = if info.hidden { 0.0 } else { info.size.map_or(default, |s| s as f64) };
             lines.push((line, pos, size));
@@ -422,13 +424,13 @@ impl LineIndex {
 }
 
 /// Inverse of the cumulative size along an axis with sparse custom sizes.
-fn line_at(pos: f64, default: f64, custom: &BTreeMap<u32, LineInfo>, max: u32) -> u32 {
+fn line_at(pos: f64, default: f64, custom: &LineMap, max: u32) -> u32 {
     if pos <= 0.0 {
         return 0;
     }
     let mut start_pos = 0.0; // position of line `idx`
     let mut idx: u32 = 0;
-    for (&line, info) in custom.iter() {
+    for (line, info) in custom.iter() {
         // Lines idx..line have default size.
         let span = (line - idx) as f64 * default;
         if pos < start_pos + span {
@@ -469,6 +471,31 @@ mod tests {
         for y in [0.0, 5.0, 33.3, 1000.0, 47_000.0, 90_000.0] {
             assert_eq!(idx.at(y), s.row_at(y), "at {y}");
         }
+    }
+
+    /// After a row insert the metadata lives on shifted logical lines; the prefix index and the
+    /// linear scans must speak the same logical lines as the entries.
+    #[test]
+    fn line_index_and_geometry_follow_a_shifted_line_map() {
+        let mut s = Sheet::new("S");
+        for r in (0..300).step_by(4) {
+            s.rows.insert(r, LineInfo { size: Some(10.0 + (r % 7) as f32), hidden: r % 13 == 0, ..Default::default() });
+        }
+        let moved = s.rows.get(&52).copied().unwrap();
+        s.rows.insert_lines(50, 7);
+        assert_eq!(s.rows.get(&53), None, "the inserted rows are empty");
+        assert_eq!(s.rows.get(&59), Some(&moved), "row 52 moved to 59");
+        assert_eq!(s.rows.get(&52), None);
+        let idx = LineIndex::new(&s.rows, s.default_row_height, gridcraft_core::MAX_ROWS);
+        for r in [0u32, 1, 49, 50, 56, 57, 60, 299, 310, 400] {
+            assert!((idx.start(r) - s.row_top(r)).abs() < 1e-6, "start {r}");
+        }
+        for y in [0.0, 5.0, 990.0, 1000.0, 1050.0, 5000.0, 9000.0] {
+            assert_eq!(idx.at(y), s.row_at(y), "at {y}");
+        }
+        s.rows.delete_lines(50, 7);
+        assert_eq!(s.rows.get(&52), Some(&moved), "row 52 is back");
+        assert!((LineIndex::new(&s.rows, s.default_row_height, gridcraft_core::MAX_ROWS).start(52) - s.row_top(52)).abs() < 1e-6);
     }
 
     /// Reference implementation: one `value_ref` call per row, exactly the loop

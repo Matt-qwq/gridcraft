@@ -9,10 +9,9 @@
 
 use egui::{Align2, Painter, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
 use gridcraft_engine::core::col_to_letters;
-use gridcraft_engine::model::{LineInfo, Sheet};
+use gridcraft_engine::model::{LineMap, Sheet};
 use gridcraft_engine::outline::{self, OutlineGroup};
 use serde_json::{Value as Json, json};
-use std::collections::BTreeMap;
 
 use crate::grid::{DISPLAY_SCALE, Geo};
 use crate::theme::{self, Tokens};
@@ -28,7 +27,7 @@ pub struct Axis {
 }
 
 impl Axis {
-    pub fn new(lines: &BTreeMap<u32, LineInfo>) -> Axis {
+    pub fn new(lines: &LineMap) -> Axis {
         Axis { levels: outline::max_level(lines), groups: outline::groups(lines) }
     }
 }

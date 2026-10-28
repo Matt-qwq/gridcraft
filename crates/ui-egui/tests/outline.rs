@@ -41,7 +41,7 @@ fn button(h: &Harness, which: impl Fn(&Action) -> bool) -> Pos2 {
 
 fn hidden_rows(h: &Harness) -> Vec<u32> {
     let sh = h.state().session.active().unwrap().wb.active().unwrap().clone();
-    sh.rows.iter().filter(|(_, l)| l.hidden).map(|(r, _)| *r).collect()
+    sh.rows.iter().filter(|(_, l)| l.hidden).map(|(r, _)| r).collect()
 }
 
 fn toggle(rows: bool, level: u8) -> impl Fn(&Action) -> bool {

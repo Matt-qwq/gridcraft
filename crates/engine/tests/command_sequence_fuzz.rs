@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value, col_to_letters};
 use gridcraft_engine::calc::Calc;
-use gridcraft_engine::model::{CalcMode, Formula, Sheet, Workbook};
+use gridcraft_engine::model::{CalcMode, Formula, LineMap, Sheet, Style, StyleId, StyleTable, Workbook};
 use gridcraft_engine::{EngineError, Session, command_specs, find_command, io};
 use serde_json::{Value as Json, json};
 
@@ -521,6 +521,37 @@ fn normalized_formula(f: &Formula) -> String {
     if f.array.is_some() { format!("{{={text}}}") } else { format!("={text}") }
 }
 
+/// A line as the file keeps it: line, hidden, outline, collapsed, style, user-set size flag and
+/// the size in the file's own precision.
+type KeptLine = (u32, bool, u8, bool, Option<Style>, bool, i64);
+
+/// The line metadata a save and reload gives back. The format is lossier than the model in four
+/// ways, all of them in `sheet_write`/`sheet_read`:
+/// - a line whose settings are all default is not written at all;
+/// - a row height the user did not set is auto-fitted from content and re-fitted on open
+///   (`fit_imported_rows`), so it is derived, not content;
+/// - a height is stored in points (rounded to 0.01) and a width in whole pixels;
+/// - a line whose style is the default style is written as `style="0"` and reads back unstyled.
+///
+/// Sizes compare in the file's units, styles by content (the style table may be renumbered).
+fn kept_lines(map: &LineMap, styles: &StyleTable, rows: bool) -> Vec<KeptLine> {
+    map.iter()
+        .filter_map(|(line, info)| {
+            let style = info.style.filter(|s| *s != StyleId::DEFAULT).map(|s| styles.get(s).clone());
+            let outline = info.outline.min(7);
+            let custom = rows && info.custom && info.size.is_some();
+            let size = match info.size {
+                _ if rows && !custom => -1,
+                Some(px) if rows => (f64::from(px.clamp(0.0, 546.0)) * 75.0).round() as i64,
+                Some(px) => px.clamp(0.0, 1790.0).round() as i64,
+                None => -1,
+            };
+            let content = info.hidden || outline > 0 || info.collapsed || style.is_some() || custom || size >= 0;
+            content.then_some((line, info.hidden, outline, info.collapsed, style, custom, size))
+        })
+        .collect()
+}
+
 /// Save to XLSX, reload (recalculating like opening does) and compare sheets, formulas and values.
 fn roundtrip_diff(wb: &Workbook) -> Result<(), String> {
     let bytes = io::save_bytes(wb, "fuzz.xlsx").map_err(|e| format!("save failed: {e}"))?;
@@ -537,6 +568,14 @@ fn roundtrip_diff(wb: &Workbook) -> Result<(), String> {
             let first = fx.iter().zip(&fy).find(|(a, b)| a != b).map(|(a, b)| format!("{a:?} vs {b:?}"));
             let first = first.unwrap_or_else(|| format!("{} formulas vs {}", fx.len(), fy.len()));
             return Err(format!("{}: formulas differ after reload: {first}", x.name));
+        }
+        // Line metadata maps through physical ids now; the file still stores logical lines, so a
+        // mapped sheet must reload with the same rows and columns.
+        if kept_lines(&x.rows, &wb.styles, true) != kept_lines(&y.rows, &back.styles, true) {
+            return Err(format!("{}: rows differ after reload", x.name));
+        }
+        if kept_lines(&x.cols, &wb.styles, false) != kept_lines(&y.cols, &back.styles, false) {
+            return Err(format!("{}: cols differ after reload", x.name));
         }
     }
     if wb.calc.mode == CalcMode::Automatic && !wb.calc.iterative {

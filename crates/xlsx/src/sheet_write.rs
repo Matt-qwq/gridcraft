@@ -261,7 +261,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
             }
             s.push_str("/>");
         };
-        for (&c, info) in &sheet.cols {
+        for (c, info) in &sheet.cols {
             if c >= gridcraft_core::MAX_COLS {
                 continue;
             }
@@ -306,7 +306,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
     loop {
         let next_store = store.peek().map(|(at, _)| at.row);
         let next_sparse = sparse.peek().map(|(r, _)| *r);
-        let next_info = info_rows.peek().map(|(r, _)| **r);
+        let next_info = info_rows.peek().map(|(r, _)| *r);
         let Some(row) = [next_store, next_sparse, next_info].into_iter().flatten().min() else { break };
         let info = if next_info == Some(row) {
             info_rows.next().map(|(_, i)| *i).unwrap_or_default()

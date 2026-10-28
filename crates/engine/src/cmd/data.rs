@@ -519,7 +519,7 @@ fn toggle_filter(s: &mut Session, p: &Json) -> Result<Json> {
         return edit(s, |cx| {
             let sh = cx.sheet_mut(sheet)?;
             // Reveal only rows the filter hid; rows hidden by hand or by a collapsed group stay hidden.
-            let filtered: Vec<u32> = sh.rows.keys().copied().filter(|r| sh.is_row_filtered(*r)).collect();
+            let filtered: Vec<u32> = sh.rows.keys().filter(|r| sh.is_row_filtered(*r)).collect();
             sh.autofilter = None;
             for r in filtered {
                 if let Some(info) = sh.rows.get_mut(&r) {
@@ -1671,7 +1671,7 @@ mod tests {
         s.execute("home.hideRows", json!({"rows": "10:10"})).unwrap();
         let hidden = |s: &Session| -> Vec<u32> {
             let sh = s.doc().unwrap().wb.active().unwrap();
-            sh.rows.iter().filter(|(_, l)| l.hidden).map(|(r, _)| *r).collect()
+            sh.rows.iter().filter(|(_, l)| l.hidden).map(|(r, _)| r).collect()
         };
         let before = hidden(&s);
         assert_eq!(before, [1, 2, 3, 9]);
@@ -1696,7 +1696,7 @@ mod tests {
         s.execute("data.filter", json!({"range": "A1:A4"})).unwrap();
         s.execute("data.filter", json!({"range": "A1:A4"})).unwrap();
         let sh = s.doc().unwrap().wb.active().unwrap();
-        assert_eq!(sh.rows.iter().filter(|(_, l)| l.hidden).map(|(r, _)| *r).collect::<Vec<_>>(), [2, 9]);
+        assert_eq!(sh.rows.iter().filter(|(_, l)| l.hidden).map(|(r, _)| r).collect::<Vec<_>>(), [2, 9]);
     }
 
     /// Rows 5:8 grouped, with 6:7 grouped again inside (0-based 4..=7 and 5..=6).
