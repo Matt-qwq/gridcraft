@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (§2: M20 row map lands; insert above 1M×20 is 3.7 ms / 35.8 ms commit with zero cell moves; columns and compaction remain) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (§2: M20 row and column maps land; row insert 3.7 ms, column insert 9.8 ms on 1M×20 with zero cell moves; compaction and line metadata remain) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -82,13 +82,18 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   and reads/iteration/used range/formulas map through. Insert one row above a 1M×20 sheet is
   **3.7 ms command / 35.8 ms commit**, with no cell moved. The formula rewrite no longer walks every
   cell to find none (it reads the store's formula side tables), and iteration skips empty bands.
+- **Landed (10-28): the column sibling.** `ColMap` materializes only the used width, allocates a
+  fresh physical column for a written insert (or reuses a deleted one), and maps reads/iteration/
+  formulas/used range. A column insert at A in the same 1M×20 sheet is **9.8 ms / 42.5 ms commit**,
+  no cell moved. Save/reopen tests cover both axes; column-mapped value writes take the
+  value-at-a-time path.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
   file is a temporary beside the system temp directory (not the document), the cache budget is a
   page count (not a byte count), and a save decodes the whole model transiently; the per-band value
   dictionaries still cost full price when values do not repeat;
-  **column** inserts/deletes still shift every cell to the right, row line metadata is still shifted
-  as a BTreeMap, there is no segment compaction and `set_values` on a mapped sheet is value-at-a-time;
+  row line metadata is still shifted as a BTreeMap, there is no segment compaction,
+  `set_values` on a mapped sheet is value-at-a-time and `diff` is still physical;
   whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
   a ten-row used range in 0.0 ms). The 159 cells that still differ from the cached values of the
   1.28 GB report are Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the

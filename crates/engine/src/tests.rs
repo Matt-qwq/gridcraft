@@ -693,6 +693,39 @@ fn insert_delete_rows_adjust() {
 }
 
 #[test]
+fn a_column_delete_keeps_formula_values_writable() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"sample": "grades"})).unwrap();
+    s.execute("home.deleteCells", json!({"range": "K2:N2", "shift": "column"})).unwrap();
+    s.execute("cell.set", json!({"cell": "I16", "input": "=1/0"})).unwrap();
+    // The column map is active; the formula result must go through the physical column map.
+    assert_eq!(v(&s, "I16"), Value::Error(gridcraft_core::CellError::Div0));
+    let d = s.doc().unwrap();
+    let sh = d.wb.active().unwrap();
+    assert_eq!(sh.cells.formulas().filter(|(c, _, _)| c.a1() == "I16").count(), 1);
+}
+
+#[test]
+fn inserted_columns_survive_save_and_reopen() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2, 3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "A2", "input": "=SUM(A1:C1)"})).unwrap();
+    s.execute("home.insertColumns", json!({"cols": "B:B"})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "10"})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(1.0));
+    assert_eq!(v(&s, "B1"), Value::Number(10.0));
+    assert_eq!(v(&s, "C1"), Value::Number(2.0));
+    assert_eq!(v(&s, "D1"), Value::Number(3.0));
+    assert_eq!(v(&s, "A2"), Value::Number(16.0));
+    let wb = &s.doc().unwrap().wb;
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&gridcraft_xlsx::write_xlsx(wb).unwrap()).unwrap();
+    let sh = reopened.active().expect("sheet");
+    assert_eq!(sh.value(CellRef::parse("B1").expect("B1")), Value::Number(10.0));
+    assert_eq!(sh.value(CellRef::parse("C1").expect("C1")), Value::Number(2.0));
+    assert_eq!(sh.value(CellRef::parse("A2").expect("A2")), Value::Number(16.0));
+}
+
+#[test]
 fn inserted_rows_survive_save_and_reopen() {
     let mut s = s();
     s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3]]})).unwrap();

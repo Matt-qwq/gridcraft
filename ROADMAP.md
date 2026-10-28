@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (M20 row half lands: a logical→physical row map; insert above 1M×20 is 3.7 ms / 35.8 ms commit with no cell move; columns and compaction remain) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (M20 row and column maps land: row insert 3.7 ms, column insert 9.8 ms on 1M×20 with no cell moves; compaction and line metadata remain) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -125,7 +125,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
    correctness, chart kind round-trip, CJK font fallback, macOS Finder open, German and Chinese
    UI). Review and merge: 8–15 h.
 2. **XLSX fidelity on a real-world corpus**, with Excel opening our output without repair: 25–35 h.
-3. **Large workbooks and recalc speed**: 100 MB XLSX, 1M-row operations, paging and append-style edits: 40–60 h (multi-threaded recalc, bounded bulk commands, cold paging and the M20 row map landed 10-27/28; column mapping and compaction remain).
+3. **Large workbooks and recalc speed**: 100 MB XLSX, 1M-row operations, paging and append-style edits: 40–60 h (multi-threaded recalc, bounded bulk commands, cold paging and the M20 row/column maps landed 10-27/28; compaction and line metadata remain).
 4. **Charts depth**: kinds and options round-trip, axes, trendlines, error bars: 25–35 h.
 5. **Text in every script** (CJK, Thai, Arabic, Devanagari) in cells and PDF: 12–20 h.
 6. **Legacy `.xls` import and password-protected workbooks**: 20–30 h.
@@ -135,7 +135,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
-| 2026-10-28 | M20's row half lands: `CellStore` keeps a logical→physical `RowMap`; `shift_rows` changes a segment list instead of moving cells, inserted rows allocate fresh physical keys on write, and reads/iteration/formulas/used range map through. **Insert one row above 1M×20 is 3.7 ms command / 35.8 ms commit, with 0 cells moved** (deleting the last row first to make room). `rewrite_all_formulas` no longer walks every cell to find no formulas, and `CellStore::iter` walks only bands that exist. Columns, segment compaction, row line metadata and value writes on mapped sheets remain |
+| 2026-10-28 | M20's row and column halves land: `CellStore` keeps a logical→physical `RowMap`; `shift_rows` changes a segment list instead of moving cells, inserted rows allocate fresh physical keys on write, and reads/iteration/formulas/used range map through. **Insert one row above 1M×20 is 3.7 ms command / 35.8 ms commit, with 0 cells moved** (deleting the last row first to make room). `rewrite_all_formulas` no longer walks every cell to find no formulas, and `CellStore::iter` walks only bands that exist. The column sibling (`ColMap`) uses the same runs over the used width, allocates/reuses physical columns on write, and makes a column insert 9.8 ms command / 42.5 ms commit with no cell moved. Segment compaction, row line metadata and value writes on mapped sheets remain |
 | 2026-10-28 | M19 cold paging lands: completed bands are compressed into per-sheet `GPB1` page files (zlib) and decoded through a 4,096-band LRU; the engine pages packages over 200 MB, so the 55 MB 1M×10 sheet stays live. The **100M-cell export opens at 16.7 MiB live / 183.1 MiB peak** (was 1.91 GiB) with 729.5 MiB of compressed pages and its digest cell-for-cell unchanged; the **31.7M report stays live at 49.7 MiB and 1.47 s**. Page files die with the store, corrupt pages are refused; spill-beside-document and a byte budget remain |
 | 2026-10-28 | M19 starts on memory: a finished band drops the text pointer index (the text table stays; the first edit rebuilds the index), so the 100M-cell unique-key export falls from **2,411 to 1,911 MiB** live, its text tables from 640 to 301 MiB and the number-table slack is returned (band overhead 679 to 519 MiB); the 31.7M-cell report digest is unchanged. A text past the u16 slots now keeps its own slot in the row's wide table instead of the last text added. Cold paging is still what takes the remaining 1.9 GB under 600 MB |
 | 2026-10-28 | Bulk edits no longer scan a 64×64 blocked-array block per changed cell: the scan covers the union once, so Remove Duplicates on a 1M×10 sheet fell from **91 s to 12 s** (1M×3: 15.4 → 5.3 s; recalculation 80 → 1.4 s), Sort on the same sheet is 3.2 s and Fill Down of 1M rows 1.45 s. `data.sort`, `data.removeDuplicates` and `range.setValues` share a 12M-cell cap (1M×10 fits, 1M×20 is refused in 1.3 s with the count and limit); Remove Duplicates parses a style's number format once, and `CellStore::style` avoids rebuilding values and formulas for style lookups |
@@ -230,7 +230,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-28 | major | M20 row map (insert above 1M×20 3.7 ms / 35.8 ms commit, 0 cells moved; formula rewrite and iteration skip empty cells); gaps §2, roadmap M20 and progress log updated |
+| 2026-10-28 | major | M20 row+column maps (row insert 3.7 ms / 35.8 ms commit, column insert 9.8 ms / 42.5 ms on 1M×20, 0 cells moved; formula rewrite and iteration skip empty cells); gaps §2, roadmap M20 and progress log updated |
 | 2026-10-28 | major | M19 cold paging (compressed pages, LRU; 100M-cell export 16.7 MiB live / 183.1 MiB peak; digest unchanged); gaps §2, roadmap M19 and the progress log updated |
 | 2026-10-28 | minor | M19 memory step (text index dropped after a band is complete, number table shrunk; 100M-cell export 2,411 → 1,911 MiB live); gaps §2 and roadmap M19 updated |
 | 2026-10-28 | minor | Bulk data commands bounded (Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill 1.45 s, 12M-cell cap); gaps §2, roadmap M18 and the parity table updated |

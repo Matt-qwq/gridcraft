@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** major (M20 row half lands: a logical→physical row map; insert one row above 1M×20 in 3.7 ms / 35.8 ms commit, no cell move; columns/compaction remain) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** major (M20 row and column halves land: logical→physical maps; row insert 3.7 ms, column insert 9.8 ms on 1M×20, no cell moves; compaction/line metadata remain) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -82,7 +82,7 @@ to check our files, and Windows machines with the reported GPU drivers.
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | planned |
 | M19 | Cold paging: bands leave memory when unused | **landed (10-28)**: compressed pages + 4,096-band LRU; spill-beside-document, byte budget and save/scan remain |
-| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **row half landed (10-28)**: logical→physical row map, 3.7 ms insert on 1M×20; columns, compaction and line metadata remain |
+| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **row and column halves landed (10-28)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20; compaction, line metadata and mapped value writes remain |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading and linked tables remain |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
 
@@ -551,6 +551,16 @@ walking every cell of every sheet (`cells.iter().filter_map(...)`), so a 20M-cel
 formulas spent ~300 ms finding none. It now asks the store's formula side tables (`cells.formulas()`),
 and `CellStore::iter` walks only bands that exist rather than every logical row.
 
+**Landed (10-28, same round): columns.** `ColMap` is the column sibling: identity until the first
+whole-column edit, then sorted logical→physical runs. Unlike rows, its initial run covers only the
+sheet's used width, so an inserted column at A allocates physical column 20 on a 20-column sheet
+rather than 16,384; a deleted run's physical columns go on a free list. `shift_cols` changes the map;
+`get/style/contains/set/set_row/remove/used_range/iter/row/formula_cells/formulas/has_owned_cells`
+map through it. Cells in inserted columns are written at a fresh physical key; a column-mapped sheet
+uses the value-at-a-time `set_values` path (the logical and physical orders differ), and
+`visit_packed` falls back to the logical walk until a physical-column packed walk lands. A column
+insert at A in `wide_1m_x20.xlsx` is **9.8 ms command / 42.5 ms commit**, with no cell moved.
+
 Measured on `wide_1m_x20.xlsx` (1M × 20 = 20M cells) through `gridcraft-cli`, deleting the last row
 to leave room and then inserting a row at 1:
 
@@ -564,18 +574,18 @@ The 1M×10 case is 3.9 / 4.0 ms and 36.8 / 35.7 ms commit. A save/reopen test ke
 shifted formula, and the model test checks the map, insertion into a gap, delete, iteration and JSON
 round trip. Full 412 engine tests, 43 model, 265 xlsx, 86 calc and release fuzz 100×200 stay green.
 
-**Remaining.** Column inserts/deletes still move every cell to the right; row line metadata
-(`Sheet.rows`) is still shifted as a BTreeMap (a workbook with a custom height on every row pays
-that); a compaction pass has not been written, so repeated inserts/deletes can leave many small
-segments and orphan physical rows; and `set_values` on a mapped sheet takes the value-at-a-time
-path because logical and physical rows are no longer ordered together. These are the next M20
-slices.
+**Remaining.** Row line metadata (`Sheet.rows`) is still shifted as a BTreeMap (a workbook with a
+custom height on every row pays that); a compaction pass has not been written, so repeated
+inserts/deletes can leave many small segments and orphan physical rows; `set_values` on a mapped
+sheet takes the value-at-a-time path because logical and physical rows are no longer ordered
+together; and `CellStore::diff` still compares physical cells (the engine skips array checks on
+structural commits). These are the next M20 slices.
 
-**Acceptance (row half).**
+**Acceptance (rows and columns).**
 - Insert one row above a 1M-row, 20-column sheet: **3.7 ms command / 35.8 ms commit**, below 50 ms;
-  no cell moved.
+  no cell moved. Insert one column: **9.8 ms / 42.5 ms**, no cell moved.
 - Every existing undo, sort, filter, merge and save test unchanged; the XLSX digest of a mapped
-  sheet is the logical one (a save/reopen test covers it).
+  sheet is the logical one (row and column save/reopen tests cover it).
 - Reading a mapped sheet: `get` is one binary lookup over the segments; iteration walks only bands
   that exist; the full suites and the release fuzz stayed unchanged.
 
@@ -696,7 +706,7 @@ different trade — speed and size against interoperability, and against every t
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-28 | minor | Bulk edits scan blocked arrays once for the union of the changed blocks (Remove Duplicates 1M×10 91 → 12 s, recalc 80 s → 1.4 s); Sort 1M×10 3.2 s, Fill Down 1M rows 1.45 s; `data.sort`/`removeDuplicates`/`setValues` share a 12M-cell cap, 1M×20 refused in 1.3 s; `CellStore::style` fast path |
-| 2026-10-28 | major | M20 row half: `CellStore` keeps a logical→physical `RowMap`; `shift_rows` changes the map instead of moving cells, inserted gaps allocate physical rows on write, and every read path maps. Insert one row above 1M×20 is 3.7 ms command / 35.8 ms commit, 0 cells moved; `rewrite_all_formulas` and `iter` stop walking every cell/empty row. Columns, compaction and row line metadata remain |
+| 2026-10-28 | major | M20 row and column halves: `CellStore` keeps logical→physical `RowMap` and `ColMap`; inserts/deletes change maps instead of moving cells, gaps allocate physical keys on write, and reads/iteration/formulas/used range map. Row insert above 1M×20 3.7 ms / 35.8 ms commit, column insert 9.8 ms / 42.5 ms, 0 cells moved; formula rewrite and iteration stop walking every cell/empty row. Compaction, line metadata and mapped value writes remain |
 | 2026-10-28 | major | M19 cold paging: completed bands are compressed into per-sheet `GPB1` page files, loaded on read through a 4,096-band LRU; the engine pages packages over 200 MB. 100M-cell export: 16.7 MiB live / 183.1 MiB peak / 729.5 MiB compressed pages (11.58 s open), digest unchanged; 31.7M report: 49.7 MiB live, 1.47 s open. Remaining: spill beside document, byte budget, save/scan decode |
 | 2026-10-28 | minor | M19 step: a finished band drops its text pointer index and rebuilds it on the first edit; the 100M-cell export falls from 2,411 to 1,911 MiB live (texts 640 → 301 MiB, number-table slack returned), digest unchanged; a text past the u16 slots keeps its own slot |
 | 2026-10-27 | minor | Independent formulas recalculate on up to eight threads (wave by wave, leaves only; arrays/volatile/iterative stay sequential): 100k end-to-end edit 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; parallel band value writes (4M cap); `Node::may_spill` and graph safety sets |
