@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (§2: bulk edits bound; Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill 1.45 s, 12M-cell cap) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (§2: a finished band drops its text index and number-table slack; the 100M-cell export is 1,911 MiB live, texts 640 → 301 MiB) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -67,12 +67,16 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   `data.sort`, `data.removeDuplicates` and `range.setValues` share a **12M-cell cap** (1M×10 fits;
   1M×20 is refused in 1.3 s with a clear error), and `CellStore::style`/Remove Duplicates parse a
   style's number format once rather than once a cell.
+- **Landed (10-28): the per-band text index goes away when a band is finished.** The sorted
+  pointer→slot index is only needed while cells are being added, so `Band::finish` drops it and the
+  first edit rebuilds it; a completed band keeps one `Arc<str>` per distinct text. The 100M-cell
+  unique-key export drops from 2,411 to **1,911 MiB** live (texts 640 → 301 MiB; number tables 679 → 519 MiB), digest unchanged.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); memory
   proportional to the cells, never the file (the 1.28 GB,
-  220k-cell workbook lives in 237 MiB), but no cold paging yet — the stripes are what makes a band
-  one copy to page out; the per-band value dictionaries still cost full price when values do not
-  repeat;
+  220k-cell workbook lives in 237 MiB), but no cold paging yet — the 100M export still holds 1.91 GB,
+  and the stripes are what makes a band one copy to page out; the per-band value dictionaries still
+  cost full price when values do not repeat;
   structural edits still shift every cell below them; whole-column references are already clipped
   (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms). The 159
   cells that still differ from the cached values of the 1.28 GB report are Excel's stale cache — 276
@@ -265,6 +269,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-28 | minor | §2: a finished band drops its text pointer index (rebuilt on the first edit); the 100M-cell export falls from 2,411 to 1,911 MiB live (texts 640 → 301, number tables 679 → 519) and a text past the u16 slots keeps its own slot |
 | 2026-10-28 | minor | §2: bulk changes scan blocked arrays once for the union of the changed cells and data commands cap at 12M cells: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill Down 1.45 s; 1M×20 refused in 1.3 s |
 | 2026-10-27 | minor | §2: independent formulas recalculate on up to eight threads (leaves wave by wave; arrays/volatile/iterative sequential): 100k end-to-end 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; §10 next step is bounded whole-sheet work and paging |
 | 2026-10-27 | minor | §2: the 100k-dependent edit gate is met single-threaded (245 → 65–75 ms; full recalculation 281–289 → 134–147 ms) by reading formulas and legacy ranges from the graph, one result slot, row-major value writes, shared row extras, cached AST byte counts and a diff-first array check; §10 next step is multi-threaded recalc |

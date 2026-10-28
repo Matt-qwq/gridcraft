@@ -737,20 +737,43 @@ impl Band {
         self.kinds.shrink_to_fit();
         self.styles.shrink_to_fit();
         self.payloads.shrink_to_fit();
+        self.numbers.shrink_to_fit();
+        self.texts.shrink_to_fit();
+        self.style_ids.shrink_to_fit();
         self.drop_number_slots();
+        self.drop_text_index();
     }
 
-    fn text_slot(&mut self, s: &Arc<str>) -> Option<u16> {
+    /// The band's slot for `s`, adding it when new. A band that has been finished has no index;
+    /// the first edit that needs one rebuilds it from the texts the band still holds.
+    fn text_slot(&mut self, s: &Arc<str>) -> u32 {
+        if self.text_index.is_empty() && !self.texts.is_empty() {
+            self.reindex_texts();
+        }
         let key = Arc::as_ptr(s) as *const u8 as usize;
         match self.text_index.binary_search_by_key(&key, |(at, _)| *at) {
-            Ok(i) => u16::try_from(self.text_index[i].1).ok(),
+            Ok(i) => self.text_index[i].1,
             Err(at) => {
                 let slot = self.texts.len() as u32;
                 self.texts.push(s.clone());
                 self.text_index.insert(at, (key, slot));
-                u16::try_from(slot).ok()
+                slot
             }
         }
+    }
+
+    /// Rebuilds the pointer index from the band's text table. The table is kept after the band is
+    /// finished; the index is only needed while cells are being added.
+    fn reindex_texts(&mut self) {
+        self.text_index = self.texts.iter().enumerate().map(|(i, t)| (Arc::as_ptr(t) as *const u8 as usize, i as u32)).collect();
+        self.text_index.sort_unstable_by_key(|(at, _)| *at);
+    }
+
+    /// Offers the text index back to the allocator, like the number index: only adding cells needs
+    /// it. Dropping it matters most on a unique-key export, where a band holds hundreds of texts
+    /// and every band would otherwise keep a 16-byte sorted entry per text forever.
+    fn drop_text_index(&mut self) {
+        self.text_index = Vec::new();
     }
 
     /// The band's slot for `v`, adding it when new — `None` once the band holds more numbers than
@@ -830,10 +853,15 @@ impl Band {
     /// Kind and payload for a value. The tables are per band, so this needs the band.
     fn payload(&mut self, value: &Value) -> (u8, Payload) {
         match value {
-            Value::Text(t) => match self.text_slot(t) {
-                Some(slot) => (TEXT, Payload::Small(slot)),
-                None => (TEXT_WIDE, Payload::Wide(u64::from(self.texts.len() as u32 - 1))),
-            },
+            Value::Text(t) => {
+                let slot = self.text_slot(t);
+                match u16::try_from(slot) {
+                    Ok(slot) => (TEXT, Payload::Small(slot)),
+                    // The table holds more texts than a `u16` can index: the payload points into
+                    // the row's side table, which holds this text's slot.
+                    Err(_) => (TEXT_WIDE, Payload::Wide(u64::from(slot))),
+                }
+            }
             Value::Number(n) => match self.number_slot(*n) {
                 Some(slot) => (NUMBER, Payload::Small(slot)),
                 None => (NUMBER_WIDE, Payload::Wide(if *n == 0.0 { 0f64.to_bits() } else { n.to_bits() })),
@@ -2177,6 +2205,59 @@ mod tests {
         assert!(!s.set_value(c(9, 9), &Value::Number(5.0)));
         assert!(s.get(c(9, 9)).is_none());
         assert_eq!(s.len(), 2);
+    }
+
+    /// A finished band keeps its texts but not the pointer index that only adding cells needs;
+    /// the first edit rebuilds it. On a unique-key export this index was 16 bytes for every text
+    /// of every band (640 MiB on the 100M-cell export).
+    #[test]
+    fn a_finished_band_drops_its_text_index_and_rebuilds_it_on_edit() {
+        let alpha: Arc<str> = Arc::from("alpha");
+        let beta: Arc<str> = Arc::from("beta");
+        let mut batch = BandBatch::new();
+        let mut cells = vec![
+            (0, Cell::value(Value::Text(alpha.clone()))),
+            (1, Cell::value(Value::Text(alpha.clone()))),
+            (2, Cell::value(Value::Text(beta.clone()))),
+        ];
+        batch.set_row(0, &mut cells);
+        let mut s = CellStore::new();
+        s.insert_batch(batch);
+        let band = s.bands.get(&0).expect("band");
+        assert!(band.text_index.is_empty(), "the completed band dropped its text index");
+        assert_eq!(band.texts.len(), 2, "the same Arc is stored once");
+        assert_eq!(s.get(c(0, 0)).map(|x| x.value), Some(Value::Text(alpha.clone())));
+        assert_eq!(s.get(c(0, 2)).map(|x| x.value), Some(Value::Text(beta.clone())));
+        // The edit finds the existing text through the rebuilt index and interns a new one.
+        s.set(c(1, 0), Cell::value(Value::Text(alpha.clone())));
+        s.set(c(1, 1), Cell::value(Value::Text(Arc::from("gamma"))));
+        let band = s.bands.get(&0).expect("band");
+        assert_eq!(band.texts.len(), 3);
+        assert!(!band.text_index.is_empty(), "the index is back while the band is being edited");
+        assert_eq!(s.get(c(1, 0)).map(|x| x.value), Some(Value::Text(alpha)));
+        assert_eq!(s.get(c(1, 1)).map(|x| x.value), Some(Value::Text(Arc::from("gamma"))));
+    }
+
+    /// A band with more texts than a `u16` can index stores the actual slot of an existing text in
+    /// the row's wide table. The old code stored the last text instead, which was only right when
+    /// the text was the one that had just been added.
+    #[test]
+    fn a_text_past_the_u16_slots_keeps_its_own_slot() {
+        let mut band = Band::default();
+        let mut texts: Vec<Arc<str>> = Vec::new();
+        for i in 0..=65_536usize {
+            let text: Arc<str> = Arc::from(format!("t{i}"));
+            assert_eq!(band.text_slot(&text), i as u32, "slot {i}");
+            texts.push(text);
+        }
+        // One more text so the band's last slot is not the one the lookup asks for.
+        assert_eq!(band.text_slot(&Arc::from("extra")), 65_537);
+        let found = texts.get(65_536).cloned().expect("the text at the last u16 slot");
+        let (kind, payload) = band.payload(&Value::Text(found));
+        assert_eq!(kind, TEXT_WIDE);
+        let Payload::Wide(slot) = payload else { panic!("expected a wide payload") };
+        assert_eq!(slot, 65_536);
+        assert_eq!(&*band.text(slot), "t65536");
     }
 
     #[test]

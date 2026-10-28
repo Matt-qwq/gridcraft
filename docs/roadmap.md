@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** minor (bulk data commands are bounded: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, 12M-cell cap; M18 records it) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** minor (M19: finished bands drop their text index and table slack; the 100M-cell export falls from 2,411 to 1,911 MiB live) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -453,6 +453,30 @@ worth taking before it: a band whose numbers are nearly all distinct should keep
 (`NUMBER_WIDE` exists, but its trigger is 65,535 distinct in a band, not cost), and the same for
 texts (`TEXT_WIDE`). Neither closes a 4× gap on its own.
 
+**Landed (10-28): a finished band drops its text pointer index.** The text table itself has to stay
+(a cell's payload is a `u16` slot into it), but the sorted pointer→slot index only exists to find a
+text while cells are being added. `Band::finish` now drops it, like the number hash, and the first
+edit of that band rebuilds it from the texts it still holds; it also shrinks the number table (its
+capacity was rounded up to a power of two, about 1 KiB of slack a band). A completed band therefore
+keeps one `Arc<str>` per distinct text instead of also a 16-byte index entry per text. On the
+100M-cell export:
+
+| | before | after |
+|---|---|---|
+| live after open | 2,411 MiB | **1,911 MiB** |
+| cells | 2,404 MiB | **1,905** |
+| … texts | 640 MiB | **301** |
+| open / reopen | 7.50 s / 7.60 s | **6.63 s / 7.06 s** |
+
+The rest of the breakdown after both shrinks: rows 481, numbers 519 (was 679 before the table was
+shrunk to fit), kinds and payloads 201 each, styles 120, bitmaps 80. The text table is still 8 bytes
+a distinct text for every band, and the number table is 8 bytes a distinct number; paging is what
+takes the remaining 1.9 GB below 600 MB. While
+fixing the table overflow path, a text past the `u16` slots now stores its own slot in the row's
+wide table instead of the last text added (`TEXT_WIDE` had only been right when the text was the
+one just inserted). Tests: 38 model, including a finished band rebuilt on edit and the 65,536th
+text.
+
 **Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
 document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
 An LRU budget (default a few hundred MB) decides what stays.
@@ -460,8 +484,8 @@ An LRU budget (default a few hundred MB) decides what stays.
 **Acceptance.**
 - Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size. Measured 10-26
   at both densities: report-shaped data extrapolates to ~490 MiB and passes; a unique-key export
-  measures 2.4 GB and needs paging, or a dictionary break-even, to pass. Either way 100M cells is
-  the number to hold the phase to.
+  measured 2.4 GB (1.91 GB after the 10-28 finish pass) and still needs paging to pass. Either way
+  100M cells is the number to hold the phase to.
 - The 31.7M-cell report: open time within 15% of the 4.1 s baseline; paint and edit within 5%.
 - Digest unchanged after a cold-then-warm round trip of every sheet.
 - A spill file never outlives the document, and a crash leaves no half-written state that a reopen
@@ -601,6 +625,7 @@ different trade — speed and size against interoperability, and against every t
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-28 | minor | Bulk edits scan blocked arrays once for the union of the changed blocks (Remove Duplicates 1M×10 91 → 12 s, recalc 80 s → 1.4 s); Sort 1M×10 3.2 s, Fill Down 1M rows 1.45 s; `data.sort`/`removeDuplicates`/`setValues` share a 12M-cell cap, 1M×20 refused in 1.3 s; `CellStore::style` fast path |
+| 2026-10-28 | minor | M19 step: a finished band drops its text pointer index and rebuilds it on the first edit; the 100M-cell export falls from 2,411 to 1,911 MiB live (texts 640 → 301 MiB, number-table slack returned), digest unchanged; a text past the u16 slots keeps its own slot |
 | 2026-10-27 | minor | Independent formulas recalculate on up to eight threads (wave by wave, leaves only; arrays/volatile/iterative stay sequential): 100k end-to-end edit 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; parallel band value writes (4M cap); `Node::may_spill` and graph safety sets |
 | 2026-10-27 | minor | The 100k-dependent edit gate is met single-threaded: 245 → 65–75 ms (full recalculation 281–289 → 134–147 ms) by reading parsed formulas and legacy ranges from the graph, one `Slot` per result (in-progress is an empty value), row-major `CellStore::set_values`, `Arc<RowExtras>` band copies, cached `Formula::expr_bytes` for undo accounting, a diff-first `check_arrays`, and single-cell/one-operator fast paths in the evaluator |
 | 2026-10-27 | minor | The trust-track soak is closed: 500 seeds × 200 commands (100,000 commands, release, 49 min) are green. Reopening a file rebuilds spilled arrays from the anchor's `ref` and cached values (a contested area keeps its owner), F9 prefers real spill owners and lets a grow-back owner reclaim its cells, swallowed `#CIRC!` stays explicit, `_sc_*` view-state names are invisible to formulas, table filters and blocked legacy arrays round-trip, and Insert/Delete Cells refuses to cut a merge. The format's `#SPILL!`/`#CALC!`-as-`#VALUE!` cache is still to verify on a licensed Excel |
