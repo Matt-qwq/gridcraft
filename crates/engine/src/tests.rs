@@ -693,6 +693,27 @@ fn insert_delete_rows_adjust() {
 }
 
 #[test]
+fn inserted_rows_survive_save_and_reopen() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=SUM(A1:A3)"})).unwrap();
+    s.execute("home.insertRows", json!({"rows": "2:2"})).unwrap();
+    s.execute("cell.set", json!({"cell": "A2", "input": "10"})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(1.0));
+    assert_eq!(v(&s, "A2"), Value::Number(10.0));
+    assert_eq!(v(&s, "A3"), Value::Number(2.0));
+    assert_eq!(v(&s, "A4"), Value::Number(3.0));
+    assert_eq!(v(&s, "B1"), Value::Number(16.0));
+    let wb = &s.doc().unwrap().wb;
+    let (reopened, _) = gridcraft_xlsx::read_xlsx(&gridcraft_xlsx::write_xlsx(wb).unwrap()).unwrap();
+    let sh = reopened.active().expect("sheet");
+    assert_eq!(sh.value(CellRef::parse("A2").expect("A2")), Value::Number(10.0));
+    assert_eq!(sh.value(CellRef::parse("A3").expect("A3")), Value::Number(2.0));
+    assert_eq!(sh.value(CellRef::parse("A4").expect("A4")), Value::Number(3.0));
+    assert_eq!(sh.value(CellRef::parse("B1").expect("B1")), Value::Number(16.0));
+}
+
+#[test]
 fn deleting_a_multi_area_row_selection_removes_every_area_and_undoes_once() {
     let mut s = s();
     s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3], [4], [5], [6]]})).unwrap();

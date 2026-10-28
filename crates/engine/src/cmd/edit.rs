@@ -1253,8 +1253,10 @@ pub(crate) fn rewrite_all_formulas(wb: &mut gridcraft_model::Workbook, target: &
     let moves_arrays = matches!(e, Edit::Insert { .. } | Edit::Delete { .. } | Edit::InsertCells { .. } | Edit::DeleteCells { .. });
     for si in 0..wb.sheets.len() {
         let host = wb.sheets.get(si).map(|s| s.name.clone()).unwrap_or_default();
+        // The store yields formulas from its side tables, not by walking every cell: a
+        // 10-million-cell sheet with no formulas must not make an insert walk 10 million cells.
         let keys: Vec<(CellRef, std::sync::Arc<Formula>)> =
-            wb.sheets.get(si).map(|s| s.cells.iter().filter_map(|(c, cell)| cell.formula.clone().map(|f| (c, f))).collect()).unwrap_or_default();
+            wb.sheets.get(si).map(|s| s.cells.formulas().map(|(c, f, _)| (c, f)).collect()).unwrap_or_default();
         if keys.is_empty() {
             continue;
         }

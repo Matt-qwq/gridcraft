@@ -1192,6 +1192,217 @@ pub enum Packed<'a> {
     Error(CellError),
 }
 
+/// One logical→physical row run. Rows are stored under physical keys; a structural row edit changes
+/// this map instead of moving every cell below it. `len` is in rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowSegment {
+    logical: u32,
+    physical: u32,
+    len: u32,
+}
+
+impl RowSegment {
+    fn logical_end(self) -> u32 {
+        self.logical.saturating_add(self.len)
+    }
+
+    fn physical_end(self) -> u32 {
+        self.physical.saturating_add(self.len)
+    }
+}
+
+/// The logical→physical row map. `identity` is the fast path used by every workbook that has never
+/// had a row inserted or deleted: logical row = physical row, no lookup. The first structural edit
+/// materializes one segment covering the sheet and thereafter keeps two sorted views, by logical
+/// row for reads/writes and by physical row for iteration and `used_range`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RowMap {
+    identity: bool,
+    segments: Vec<RowSegment>,
+    by_physical: Vec<RowSegment>,
+    /// Rows written into an inserted gap get fresh physical rows from here; existing rows keep
+    /// their physical keys, so an insert never touches a band.
+    next_physical: u32,
+}
+
+impl Default for RowMap {
+    fn default() -> Self {
+        RowMap { identity: true, segments: Vec::new(), by_physical: Vec::new(), next_physical: gridcraft_core::MAX_ROWS }
+    }
+}
+
+impl RowMap {
+    fn is_identity(&self) -> bool {
+        self.identity
+    }
+
+    fn map(&self, logical: u32) -> Option<u32> {
+        if logical >= gridcraft_core::MAX_ROWS {
+            return None;
+        }
+        if self.identity {
+            return Some(logical);
+        }
+        let index = self.segments.partition_point(|s| s.logical <= logical).checked_sub(1)?;
+        let segment = self.segments.get(index)?;
+        let offset = logical.checked_sub(segment.logical)?;
+        (offset < segment.len).then(|| segment.physical.saturating_add(offset))
+    }
+
+    fn inverse(&self, physical: u32) -> Option<u32> {
+        if self.identity {
+            return (physical < gridcraft_core::MAX_ROWS).then_some(physical);
+        }
+        let index = self.by_physical.partition_point(|s| s.physical <= physical).checked_sub(1)?;
+        let segment = self.by_physical.get(index)?;
+        let offset = physical.checked_sub(segment.physical)?;
+        (offset < segment.len).then(|| segment.logical.saturating_add(offset))
+    }
+
+    fn ensure(&mut self) {
+        if self.identity {
+            self.identity = false;
+            self.segments = vec![RowSegment { logical: 0, physical: 0, len: gridcraft_core::MAX_ROWS }];
+            self.rebuild();
+        }
+    }
+
+    /// Allocates a physical row for a logical row that has no mapping (a row inside an inserted
+    /// gap, or one exposed by a delete). The fresh key is above every physical row the sheet had,
+    /// so it cannot collide with an existing band.
+    fn allocate(&mut self, logical: u32) -> Option<u32> {
+        if let Some(physical) = self.map(logical) {
+            return Some(physical);
+        }
+        if logical >= gridcraft_core::MAX_ROWS {
+            return None;
+        }
+        self.ensure();
+        let physical = self.next_physical;
+        self.next_physical = self.next_physical.checked_add(1)?;
+        let at = self.segments.partition_point(|s| s.logical < logical);
+        self.segments.insert(at, RowSegment { logical, physical, len: 1 });
+        self.rebuild();
+        Some(physical)
+    }
+
+    /// The segments intersecting a logical row range, clipped to it, in logical order.
+    fn segments_in(&self, r0: u32, r1: u32) -> Vec<RowSegment> {
+        let (r0, r1) = (r0.min(gridcraft_core::MAX_ROWS.saturating_sub(1)), r1.min(gridcraft_core::MAX_ROWS.saturating_sub(1)));
+        if r0 > r1 {
+            return Vec::new();
+        }
+        if self.identity {
+            return vec![RowSegment { logical: r0, physical: r0, len: r1 - r0 + 1 }];
+        }
+        let mut out = Vec::new();
+        for s in &self.segments {
+            let lo = s.logical.max(r0);
+            let hi = s.logical_end().min(r1.saturating_add(1));
+            if lo >= hi {
+                continue;
+            }
+            out.push(RowSegment { logical: lo, physical: s.physical.saturating_add(lo - s.logical), len: hi - lo });
+        }
+        out
+    }
+
+    /// Inserts (`delta > 0`) or deletes (`delta < 0`) logical rows at `from`, changing only the
+    /// mapping. Rows below stay on their physical bands; the vacated/removed range is a gap or a
+    /// dropped set of segments. `from` is the first source row for a delete, as in the old
+    /// `shift_rows`, so the deleted destination range is `[from - count, from)`.
+    fn shift(&mut self, from: u32, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let from = from.min(gridcraft_core::MAX_ROWS);
+        let count = delta.unsigned_abs().min(u64::from(gridcraft_core::MAX_ROWS)) as u32;
+        if count == 0 {
+            return;
+        }
+        self.ensure();
+        let mut out: Vec<RowSegment> = Vec::new();
+        for s in &self.segments {
+            let a = s.logical;
+            let b = s.logical_end().min(gridcraft_core::MAX_ROWS);
+            if a >= b {
+                continue;
+            }
+            if delta > 0 {
+                if a < from {
+                    let hi = b.min(from);
+                    if a < hi {
+                        out.push(RowSegment { logical: a, physical: s.physical, len: hi - a });
+                    }
+                }
+                if b > from {
+                    let start = a.max(from);
+                    let new_logical = start.saturating_add(count);
+                    if new_logical < gridcraft_core::MAX_ROWS {
+                        let end = b.saturating_add(count).min(gridcraft_core::MAX_ROWS);
+                        if new_logical < end {
+                            out.push(RowSegment { logical: new_logical, physical: s.physical.saturating_add(start - a), len: end - new_logical });
+                        }
+                    }
+                }
+            } else {
+                let delete_start = from.saturating_sub(count);
+                let delete_end = from;
+                if a < delete_start {
+                    let hi = b.min(delete_start);
+                    if a < hi {
+                        out.push(RowSegment { logical: a, physical: s.physical, len: hi - a });
+                    }
+                }
+                if b > delete_end {
+                    let start = a.max(delete_end);
+                    let new_logical = start.saturating_sub(count);
+                    if start < b {
+                        out.push(RowSegment { logical: new_logical, physical: s.physical.saturating_add(start - a), len: b - start });
+                    }
+                }
+            }
+        }
+        self.segments = out;
+        self.rebuild();
+    }
+
+    /// Merges adjacent logical/physical runs and refreshes the inverse view.
+    fn rebuild(&mut self) {
+        let mut merged: Vec<RowSegment> = Vec::with_capacity(self.segments.len());
+        for s in self.segments.drain(..) {
+            if s.len == 0 {
+                continue;
+            }
+            if let Some(last) = merged.last_mut()
+                && last.logical_end() == s.logical
+                && last.physical_end() == s.physical
+                && last.len.checked_add(s.len).is_some()
+            {
+                last.len = last.len.saturating_add(s.len);
+                continue;
+            }
+            merged.push(s);
+        }
+        self.segments = merged;
+        let mut by = self.segments.clone();
+        by.sort_unstable_by_key(|s| (s.physical, s.logical));
+        let mut inverse: Vec<RowSegment> = Vec::with_capacity(by.len());
+        for s in by {
+            if let Some(last) = inverse.last_mut()
+                && last.physical_end() == s.physical
+                && last.logical_end() == s.logical
+                && last.len.checked_add(s.len).is_some()
+            {
+                last.len = last.len.saturating_add(s.len);
+                continue;
+            }
+            inverse.push(s);
+        }
+        self.by_physical = inverse;
+    }
+}
+
 /// A `CellStore`'s packed bands, plus the count of stored cells.
 #[derive(Debug, Default)]
 pub struct CellStore {
@@ -1202,6 +1413,8 @@ pub struct CellStore {
     /// The temporary file the pages live in. One per store (and shared by its clones); dropping
     /// the last store removes it.
     page_file: Option<Arc<page::PageFile>>,
+    /// Logical→physical rows. Identity until a row insert or delete.
+    row_map: RowMap,
     /// The recency queue for decoded pages; shared by clones, like the file. It holds keys whose
     /// page is (or was) decoded; a key whose page was evicted is a no-op when it reaches the front.
     page_order: Option<Arc<Mutex<VecDeque<u32>>>>,
@@ -1221,6 +1434,7 @@ impl Clone for CellStore {
             pages: self.pages.clone(),
             page_file: self.page_file.clone(),
             page_order: self.page_order.clone(),
+            row_map: self.row_map.clone(),
             len: self.len,
             building: None,
         }
@@ -1229,8 +1443,25 @@ impl Clone for CellStore {
 
 impl PartialEq for CellStore {
     fn eq(&self, other: &Self) -> bool {
-        self.len == other.len
-            && self.band_count() == other.band_count()
+        if self.len != other.len {
+            return false;
+        }
+        if self.row_map != other.row_map {
+            // A structural edit changes where a cell lives, not what it is: compare the logical
+            // walk, which applies each map. A saved-and-reopened sheet has an identity map, so this
+            // is the path that holds it equal to the mapped sheet it came from.
+            let mut mine = self.iter();
+            let mut theirs = other.iter();
+            loop {
+                match (mine.next(), theirs.next()) {
+                    (None, None) => break,
+                    (Some((a_at, a)), Some((b_at, b))) if a_at == b_at && same_cell(&a, &b) => {}
+                    _ => return false,
+                }
+            }
+            return true;
+        }
+        self.band_count() == other.band_count()
             && self.bands.keys().chain(self.pages.keys()).eq(other.bands.keys().chain(other.pages.keys()))
             && self.bands.keys().chain(self.pages.keys()).all(|k| match (self.band_arc(*k), other.band_arc(*k)) {
                 (Some(a), Some(b)) => Arc::ptr_eq(&a, &b) || a.same_as(&b),
@@ -1289,14 +1520,23 @@ fn packed_row<'a>(band: &'a Band, row: u32, cells: &'a BandRow, c0: u32, c1: u32
 /// iterator before the next band is loaded.
 struct CellWalk<'a> {
     store: &'a CellStore,
+    segments: std::vec::IntoIter<RowSegment>,
+    segment: Option<RowSegment>,
     keys: std::vec::IntoIter<u32>,
     cells: std::vec::IntoIter<(CellRef, Cell)>,
     r: RangeRef,
 }
 
 impl<'a> CellWalk<'a> {
-    fn new(store: &'a CellStore, keys: Vec<u32>, r: RangeRef) -> CellWalk<'a> {
-        CellWalk { store, keys: keys.into_iter(), cells: Vec::new().into_iter(), r }
+    fn new(store: &'a CellStore, r: RangeRef) -> CellWalk<'a> {
+        CellWalk {
+            store,
+            segments: store.row_map.segments_in(r.start.row, r.end.row).into_iter(),
+            segment: None,
+            keys: Vec::new().into_iter(),
+            cells: Vec::new().into_iter(),
+            r,
+        }
     }
 }
 
@@ -1308,16 +1548,31 @@ impl Iterator for CellWalk<'_> {
             if let Some(cell) = self.cells.next() {
                 return Some(cell);
             }
-            let key = self.keys.next()?;
-            let Some(band) = self.store.band_arc(key) else { continue };
-            let mut cells = Vec::new();
-            for row in &band.rows {
-                let at = key * BAND + row.key;
-                if at >= self.r.start.row && at <= self.r.end.row {
-                    cells.extend(packed_row(&band, at, row, self.r.start.col, self.r.end.col));
+            if let Some(key) = self.keys.next() {
+                let Some(segment) = self.segment else { continue };
+                let Some(band) = self.store.band_arc(key) else { continue };
+                let physical_start = segment.physical;
+                let physical_end = segment.physical.saturating_add(segment.len);
+                let mut cells = Vec::new();
+                for row in &band.rows {
+                    let physical = key * BAND + row.key;
+                    if physical < physical_start || physical >= physical_end {
+                        continue;
+                    }
+                    let logical = segment.logical.saturating_add(physical - physical_start);
+                    if logical >= self.r.start.row && logical <= self.r.end.row {
+                        cells.extend(packed_row(&band, logical, row, self.r.start.col, self.r.end.col));
+                    }
                 }
+                self.cells = cells.into_iter();
+                continue;
             }
-            self.cells = cells.into_iter();
+            let segment = self.segments.next()?;
+            if segment.len == 0 {
+                continue;
+            }
+            self.keys = self.store.bands_in(segment.physical, segment.physical.saturating_add(segment.len)).into_iter();
+            self.segment = Some(segment);
         }
     }
 }
@@ -1345,6 +1600,37 @@ impl CellStore {
             self.touch_page(key);
         }
         band
+    }
+
+    /// The band keys that hold data in a physical row range. Unlike a range of band numbers, this
+    /// only walks bands the store actually has, so iterating a small sheet does not probe 16,384
+    /// empty bands (or a million empty logical rows).
+    fn bands_in(&self, physical_start: u32, physical_end: u32) -> Vec<u32> {
+        let first = physical_start / BAND;
+        let last = physical_end.saturating_sub(1) / BAND;
+        if physical_start >= physical_end {
+            return Vec::new();
+        }
+        let mut keys: Vec<u32> = self.bands.range(first..=last).map(|(k, _)| *k).collect();
+        keys.extend(self.pages.range(first..=last).map(|(k, _)| *k));
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    /// The physical row a logical row lives on, or `None` when the row is a gap made by an insert
+    /// or a delete.
+    fn physical_row(&self, logical: u32) -> Option<u32> {
+        self.row_map.map(logical)
+    }
+
+    /// The physical row for a write: an existing mapping, or a fresh row for a logical row in an
+    /// inserted gap. A failed allocation (the physical key space is exhausted) refuses the write.
+    fn physical_row_for_write(&mut self, logical: u32) -> Option<u32> {
+        if let Some(physical) = self.row_map.map(logical) {
+            return Some(physical);
+        }
+        self.row_map.allocate(logical)
     }
 
     /// Records a decoded page and evicts the oldest when the cache is full. The queue is shared by
@@ -1424,21 +1710,13 @@ impl CellStore {
         self.pages.values().map(|p| p.page_len()).sum()
     }
 
-    /// The band keys in a row range, from memory and from pages, in order and without duplicates.
-    fn keys_in(&self, r0: u32, r1: u32) -> Vec<u32> {
-        let mut keys: Vec<u32> = self.bands.range(r0 / BAND..=r1 / BAND).map(|(k, _)| *k).collect();
-        keys.extend(self.pages.range(r0 / BAND..=r1 / BAND).map(|(k, _)| *k));
-        keys.sort_unstable();
-        keys.dedup();
-        keys
-    }
-
     /// Reads one cell. The value is rebuilt rather than borrowed: cells live in packed pages, so
     /// there is no `Cell` to point at. A text cell shares its string, so the copy is a pointer
     /// bump, not a string copy.
     pub fn get(&self, c: CellRef) -> Option<Cell> {
-        let band = self.band_arc(c.row / BAND)?;
-        let row = band.row(c.row % BAND)?;
+        let physical = self.physical_row(c.row)?;
+        let band = self.band_arc(physical / BAND)?;
+        let row = band.row(physical % BAND)?;
         let i = row.index_of(&band, c.col)?;
         Some(band.cell_at(row, i, c.col))
     }
@@ -1446,21 +1724,35 @@ impl CellStore {
     /// The style of a stored cell, without reconstructing the `Cell` (and its value and formula).
     /// A style is all a formatting or duplicate check needs; `get` rebuilds the rest for nothing.
     pub fn style(&self, c: CellRef) -> Option<StyleId> {
-        let band = self.band_arc(c.row / BAND)?;
-        let row = band.row(c.row % BAND)?;
+        let physical = self.physical_row(c.row)?;
+        let band = self.band_arc(physical / BAND)?;
+        let row = band.row(physical % BAND)?;
         let i = row.index_of(&band, c.col)?;
         Some(band.style(row.style_at(&band, i)))
     }
 
     /// True when the position holds a cell at all (a stored style counts).
     pub fn contains(&self, c: CellRef) -> bool {
-        self.band_arc(c.row / BAND).is_some_and(|b| b.row(c.row % BAND).is_some_and(|r| r.index_of(&b, c.col).is_some()))
+        self.physical_row(c.row)
+            .and_then(|physical| self.band_arc(physical / BAND).map(|b| (b, physical)))
+            .is_some_and(|(b, physical)| b.row(physical % BAND).is_some_and(|r| r.index_of(&b, c.col).is_some()))
     }
 
     /// Stores a cell; a default (empty, unstyled) cell is removed instead.
     pub fn set(&mut self, c: CellRef, cell: Cell) {
-        let key = c.row / BAND;
-        let row = c.row % BAND;
+        let physical = match self.physical_row(c.row) {
+            Some(physical) => physical,
+            None => {
+                // A blank write into an inserted row must not allocate storage for nothing.
+                if cell.is_blank() {
+                    return;
+                }
+                let Some(physical) = self.physical_row_for_write(c.row) else { return };
+                physical
+            }
+        };
+        let key = physical / BAND;
+        let row = physical % BAND;
         if self.pages.contains_key(&key) && self.materialize(key).is_none() {
             return;
         }
@@ -1531,17 +1823,28 @@ impl CellStore {
     /// A recalculation only changes values, but [`set`](Self::set) rebuilds the whole `Cell` (and
     /// takes the store's bands apart) for each one; at 100k results that is most of the write-back.
     pub fn set_value(&mut self, c: CellRef, value: &Value) -> bool {
-        let key = c.row / BAND;
+        let Some(physical) = self.physical_row(c.row) else { return false };
+        let key = physical / BAND;
         if self.pages.contains_key(&key) && self.materialize(key).is_none() {
             return false;
         }
         let Some(band) = self.bands.get_mut(&key) else { return false };
-        Arc::make_mut(band).set_value(c.row % BAND, c.col, value)
+        Arc::make_mut(band).set_value(physical % BAND, c.col, value)
     }
 
     /// Replaces the values of cells that already exist. `values` must be sorted in row-major
     /// order (the order a recalculation writes them in), so each band is looked up once.
     pub fn set_values(&mut self, values: &mut [(CellRef, Value)]) {
+        // A mapped sheet's logical rows are not in physical order, so the band-grouped fast paths
+        // cannot use the logical row as a band key. Recalculation on such a sheet takes the
+        // value-at-a-time path; a mapped sheet is one that has had a structural edit, not the
+        // common editing case.
+        if !self.row_map.is_identity() {
+            for (c, v) in values.iter() {
+                self.set_value(*c, v);
+            }
+            return;
+        }
         // A paged band a result lands in has to come back before either write path looks at the
         // live map. Values are sorted by row, so the touched bands are a short run of keys.
         if !self.pages.is_empty() {
@@ -1648,8 +1951,16 @@ impl CellStore {
                 true
             }
         });
-        let key = row / BAND;
-        let band_row = row % BAND;
+        // A serialized band may carry a row outside the sheet grid; keep it physical so `rebuild`
+        // can find and report it rather than silently losing it (#1008).
+        let physical = if row >= gridcraft_core::MAX_ROWS {
+            row
+        } else {
+            let Some(physical) = self.physical_row_for_write(row) else { return };
+            physical
+        };
+        let key = physical / BAND;
+        let band_row = physical % BAND;
         if self.pages.contains_key(&key) && self.materialize(key).is_none() {
             return;
         }
@@ -1693,7 +2004,9 @@ impl CellStore {
     pub fn rebuild(&mut self) -> usize {
         let mut out = CellStore::new();
         let mut dropped = 0;
-        let cells: Vec<(CellRef, Cell)> = self.iter().collect();
+        // Physical order, not logical: a deserialized off-grid row has no logical mapping, and
+        // that is exactly what `rebuild` is here to find and drop.
+        let cells: Vec<(CellRef, Cell)> = self.raw_cells();
         for (at, cell) in cells {
             if at.is_valid() {
                 out.set(at, cell);
@@ -1705,13 +2018,31 @@ impl CellStore {
         dropped
     }
 
+    /// Every stored cell at its physical key, ignoring the row map. Used by `rebuild` to see
+    /// rows a serialized file put outside the grid.
+    fn raw_cells(&self) -> Vec<(CellRef, Cell)> {
+        let mut keys: Vec<u32> = self.bands.keys().chain(self.pages.keys()).copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut out = Vec::new();
+        for key in keys {
+            let Some(band) = self.band_arc(key) else { continue };
+            for row in &band.rows {
+                let at = key * BAND + row.key;
+                out.extend(packed_row(&band, at, row, 0, u32::MAX));
+            }
+        }
+        out
+    }
+
     pub fn remove(&mut self, c: CellRef) -> Option<Cell> {
-        let key = c.row / BAND;
+        let physical = self.physical_row(c.row)?;
+        let key = physical / BAND;
         if self.pages.contains_key(&key) && self.materialize(key).is_none() {
             return None;
         }
         let band = self.bands.get_mut(&key)?;
-        let cell = Arc::make_mut(band).take(c.row % BAND, c.col)?;
+        let cell = Arc::make_mut(band).take(physical % BAND, c.col)?;
         self.len -= 1;
         if self.bands.get(&key).is_some_and(|b| b.rows.is_empty()) {
             self.bands.remove(&key);
@@ -1722,19 +2053,17 @@ impl CellStore {
     /// The cells of `r` that carry a formula, in row-major order.
     pub fn formula_cells(&self, r: RangeRef) -> impl Iterator<Item = CellRef> + '_ {
         let mut out = Vec::new();
-        for bk in self.keys_in(r.start.row, r.end.row) {
-            if self.pages.get(&bk).is_some_and(|page| !page.has_formulas()) {
-                continue;
-            }
-            let Some(band) = self.band_arc(bk) else { continue };
-            for row in &band.rows {
-                let at_row = bk * BAND + row.key;
-                out.extend(
-                    row.formulas()
-                        .iter()
-                        .filter(|(c, _)| at_row >= r.start.row && at_row <= r.end.row && *c >= r.start.col && *c <= r.end.col)
-                        .map(|(c, _)| CellRef::new(at_row, *c)),
-                );
+        for segment in self.row_map.segments_in(r.start.row, r.end.row) {
+            for offset in 0..segment.len {
+                let logical = segment.logical.saturating_add(offset);
+                let physical = segment.physical.saturating_add(offset);
+                let key = physical / BAND;
+                if self.pages.get(&key).is_some_and(|page| !page.has_formulas()) {
+                    continue;
+                }
+                let Some(band) = self.band_arc(key) else { continue };
+                let Some(row) = band.row(physical % BAND) else { continue };
+                out.extend(row.formulas().iter().filter(|(c, _)| *c >= r.start.col && *c <= r.end.col).map(|(c, _)| CellRef::new(logical, *c)));
             }
         }
         out.into_iter()
@@ -1743,22 +2072,26 @@ impl CellStore {
     /// Whether the block holds a cell whose value the store cannot give: a formula (it holds the
     /// value the file cached) or an array. Cheap next to reading the block: one check a row.
     pub fn has_owned_cells(&self, r: RangeRef) -> bool {
-        self.keys_in(r.start.row, r.end.row).into_iter().any(|bk| {
-            if self.pages.get(&bk).is_some_and(|page| !page.has_owned()) {
-                return false;
+        for segment in self.row_map.segments_in(r.start.row, r.end.row) {
+            for offset in 0..segment.len {
+                let logical = segment.logical.saturating_add(offset);
+                let physical = segment.physical.saturating_add(offset);
+                let key = physical / BAND;
+                if self.pages.get(&key).is_some_and(|page| !page.has_owned()) {
+                    continue;
+                }
+                let Some(band) = self.band_arc(key) else { continue };
+                let Some(row) = band.row(physical % BAND) else { continue };
+                if row.extras.as_ref().is_some_and(|e| {
+                    e.formulas.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
+                        || e.arrays.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
+                }) {
+                    return true;
+                }
+                let _ = logical;
             }
-            self.band_arc(bk).is_some_and(|band| {
-                band.rows.iter().any(|row| {
-                    let at_row = bk * BAND + row.key;
-                    at_row >= r.start.row
-                        && at_row <= r.end.row
-                        && row.extras.as_ref().is_some_and(|e| {
-                            e.formulas.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
-                                || e.arrays.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
-                        })
-                })
-            })
-        })
+        }
+        false
     }
 
     /// Calls `f` on each stored cell of `r`, row-major, handing the value as the page holds it, and
@@ -1769,13 +2102,22 @@ impl CellStore {
     /// a million-cell column spent all of its 154 ms there.
     pub fn visit_packed(&self, r: RangeRef, f: &mut dyn FnMut(CellRef, Option<Packed<'_>>) -> bool) -> bool {
         let (r0, r1) = (r.start.row, r.end.row);
-        for bk in self.keys_in(r0, r1) {
-            let Some(band) = self.band_arc(bk) else { continue };
-            for row in &band.rows {
-                let at_row = bk * BAND + row.key;
+        let mut current_key = None;
+        let mut current_band: Option<Arc<Band>> = None;
+        for segment in self.row_map.segments_in(r0, r1) {
+            for offset in 0..segment.len {
+                let at_row = segment.logical.saturating_add(offset);
+                let physical = segment.physical.saturating_add(offset);
                 if at_row < r0 || at_row > r1 {
                     continue;
                 }
+                let key = physical / BAND;
+                if current_key != Some(key) {
+                    current_key = Some(key);
+                    current_band = self.band_arc(key);
+                }
+                let Some(band) = current_band.as_ref() else { continue };
+                let Some(row) = band.row(physical % BAND) else { continue };
                 // Start at the first stored column of the range and stop past its last, so a
                 // narrow read of a wide row costs the cells it asks for, not the row's width.
                 let lo = r.start.col.max(row.first);
@@ -1787,9 +2129,9 @@ impl CellStore {
                 // A cell that carries a formula stores the value the file cached, which is not
                 // its value now: the evaluator owns it, so hand it over as `None`.
                 let formulas = row.extras.as_ref().map(|e| e.formulas.as_slice()).filter(|f| !f.is_empty());
-                let mut i = row.rank_before(&band, lo);
-                let mut kinds = RunCursor::new(row.kind_runs(&band), u16::from(EMPTY));
-                'words: for (word, bits) in row.bits(&band).iter().enumerate().skip(start_slot / 64) {
+                let mut i = row.rank_before(band, lo);
+                let mut kinds = RunCursor::new(row.kind_runs(band), u16::from(EMPTY));
+                'words: for (word, bits) in row.bits(band).iter().enumerate().skip(start_slot / 64) {
                     let mut w = *bits;
                     if word == start_slot / 64 {
                         w &= !((1u64 << (start_slot % 64)) - 1);
@@ -1805,7 +2147,7 @@ impl CellStore {
                             break 'words;
                         }
                         let has_formula = formulas.is_some_and(|f| f.binary_search_by_key(&col, |(c, _)| *c).is_ok());
-                        let payload = row.payload_at(&band, index);
+                        let payload = row.payload_at(band, index);
                         let packed = if has_formula {
                             None
                         } else {
@@ -1814,9 +2156,9 @@ impl CellStore {
                                 // and `iter_range` does not hand one out either.
                                 EMPTY => continue,
                                 NUMBER => Some(Packed::Number(band.number(payload))),
-                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(&band, index)))),
+                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(band, index)))),
                                 TEXT => band.texts.get(payload as usize).map(|t| Packed::Text(t)),
-                                TEXT_WIDE => band.texts.get(row.wide_at(&band, index) as usize).map(|t| Packed::Text(t)),
+                                TEXT_WIDE => band.texts.get(row.wide_at(band, index) as usize).map(|t| Packed::Text(t)),
                                 BOOL => Some(Packed::Bool(payload != 0)),
                                 ERROR => Some(Packed::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value))),
                                 _ => None,
@@ -1833,21 +2175,18 @@ impl CellStore {
     }
 
     pub fn iter_range(&self, r: RangeRef) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
-        CellWalk::new(self, self.keys_in(r.start.row, r.end.row), r)
+        CellWalk::new(self, r)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
-        let mut keys: Vec<u32> = self.bands.keys().chain(self.pages.keys()).copied().collect();
-        keys.sort_unstable();
-        keys.dedup();
-        let all = RangeRef::new(CellRef::new(0, 0), CellRef::new(u32::MAX, u32::MAX));
-        CellWalk::new(self, keys, all)
+        CellWalk::new(self, RangeRef::new(CellRef::new(0, 0), CellRef::new(u32::MAX, u32::MAX)))
     }
 
     pub fn row(&self, row: u32, c0: u32, c1: u32) -> impl Iterator<Item = (u32, Cell)> + '_ {
         let mut out = Vec::new();
-        if let Some(band) = self.band_arc(row / BAND)
-            && let Some(cells) = band.row(row % BAND)
+        if let Some(physical) = self.physical_row(row)
+            && let Some(band) = self.band_arc(physical / BAND)
+            && let Some(cells) = band.row(physical % BAND)
         {
             out.extend(packed_row(&band, row, cells, c0, c1).map(|(at, cell)| (at.col, cell)));
         }
@@ -1862,17 +2201,21 @@ impl CellStore {
         for (bk, band) in &self.bands {
             for cells in &band.rows {
                 let Some((first, last)) = cells.column_span(band) else { continue };
-                let at = bk * BAND + cells.key;
-                r0 = r0.min(at);
-                r1 = r1.max(at);
+                let physical = bk * BAND + cells.key;
+                let Some(logical) = self.row_map.inverse(physical) else { continue };
+                r0 = r0.min(logical);
+                r1 = r1.max(logical);
                 c0 = c0.min(first);
                 c1 = c1.max(last);
             }
         }
         for (bk, page) in &self.pages {
             let Some((pr0, pr1, pc0, pc1)) = page.bounds() else { continue };
-            r0 = r0.min(bk * BAND + pr0);
-            r1 = r1.max(bk * BAND + pr1);
+            for row in pr0..=pr1 {
+                let Some(logical) = self.row_map.inverse(bk * BAND + row) else { continue };
+                r0 = r0.min(logical);
+                r1 = r1.max(logical);
+            }
             c0 = c0.min(pc0);
             c1 = c1.max(pc1);
         }
@@ -1891,24 +2234,31 @@ impl CellStore {
         keys.sort_unstable();
         keys.dedup();
         let mut out = Vec::new();
-        for bk in keys {
-            if self.pages.get(&bk).is_some_and(|page| !page.has_formulas()) {
+        for key in keys {
+            if self.pages.get(&key).is_some_and(|page| !page.has_formulas()) {
                 continue;
             }
-            let Some(band) = self.band_arc(bk) else { continue };
+            let Some(band) = self.band_arc(key) else { continue };
             for cells in &band.rows {
+                if cells.formulas().is_empty() {
+                    continue;
+                }
+                let Some(logical) = self.row_map.inverse(key * BAND + cells.key) else { continue };
                 for (col, f) in cells.formulas() {
                     let has_value = cells.index_of(&band, *col).is_some_and(|i| cells.kind_at(&band, i) != EMPTY);
-                    out.push((CellRef::new(bk * BAND + cells.key, *col), f.clone(), has_value));
+                    out.push((CellRef::new(logical, *col), f.clone(), has_value));
                 }
             }
         }
+        out.sort_unstable_by_key(|(c, _, _)| (c.row, c.col));
         out.into_iter()
     }
 
     /// A stored cell with a value or a formula (a style alone does not count).
     pub fn has(&self, c: CellRef) -> bool {
-        self.band_arc(c.row / BAND).is_some_and(|b| b.row(c.row % BAND).is_some_and(|row| row_has_value(&b, row, c.col)))
+        self.physical_row(c.row)
+            .and_then(|physical| self.band_arc(physical / BAND).map(|b| (b, physical)))
+            .is_some_and(|(b, physical)| b.row(physical % BAND).is_some_and(|row| row_has_value(&b, row, c.col)))
     }
 
     /// Last row (inclusive, capped at `cap`) of the maximal run of contiguous rows at or after
@@ -1917,26 +2267,14 @@ impl CellStore {
         let mut last = None;
         let mut expect = from.row;
         while expect <= cap {
-            let band_key = expect / BAND;
-            let Some(band) = self.band_arc(band_key) else { break };
-            let mut advanced = false;
-            let start = expect % BAND;
-            let first = band.rows.partition_point(|r| r.key < start);
-            for row in &band.rows[first..] {
-                let at = band_key * BAND + row.key;
-                if at != expect || at > cap {
-                    break;
-                }
-                if !row.value_nonempty(&band, from.col) {
-                    return last;
-                }
-                last = Some(expect);
-                expect += 1;
-                advanced = true;
+            let Some(physical) = self.physical_row(expect) else { break };
+            let Some(band) = self.band_arc(physical / BAND) else { break };
+            let Some(row) = band.row(physical % BAND) else { break };
+            if !row.value_nonempty(&band, from.col) {
+                return last;
             }
-            if !advanced {
-                break;
-            }
+            last = Some(expect);
+            expect += 1;
         }
         last
     }
@@ -1989,7 +2327,10 @@ impl CellStore {
                         _ => false,
                     };
                     if !same {
-                        out.push(CellRef::new(band + row, col));
+                        let physical = band + row;
+                        if let Some(logical) = self.row_map.inverse(physical).or_else(|| other.row_map.inverse(physical)) {
+                            out.push(CellRef::new(logical, col));
+                        }
                     }
                 }
             }
@@ -2084,15 +2425,11 @@ impl CellStore {
         keys.into_iter().filter_map(|c| self.remove(c).map(|cell| (c, cell))).collect()
     }
 
-    /// Rows at or after `from` moved by `delta` (positive = down).
+    /// Rows at or after `from` moved by `delta` (positive = down). This changes the row map, not
+    /// the bands: an insert above a million rows is a handful of segments, not a million cell
+    /// moves.
     pub fn shift_rows(&mut self, from: u32, delta: i64) {
-        let moved = self.take_pred(|c| c.row >= from);
-        for (c, cell) in moved {
-            let nr = c.row as i64 + delta;
-            if (0..gridcraft_core::MAX_ROWS as i64).contains(&nr) {
-                self.set(CellRef::new(nr as u32, c.col), cell);
-            }
-        }
+        self.row_map.shift(from, delta);
     }
 
     pub fn shift_cols(&mut self, from: u32, delta: i64) {
@@ -2130,6 +2467,19 @@ impl CellStore {
     fn take_pred(&mut self, keep: impl Fn(CellRef) -> bool) -> Vec<(CellRef, Cell)> {
         let keys: Vec<CellRef> = self.iter().filter(|(c, _)| keep(*c)).map(|(c, _)| c).collect();
         keys.into_iter().filter_map(|c| self.remove(c).map(|cell| (c, cell))).collect()
+    }
+}
+
+/// A cell's content for logical equality: the parsed formula tree and its cached byte count are
+/// derived (one side may have reparsed), so compare the text and the array/dynamic flags.
+fn same_cell(a: &Cell, b: &Cell) -> bool {
+    if a.value != b.value || a.style != b.style {
+        return false;
+    }
+    match (&a.formula, &b.formula) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.text == b.text && a.array == b.array && a.dynamic == b.dynamic,
+        _ => false,
     }
 }
 
@@ -3340,6 +3690,51 @@ mod tests {
         // Text in the same band, past the numbers, is still found.
         s.set(c(0, 3_000), Cell::value("tail".into()));
         assert_eq!(s.get(c(0, 3_000)).map(|cell| cell.value), Some(Value::Text("tail".into())));
+    }
+
+    #[test]
+    fn a_row_insert_changes_the_map_not_the_bands() {
+        let mut s = CellStore::new();
+        for r in 0..8u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r))));
+            s.set(c(r, 1), Cell::value(Value::Text(Arc::from(format!("r{r}")))));
+        }
+        s.set(c(2, 2), Cell { value: Value::Number(2.0), formula: Some(Arc::new(Formula::new("=A3"))), style: StyleId(1) });
+        let bands = s.band_count();
+        let len = s.len();
+        s.shift_rows(1, 1);
+        assert_eq!(s.band_count(), bands, "an insert does not move or split a band");
+        assert_eq!(s.len(), len);
+        assert_eq!(s.get(c(0, 0)).map(|x| x.value), Some(Value::Number(0.0)));
+        assert_eq!(s.get(c(1, 0)), None, "the inserted row is empty");
+        assert_eq!(s.get(c(2, 0)).map(|x| x.value), Some(Value::Number(1.0)));
+        assert_eq!(s.get(c(3, 2)).and_then(|x| x.formula).map(|f| f.text.clone()), Some("A3".to_string()));
+        let mut rows: Vec<u32> = s.iter().map(|(at, _)| at.row).collect();
+        rows.dedup();
+        assert_eq!(rows, [0, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(s.used_range().map(|r| r.a1()), Some("A1:C9".to_string()));
+        // Writing the inserted row allocates a fresh physical row without disturbing the rest.
+        s.set(c(1, 0), Cell::value(Value::Number(-1.0)));
+        s.set_row(1, &mut vec![(1, Cell::value(Value::Text(Arc::from("new"))))]);
+        assert_eq!(s.get(c(1, 0)).map(|x| x.value), Some(Value::Number(-1.0)));
+        assert_eq!(s.get(c(1, 1)).map(|x| x.value), Some(Value::Text(Arc::from("new"))));
+        assert_eq!(s.get(c(2, 0)).map(|x| x.value), Some(Value::Number(1.0)));
+        assert_eq!(s.iter_range(RangeRef::parse("A1:C3").expect("range")).count(), 6);
+        // A delete drops the inserted row and pulls the later rows up, still without moving bands.
+        s.take_range(RangeRef::rows(1, 1));
+        s.shift_rows(2, -1);
+        assert_eq!(s.get(c(1, 0)).map(|x| x.value), Some(Value::Number(1.0)));
+        assert_eq!(s.get(c(2, 0)).map(|x| x.value), Some(Value::Number(2.0)));
+        assert_eq!(s.get(c(1, 1)).map(|x| x.value), Some(Value::Text(Arc::from("r1"))));
+        assert!(s.get(c(2, 2)).is_some());
+        // A formula at a logical position is yielded there after the shifts.
+        let formulas: Vec<CellRef> = s.formulas().map(|(at, _, _)| at).collect();
+        assert_eq!(formulas, [c(2, 2)]);
+        assert_eq!(s.formula_cells(RangeRef::parse("A1:C9").expect("range")).collect::<Vec<_>>(), [c(2, 2)]);
+        // The serialized shape is logical: a reopened store has an identity map but the same cells.
+        let bytes = serde_json::to_vec(&s).expect("serialize");
+        let back: CellStore = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(s, back, "the row map is not part of the saved cells");
     }
 
     #[test]

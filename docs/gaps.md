@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (§2: cold paging lands; the 100M-cell export opens at 16.7 MiB live / 183.1 MiB peak with 729.5 MiB of compressed pages; digest unchanged) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (§2: M20 row map lands; insert above 1M×20 is 3.7 ms / 35.8 ms commit with zero cell moves; columns and compaction remain) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -77,16 +77,22 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   (was 1.91 GB live) and 729.5 MiB of compressed pages on disk; its digest is cell-for-cell the same
   with and without paging. The 31.7M report stays live at 49.7 MiB and opens in 1.47 s. Page files
   are removed with the store; a corrupt or truncated page is refused.
+- **Landed (10-28): row inserts/deletes are a logical→physical map.** `CellStore::shift_rows`
+  changes a segment list instead of moving cells; a gap row gets a fresh physical key when written,
+  and reads/iteration/used range/formulas map through. Insert one row above a 1M×20 sheet is
+  **3.7 ms command / 35.8 ms commit**, with no cell moved. The formula rewrite no longer walks every
+  cell to find none (it reads the store's formula side tables), and iteration skips empty bands.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
   file is a temporary beside the system temp directory (not the document), the cache budget is a
   page count (not a byte count), and a save decodes the whole model transiently; the per-band value
   dictionaries still cost full price when values do not repeat;
-  structural edits still shift every cell below them; whole-column references are already clipped
-  (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms). The 159
-  cells that still differ from the cached values of the 1.28 GB report are Excel's stale cache — 276
-  cells of the same `IFERROR(XLOOKUP(...))` shape in the same workbook cache `#N/A` — not a
-  calculation difference.
+  **column** inserts/deletes still shift every cell to the right, row line metadata is still shifted
+  as a BTreeMap, there is no segment compaction and `set_values` on a mapped sheet is value-at-a-time;
+  whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
+  a ten-row used range in 0.0 ms). The 159 cells that still differ from the cached values of the
+  1.28 GB report are Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the
+  same workbook cache `#N/A` — not a calculation difference.
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
   (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
