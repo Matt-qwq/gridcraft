@@ -87,24 +87,30 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   formulas/used range. A column insert at A in the same 1M×20 sheet is **9.8 ms / 42.5 ms commit**,
   no cell moved. Save/reopen tests cover both axes; column-mapped value writes take the
   value-at-a-time path.
+- **Landed (10-29): row/column line metadata is a physical-id map too.** `Sheet.rows`/`cols` are a
+  `LineMap`: the store's logical→physical runs with the entries in 128-line `Arc` chunks. A row or
+  column insert/delete moves runs instead of reindexing every custom height, hidden line or
+  outline entry, an undo snapshot shares untouched chunks, and JSON/XLSX still store logical lines.
+  Insert inheritance, delete, undo and a mapped-sheet XLSX round trip are covered (model 62,
+  engine 419, xlsx 265 tests).
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
   file is a temporary beside the system temp directory (not the document), the cache budget is a
   page count (not a byte count), and a save decodes the whole model transiently; the per-band value
   dictionaries still cost full price when values do not repeat;
-  row line metadata is still shifted as a BTreeMap; model-level compaction landed 10-29 but paged orphans and a save/idle caller remain;
+  model-level compaction landed 10-29 but paged orphans and a save/idle caller remain;
   `set_values` on a mapped sheet is value-at-a-time and `diff` is still physical;
   whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
   a ten-row used range in 0.0 ms). The 159 cells that still differ from the cached values of the
   1.28 GB report are Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the
   same workbook cache `#N/A` — not a calculation difference.
-- **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
-  (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
+- **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `crates/model/src/line.rs`,
+  `docs/roadmap.md` (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
 - **Status (10-29): the large-workbook beta gate is met.** Recalc, edit latency, 1M-row operations,
   bounded data commands and memory all pass their targets; M19 cold paging and the M20 row/column
-  maps landed. Remaining work is base hardening, not capacity: M20 compaction/line metadata/mapped
-  value writes and M19 spill placement/byte budget/flat-memory save are wave 0 in
+  maps landed. Remaining work is base hardening, not capacity: M20 compaction wiring/mapped value
+  writes and M19 spill placement/byte budget/flat-memory save are wave 0 in
   [`roadmap.md`](roadmap.md#execution-queue). The M21 Parquet read half is post-beta. The old
   estimate is superseded by those waves.
 

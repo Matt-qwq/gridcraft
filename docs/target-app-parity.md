@@ -20,7 +20,7 @@ generated ribbon checklist is [`parity-checklist.md`](parity-checklist.md).
 | **Mainstream practitioner** | **~50%** | estimated; [method](#mainstream-practitioner) (69.5 depth × 0.90 × 0.92 × 0.88 = 50.6) |
 | **Essentials user** | **~63%** | estimated; [method](#essentials-user) (80.2 depth × 0.92 × 0.95 × 0.90 = 63.1) |
 | Stage | **alpha** | see [Stage](#stage) |
-| Remaining to beta | **~160–250 Opus 5.5 agent-hours** | estimated; [roadmap.md](roadmap.md#beta-gates); large-workbook gate met, base polish in wave 0 |
+| Remaining to beta | **~150–240 Opus 5.5 agent-hours** | estimated; [roadmap.md](roadmap.md#beta-gates); large-workbook gate met, base polish in wave 0 |
 | Remaining to full parity | **~700–1,100 Opus 5.5 agent-hours** | estimated; sum of the rows below |
 
 ### Readiness by audience
@@ -210,8 +210,8 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Row / column structural insert | 1M×20: row **3.7 ms** command / 35.8 ms commit; column **9.8 ms** / 42.5 ms; zero cells moved | immediate | measured 2026-10-28, `gridcraft-cli` |
 | Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
-Work: M20/M19 polish (segment compaction, line metadata, mapped value writes, spill placement and
-byte budget, flat-memory save), then M17 zone maps and the M21 Parquet read half after beta. The
+Work: M20/M19 polish (compaction wiring, mapped value writes, spill placement and byte budget,
+flat-memory save), then M17 zone maps and the M21 Parquet read half after beta. The
 old streaming/threading/whole-column items are landed; keep the measured workbooks and
 `cargo xtask bench` as the regression net.
 
@@ -246,9 +246,9 @@ Linux, BSD and RISC-V, where Excel doesn't run.
 (ready ~50%, inside the 40–75% alpha band). The large-workbook gate is met: 100M cells open with
 16.7 MiB live, 100k-dependent edits are 20–25 ms, and row/column structural maps are in. Not beta:
 XLSX has not been proven on real-world files or confirmed to open in Excel without repair, `.xls`
-is missing, charts/text/Pivot/keyboard gates remain, and the M20/M19 base still needs compaction,
-line metadata, spill placement and flat-memory save. Distance to beta: ~25 points of readiness and
-~160–250 h, itemized in [roadmap.md](roadmap.md#beta-gates).
+is missing, charts/text/Pivot/keyboard gates remain, and the M20/M19 base still needs compaction
+wiring, spill placement and flat-memory save. Distance to beta: ~25 points of readiness and
+~150–240 h, itemized in [roadmap.md](roadmap.md#beta-gates).
 
 ## Effort and calibration
 

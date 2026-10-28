@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** major (roadmap re-planned after M19/M20: large-workbook beta gate met; execution queue, parallel plan and post-beta order set) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (M20 line metadata is a chunked physical-id map; wave 0 and the beta estimate narrow) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M20 segment compaction (model half landed 10-29; page-aware pass and a caller remain); row line-metadata map; mapped `set_values`, logical `diff`, physical-column `visit_packed`; M19 spill-beside-document, byte-budget LRU, flat-memory save/scan | M20/M19 follow-up | **30–45** | Start now; no owner. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: M20 compaction (model half landed 10-29; page-aware pass and a caller remain); mapped `set_values`, logical `diff`, physical-column `visit_packed`; M19 spill-beside-document, byte-budget LRU, flat-memory save/scan | M20/M19 follow-up | **20–30** | Start now; no owner. This is the last large-workbook debt before beta evidence. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -68,7 +68,7 @@ and edge features. Each gate links its gap.
 |---|---|---|---|
 | XLSX proven on a real-world corpus; Excel opens our output without repair | #1 | **open**; owner needed | 15–25 |
 | Unmodelled XLSX parts preserved on save | #3 | **open**; do with #1 | 6–10 |
-| 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | **met 10-28** (M19/M20); M20/M19 polish in wave 0 | 0 for the gate; 30–45 polish |
+| 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | **met 10-28** (M19/M20); M20/M19 polish in wave 0 | 0 for the gate; 20–30 polish |
 | Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **open**; longest gate | 25–35 |
 | Text in every script renders and exports | #5 | **open** | 12–20 |
 | Calculation correctness bugs closed; iterative calculation | #6 | **open** | 10–15 |
@@ -76,7 +76,7 @@ and edge features. Each gate links its gap.
 | PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **open** | 12–20 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #3–#10 | **~136–209 + 30–45 base = ~160–250** |
+| **Total** | | gates #1, #3–#10 | **~136–209 + 20–30 base = ~155–240** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
@@ -105,7 +105,7 @@ to check our files (gate #1/#8), and Windows machines with the reported GPU driv
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | landed (10-24/27): whole-column folds and recalc kernels; remaining work in gaps |
 | M19 | Cold paging: bands leave memory when unused | **landed (10-28)**: compressed pages + 4,096-band LRU; spill-beside-document, byte budget and save/scan remain |
-| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **row and column halves landed (10-28)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20; compaction landed at model level (10-29; page-aware pass and caller remain); wave 0 closes line metadata and mapped value writes |
+| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **rows, columns and line metadata landed (10-29)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20, chunked line metadata; compaction landed at model level (page-aware pass and caller remain); wave 0 closes mapped value writes and M19 |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading/linked tables are post-beta (not a beta gate) |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
 
@@ -605,11 +605,21 @@ rows/columns, fragmentation, free-list bounds, serialization and a paged store. 
 or rewrite pages yet: paged orphans stay counted and unreadable, and no engine/UI caller invokes
 `compact` yet. Model tests are now 52 (33 store tests), up from 46.
 
-**Remaining.** Row line metadata (`Sheet.rows`) is still shifted as a BTreeMap (a workbook with a
-custom height on every row pays that); compaction needs a page-aware pass and a caller on save or
-idle; `set_values` on a mapped sheet takes the value-at-a-time path because logical and physical
-rows are no longer ordered together; and `CellStore::diff` still compares physical cells (the
-engine skips array checks on structural commits). These are the next M20 slices.
+**Line metadata (10-29).** `Sheet.rows`/`cols` are a `LineMap`: the cell store's logical→physical
+runs, with the entries themselves in 128-line `Arc` chunks. An insert or delete moves runs and
+renumbers no entry; an undo snapshot clones chunk pointers; a line written into an inserted gap
+gets a fresh physical id. JSON and XLSX still read and write logical lines, so files are unchanged;
+inserts still inherit the line above (size/style/custom, not hidden/outline/collapsed), deletes drop
+their entries, and `moveColumns` follows its insert/move/delete sequence. `LineIndex`, outline,
+geometry, sort/filter, clipboard and the file reader/writer all take the logical view; undo
+accounting charges only chunks a snapshot does not share. Model tests are 62, engine 419, xlsx 265;
+`cargo check --workspace --all-targets` compiles (the UI test suite was not run).
+
+**Remaining.** Compaction is model-only: a page-aware pass and a caller on save or idle are still
+missing. `set_values` on a mapped sheet takes the value-at-a-time path because logical and physical
+rows are no longer ordered together; `CellStore::diff` still compares physical cells (the engine
+skips array checks on structural commits); and `visit_packed` falls back to the logical walk on a
+column-mapped sheet. Those complete wave 0's M20 work beside the M19 polish.
 
 **Acceptance (rows and columns).**
 - Insert one row above a 1M-row, 20-column sheet: **3.7 ms command / 35.8 ms commit**, below 50 ms;
@@ -735,6 +745,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 line metadata maps through physical ids: chunked `LineMap`, logical JSON/XLSX, inserts inherit and deletes drop entries, undo charges unshared chunks; 62 model / 419 engine / 265 xlsx tests; wave 0 and beta estimate narrow to 20–30 base / ~155–240 |
 | 2026-10-29 | minor | M20 compaction at model level: `CellStore::compact` reclaims live orphan rows/columns and normalizes maps; 6 new model tests (52 total); page orphans and a save/idle caller remain |
 | 2026-10-29 | major | Roadmap re-planned after M19/M20: current focus, execution queue, parallel plan, beta gate status and post-beta order set; large-workbook gate marked met and the old PR-queue wave folded into the gaps |
 | 2026-10-28 | minor | Bulk edits scan blocked arrays once for the union of the changed blocks (Remove Duplicates 1M×10 91 → 12 s, recalc 80 s → 1.4 s); Sort 1M×10 3.2 s, Fill Down 1M rows 1.45 s; `data.sort`/`removeDuplicates`/`setValues` share a 12M-cell cap, 1M×20 refused in 1.3 s; `CellStore::style` fast path |

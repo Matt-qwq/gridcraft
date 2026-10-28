@@ -1,6 +1,6 @@
 # GridCraft roadmap
 
-**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~160–250 h away
+**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~150–240 h away
 
 > **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** major (roadmap re-planned: large-workbook beta gate met; ordered waves, parallel plan and post-beta order set) · **Target:** Microsoft Excel (Microsoft 365)
 
@@ -26,7 +26,7 @@ This page is the summary. The detail is in:
 | **Ready for real work** | **~50%** | estimated from written weights (51.6); [target-app-parity.md](docs/target-app-parity.md) |
 | **Mainstream practitioner** | **~50%** | estimated: typical analyst/finance user, weekly features, × 0.90 interaction × 0.92 stability × 0.88 file exchange; [method](docs/target-app-parity.md#mainstream-practitioner) |
 | **Essentials user** | **~63%** | estimated: core features only, × 0.92 launch/stability × 0.95 clarity × 0.90 opening sent files; [method](docs/target-app-parity.md#essentials-user) |
-| Remaining to **beta** | **~160–250 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met |
+| Remaining to **beta** | **~150–240 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met |
 | Remaining to **full parity** | **~700–1,100 Opus 5.5 agent-hours** | estimated; sum of the dimension rows below |
 
 | Audience | Ready % | Opus 5.5 agent wall-clock hours to ~95% | Work that dominates |
@@ -127,7 +127,7 @@ The detailed queue with dependencies and the parallel plan is in
 
 | Wave | Work | Hours | Notes |
 |---|---|---|---|
-| **0** | Close the base: M20 compaction, line-metadata map, mapped writes/logical diff/physical-column packed walk; M19 spill path, byte-budget LRU, flat-memory save/scan | **30–45** | Start now; no owner. Last large-workbook debt. |
+| **0** | Close the base: M20 compaction wiring, mapped writes/logical diff/physical-column packed walk; M19 spill path, byte-budget LRU, flat-memory save/scan | **20–30** | Start now; no owner. Last large-workbook debt. |
 | **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
 | **1** | **XLSX corpus + Excel acceptance** (#1/#3) | 21–35 | **Owner: half a day in Excel.** The only external gate; start early. |
 | **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M20 line metadata maps through physical ids: `Sheet.rows`/`cols` are a `LineMap` with a logical→physical axis map and 128-line `Arc` chunks, so a row/column insert or delete moves runs instead of reindexing every custom line and an undo snapshot shares untouched chunks; JSON and XLSX still store logical lines, inheritance and delete semantics unchanged. Model 62 tests, engine 419, xlsx 265; undo accounting charges unshared chunks |
 | 2026-10-29 | M20 compaction at model level: `CellStore::compact()` reclaims live orphan rows/columns and normalizes row/column maps, with 6 new model tests (52 total); paged orphans and a save/idle caller remain |
 | 2026-10-29 | Roadmap re-planned: wave 0 closes the M20/M19 base (30–45 h), wave 1 proves XLSX in Excel/corpus with the owner (21–35 h), then calc/text/keyboard/charts, `.xls`/encryption and Pivot slicers; beta exit is wave 4. Post-beta puts M21 read/linked tables, zone maps, localization and Get & Transform. M22 stays deferred. The old PR-queue wave is folded into the gap it addresses |
 | 2026-10-28 | M20's row and column halves land: `CellStore` keeps a logical→physical `RowMap`; `shift_rows` changes a segment list instead of moving cells, inserted rows allocate fresh physical keys on write, and reads/iteration/formulas/used range map through. **Insert one row above 1M×20 is 3.7 ms command / 35.8 ms commit, with 0 cells moved** (deleting the last row first to make room). `rewrite_all_formulas` no longer walks every cell to find no formulas, and `CellStore::iter` walks only bands that exist. The column sibling (`ColMap`) uses the same runs over the used width, allocates/reuses physical columns on write, and makes a column insert 9.8 ms command / 42.5 ms commit with no cell moved. Segment compaction, row line metadata and value writes on mapped sheets remain |
@@ -243,6 +244,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 line metadata maps through physical ids (chunked `LineMap`, logical JSON/XLSX, O(1) clone; 62 model / 419 engine / 265 xlsx tests); wave 0 narrows to compaction wiring, mapped value writes and M19, beta ~150–240 h |
 | 2026-10-29 | minor | M20 compaction at model level (live orphan rows/columns, map normalization, 6 new tests; 52 model total); page-aware pass and caller remain |
 | 2026-10-29 | major | Roadmap re-planned after M19/M20: large-workbook beta gate met; wave 0 base (30–45 h), wave 1 XLSX/Excel (21–35 h, owner), waves 2–3 fidelity/formats, wave 4 beta exit; M21 post-beta, M22 deferred |
 | 2026-10-28 | major | M20 row+column maps (row insert 3.7 ms / 35.8 ms commit, column insert 9.8 ms / 42.5 ms on 1M×20, 0 cells moved; formula rewrite and iteration skip empty cells); gaps §2, roadmap M20 and progress log updated |
