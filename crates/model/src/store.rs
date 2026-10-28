@@ -1253,6 +1253,15 @@ impl CellStore {
         Some(band.cell_at(row, i, c.col))
     }
 
+    /// The style of a stored cell, without reconstructing the `Cell` (and its value and formula).
+    /// A style is all a formatting or duplicate check needs; `get` rebuilds the rest for nothing.
+    pub fn style(&self, c: CellRef) -> Option<StyleId> {
+        let band = self.bands.get(&(c.row / BAND))?;
+        let row = band.row(c.row % BAND)?;
+        let i = row.index_of(band, c.col)?;
+        Some(band.style(row.style_at(band, i)))
+    }
+
     /// True when the position holds a cell at all (a stored style counts).
     pub fn contains(&self, c: CellRef) -> bool {
         self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND).map(|r| (b, r))).is_some_and(|(b, r)| r.index_of(b, c.col).is_some())

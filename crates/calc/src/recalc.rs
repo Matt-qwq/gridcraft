@@ -1671,24 +1671,64 @@ impl Calc {
         }
         let mut seeds: Vec<Key> = changed.to_vec();
         let mut emptied: Vec<Key> = Vec::new();
-        // Typing into (or clearing) a cell a dynamic array spills over (or would spill over)
-        // re-evaluates the anchor, which may now be blocked or unblocked.
+        // Per-sheet bounds of the edit, so a bulk change scans for blocked arrays once instead of
+        // once per cell: redoing a whole row of Remove Duplicates used to walk a 64×64 block for
+        // each of a million changed cells.
+        let mut bounds: Vec<(usize, u32, u32, u32, u32)> = Vec::new();
         for &k in changed {
-            if let Some(sh) = wb.sheet(k.0) {
+            let Some(sh) = wb.sheet(k.0) else { continue };
+            match bounds.iter_mut().find(|x| x.0 == k.0) {
+                Some(x) => {
+                    x.1 = x.1.min(k.1.row);
+                    x.2 = x.2.min(k.1.col);
+                    x.3 = x.3.max(k.1.row);
+                    x.4 = x.4.max(k.1.col);
+                }
+                None => bounds.push((k.0, k.1.row, k.1.col, k.1.row, k.1.col)),
+            }
+            if !sh.cells.has(k.1) {
+                match emptied.iter_mut().find(|x| x.0 == k.0) {
+                    Some(x) => x.1 = CellRef::new(x.1.row.max(k.1.row), x.1.col.max(k.1.col)),
+                    None => emptied.push(k),
+                }
+            }
+        }
+        // The per-cell scan looks at the 64×64 block above and to the left of each changed cell.
+        // For a bulk edit, scan the union of those blocks once (or keep the per-cell scan when the
+        // changed cells are scattered and the union would be much larger).
+        let per_cell_cost = (changed.len() as u64).saturating_mul(4096);
+        let union_cost: u64 = bounds.iter().map(|&(_, r0, c0, r1, c1)| (u64::from(r1 - r0) + 64).saturating_mul(u64::from(c1 - c0) + 64)).sum();
+        let bulk_spill_scan = changed.len() > 64 && union_cost <= per_cell_cost;
+        if bulk_spill_scan {
+            for &(si, r0, c0, r1, c1) in &bounds {
+                let Some(sh) = wb.sheet(si) else { continue };
+                let area = RangeRef::new(CellRef::new(r0.saturating_sub(64), c0.saturating_sub(64)), CellRef::new(r1, c1));
+                for (c, cell) in sh.cells.iter_range(area) {
+                    if cell.value == Value::Error(CellError::Spill) {
+                        seeds.push((si, c));
+                    }
+                }
+                let body = RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1));
                 for (anchor, r) in &sh.spill_ranges {
-                    if *anchor != k.1 && r.contains(k.1) {
-                        seeds.push((k.0, *anchor));
+                    if r.intersects(&body) {
+                        seeds.push((si, *anchor));
                     }
                 }
-                for (c, cell) in sh.cells.iter_range(RangeRef::new(CellRef::new(k.1.row.saturating_sub(64), k.1.col.saturating_sub(64)), k.1)) {
-                    if c != k.1 && cell.value == Value::Error(CellError::Spill) {
-                        seeds.push((k.0, c));
+            }
+        } else {
+            // Typing into (or clearing) a cell a dynamic array spills over (or would spill over)
+            // re-evaluates the anchor, which may now be blocked or unblocked.
+            for &k in changed {
+                if let Some(sh) = wb.sheet(k.0) {
+                    for (anchor, r) in &sh.spill_ranges {
+                        if *anchor != k.1 && r.contains(k.1) {
+                            seeds.push((k.0, *anchor));
+                        }
                     }
-                }
-                if !sh.cells.has(k.1) {
-                    match emptied.iter_mut().find(|x| x.0 == k.0) {
-                        Some(x) => x.1 = CellRef::new(x.1.row.max(k.1.row), x.1.col.max(k.1.col)),
-                        None => emptied.push(k),
+                    for (c, cell) in sh.cells.iter_range(RangeRef::new(CellRef::new(k.1.row.saturating_sub(64), k.1.col.saturating_sub(64)), k.1)) {
+                        if c != k.1 && cell.value == Value::Error(CellError::Spill) {
+                            seeds.push((k.0, c));
+                        }
                     }
                 }
             }
@@ -2043,7 +2083,7 @@ fn prof_now() -> f64 {
 pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
-    use gridcraft_core::{CellRef, RangeRef, Value};
+    use gridcraft_core::{CellError, CellRef, RangeRef, Value};
     use gridcraft_model::{Cell, Formula, Workbook};
 
     use super::{Calc, Graph, HashMap, Host, Intervals, Key, PassHost};
@@ -2323,6 +2363,36 @@ pub(crate) mod tests {
             assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(r, 9)), Value::Number(2.0));
             assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(r, 10)), Value::Number(3.0));
         }
+    }
+
+    /// Clearing a blocked array's cell along with a bulk change (Remove Duplicates, a paste, a
+    /// whole-row clear) still finds the anchor: the blocked-anchor scan covers the union of the
+    /// changed cells' 64×64 blocks once.
+    #[test]
+    fn a_bulk_change_unblocks_a_blocked_array() {
+        let mut wb = Workbook::new();
+        {
+            let sh = wb.sheet_mut(0).expect("sheet");
+            sh.cells.set(CellRef::new(0, 0), Cell::value(Value::Number(1.0)));
+            sh.cells.set(CellRef::new(1, 0), Cell::value(Value::Number(2.0)));
+            sh.cells.set(CellRef::new(0, 10), Cell::formula(Formula::new("=A1:A2")));
+            sh.cells.set(CellRef::new(1, 10), Cell::value(Value::Number(3.0)));
+            for r in 0..1_000 {
+                sh.cells.set(CellRef::new(r, 1), Cell::value(Value::Number(4.0)));
+            }
+        }
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(0, 10)), Value::Error(CellError::Spill));
+        let mut changed = vec![(0, CellRef::new(1, 10))];
+        wb.sheet_mut(0).unwrap().cells.remove(CellRef::new(1, 10));
+        for r in 0..1_000 {
+            wb.sheet_mut(0).unwrap().cells.remove(CellRef::new(r, 1));
+            changed.push((0, CellRef::new(r, 1)));
+        }
+        calc.cells_changed(&mut wb, &changed);
+        assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(0, 10)), Value::Number(1.0));
+        assert_eq!(wb.sheet(0).unwrap().value(CellRef::new(1, 10)), Value::Number(2.0));
     }
 
     #[test]

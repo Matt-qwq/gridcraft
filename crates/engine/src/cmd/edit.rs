@@ -302,6 +302,8 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
     if rows.len() > MAX_ROWS as usize {
         return Err(bad("range.setValues", "too many rows"));
     }
+    let cells: u64 = rows.iter().map(|row| row.as_array().map_or(1, |a| a.len()) as u64).sum();
+    super::check_bulk(cells)?;
     let mut count = 0;
     edit(s, |cx| {
         for (ri, row) in rows.iter().enumerate() {

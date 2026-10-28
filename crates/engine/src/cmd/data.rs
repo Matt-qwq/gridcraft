@@ -275,9 +275,7 @@ fn do_sort(s: &mut Session, sheet: usize, r: RangeRef, header: bool, keys: Vec<S
     } else {
         r
     };
-    if body.count() > 20_000_000 {
-        return Err(bad("data.sort", "range too large"));
-    }
+    super::check_bulk(body.count())?;
     edit(s, |cx| {
         let Some(sh) = cx.wb.sheet(sheet) else { return Ok(Json::Null) };
         if sh.merges.iter().any(|m| m.intersects(&body) && !m.is_single()) {
@@ -833,6 +831,7 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
     // Rows and columns past the data are blank: only the part with data is compared (whole
     // columns compared a million blank rows and reported them as removed duplicates).
     let r = sh.used_range().and_then(|u| r.intersection(&u)).unwrap_or(RangeRef::cell(r.start));
+    super::check_bulk(r.count())?;
     let header = bool_param(p, "header").unwrap_or_else(|| guess_header(&d.wb, sh, r));
     let cols: Vec<u32> = p
         .get("columns")
@@ -852,8 +851,16 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
         let mut seen = std::collections::HashSet::new();
         let mut keep: Vec<u32> = Vec::new();
         // Cells are compared by the text they show, as in Excel: the same date in two formats
-        // isn't a duplicate, while 1.01 and 1.02 shown as 1.0 are.
-        let shown = |c: CellRef| crate::display::format(&sh.value(c), cx.wb.styles.get(sh.style_id(c)).num_fmt.as_str(), &cx.wb).text;
+        // isn't a duplicate, while 1.01 and 1.02 shown as 1.0 are. A selection usually holds a
+        // handful of styles, so the number format is parsed once a style instead of once a cell
+        // (the global format cache still took a lock and cloned it for every one of 10M cells).
+        let date_system = cx.wb.date_system;
+        let mut formats: std::collections::HashMap<StyleId, gridcraft_numfmt::NumberFormat> = std::collections::HashMap::new();
+        let mut shown = |c: CellRef| {
+            let style = sh.style_id(c);
+            let fmt = formats.entry(style).or_insert_with(|| crate::display::number_format(cx.wb.styles.get(style).num_fmt.as_str()));
+            gridcraft_numfmt::format_value(&sh.value(c), fmt, date_system).text
+        };
         for row in start..=r.end.row {
             let key: Vec<String> = cols.iter().map(|c| shown(CellRef::new(row, *c)).to_lowercase()).collect();
             if seen.insert(key) {
@@ -1508,6 +1515,13 @@ fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_commands_refuse_ranges_above_the_memory_limit() {
+        assert!(crate::cmd::check_bulk(crate::cmd::MAX_BULK_CELLS).is_ok());
+        let err = crate::cmd::check_bulk(crate::cmd::MAX_BULK_CELLS + 1).expect_err("one cell over the limit");
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
 
     #[test]
     fn filter_blanks_include_empty_text_and_formula_results() {

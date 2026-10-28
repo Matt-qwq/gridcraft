@@ -303,6 +303,19 @@ pub(crate) fn cell_param_on(s: &Session, p: &Json, key: &str, sheet: usize) -> R
 /// Applies an edit to a copy of the active workbook, then recalculates and commits it.
 /// `changed` collects cells whose content changed; set `structural` for row/column/sheet edits
 /// (full recalc).
+/// The most cells one bulk command may touch in memory at once. It allows a million rows by ten
+/// columns (10.5M, the shape of a real 1M-row sheet) and refuses the 20M-cell sheets that made
+/// Remove Duplicates grow to gigabytes. Fill has its own 5M limit in `fill.rs`.
+pub(crate) const MAX_BULK_CELLS: u64 = 12_000_000;
+
+/// Refuses a bulk range that would build more than [`MAX_BULK_CELLS`] cells at once.
+pub(crate) fn check_bulk(cells: u64) -> Result<()> {
+    if cells > MAX_BULK_CELLS {
+        return Err(EngineError::Other(format!("The range is too large ({cells} cells; the limit is {MAX_BULK_CELLS}).")));
+    }
+    Ok(())
+}
+
 pub struct Ctx<'a> {
     pub wb: Workbook,
     pub changed: Vec<Key>,

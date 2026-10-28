@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (§2: recalculation uses up to eight threads for independent formulas; 100k edits are 20–25 ms and 1M are 208–277 ms) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (§2: bulk edits bound; Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill 1.45 s, 12M-cell cap) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -58,8 +58,18 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   large batches. An edit of A1 with 100,000 `=$A$1*2` cells is **20–25 ms** end to end (was 65–75),
   200k is ~35–42 ms, 500k ~100–132 ms and 1M ~208–277 ms in `_gridcraft-bench/calcbench`; the 100k
   full recalculation is 89–114 ms. Details in [`roadmap.md`](roadmap.md#m18--vectorized-aggregation-kernels--3045-h).
+- **Landed (10-28): bulk edits and whole-sheet data commands.** `Calc::cells_changed` used to scan
+  a 64×64 block for blocked arrays **per changed cell**; a 10M-cell Remove Duplicates therefore did
+  ~40 billion block visits. It now scans the union of the changed blocks once (or keeps the per-cell
+  scan when the changed cells are scattered), and the same 10M-cell Remove Duplicates fell from
+  **91 s to 12 s** (1M×3: 15.4 → 5.3 s); its recalculation phase went from ~80 s to 1.4 s. Sort on
+  the same 1M×10 sheet is **3.2 s** (recalculation 0.02 s) and Fill Down on 1M rows **1.45 s**.
+  `data.sort`, `data.removeDuplicates` and `range.setValues` share a **12M-cell cap** (1M×10 fits;
+  1M×20 is refused in 1.3 s with a clear error), and `CellStore::style`/Remove Duplicates parse a
+  style's number format once rather than once a cell.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
-  operations bounded (#152, #151); memory proportional to the cells, never the file (the 1.28 GB,
+  clear/copy/paste still clone the stored cells (they scale with the data, not the file); memory
+  proportional to the cells, never the file (the 1.28 GB,
   220k-cell workbook lives in 237 MiB), but no cold paging yet — the stripes are what makes a band
   one copy to page out; the per-band value dictionaries still cost full price when values do not
   repeat;
@@ -71,8 +81,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
   (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
-- **Estimate:** ~5–10 h for the rest of the beta gate (bounded whole-sheet work and the 1M-row
-  operations); the big-data-shaped work beyond it is planned in
+- **Estimate:** the beta gate's recalc, edit-latency, 1M-row and bounded data-command items are met;
+  cold paging (M19) and append-style structural edits (M20) are the work beyond it, planned in
   [`roadmap.md`](roadmap.md#large-workbooks-what-big-data-engineering-offers-a-spreadsheet).
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)
@@ -172,10 +182,10 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   `#VALUE!`, following the claim that Excel refuses those error codes; **needs verification on a
   licensed Excel**) or `#CIRC!` (written as 0). A *literal* `#SPILL!` pasted as a value therefore
   comes back `#VALUE!`; formulas and spilled values are recalculated and agree.
-- **Next:** the trust track's soak is closed; the 100k-dependent gate is met and independent
-  formulas now recalculate on up to eight threads (20–25 ms end to end at 100k, 208–277 ms at 1M,
-  gaps §2). Bounded whole-sheet operations and cold paging are the next large-workbook tasks.
-  Replays and details in `plan/HANDOVER.md`.
+- **Next:** the trust track's soak is closed; the 100k-dependent gate is met, independent formulas
+  recalculate on up to eight threads (20–25 ms at 100k, 208–277 ms at 1M) and the bulk data
+  commands are bounded (12M cells; Remove Duplicates 1M×10 in 12 s, Sort in 3.2 s, gaps §2). Cold
+  paging (M19) is the next large-workbook task. Replays and details in `plan/HANDOVER.md`.
 - **Estimate:** 12–16 h for this soak and its fixes; done.
 ## After beta
 
@@ -255,6 +265,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-28 | minor | §2: bulk changes scan blocked arrays once for the union of the changed cells and data commands cap at 12M cells: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill Down 1.45 s; 1M×20 refused in 1.3 s |
 | 2026-10-27 | minor | §2: independent formulas recalculate on up to eight threads (leaves wave by wave; arrays/volatile/iterative sequential): 100k end-to-end 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; §10 next step is bounded whole-sheet work and paging |
 | 2026-10-27 | minor | §2: the 100k-dependent edit gate is met single-threaded (245 → 65–75 ms; full recalculation 281–289 → 134–147 ms) by reading formulas and legacy ranges from the graph, one result slot, row-major value writes, shared row extras, cached AST byte counts and a diff-first array check; §10 next step is multi-threaded recalc |
 | 2026-10-26 | minor | §10: self-spilling arrays are `#CIRC!` and a contested spill keeps its owner across F9; three seeds remain, two of them the file side of spilled arrays |

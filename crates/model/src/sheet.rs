@@ -223,8 +223,8 @@ impl Sheet {
         }
     }
     pub fn style_id(&self, c: CellRef) -> StyleId {
-        if let Some(cell) = self.cells.get(c) {
-            return cell.style;
+        if let Some(style) = self.cells.style(c) {
+            return style;
         }
         if let Some(s) = self.rows.get(&c.row).and_then(|r| r.style) {
             return s;

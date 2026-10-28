@@ -1,6 +1,6 @@
 # Target-app parity: GridCraft vs Microsoft Excel
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (recalculation now uses up to eight threads for independent formulas: a 100k-dependent edit is 20–25 ms and 1M is 208–277 ms; no score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (bulk whole-sheet commands are bounded: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, 12M-cell cap; no score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 This is the authoritative parity assessment. [`ROADMAP.md`](../ROADMAP.md) summarizes it,
 [`gaps.md`](gaps.md) lists every shortfall, and the area checklists hold the detail:
@@ -207,7 +207,7 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Edit → recalc, 100k dependents | **20–25 ms** (2026-10-27); target < 100 ms met | tens of ms | measured on the owner's machine, `_gridcraft-bench/formula_bench`, release: 65–75 ms before threading, 245 ms before the round; 1M dependents are 208–277 ms in `calcbench`; a full recalc of the 100k sheet is 89–114 ms |
 | Grid scrolling | virtualised, O(log n) geometry with custom row heights | smooth | measured in code |
 | Open a ~100 MB XLSX | fails (#175) | opens | user report |
-| Whole-sheet operations | Fill and Remove Duplicates on a whole-sheet selection run out of memory or time (fix in PR #152) | fine | open PR |
+| Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
 Work: streaming XLSX reader with shared-string and style dedup, multi-threaded recalc of
 independent chains (native only; WASM stays single-threaded), whole-column reference
@@ -334,6 +334,7 @@ The inventory carried over from the 2026-10-07 ROADMAP.md, updated for what land
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-28 | minor | Whole-sheet operations: bulk edits scan blocked arrays once for the union of changed cells; Remove Duplicates on 1M×10 is 12 s (was 91), Sort 3.2 s, Fill Down 1M rows 1.45 s, and sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) |
 | 2026-10-27 | minor | Recalculation performance: independent formulas now run on up to eight threads (leaves wave by wave); the 100k-dependent edit is 20–25 ms end to end (was 65–75 single-threaded, 245 before the round) and 1M is 208–277 ms — the recalculation-threads and `< 100 ms` rows are updated |
 | 2026-10-27 | minor | Recalculation performance: the 100k-dependent edit is 65–75 ms (was 245) and a full recalc 134–147 ms (was 281–289), single-threaded — the `< 100 ms` target in the performance table is met |
 | 2026-10-21 | minor | Page Setup paper sizes: `B4`/`B5`/`B6` are the JIS sizes Japanese Excel uses (ISO B4/B5/B6 by name), and Japanese Postcard, Japanese Double Postcard, the chou/kaku envelopes and A6 are added; PDF MediaBox and `file.print` follow, and the Size menu lists them |

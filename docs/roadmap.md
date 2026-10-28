@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-27 · **Change:** minor (recalculation now uses the machine's threads for independent formulas: 100k edit 20–25 ms end to end, 1M 0.21–0.28 s; M18 records the split) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** minor (bulk data commands are bounded: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, 12M-cell cap; M18 records it) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -307,6 +307,29 @@ Remaining: dependent formulas that are not leaves (a chain, or a wave below the 
 the last wave) are still evaluated sequentially; a chain cannot be parallelised, and a wide array
 formula keeps its whole pass sequential by design.
 
+#### Bulk changes and whole-sheet data commands (10-28)
+
+`Calc::cells_changed` used to look for blocked arrays in the 64×64 block above and to the left of
+**every** changed cell. A 10M-cell Remove Duplicates therefore made ~40 billion block visits after
+the command itself had finished; that, not the command, was the 91 s. It now scans the union of the
+changed blocks once (or keeps the per-cell scan for a few scattered edits), which took the
+recalculation phase from ~80 s to **1.4 s**. The same edit, measured on the 1M×10
+`max_1048576.xlsx` through `gridcraft-cli` (peak working set in brackets):
+
+| operation, 1M×10 | before | after |
+|---|---|---|
+| Remove Duplicates, A:J | 91 s (1.28 GB) | **12 s** (1.29 GB) — 1M×3: 15.4 → **5.3 s** |
+| Sort, B descending | 3.2 s now (recalc 0.02 s) | |
+| Fill Down, column A, 1M rows | 1.45 s (588 MB) | |
+| Remove Duplicates / Sort on 1M×20 | — | **refused in 1.3 s** (12M-cell cap) |
+
+`data.sort`, `data.removeDuplicates` and `range.setValues` share a **12M-cell cap** (a 1M×10 sheet
+is 10.49M and fits; 1M×20 is 20.97M and is refused with the count and the limit). Fill keeps its
+own 5M cap. `CellStore::style` reads a cell's packed style without rebuilding its value and formula,
+and Remove Duplicates parses each style's number format once instead of once a cell. Whole-sheet
+clear/copy/paste still clone the stored cells; they scale with the data rather than the file, and
+are the remaining bulk path to measure.
+
 **Scope.** A range read as column stripes (`&[f64]` plus a validity bitmap, taken straight from a
 band's payload stripe) and typed loops for `SUM`, `SUMPRODUCT`, `COUNTIF`, `SUMIFS`, `AVERAGE`,
 `MIN`, `MAX`. The scalar evaluator stays the fallback for everything else; nothing changes about
@@ -577,6 +600,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-28 | minor | Bulk edits scan blocked arrays once for the union of the changed blocks (Remove Duplicates 1M×10 91 → 12 s, recalc 80 s → 1.4 s); Sort 1M×10 3.2 s, Fill Down 1M rows 1.45 s; `data.sort`/`removeDuplicates`/`setValues` share a 12M-cell cap, 1M×20 refused in 1.3 s; `CellStore::style` fast path |
 | 2026-10-27 | minor | Independent formulas recalculate on up to eight threads (wave by wave, leaves only; arrays/volatile/iterative stay sequential): 100k end-to-end edit 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; parallel band value writes (4M cap); `Node::may_spill` and graph safety sets |
 | 2026-10-27 | minor | The 100k-dependent edit gate is met single-threaded: 245 → 65–75 ms (full recalculation 281–289 → 134–147 ms) by reading parsed formulas and legacy ranges from the graph, one `Slot` per result (in-progress is an empty value), row-major `CellStore::set_values`, `Arc<RowExtras>` band copies, cached `Formula::expr_bytes` for undo accounting, a diff-first `check_arrays`, and single-cell/one-operator fast paths in the evaluator |
 | 2026-10-27 | minor | The trust-track soak is closed: 500 seeds × 200 commands (100,000 commands, release, 49 min) are green. Reopening a file rebuilds spilled arrays from the anchor's `ref` and cached values (a contested area keeps its owner), F9 prefers real spill owners and lets a grow-back owner reclaim its cells, swallowed `#CIRC!` stays explicit, `_sc_*` view-state names are invisible to formulas, table filters and blocked legacy arrays round-trip, and Insert/Delete Cells refuses to cut a merge. The format's `#SPILL!`/`#CALC!`-as-`#VALUE!` cache is still to verify on a licensed Excel |

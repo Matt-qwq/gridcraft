@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-27 · **Change:** minor (independent formulas recalculate on up to eight threads: 100k edit 20–25 ms, 1M 208–277 ms) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (bulk data commands are bounded: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, 12M-cell cap) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -125,7 +125,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
    correctness, chart kind round-trip, CJK font fallback, macOS Finder open, German and Chinese
    UI). Review and merge: 8–15 h.
 2. **XLSX fidelity on a real-world corpus**, with Excel opening our output without repair: 25–35 h.
-3. **Large workbooks and recalc speed**: 100 MB XLSX, 1M-row operations, bounded whole-sheet work: 40–60 h (multi-threaded recalc landed 10-27).
+3. **Large workbooks and recalc speed**: 100 MB XLSX, 1M-row operations, paging and append-style edits: 40–60 h (multi-threaded recalc and bounded bulk data commands landed 10-27/28).
 4. **Charts depth**: kinds and options round-trip, axes, trendlines, error bars: 25–35 h.
 5. **Text in every script** (CJK, Thai, Arabic, Devanagari) in cells and PDF: 12–20 h.
 6. **Legacy `.xls` import and password-protected workbooks**: 20–30 h.
@@ -135,6 +135,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-28 | Bulk edits no longer scan a 64×64 blocked-array block per changed cell: the scan covers the union once, so Remove Duplicates on a 1M×10 sheet fell from **91 s to 12 s** (1M×3: 15.4 → 5.3 s; recalculation 80 → 1.4 s), Sort on the same sheet is 3.2 s and Fill Down of 1M rows 1.45 s. `data.sort`, `data.removeDuplicates` and `range.setValues` share a 12M-cell cap (1M×10 fits, 1M×20 is refused in 1.3 s with the count and limit); Remove Duplicates parses a style's number format once, and `CellStore::style` avoids rebuilding values and formulas for style lookups |
 | 2026-10-27 | Recalc uses the machine's threads: independent formulas (leaves) are evaluated in up to eight shards, wave by wave, so a layered sheet parallelises level by level; large value batches clone the touched bands in workers. An edit of A1 with 100,000 `=$A$1*2` cells is **20–25 ms** end to end (was 65–75 single-threaded, 245 before the round) and a full recalc 89–114 ms; in `calcbench`, 200k is 35–42 ms, 500k 100–132 ms and 1M 208–277 ms (1M full recalc 0.85–1.29 s). Arrays, volatile formulas, legacy arrays and iterative calculation keep the pass sequential; a spill or cycle rolls the parallel results back. The 1.28 GB report (its `FILTER` is an array) is unchanged: same `cell_digest`, same 159 stale-cache cells |
 | 2026-10-27 | Recalc meets the 100k gate on one thread: an edit of A1 with 100,000 `=$A$1*2` cells is **65–75 ms**, down from 245 ms, and a full recalc of the same sheet 134–147 ms (was 281–289). The pass now reads parsed formulas and legacy array ranges from the dependency graph rather than rebuilding 100k cells, keeps one `Slot` per result (an empty value means in progress), writes values row-major through `CellStore::set_values` (no `Cell` built, no formula or style lookup), shares each row's `Arc<RowExtras>` when a band is copied for undo, charges undo from a cached `Formula::expr_bytes`, checks legacy arrays only at or above the lowest edited row, and reads a single-cell reference without an area vector. The evaluator is still single-threaded; threading is the gate past ~200k dependents |
 | 2026-10-27 | Trust track closed: a 500-seed command-sequence soak (200 commands each, 100,000 commands, release, 49 min) is green. Reopening a file now rebuilds each dynamic array's spill from the anchor's `ref` and its cached values instead of recalculating it, so a contested area keeps its owner; F9 prefers the arrays that actually spill and lets a grow-back owner reclaim its cells. A swallowed `#CIRC!` (COUNTIF over its own column) is explicit; `_sc_*` view-state names are invisible to formulas; table filters, blocked legacy arrays and merges cut by Insert/Delete Cells are handled; the harness tells a byte-capped undo history from an undo bug. Remaining caveat: the file can't cache `#SPILL!`/`#CALC!` or `#CIRC!` (still to verify the first with a licensed Excel) |
@@ -226,6 +227,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-28 | minor | Bulk data commands bounded (Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill 1.45 s, 12M-cell cap); gaps §2, roadmap M18 and the parity table updated |
 | 2026-10-27 | minor | Multi-threaded recalculation of independent formulas (100k end-to-end 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms); gaps §2, roadmap M18 and the parity table record the split and the sequential cases |
 | 2026-10-27 | minor | 100k-dependent recalculation gate met single-threaded (245 → 65–75 ms; full recalc 281–289 → 134–147 ms); gaps §2 and roadmap M18 record the split |
 | 2026-10-26 | minor | Spill contests: self-spilling arrays are `#CIRC!`, F9 keeps the owner; gaps §10 down to three open seeds |
