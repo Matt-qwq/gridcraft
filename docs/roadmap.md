@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** minor (M19: finished bands drop their text index and table slack; the 100M-cell export falls from 2,411 to 1,911 MiB live) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-24 · **Last updated:** 2026-10-28 · **Change:** major (M19 cold paging lands: a 100M-cell workbook opens with 16.7 MiB live and 183 MiB peak, its 729 MiB of compressed pages evicted through a 4,096-band cache; the 31.7M report is unchanged) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -81,7 +81,7 @@ to check our files, and Windows machines with the reported GPU drivers.
 | M16 | Get & Transform, data model | not started |
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | planned |
-| M19 | Cold paging: bands leave memory when unused | planned |
+| M19 | Cold paging: bands leave memory when unused | **landed (10-28)**: compressed pages + 4,096-band LRU; spill-beside-document, byte budget and save/scan remain |
 | M20 | Append-style structural edits (segments, no whole-sheet shifts) | planned |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading and linked tables remain |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
@@ -471,29 +471,60 @@ keeps one `Arc<str>` per distinct text instead of also a 16-byte index entry per
 The rest of the breakdown after both shrinks: rows 481, numbers 519 (was 679 before the table was
 shrunk to fit), kinds and payloads 201 each, styles 120, bitmaps 80. The text table is still 8 bytes
 a distinct text for every band, and the number table is 8 bytes a distinct number; paging is what
-takes the remaining 1.9 GB below 600 MB. While
-fixing the table overflow path, a text past the `u16` slots now stores its own slot in the row's
-wide table instead of the last text added (`TEXT_WIDE` had only been right when the text was the
-one just inserted). Tests: 38 model, including a finished band rebuilt on edit and the 65,536th
-text.
+takes the remaining 1.9 GB below 600 MB. While fixing the table overflow path, a text past the
+`u16` slots now stores its own slot in the row's wide table instead of the last text added
+(`TEXT_WIDE` had only been right when the text was the one just inserted). Tests: 42 model,
+including a finished band rebuilt on edit and the 65,536th text.
 
-**Scope.** Bands outside the working set leave memory: compressed into a spill file beside the
-document, kept as a handle, decompressed when the viewport, calculation or a command touches them.
-An LRU budget (default a few hundred MB) decides what stays.
+**Landed (10-28): bands page to a compressed spill file under an LRU.** A completed band now has a
+second home. `CellStore` keeps `bands` (live, edited) and `pages` (spilled); a page is a
+self-describing `GPB1` record with the four stripes, the number table, the text table, the style
+table and the formulas/arrays side tables, compressed with zlib at the fast level. `enable_paging`
+creates one temporary file per sheet; the reader turns it on before the first row of a sheet in a
+package larger than 200 MB (`read_xlsx_file_paged`, `read_xlsx_paged`; the engine's 100M export is
+551 MB, while the 55 MB `max_1048576.xlsx` and the 118 MB report never enter this path), and every
+`insert_batch` spills the bands it just completed. A read goes through `band_arc`: it decodes the
+page once and keeps it in a 4,096-band cache (about 2.6M cells, roughly 50 MiB at this density); the
+queue evicts the oldest decoded page, so a full-sheet scan cannot grow the working set back to the
+live model. An edit materializes only the band it touches. `used_range`, `formulas` and
+`has_owned_cells` answer from bounds/flags in the page metadata, without decoding a page that cannot
+contain what they ask for.
+
+| measured through `session_breakdown` (release, counting allocator) | 100M-cell export | 31.7M-cell report |
+|---|---|---|
+| live after open | **16.7 MiB** | **49.7 MiB** |
+| peak | **183.1 MiB** | 232.3 MiB |
+| open / reopen | 11.58 s / 11.94 s | 1.47 s / 1.49 s |
+| page file | 729.5 MiB compressed (1,727.4 raw), 163,840 pages | none (package ≤ 200 MB) |
+
+The 100M digest is `8964dde87c902c00` both with and without paging, cell for cell; the 31.7M
+report's `f5b186062e525ec8` is unchanged. A page that does not parse is treated as missing rather
+than trusted; the temporary file is removed with the last store that owns it, and a crash leaves a
+file that no reopen reads. The B2 1M×10 sheet stays live (it is 55 MB), so Remove Duplicates is still
+12 s; only the package-size threshold crosses into paging.
+
+**Scope (remaining).** The file is a temporary beside the system temp directory, not beside the
+document; a byte-budget LRU (the phase's “few hundred MB”) is a fixed page count with the same
+effect at the export's density but not at every density; a save touches every page and so decodes
+the whole model transiently; and a spill file left by a crash is not cleaned on the next open. Bands
+outside the working set do leave memory, decompressed when the viewport, calculation or a command
+touches them, which is the phase's core.
 
 **Acceptance.**
-- Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size. Measured 10-26
-  at both densities: report-shaped data extrapolates to ~490 MiB and passes; a unique-key export
-  measured 2.4 GB (1.91 GB after the 10-28 finish pass) and still needs paging to pass. Either way
-  100M cells is the number to hold the phase to.
-- The 31.7M-cell report: open time within 15% of the 4.1 s baseline; paint and edit within 5%.
-- Digest unchanged after a cold-then-warm round trip of every sheet.
+- Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size: **16.7 MiB live,
+  183.1 MiB peak**, with 729.5 MiB of compressed pages on disk.
+- The 31.7M-cell report: open time within 15% of the baseline (1.47 s against 1.37 s on this run),
+  paint and edit within 5%.
+- Digest unchanged after a cold-then-warm round trip of every sheet: the paged 100M digest matches
+  the live one, and the report digest is unchanged.
 - A spill file never outlives the document, and a crash leaves no half-written state that a reopen
-  would trust.
+  would trust: the model test drops the store and checks the file is gone; the codec rejects a
+  truncated or corrupt page.
 
-**Risk.** The highest of the group: I/O errors, eviction bugs, and a slow first paint after
-switching sheets. Ship behind `settings.paging` (default on once measured), with the old behaviour
-reachable.
+**Risk.** I/O errors, eviction bugs, and a slow first paint after switching sheets. The store treats
+a failed page write as “stay live” and a corrupt page as missing, never as cells to overwrite; the
+reader's threshold keeps small workbooks out of the path entirely. The remaining work above is the
+polish, not the core.
 
 ### M20 — Append-style structural edits · 80–120 h
 
@@ -625,6 +656,7 @@ different trade — speed and size against interoperability, and against every t
 | Date | Change | Summary |
 |---|---|---|
 | 2026-10-28 | minor | Bulk edits scan blocked arrays once for the union of the changed blocks (Remove Duplicates 1M×10 91 → 12 s, recalc 80 s → 1.4 s); Sort 1M×10 3.2 s, Fill Down 1M rows 1.45 s; `data.sort`/`removeDuplicates`/`setValues` share a 12M-cell cap, 1M×20 refused in 1.3 s; `CellStore::style` fast path |
+| 2026-10-28 | major | M19 cold paging: completed bands are compressed into per-sheet `GPB1` page files, loaded on read through a 4,096-band LRU; the engine pages packages over 200 MB. 100M-cell export: 16.7 MiB live / 183.1 MiB peak / 729.5 MiB compressed pages (11.58 s open), digest unchanged; 31.7M report: 49.7 MiB live, 1.47 s open. Remaining: spill beside document, byte budget, save/scan decode |
 | 2026-10-28 | minor | M19 step: a finished band drops its text pointer index and rebuilds it on the first edit; the 100M-cell export falls from 2,411 to 1,911 MiB live (texts 640 → 301 MiB, number-table slack returned), digest unchanged; a text past the u16 slots keeps its own slot |
 | 2026-10-27 | minor | Independent formulas recalculate on up to eight threads (wave by wave, leaves only; arrays/volatile/iterative stay sequential): 100k end-to-end edit 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; parallel band value writes (4M cap); `Node::may_spill` and graph safety sets |
 | 2026-10-27 | minor | The 100k-dependent edit gate is met single-threaded: 245 → 65–75 ms (full recalculation 281–289 → 134–147 ms) by reading parsed formulas and legacy ranges from the graph, one `Slot` per result (in-progress is an empty value), row-major `CellStore::set_values`, `Arc<RowExtras>` band copies, cached `Formula::expr_bytes` for undo accounting, a diff-first `check_arrays`, and single-cell/one-operator fast paths in the evaluator |

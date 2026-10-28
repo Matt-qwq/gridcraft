@@ -150,7 +150,8 @@ pub fn open_from_path(name: &str, path: &str, password: Option<&str>) -> Result<
     if size > 2 * 1024 * 1024 * 1024 {
         return Err(EngineError::Other("files larger than 2 GB aren't supported".into()));
     }
-    let (mut wb, report) = match gridcraft_xlsx::read_xlsx_file(std::path::Path::new(path)) {
+    let paging = size > 200 * 1024 * 1024;
+    let (mut wb, report) = match gridcraft_xlsx::read_xlsx_file_paged(std::path::Path::new(path), paging) {
         Ok(read) => read,
         // A size complaint is the answer, not a reason to load the file to hear it again.
         Err(e @ gridcraft_xlsx::IoError::TooLarge(_)) => {
@@ -195,7 +196,10 @@ fn open_plain(name: &str, bytes: &[u8], csv_as_text: bool) -> Result<(Workbook, 
     }
     // Text named `.xlsx` is read as text.
     if sniffed == gridcraft_xlsx::Format::Xlsx || (kind == Some(FileKind::Xlsx) && sniffed != gridcraft_xlsx::Format::Csv) {
-        let (wb, report) = gridcraft_xlsx::read_xlsx(bytes).map_err(|e| {
+        // Above this a workbook's cells would dominate memory; the reader spills completed bands
+        // and the model keeps only the pages. The 100M-cell export is 551 MB.
+        let paging = bytes.len() > 200 * 1024 * 1024;
+        let (wb, report) = gridcraft_xlsx::read_xlsx_paged(bytes, paging).map_err(|e| {
             EngineError::Other(match (&e, gridcraft_xlsx::oversized_part(bytes)) {
                 (gridcraft_xlsx::IoError::TooLarge(_), Some((part, size))) => part_too_large_message(name, &part, size),
                 _ => format!("We can't open '{name}': {e}"),

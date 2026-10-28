@@ -77,19 +77,27 @@ pub(crate) struct ReadPlan {
     /// Rows region at least this long may be cut into parallel chunks. Tests lower it so a small
     /// fixture exercises the chunked path.
     pub chunk_min: usize,
+    /// Spill completed bands to a temporary page file while reading. The engine turns this on for
+    /// a workbook large enough that holding all its cells live is not worth it.
+    pub paging: bool,
 }
 
 impl Default for ReadPlan {
     fn default() -> Self {
         // One window is big enough to keep the parallel row decode busy and small enough that a
         // sheet unpacks through memory instead of into it.
-        ReadPlan { stream_min: 64 * 1024 * 1024, window: 24 * 1024 * 1024, chunk_min: 8 * 1024 * 1024 }
+        ReadPlan { stream_min: 64 * 1024 * 1024, window: 24 * 1024 * 1024, chunk_min: 8 * 1024 * 1024, paging: false }
     }
 }
 
 pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: ReadPlan) -> Result<Sheet, IoError> {
     let rels = cx.pkg.rels(part)?;
     let mut sheet = Sheet::new(name);
+    if plan.paging {
+        // Start the page file before the first row is packed, so no band is ever held live only to
+        // be spilled later. A file that cannot be created leaves the sheet in the ordinary store.
+        sheet.cells.enable_paging();
+    }
     let default_height = sheet.default_row_height;
     // A big worksheet is decompressed and decoded window by window; a small one is read whole,
     // which the chunked row decode then splits on its own.

@@ -95,6 +95,16 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     read::read_xlsx(bytes)
 }
 
+/// [`read_xlsx`] with the reader allowed to spill completed bands to a page file.
+pub fn read_xlsx_paged(bytes: &[u8], paging: bool) -> Result<(Workbook, ReadReport), IoError> {
+    read::read_xlsx_paged(bytes, paging)
+}
+
+/// [`read_xlsx_file`] with the reader allowed to spill completed bands to a page file.
+pub fn read_xlsx_file_paged(path: &std::path::Path, paging: bool) -> Result<(Workbook, ReadReport), IoError> {
+    read::read_xlsx_file_paged(path, paging)
+}
+
 /// [`read_xlsx`] straight from a file: the zip directory is read and parts are decompressed as they
 /// are wanted, so a workbook whose sheets are small relative to its size does not arrive as one
 /// resident buffer. A 1.3 GB report of 26,000 cells reads 49 MB of parts.

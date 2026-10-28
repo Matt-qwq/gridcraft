@@ -100,6 +100,13 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     read_xlsx_with(bytes, crate::sheet_read::ReadPlan::default())
 }
 
+/// [`read_xlsx`], choosing whether completed bands go to a page file while the sheets are read.
+/// The engine passes true for a package large enough that the live model would dominate memory;
+/// the plain entry point stays live so tests and small files pay nothing for paging.
+pub fn read_xlsx_paged(bytes: &[u8], paging: bool) -> Result<(Workbook, ReadReport), IoError> {
+    read_xlsx_with(bytes, crate::sheet_read::ReadPlan { paging, ..Default::default() })
+}
+
 /// [`read_xlsx`] with the row-reading plan spelled out: tests use it to read one fixture whole, in
 /// chunks and streamed, and to hold the three against each other.
 pub(crate) fn read_xlsx_with(bytes: &[u8], plan: crate::sheet_read::ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
@@ -108,8 +115,13 @@ pub(crate) fn read_xlsx_with(bytes: &[u8], plan: crate::sheet_read::ReadPlan) ->
 
 /// [`read_xlsx`] from a file, decompressing parts as they are needed instead of holding the file.
 pub fn read_xlsx_file(path: &std::path::Path) -> Result<(Workbook, ReadReport), IoError> {
+    read_xlsx_file_paged(path, false)
+}
+
+/// [`read_xlsx_file`] with the reader allowed to spill completed bands to a page file.
+pub fn read_xlsx_file_paged(path: &std::path::Path, paging: bool) -> Result<(Workbook, ReadReport), IoError> {
     let file = std::fs::File::open(path).map_err(|e| IoError::Format(format!("{}: {e}", path.display())))?;
-    read_package(Package::open_file(file)?, crate::sheet_read::ReadPlan::default())
+    read_package(Package::open_file(file)?, crate::sheet_read::ReadPlan { paging, ..Default::default() })
 }
 
 fn read_package(pkg: Package<'_>, plan: crate::sheet_read::ReadPlan) -> Result<(Workbook, ReadReport), IoError> {

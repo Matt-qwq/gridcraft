@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (§2: a finished band drops its text index and number-table slack; the 100M-cell export is 1,911 MiB live, texts 640 → 301 MiB) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (§2: cold paging lands; the 100M-cell export opens at 16.7 MiB live / 183.1 MiB peak with 729.5 MiB of compressed pages; digest unchanged) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -71,12 +71,17 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   pointer→slot index is only needed while cells are being added, so `Band::finish` drops it and the
   first edit rebuilds it; a completed band keeps one `Arc<str>` per distinct text. The 100M-cell
   unique-key export drops from 2,411 to **1,911 MiB** live (texts 640 → 301 MiB; number tables 679 → 519 MiB), digest unchanged.
+- **Landed (10-28): cold paging.** Completed bands are compressed into per-sheet `GPB1` page files
+  (zlib, fast) and read back through a 4,096-band LRU; the engine pages packages over 200 MB, so the
+  55 MB 1M×10 sheet stays live. The 100M-cell export opens with **16.7 MiB live and 183.1 MiB peak**
+  (was 1.91 GB live) and 729.5 MiB of compressed pages on disk; its digest is cell-for-cell the same
+  with and without paging. The 31.7M report stays live at 49.7 MiB and opens in 1.47 s. Page files
+  are removed with the store; a corrupt or truncated page is refused.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
-  clear/copy/paste still clone the stored cells (they scale with the data, not the file); memory
-  proportional to the cells, never the file (the 1.28 GB,
-  220k-cell workbook lives in 237 MiB), but no cold paging yet — the 100M export still holds 1.91 GB,
-  and the stripes are what makes a band one copy to page out; the per-band value dictionaries still
-  cost full price when values do not repeat;
+  clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
+  file is a temporary beside the system temp directory (not the document), the cache budget is a
+  page count (not a byte count), and a save decodes the whole model transiently; the per-band value
+  dictionaries still cost full price when values do not repeat;
   structural edits still shift every cell below them; whole-column references are already clipped
   (`SUM(A:A)` folds a million numeric cells in 21.5 ms, a ten-row used range in 0.0 ms). The 159
   cells that still differ from the cached values of the 1.28 GB report are Excel's stale cache — 276
@@ -85,8 +90,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `docs/roadmap.md`
   (M17–M21), and the harness kept beside the fork (`_gridcraft-bench/`).
 - **Impact:** finance and data users routinely have big workbooks.
-- **Estimate:** the beta gate's recalc, edit-latency, 1M-row and bounded data-command items are met;
-  cold paging (M19) and append-style structural edits (M20) are the work beyond it, planned in
+- **Estimate:** the beta gate's recalc, edit-latency, 1M-row, bounded data-command and memory items
+  are met; append-style structural edits (M20) are the work beyond it, planned in
   [`roadmap.md`](roadmap.md#large-workbooks-what-big-data-engineering-offers-a-spreadsheet).
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)

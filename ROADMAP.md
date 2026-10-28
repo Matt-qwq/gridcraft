@@ -2,7 +2,7 @@
 
 **Stage: alpha** · next: beta, ~25 points of "ready for real work" and ~160–240 h away
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** minor (M19: finished bands drop their text index and number-table slack; the 100M-cell export is 1,911 MiB live, texts 640 → 301) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-28 · **Change:** major (M19 cold paging lands: a 100M-cell workbook opens at 16.7 MiB live / 183.1 MiB peak, digest unchanged; the 31.7M report is unchanged) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -135,6 +135,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | What landed |
 |---|---|
+| 2026-10-28 | M19 cold paging lands: completed bands are compressed into per-sheet `GPB1` page files (zlib) and decoded through a 4,096-band LRU; the engine pages packages over 200 MB, so the 55 MB 1M×10 sheet stays live. The **100M-cell export opens at 16.7 MiB live / 183.1 MiB peak** (was 1.91 GiB) with 729.5 MiB of compressed pages and its digest cell-for-cell unchanged; the **31.7M report stays live at 49.7 MiB and 1.47 s**. Page files die with the store, corrupt pages are refused; spill-beside-document and a byte budget remain |
 | 2026-10-28 | M19 starts on memory: a finished band drops the text pointer index (the text table stays; the first edit rebuilds the index), so the 100M-cell unique-key export falls from **2,411 to 1,911 MiB** live, its text tables from 640 to 301 MiB and the number-table slack is returned (band overhead 679 to 519 MiB); the 31.7M-cell report digest is unchanged. A text past the u16 slots now keeps its own slot in the row's wide table instead of the last text added. Cold paging is still what takes the remaining 1.9 GB under 600 MB |
 | 2026-10-28 | Bulk edits no longer scan a 64×64 blocked-array block per changed cell: the scan covers the union once, so Remove Duplicates on a 1M×10 sheet fell from **91 s to 12 s** (1M×3: 15.4 → 5.3 s; recalculation 80 → 1.4 s), Sort on the same sheet is 3.2 s and Fill Down of 1M rows 1.45 s. `data.sort`, `data.removeDuplicates` and `range.setValues` share a 12M-cell cap (1M×10 fits, 1M×20 is refused in 1.3 s with the count and limit); Remove Duplicates parses a style's number format once, and `CellStore::style` avoids rebuilding values and formulas for style lookups |
 | 2026-10-27 | Recalc uses the machine's threads: independent formulas (leaves) are evaluated in up to eight shards, wave by wave, so a layered sheet parallelises level by level; large value batches clone the touched bands in workers. An edit of A1 with 100,000 `=$A$1*2` cells is **20–25 ms** end to end (was 65–75 single-threaded, 245 before the round) and a full recalc 89–114 ms; in `calcbench`, 200k is 35–42 ms, 500k 100–132 ms and 1M 208–277 ms (1M full recalc 0.85–1.29 s). Arrays, volatile formulas, legacy arrays and iterative calculation keep the pass sequential; a spill or cycle rolls the parallel results back. The 1.28 GB report (its `FILTER` is an array) is unchanged: same `cell_digest`, same 159 stale-cache cells |
@@ -228,6 +229,7 @@ Ranked; estimates in Opus 5.5 agent-hours. Detail and the full beta-gate list in
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-28 | major | M19 cold paging (compressed pages, LRU; 100M-cell export 16.7 MiB live / 183.1 MiB peak; digest unchanged); gaps §2, roadmap M19 and the progress log updated |
 | 2026-10-28 | minor | M19 memory step (text index dropped after a band is complete, number table shrunk; 100M-cell export 2,411 → 1,911 MiB live); gaps §2 and roadmap M19 updated |
 | 2026-10-28 | minor | Bulk data commands bounded (Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill 1.45 s, 12M-cell cap); gaps §2, roadmap M18 and the parity table updated |
 | 2026-10-27 | minor | Multi-threaded recalculation of independent formulas (100k end-to-end 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms); gaps §2, roadmap M18 and the parity table record the split and the sequential cases |

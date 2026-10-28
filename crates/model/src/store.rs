@@ -27,8 +27,8 @@
 //! A band that overflows the index (more than 65,535 distinct numbers in 64 rows) falls back to
 //! `NUMBER_WIDE`, which keeps the bits in the row's side table.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use gridcraft_core::{CellError, CellRef, RangeRef, Value};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,11 @@ const BAND: u32 = 64;
 const PARALLEL_WRITE_MIN: usize = 16_384;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_WRITE_MAX_CELLS: usize = 4_000_000;
+
+/// How many decoded bands the page cache keeps. A band is at most 64 rows; this is roughly 2.6M
+/// cells at the export's density (a few tens of MiB), enough for a viewport and a scrolling burst
+/// without letting a full-sheet scan grow the working set back to the live model.
+const PAGE_CACHE_PAGES: usize = 4_096;
 
 /// What a payload holds, one byte per stored cell, in column order within the row.
 const NUMBER: u8 = 0;
@@ -1191,6 +1196,15 @@ pub enum Packed<'a> {
 #[derive(Debug, Default)]
 pub struct CellStore {
     bands: BTreeMap<u32, Arc<Band>>,
+    /// Bands that were spilled to a page file. A paged band is still in the store's logical range
+    /// and `len`; it is decoded on the first read and then cached in its `Page`.
+    pages: BTreeMap<u32, Arc<page::Page>>,
+    /// The temporary file the pages live in. One per store (and shared by its clones); dropping
+    /// the last store removes it.
+    page_file: Option<Arc<page::PageFile>>,
+    /// The recency queue for decoded pages; shared by clones, like the file. It holds keys whose
+    /// page is (or was) decoded; a key whose page was evicted is a no-op when it reaches the front.
+    page_order: Option<Arc<Mutex<VecDeque<u32>>>>,
     len: usize,
     /// The band cells were last added to. Cells arrive band by band as a file is read, so the band
     /// before it is complete and can stop carrying its number index. Not part of what a store is:
@@ -1202,16 +1216,26 @@ impl Clone for CellStore {
     /// A copy shares the bands; where the next cell would go is not part of what a store is, so the
     /// copy starts afresh and the first row it takes settles it.
     fn clone(&self) -> Self {
-        CellStore { bands: self.bands.clone(), len: self.len, building: None }
+        CellStore {
+            bands: self.bands.clone(),
+            pages: self.pages.clone(),
+            page_file: self.page_file.clone(),
+            page_order: self.page_order.clone(),
+            len: self.len,
+            building: None,
+        }
     }
 }
 
 impl PartialEq for CellStore {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len
-            && self.bands.len() == other.bands.len()
-            && self.bands.keys().eq(other.bands.keys())
-            && self.bands.iter().all(|(k, a)| other.bands.get(k).is_some_and(|b| Arc::ptr_eq(a, b) || a.same_as(b)))
+            && self.band_count() == other.band_count()
+            && self.bands.keys().chain(self.pages.keys()).eq(other.bands.keys().chain(other.pages.keys()))
+            && self.bands.keys().chain(self.pages.keys()).all(|k| match (self.band_arc(*k), other.band_arc(*k)) {
+                (Some(a), Some(b)) => Arc::ptr_eq(&a, &b) || a.same_as(&b),
+                _ => false,
+            })
     }
 }
 
@@ -1260,6 +1284,44 @@ fn packed_row<'a>(band: &'a Band, row: u32, cells: &'a BandRow, c0: u32, c1: u32
     PackedRow { band, row, cells, col, hi, i }
 }
 
+/// Walks a row range over live and paged bands one band at a time, so a whole-column read does not
+/// collect the sheet (or decode every page at once). A band's cells are gathered into a small
+/// iterator before the next band is loaded.
+struct CellWalk<'a> {
+    store: &'a CellStore,
+    keys: std::vec::IntoIter<u32>,
+    cells: std::vec::IntoIter<(CellRef, Cell)>,
+    r: RangeRef,
+}
+
+impl<'a> CellWalk<'a> {
+    fn new(store: &'a CellStore, keys: Vec<u32>, r: RangeRef) -> CellWalk<'a> {
+        CellWalk { store, keys: keys.into_iter(), cells: Vec::new().into_iter(), r }
+    }
+}
+
+impl Iterator for CellWalk<'_> {
+    type Item = (CellRef, Cell);
+
+    fn next(&mut self) -> Option<(CellRef, Cell)> {
+        loop {
+            if let Some(cell) = self.cells.next() {
+                return Some(cell);
+            }
+            let key = self.keys.next()?;
+            let Some(band) = self.store.band_arc(key) else { continue };
+            let mut cells = Vec::new();
+            for row in &band.rows {
+                let at = key * BAND + row.key;
+                if at >= self.r.start.row && at <= self.r.end.row {
+                    cells.extend(packed_row(&band, at, row, self.r.start.col, self.r.end.col));
+                }
+            }
+            self.cells = cells.into_iter();
+        }
+    }
+}
+
 impl CellStore {
     pub fn new() -> Self {
         Self::default()
@@ -1271,34 +1333,137 @@ impl CellStore {
         self.len == 0
     }
 
+    /// The live band, or the decoded copy of its page. The `Arc` is returned so a caller can keep
+    /// it alive while it walks the band after the store borrow ends.
+    fn band_arc(&self, key: u32) -> Option<Arc<Band>> {
+        if let Some(band) = self.bands.get(&key) {
+            return Some(band.clone());
+        }
+        let page = self.pages.get(&key)?;
+        let (band, first) = page.load(self.page_file.as_deref()?);
+        if first && band.is_some() {
+            self.touch_page(key);
+        }
+        band
+    }
+
+    /// Records a decoded page and evicts the oldest when the cache is full. The queue is shared by
+    /// undo snapshots, so an eviction here helps every store holding the same file.
+    fn touch_page(&self, key: u32) {
+        let Some(order) = &self.page_order else { return };
+        let Ok(mut order) = order.lock() else { return };
+        order.push_back(key);
+        while order.len() > PAGE_CACHE_PAGES {
+            let Some(old) = order.pop_front() else { break };
+            if old != key
+                && let Some(page) = self.pages.get(&old)
+            {
+                page.clear();
+            }
+        }
+    }
+
+    /// Bands held in memory, and bands on the page file.
+    pub fn paged_band_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Turns paging on for this store: every completed band already in it is written to a fresh
+    /// temporary page file, and later `insert_batch` calls spill the bands they add. Called by the
+    /// reader before it fills a sheet, so a large open keeps pages instead of every band.
+    ///
+    /// Returns false when a temporary file cannot be created; the store stays ordinary.
+    pub fn enable_paging(&mut self) -> bool {
+        if self.page_file.is_some() {
+            return true;
+        }
+        let Some(file) = page::PageFile::new() else { return false };
+        self.page_file = Some(Arc::new(file));
+        self.page_order = Some(Arc::new(Mutex::new(VecDeque::new())));
+        self.spill_pages();
+        true
+    }
+
+    /// Spills every live band that can be encoded. A band that fails to encode (or a page that
+    /// cannot be written) stays live; paging never loses cells.
+    pub fn spill_pages(&mut self) {
+        let keys: Vec<u32> = self.bands.keys().copied().collect();
+        for key in keys {
+            self.spill_band(key);
+        }
+    }
+
+    fn spill_band(&mut self, key: u32) {
+        let Some(file) = self.page_file.clone() else { return };
+        let Some(band) = self.bands.get(&key).cloned() else { return };
+        let Some(bytes) = page::encode_band(&band) else { return };
+        let Some(at) = file.write(&bytes) else { return };
+        let bounds = page::band_bounds(&band);
+        let formulas = band.rows.iter().any(|r| !r.formulas().is_empty());
+        let owned = band.rows.iter().any(|r| !r.formulas().is_empty() || !r.arrays().is_empty());
+        self.bands.remove(&key);
+        self.pages.insert(key, Arc::new(page::Page::new(at, bounds, formulas, owned)));
+    }
+
+    /// Loads a paged band back into the live map, so a write can modify it. A corrupt page stays
+    /// paged and the write is refused rather than replacing data with an empty band.
+    fn materialize(&mut self, key: u32) -> Option<Arc<Band>> {
+        if let Some(band) = self.bands.get(&key) {
+            return Some(band.clone());
+        }
+        let page = self.pages.get(&key)?.clone();
+        let band = page.load(self.page_file.as_deref()?).0?;
+        self.pages.remove(&key);
+        self.bands.insert(key, band.clone());
+        Some(band)
+    }
+
+    /// Bytes the page file holds, for the memory diagnostics. Pages are encoded, not compressed
+    /// yet; this is the live cost of the decoded bands that have been touched, plus the file.
+    pub fn paged_bytes(&self) -> usize {
+        self.pages.values().map(|p| p.page_len()).sum()
+    }
+
+    /// The band keys in a row range, from memory and from pages, in order and without duplicates.
+    fn keys_in(&self, r0: u32, r1: u32) -> Vec<u32> {
+        let mut keys: Vec<u32> = self.bands.range(r0 / BAND..=r1 / BAND).map(|(k, _)| *k).collect();
+        keys.extend(self.pages.range(r0 / BAND..=r1 / BAND).map(|(k, _)| *k));
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
     /// Reads one cell. The value is rebuilt rather than borrowed: cells live in packed pages, so
     /// there is no `Cell` to point at. A text cell shares its string, so the copy is a pointer
     /// bump, not a string copy.
     pub fn get(&self, c: CellRef) -> Option<Cell> {
-        let band = self.bands.get(&(c.row / BAND))?;
+        let band = self.band_arc(c.row / BAND)?;
         let row = band.row(c.row % BAND)?;
-        let i = row.index_of(band, c.col)?;
+        let i = row.index_of(&band, c.col)?;
         Some(band.cell_at(row, i, c.col))
     }
 
     /// The style of a stored cell, without reconstructing the `Cell` (and its value and formula).
     /// A style is all a formatting or duplicate check needs; `get` rebuilds the rest for nothing.
     pub fn style(&self, c: CellRef) -> Option<StyleId> {
-        let band = self.bands.get(&(c.row / BAND))?;
+        let band = self.band_arc(c.row / BAND)?;
         let row = band.row(c.row % BAND)?;
-        let i = row.index_of(band, c.col)?;
-        Some(band.style(row.style_at(band, i)))
+        let i = row.index_of(&band, c.col)?;
+        Some(band.style(row.style_at(&band, i)))
     }
 
     /// True when the position holds a cell at all (a stored style counts).
     pub fn contains(&self, c: CellRef) -> bool {
-        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND).map(|r| (b, r))).is_some_and(|(b, r)| r.index_of(b, c.col).is_some())
+        self.band_arc(c.row / BAND).is_some_and(|b| b.row(c.row % BAND).is_some_and(|r| r.index_of(&b, c.col).is_some()))
     }
 
     /// Stores a cell; a default (empty, unstyled) cell is removed instead.
     pub fn set(&mut self, c: CellRef, cell: Cell) {
         let key = c.row / BAND;
         let row = c.row % BAND;
+        if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+            return;
+        }
         let had = self.contains(c);
         let band = Arc::make_mut(self.bands.entry(key).or_default());
         band.put(row, c.col, cell);
@@ -1320,9 +1485,15 @@ impl CellStore {
         for (key, mut band) in batch.bands {
             // A batch is complete: give back what building it over-allocated.
             band.finish();
+            // A chunk boundary can land in a band already spilled by the previous batch: bring it
+            // back so the merge can see its rows, then spill the result again.
+            if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+                continue;
+            }
             let Some(existing) = self.bands.get_mut(&key) else {
                 self.len += count(&band);
                 self.bands.insert(key, Arc::new(band));
+                self.spill_band(key);
                 continue;
             };
             // A band both sides hold: a chunk boundary fell inside it, since chunks are cut at row
@@ -1347,6 +1518,7 @@ impl CellStore {
                 }
                 self.len += target.row(row.key).map_or(0, |r| r.cells as usize) - before;
             }
+            self.spill_band(key);
         }
         if self.building.is_none() {
             self.building = self.bands.keys().next_back().copied();
@@ -1359,13 +1531,28 @@ impl CellStore {
     /// A recalculation only changes values, but [`set`](Self::set) rebuilds the whole `Cell` (and
     /// takes the store's bands apart) for each one; at 100k results that is most of the write-back.
     pub fn set_value(&mut self, c: CellRef, value: &Value) -> bool {
-        let Some(band) = self.bands.get_mut(&(c.row / BAND)) else { return false };
+        let key = c.row / BAND;
+        if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+            return false;
+        }
+        let Some(band) = self.bands.get_mut(&key) else { return false };
         Arc::make_mut(band).set_value(c.row % BAND, c.col, value)
     }
 
     /// Replaces the values of cells that already exist. `values` must be sorted in row-major
     /// order (the order a recalculation writes them in), so each band is looked up once.
     pub fn set_values(&mut self, values: &mut [(CellRef, Value)]) {
+        // A paged band a result lands in has to come back before either write path looks at the
+        // live map. Values are sorted by row, so the touched bands are a short run of keys.
+        if !self.pages.is_empty() {
+            let mut keys: Vec<u32> = values.iter().map(|(c, _)| c.row / BAND).collect();
+            keys.dedup();
+            for key in keys {
+                if self.pages.contains_key(&key) {
+                    self.materialize(key);
+                }
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if values.len() >= PARALLEL_WRITE_MIN && values.len() <= PARALLEL_WRITE_MAX_CELLS {
             let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
@@ -1382,6 +1569,10 @@ impl CellStore {
         while i < values.len() {
             let key = values[i].0.row / BAND;
             let end = values[i..].partition_point(|(c, _)| c.row / BAND == key) + i;
+            if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+                i = end;
+                continue;
+            }
             if let Some(band) = self.bands.get_mut(&key) {
                 let band = Arc::make_mut(band);
                 for (c, v) in &values[i..end] {
@@ -1459,6 +1650,9 @@ impl CellStore {
         });
         let key = row / BAND;
         let band_row = row % BAND;
+        if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+            return;
+        }
         if self.building != Some(key) {
             // The band this replaces is finished; give back its index, if nobody shares it.
             if let Some(done) = self.building.replace(key)
@@ -1513,6 +1707,9 @@ impl CellStore {
 
     pub fn remove(&mut self, c: CellRef) -> Option<Cell> {
         let key = c.row / BAND;
+        if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+            return None;
+        }
         let band = self.bands.get_mut(&key)?;
         let cell = Arc::make_mut(band).take(c.row % BAND, c.col)?;
         self.len -= 1;
@@ -1524,29 +1721,42 @@ impl CellStore {
 
     /// The cells of `r` that carry a formula, in row-major order.
     pub fn formula_cells(&self, r: RangeRef) -> impl Iterator<Item = CellRef> + '_ {
-        self.bands.range(r.start.row / BAND..=r.end.row / BAND).flat_map(move |(bk, band)| {
-            band.rows.iter().flat_map(move |row| {
+        let mut out = Vec::new();
+        for bk in self.keys_in(r.start.row, r.end.row) {
+            if self.pages.get(&bk).is_some_and(|page| !page.has_formulas()) {
+                continue;
+            }
+            let Some(band) = self.band_arc(bk) else { continue };
+            for row in &band.rows {
                 let at_row = bk * BAND + row.key;
-                row.formulas()
-                    .iter()
-                    .filter(move |(c, _)| at_row >= r.start.row && at_row <= r.end.row && *c >= r.start.col && *c <= r.end.col)
-                    .map(move |(c, _)| CellRef::new(at_row, *c))
-            })
-        })
+                out.extend(
+                    row.formulas()
+                        .iter()
+                        .filter(|(c, _)| at_row >= r.start.row && at_row <= r.end.row && *c >= r.start.col && *c <= r.end.col)
+                        .map(|(c, _)| CellRef::new(at_row, *c)),
+                );
+            }
+        }
+        out.into_iter()
     }
 
     /// Whether the block holds a cell whose value the store cannot give: a formula (it holds the
     /// value the file cached) or an array. Cheap next to reading the block: one check a row.
     pub fn has_owned_cells(&self, r: RangeRef) -> bool {
-        self.bands.range(r.start.row / BAND..=r.end.row / BAND).any(|(bk, band)| {
-            band.rows.iter().any(|row| {
-                let at_row = bk * BAND + row.key;
-                at_row >= r.start.row
-                    && at_row <= r.end.row
-                    && row.extras.as_ref().is_some_and(|e| {
-                        e.formulas.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
-                            || e.arrays.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
-                    })
+        self.keys_in(r.start.row, r.end.row).into_iter().any(|bk| {
+            if self.pages.get(&bk).is_some_and(|page| !page.has_owned()) {
+                return false;
+            }
+            self.band_arc(bk).is_some_and(|band| {
+                band.rows.iter().any(|row| {
+                    let at_row = bk * BAND + row.key;
+                    at_row >= r.start.row
+                        && at_row <= r.end.row
+                        && row.extras.as_ref().is_some_and(|e| {
+                            e.formulas.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
+                                || e.arrays.iter().any(|(c, _)| (r.start.col..=r.end.col).contains(c))
+                        })
+                })
             })
         })
     }
@@ -1559,7 +1769,8 @@ impl CellStore {
     /// a million-cell column spent all of its 154 ms there.
     pub fn visit_packed(&self, r: RangeRef, f: &mut dyn FnMut(CellRef, Option<Packed<'_>>) -> bool) -> bool {
         let (r0, r1) = (r.start.row, r.end.row);
-        for (bk, band) in self.bands.range(r0 / BAND..=r1 / BAND) {
+        for bk in self.keys_in(r0, r1) {
+            let Some(band) = self.band_arc(bk) else { continue };
             for row in &band.rows {
                 let at_row = bk * BAND + row.key;
                 if at_row < r0 || at_row > r1 {
@@ -1576,9 +1787,9 @@ impl CellStore {
                 // A cell that carries a formula stores the value the file cached, which is not
                 // its value now: the evaluator owns it, so hand it over as `None`.
                 let formulas = row.extras.as_ref().map(|e| e.formulas.as_slice()).filter(|f| !f.is_empty());
-                let mut i = row.rank_before(band, lo);
-                let mut kinds = RunCursor::new(row.kind_runs(band), u16::from(EMPTY));
-                'words: for (word, bits) in row.bits(band).iter().enumerate().skip(start_slot / 64) {
+                let mut i = row.rank_before(&band, lo);
+                let mut kinds = RunCursor::new(row.kind_runs(&band), u16::from(EMPTY));
+                'words: for (word, bits) in row.bits(&band).iter().enumerate().skip(start_slot / 64) {
                     let mut w = *bits;
                     if word == start_slot / 64 {
                         w &= !((1u64 << (start_slot % 64)) - 1);
@@ -1594,7 +1805,7 @@ impl CellStore {
                             break 'words;
                         }
                         let has_formula = formulas.is_some_and(|f| f.binary_search_by_key(&col, |(c, _)| *c).is_ok());
-                        let payload = row.payload_at(band, index);
+                        let payload = row.payload_at(&band, index);
                         let packed = if has_formula {
                             None
                         } else {
@@ -1603,9 +1814,9 @@ impl CellStore {
                                 // and `iter_range` does not hand one out either.
                                 EMPTY => continue,
                                 NUMBER => Some(Packed::Number(band.number(payload))),
-                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(band, index)))),
+                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(&band, index)))),
                                 TEXT => band.texts.get(payload as usize).map(|t| Packed::Text(t)),
-                                TEXT_WIDE => band.texts.get(row.wide_at(band, index) as usize).map(|t| Packed::Text(t)),
+                                TEXT_WIDE => band.texts.get(row.wide_at(&band, index) as usize).map(|t| Packed::Text(t)),
                                 BOOL => Some(Packed::Bool(payload != 0)),
                                 ERROR => Some(Packed::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value))),
                                 _ => None,
@@ -1622,27 +1833,25 @@ impl CellStore {
     }
 
     pub fn iter_range(&self, r: RangeRef) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
-        let (r0, r1) = (r.start.row, r.end.row);
-        self.bands.range(r0 / BAND..=r1 / BAND).flat_map(move |(bk, band)| {
-            band.rows
-                .iter()
-                .filter_map(move |cells| {
-                    let row = bk * BAND + cells.key;
-                    (row >= r0 && row <= r1).then(|| packed_row(band, row, cells, r.start.col, r.end.col))
-                })
-                .flatten()
-        })
+        CellWalk::new(self, self.keys_in(r.start.row, r.end.row), r)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
-        self.bands
-            .iter()
-            .flat_map(move |(bk, band)| band.rows.iter().flat_map(move |cells| packed_row(band, bk * BAND + cells.key, cells, 0, u32::MAX)))
+        let mut keys: Vec<u32> = self.bands.keys().chain(self.pages.keys()).copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let all = RangeRef::new(CellRef::new(0, 0), CellRef::new(u32::MAX, u32::MAX));
+        CellWalk::new(self, keys, all)
     }
 
     pub fn row(&self, row: u32, c0: u32, c1: u32) -> impl Iterator<Item = (u32, Cell)> + '_ {
-        let packed = self.bands.get(&(row / BAND)).and_then(|b| b.row(row % BAND).map(|cells| packed_row(b, row, cells, c0, c1)));
-        packed.into_iter().flatten().map(|(at, cell)| (at.col, cell))
+        let mut out = Vec::new();
+        if let Some(band) = self.band_arc(row / BAND)
+            && let Some(cells) = band.row(row % BAND)
+        {
+            out.extend(packed_row(&band, row, cells, c0, c1).map(|(at, cell)| (at.col, cell)));
+        }
+        out.into_iter()
     }
 
     pub fn used_range(&self) -> Option<RangeRef> {
@@ -1660,6 +1869,13 @@ impl CellStore {
                 c1 = c1.max(last);
             }
         }
+        for (bk, page) in &self.pages {
+            let Some((pr0, pr1, pc0, pc1)) = page.bounds() else { continue };
+            r0 = r0.min(bk * BAND + pr0);
+            r1 = r1.max(bk * BAND + pr1);
+            c0 = c0.min(pc0);
+            c1 = c1.max(pc1);
+        }
         if c0 == u32::MAX {
             return None;
         }
@@ -1670,20 +1886,29 @@ impl CellStore {
     /// with it. Iterates the per-row side tables rather than the cells: a sheet can hold a hundred
     /// million cells and a few thousand formulas, and scanning the cells to find them costs more
     /// than opening the file.
-    pub fn formulas(&self) -> impl Iterator<Item = (CellRef, &Arc<Formula>, bool)> + '_ {
-        self.bands.iter().flat_map(|(bk, band)| {
-            band.rows.iter().flat_map(move |cells| {
-                cells.formulas().iter().map(move |(col, f)| {
-                    let has_value = cells.index_of(band, *col).is_some_and(|i| cells.kind_at(band, i) != EMPTY);
-                    (CellRef::new(bk * BAND + cells.key, *col), f, has_value)
-                })
-            })
-        })
+    pub fn formulas(&self) -> impl Iterator<Item = (CellRef, Arc<Formula>, bool)> + '_ {
+        let mut keys: Vec<u32> = self.bands.keys().chain(self.pages.keys()).copied().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut out = Vec::new();
+        for bk in keys {
+            if self.pages.get(&bk).is_some_and(|page| !page.has_formulas()) {
+                continue;
+            }
+            let Some(band) = self.band_arc(bk) else { continue };
+            for cells in &band.rows {
+                for (col, f) in cells.formulas() {
+                    let has_value = cells.index_of(&band, *col).is_some_and(|i| cells.kind_at(&band, i) != EMPTY);
+                    out.push((CellRef::new(bk * BAND + cells.key, *col), f.clone(), has_value));
+                }
+            }
+        }
+        out.into_iter()
     }
 
     /// A stored cell with a value or a formula (a style alone does not count).
     pub fn has(&self, c: CellRef) -> bool {
-        self.bands.get(&(c.row / BAND)).and_then(|b| b.row(c.row % BAND).map(|row| (b, row))).is_some_and(|(b, row)| row_has_value(b, row, c.col))
+        self.band_arc(c.row / BAND).is_some_and(|b| b.row(c.row % BAND).is_some_and(|row| row_has_value(&b, row, c.col)))
     }
 
     /// Last row (inclusive, capped at `cap`) of the maximal run of contiguous rows at or after
@@ -1693,7 +1918,7 @@ impl CellStore {
         let mut expect = from.row;
         while expect <= cap {
             let band_key = expect / BAND;
-            let Some(band) = self.bands.get(&band_key) else { break };
+            let Some(band) = self.band_arc(band_key) else { break };
             let mut advanced = false;
             let start = expect % BAND;
             let first = band.rows.partition_point(|r| r.key < start);
@@ -1702,7 +1927,7 @@ impl CellStore {
                 if at != expect || at > cap {
                     break;
                 }
-                if !row.value_nonempty(band, from.col) {
+                if !row.value_nonempty(&band, from.col) {
                     return last;
                 }
                 last = Some(expect);
@@ -1718,41 +1943,41 @@ impl CellStore {
 
     /// Positions whose cells differ between `self` and `other`.
     pub fn diff(&self, other: &CellStore) -> Vec<CellRef> {
-        let mut keys: Vec<u32> = self.bands.keys().chain(other.bands.keys()).copied().collect();
+        let mut keys: Vec<u32> = self.bands.keys().chain(self.pages.keys()).chain(other.bands.keys()).chain(other.pages.keys()).copied().collect();
         keys.sort_unstable();
         keys.dedup();
         let mut out = Vec::new();
         for k in keys {
-            let (a, b) = (self.bands.get(&k), other.bands.get(&k));
-            if let (Some(a), Some(b)) = (a, b)
+            let (a, b) = (self.band_arc(k), other.band_arc(k));
+            if let (Some(a), Some(b)) = (&a, &b)
                 && Arc::ptr_eq(a, b)
             {
                 continue;
             }
             let band = k * BAND;
             let mut rows: Vec<u32> = Vec::new();
-            if let Some(a) = a {
+            if let Some(a) = a.as_deref() {
                 rows.extend(a.rows.iter().map(|r| r.key));
             }
-            if let Some(b) = b {
+            if let Some(b) = b.as_deref() {
                 rows.extend(b.rows.iter().map(|r| r.key));
             }
             rows.sort_unstable();
             rows.dedup();
             for row in rows {
-                let (ra, rb) = (a.and_then(|x| x.row(row)), b.and_then(|x| x.row(row)));
+                let (ra, rb) = (a.as_deref().and_then(|x| x.row(row)), b.as_deref().and_then(|x| x.row(row)));
                 let mut cols: Vec<u32> = Vec::new();
-                if let (Some(a), Some(ra)) = (a, ra) {
+                if let (Some(a), Some(ra)) = (a.as_deref(), ra) {
                     cols.extend(packed_row(a, band + row, ra, 0, u32::MAX).map(|(c, _)| c.col));
                 }
-                if let (Some(b), Some(rb)) = (b, rb) {
+                if let (Some(b), Some(rb)) = (b.as_deref(), rb) {
                     cols.extend(packed_row(b, band + row, rb, 0, u32::MAX).map(|(c, _)| c.col));
                 }
                 cols.sort_unstable();
                 cols.dedup();
                 for col in cols {
-                    let x = a.and_then(|x| ra.and_then(|r| r.index_of(x, col).map(|i| (x, r, i))));
-                    let y = b.and_then(|y| rb.and_then(|r| r.index_of(y, col).map(|i| (y, r, i))));
+                    let x = a.as_deref().and_then(|x| ra.and_then(|r| r.index_of(x, col).map(|i| (x, r, i))));
+                    let y = b.as_deref().and_then(|y| rb.and_then(|r| r.index_of(y, col).map(|i| (y, r, i))));
                     let same = match (x, y) {
                         (None, None) => true,
                         (Some((xb, xr, xi)), Some((yb, yr, yi))) => {
@@ -1775,6 +2000,12 @@ impl CellStore {
     /// Rough heap storage kept alive by this snapshot's bands that `newer` no longer shares.
     pub fn retained_bytes_against(&self, newer: &CellStore) -> usize {
         let mut bytes = 0usize;
+        for (key, page) in &self.pages {
+            if newer.pages.get(key).is_some_and(|next| Arc::ptr_eq(next, page)) {
+                continue;
+            }
+            bytes += page.page_len();
+        }
         for (key, band) in &self.bands {
             let next = newer.bands.get(key);
             if next.is_some_and(|b| Arc::ptr_eq(b, band)) {
@@ -1839,7 +2070,7 @@ impl CellStore {
     /// How many bands the store holds: the unit paging will work in, and what tells a probe whether
     /// a file's cells are sparse across rows or packed into a few.
     pub fn band_count(&self) -> usize {
-        self.bands.len()
+        self.bands.len().saturating_add(self.pages.len())
     }
 
     /// Bytes the packing itself holds (see [`packed_breakdown`](Self::packed_breakdown)).
@@ -2074,6 +2305,620 @@ mod packed_tests {
     }
 }
 
+/// The page file a store can spill completed bands into, and the band codec it uses.
+///
+/// A page holds one finished band: the four stripes, the number table, the text table and the
+/// style table. The format is deliberately small and self-checking on read; a page that does not
+/// parse is reported as missing rather than trusted. The file is a temporary beside the system's
+/// temp directory, removed when the last store that owns it drops, and never referenced by a
+/// document on disk.
+mod page {
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    use flate2::Compression;
+    use flate2::read::ZlibDecoder;
+    use flate2::write::ZlibEncoder;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use gridcraft_core::{CellError, CellRef, RangeRef, Value};
+
+    use super::{Band, BandRow, ERRORS, Formula, RowExtras, StyleId, error_code};
+
+    const MAGIC: u32 = 0x4750_4231; // "GPB1"
+    const VERSION: u8 = 1;
+    const MAX_PAGE: usize = 64 * 1024 * 1024;
+    const MAX_ROWS: u32 = 64;
+    const MAX_COLS: u32 = 16_384;
+    const MAX_CELLS: usize = 1_048_576;
+    const MAX_TEXT: usize = 16 * 1024 * 1024;
+    const MAX_DEPTH: u32 = 8;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct PageRef {
+        offset: u64,
+        len: u32,
+    }
+
+    /// A completed band on disk, with the range its rows cover so `used_range` does not have to
+    /// load every page. `band` caches the decoded copy after the first read; a corrupt page is
+    /// remembered as `None` and behaves as missing.
+    #[derive(Debug)]
+    enum Cached {
+        Miss,
+        Corrupt,
+        Band(Arc<Band>),
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Page {
+        at: PageRef,
+        bounds: Option<(u32, u32, u32, u32)>,
+        formulas: bool,
+        owned: bool,
+        band: Mutex<Cached>,
+    }
+
+    impl Page {
+        pub(super) fn new(at: PageRef, bounds: Option<(u32, u32, u32, u32)>, formulas: bool, owned: bool) -> Page {
+            Page { at, bounds, formulas, owned, band: Mutex::new(Cached::Miss) }
+        }
+
+        pub(super) fn bounds(&self) -> Option<(u32, u32, u32, u32)> {
+            self.bounds
+        }
+
+        pub(super) fn has_formulas(&self) -> bool {
+            self.formulas
+        }
+
+        pub(super) fn has_owned(&self) -> bool {
+            self.owned
+        }
+
+        pub(super) fn page_len(&self) -> usize {
+            usize::try_from(self.at.len).unwrap_or(0)
+        }
+
+        /// The decoded band, reading and validating the page on first use. The bool says this call
+        /// decoded it, which is what the store's page-cache queue needs to know.
+        pub(super) fn load(&self, file: &PageFile) -> (Option<Arc<Band>>, bool) {
+            if let Ok(guard) = self.band.lock() {
+                match &*guard {
+                    Cached::Band(band) => return (Some(band.clone()), false),
+                    Cached::Corrupt => return (None, false),
+                    Cached::Miss => {}
+                }
+            }
+            let decoded = file.read(self.at).and_then(|bytes| decode_band(&bytes).map(Arc::new));
+            if let Ok(mut guard) = self.band.lock() {
+                match &*guard {
+                    Cached::Band(band) => return (Some(band.clone()), false),
+                    Cached::Corrupt => return (None, false),
+                    Cached::Miss => {
+                        *guard = match &decoded {
+                            Some(band) => Cached::Band(band.clone()),
+                            None => Cached::Corrupt,
+                        };
+                    }
+                }
+            }
+            (decoded, true)
+        }
+
+        /// Drops the decoded copy; a later read decodes the page again. A corrupt page stays
+        /// remembered as corrupt rather than being retried on every access.
+        pub(super) fn clear(&self) {
+            if let Ok(mut guard) = self.band.lock()
+                && matches!(&*guard, Cached::Band(_))
+            {
+                *guard = Cached::Miss;
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn is_cached(&self) -> bool {
+            self.band.lock().is_ok_and(|guard| matches!(&*guard, Cached::Band(_)))
+        }
+    }
+
+    /// A temporary file pages are appended to. One handle is shared by every clone of a store and
+    /// by its undo snapshots; writes and reads serialise on the mutex, which is fine for the read
+    /// path a viewport exercises (one page at a time).
+    #[derive(Debug)]
+    pub(super) struct PageFile {
+        path: PathBuf,
+        file: Mutex<Option<File>>,
+    }
+
+    impl PageFile {
+        pub(super) fn new() -> Option<PageFile> {
+            // A counter, not the clock: `SystemTime::now` traps on wasm. The pid separates
+            // processes; `create_new` still refuses a stale collision, and the loop tries the next
+            // name rather than trusting an existing file.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+            for attempt in 0..16u32 {
+                let path = std::env::temp_dir().join(format!("gridcraft-page-{}-{nonce}-{attempt}.bin", std::process::id()));
+                match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
+                    Ok(file) => return Some(PageFile { path, file: Mutex::new(Some(file)) }),
+                    Err(_) => continue,
+                }
+            }
+            None
+        }
+
+        /// Appends `bytes` and returns where they landed. A page larger than the cap is refused
+        /// before it is written.
+        #[cfg(test)]
+        pub(super) fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        pub(super) fn write(&self, bytes: &[u8]) -> Option<PageRef> {
+            if bytes.is_empty() || bytes.len() > MAX_PAGE {
+                return None;
+            }
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(bytes).ok()?;
+            let packed = encoder.finish().ok()?;
+            let len = u32::try_from(packed.len()).ok()?;
+            if packed.is_empty() || packed.len() > MAX_PAGE {
+                return None;
+            }
+            let mut guard = self.file.lock().ok()?;
+            let file = guard.as_mut()?;
+            let offset = file.seek(SeekFrom::End(0)).ok()?;
+            file.write_all(&packed).ok()?;
+            Some(PageRef { offset, len })
+        }
+
+        fn read(&self, at: PageRef) -> Option<Vec<u8>> {
+            let len = usize::try_from(at.len).ok()?;
+            if len == 0 || len > MAX_PAGE {
+                return None;
+            }
+            let mut guard = self.file.lock().ok()?;
+            let file = guard.as_mut()?;
+            file.seek(SeekFrom::Start(at.offset)).ok()?;
+            let mut packed = vec![0u8; len];
+            file.read_exact(&mut packed).ok()?;
+            drop(guard);
+            let mut decoder = ZlibDecoder::new(packed.as_slice());
+            let mut bytes = Vec::new();
+            decoder.by_ref().take(MAX_PAGE as u64 + 1).read_to_end(&mut bytes).ok()?;
+            (bytes.len() <= MAX_PAGE).then_some(bytes)
+        }
+    }
+
+    impl Drop for PageFile {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = self.file.lock()
+                && let Some(file) = guard.take()
+            {
+                drop(file);
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn put_u8(out: &mut Vec<u8>, v: u8) {
+        out.push(v);
+    }
+
+    fn put_u16(out: &mut Vec<u8>, v: u16) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u32(out: &mut Vec<u8>, v: u32) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_u64(out: &mut Vec<u8>, v: u64) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn put_len(out: &mut Vec<u8>, len: usize) {
+        // Every caller has checked the length against a page cap; a truncated length would make
+        // the decoder reject the page anyway, so saturate rather than truncate silently.
+        put_u32(out, u32::try_from(len).unwrap_or(u32::MAX));
+    }
+
+    fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+        put_len(out, bytes.len());
+        out.extend_from_slice(bytes);
+    }
+
+    fn put_runs(out: &mut Vec<u8>, runs: &[(u16, u16)]) {
+        put_len(out, runs.len());
+        for (a, b) in runs {
+            put_u16(out, *a);
+            put_u16(out, *b);
+        }
+    }
+
+    fn take_u8(input: &mut &[u8]) -> Option<u8> {
+        let (first, rest) = input.split_first()?;
+        *input = rest;
+        Some(*first)
+    }
+
+    fn take_u16(input: &mut &[u8]) -> Option<u16> {
+        let bytes: [u8; 2] = input.get(..2)?.try_into().ok()?;
+        *input = input.get(2..)?;
+        Some(u16::from_le_bytes(bytes))
+    }
+
+    fn take_u32(input: &mut &[u8]) -> Option<u32> {
+        let bytes: [u8; 4] = input.get(..4)?.try_into().ok()?;
+        *input = input.get(4..)?;
+        Some(u32::from_le_bytes(bytes))
+    }
+
+    fn take_u64(input: &mut &[u8]) -> Option<u64> {
+        let bytes: [u8; 8] = input.get(..8)?.try_into().ok()?;
+        *input = input.get(8..)?;
+        Some(u64::from_le_bytes(bytes))
+    }
+
+    fn take_len(input: &mut &[u8], cap: usize) -> Option<usize> {
+        let len = usize::try_from(take_u32(input)?).ok()?;
+        (len <= cap).then_some(len)
+    }
+
+    fn take_bytes(input: &mut &[u8], cap: usize) -> Option<Vec<u8>> {
+        let len = take_len(input, cap)?;
+        let bytes = input.get(..len)?.to_vec();
+        *input = input.get(len..)?;
+        Some(bytes)
+    }
+
+    fn encode_value(out: &mut Vec<u8>, value: &Value, depth: u32) -> Option<()> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match value {
+            Value::Empty => put_u8(out, 0),
+            Value::Number(n) => {
+                put_u8(out, 1);
+                put_u64(out, if *n == 0.0 { 0.0f64.to_bits() } else { n.to_bits() });
+            }
+            Value::Text(t) => {
+                put_u8(out, 2);
+                if t.len() > MAX_TEXT {
+                    return None;
+                }
+                put_bytes(out, t.as_bytes());
+            }
+            Value::Bool(b) => {
+                put_u8(out, 3);
+                put_u8(out, u8::from(*b));
+            }
+            Value::Error(e) => {
+                put_u8(out, 4);
+                put_u8(out, error_code(*e) as u8);
+            }
+            Value::Array(a) => {
+                put_u8(out, 5);
+                put_u32(out, u32::try_from(a.rows).ok()?);
+                put_u32(out, u32::try_from(a.cols).ok()?);
+                put_len(out, a.data.len());
+                for v in &a.data {
+                    encode_value(out, v, depth.saturating_add(1))?;
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn decode_value(input: &mut &[u8], depth: u32) -> Option<Value> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        match take_u8(input)? {
+            0 => Some(Value::Empty),
+            1 => Some(Value::Number(f64::from_bits(take_u64(input)?))),
+            2 => {
+                let bytes = take_bytes(input, MAX_TEXT)?;
+                let text = std::str::from_utf8(&bytes).ok()?;
+                Some(Value::Text(Arc::from(text)))
+            }
+            3 => Some(Value::Bool(take_u8(input)? != 0)),
+            4 => {
+                let code = take_u8(input)?;
+                Some(Value::Error(*ERRORS.get(usize::from(code)).unwrap_or(&CellError::Value)))
+            }
+            5 => {
+                let rows = usize::try_from(take_u32(input)?).ok()?;
+                let cols = usize::try_from(take_u32(input)?).ok()?;
+                let len = take_len(input, MAX_CELLS)?;
+                if rows == 0 || cols == 0 || rows.checked_mul(cols)? != len {
+                    return None;
+                }
+                let mut data = Vec::with_capacity(len);
+                for _ in 0..len {
+                    data.push(decode_value(input, depth.saturating_add(1))?);
+                }
+                Some(Value::Array(Arc::new(gridcraft_core::Array { rows, cols, data })))
+            }
+            _ => None,
+        }
+    }
+
+    fn encode_formula(out: &mut Vec<u8>, f: &Formula) -> Option<()> {
+        if f.text.len() > MAX_TEXT {
+            return None;
+        }
+        put_bytes(out, f.text.as_bytes());
+        match f.array {
+            Some(a) => {
+                put_u8(out, 1);
+                put_u32(out, a.start.row);
+                put_u32(out, a.start.col);
+                put_u32(out, a.end.row);
+                put_u32(out, a.end.col);
+            }
+            None => put_u8(out, 0),
+        }
+        put_u8(out, u8::from(f.dynamic));
+        Some(())
+    }
+
+    fn decode_formula(input: &mut &[u8]) -> Option<Arc<Formula>> {
+        let bytes = take_bytes(input, MAX_TEXT)?;
+        let text = String::from_utf8(bytes).ok()?;
+        let array = match take_u8(input)? {
+            0 => None,
+            1 => Some(RangeRef::new(CellRef::new(take_u32(input)?, take_u32(input)?), CellRef::new(take_u32(input)?, take_u32(input)?))),
+            _ => return None,
+        };
+        let dynamic = take_u8(input)? != 0;
+        // Reparse so a loaded formula behaves exactly like the one that was spilled (including the
+        // parsed tree and the undo byte count). Most pages hold no formulas, so the cost is rare.
+        let mut formula = Formula::new(&text);
+        formula.array = array;
+        formula.dynamic = dynamic;
+        Some(Arc::new(formula))
+    }
+
+    fn encode_row(out: &mut Vec<u8>, row: &BandRow) -> Option<()> {
+        put_u32(out, row.key);
+        put_u32(out, row.first);
+        put_u32(out, row.bits_at);
+        put_u32(out, row.words);
+        put_u32(out, row.cells_at);
+        put_u32(out, row.kinds_at);
+        put_u32(out, row.styles_at);
+        put_u32(out, row.cells);
+        put_u32(out, row.kind_runs);
+        put_u32(out, row.style_runs);
+        match &row.extras {
+            None => put_u8(out, 0),
+            Some(e) => {
+                put_u8(out, 1);
+                put_len(out, e.formulas.len());
+                for (col, f) in &e.formulas {
+                    put_u32(out, *col);
+                    encode_formula(out, f)?;
+                }
+                put_len(out, e.arrays.len());
+                for (col, a) in &e.arrays {
+                    put_u32(out, *col);
+                    put_u32(out, u32::try_from(a.rows).ok()?);
+                    put_u32(out, u32::try_from(a.cols).ok()?);
+                    put_len(out, a.data.len());
+                    for v in &a.data {
+                        encode_value(out, v, 0)?;
+                    }
+                }
+                put_len(out, e.wide.len());
+                for v in &e.wide {
+                    put_u64(out, *v);
+                }
+            }
+        }
+        Some(())
+    }
+
+    fn decode_row(input: &mut &[u8]) -> Option<BandRow> {
+        let key = take_u32(input)?;
+        if key >= MAX_ROWS {
+            return None;
+        }
+        let first = take_u32(input)?;
+        if first > MAX_COLS {
+            return None;
+        }
+        let bits_at = take_u32(input)?;
+        let words = take_u32(input)?;
+        if words > MAX_COLS / 64 {
+            return None;
+        }
+        let cells_at = take_u32(input)?;
+        let kinds_at = take_u32(input)?;
+        let styles_at = take_u32(input)?;
+        let cells = take_u32(input)?;
+        if cells > MAX_COLS {
+            return None;
+        }
+        let kind_runs = take_u32(input)?;
+        let style_runs = take_u32(input)?;
+        if kind_runs > cells || style_runs > cells {
+            return None;
+        }
+        let extras = match take_u8(input)? {
+            0 => None,
+            1 => {
+                let formula_len = take_len(input, cells as usize)?;
+                let mut formulas = Vec::with_capacity(formula_len);
+                for _ in 0..formula_len {
+                    let col = take_u32(input)?;
+                    formulas.push((col, decode_formula(input)?));
+                }
+                formulas.sort_unstable_by_key(|(c, _)| *c);
+                formulas.dedup_by_key(|(c, _)| *c);
+                let array_len = take_len(input, cells as usize)?;
+                let mut arrays = Vec::with_capacity(array_len);
+                for _ in 0..array_len {
+                    let col = take_u32(input)?;
+                    let rows = usize::try_from(take_u32(input)?).ok()?;
+                    let cols = usize::try_from(take_u32(input)?).ok()?;
+                    let len = take_len(input, MAX_CELLS)?;
+                    if rows == 0 || cols == 0 || rows.checked_mul(cols)? != len {
+                        return None;
+                    }
+                    let mut data = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        data.push(decode_value(input, 0)?);
+                    }
+                    arrays.push((col, Arc::new(gridcraft_core::Array { rows, cols, data })));
+                }
+                arrays.sort_unstable_by_key(|(c, _)| *c);
+                arrays.dedup_by_key(|(c, _)| *c);
+                let wide_len = take_len(input, MAX_CELLS)?;
+                let mut wide = Vec::with_capacity(wide_len);
+                for _ in 0..wide_len {
+                    wide.push(take_u64(input)?);
+                }
+                Some(Arc::new(RowExtras { formulas, arrays, wide }))
+            }
+            _ => return None,
+        };
+        Some(BandRow { key, first, bits_at, words, cells_at, kinds_at, styles_at, cells, kind_runs, style_runs, extras })
+    }
+
+    /// Encodes one finished band. The callers spill only bands with their indexes dropped, so the
+    /// hash/sorted indexes are not part of the page; the decoder leaves them empty and an edit
+    /// rebuilds them.
+    pub(super) fn encode_band(band: &Band) -> Option<Vec<u8>> {
+        if band.rows.len() > MAX_ROWS as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(16 * 1024);
+        put_u32(&mut out, MAGIC);
+        put_u8(&mut out, VERSION);
+        put_len(&mut out, band.rows.len());
+        for row in &band.rows {
+            encode_row(&mut out, row)?;
+        }
+        put_len(&mut out, band.bits.len());
+        for v in &band.bits {
+            put_u64(&mut out, *v);
+        }
+        put_runs(&mut out, &band.kinds);
+        put_runs(&mut out, &band.styles);
+        put_len(&mut out, band.payloads.len());
+        for v in &band.payloads {
+            put_u16(&mut out, *v);
+        }
+        put_len(&mut out, band.numbers.len());
+        for v in band.numbers.iter() {
+            put_u64(&mut out, if *v == 0.0 { 0.0f64.to_bits() } else { v.to_bits() });
+        }
+        put_len(&mut out, band.texts.len());
+        for t in &band.texts {
+            if t.len() > MAX_TEXT {
+                return None;
+            }
+            put_bytes(&mut out, t.as_bytes());
+        }
+        put_len(&mut out, band.style_ids.len());
+        for id in &band.style_ids {
+            put_u32(&mut out, id.0);
+        }
+        if out.len() > MAX_PAGE {
+            return None;
+        }
+        Some(out)
+    }
+
+    pub(super) fn decode_band(bytes: &[u8]) -> Option<Band> {
+        let mut input = bytes;
+        if take_u32(&mut input)? != MAGIC || take_u8(&mut input)? != VERSION {
+            return None;
+        }
+        let rows_len = take_len(&mut input, MAX_ROWS as usize)?;
+        let mut rows = Vec::with_capacity(rows_len);
+        for _ in 0..rows_len {
+            rows.push(decode_row(&mut input)?);
+        }
+        rows.sort_unstable_by_key(|r| r.key);
+        if rows.windows(2).any(|w| w[0].key == w[1].key) {
+            return None;
+        }
+        let bits_len = take_len(&mut input, MAX_ROWS as usize * (MAX_COLS as usize / 64))?;
+        let mut bits = Vec::with_capacity(bits_len);
+        for _ in 0..bits_len {
+            bits.push(take_u64(&mut input)?);
+        }
+        let kinds = decode_runs(&mut input, MAX_CELLS)?;
+        let styles = decode_runs(&mut input, MAX_CELLS)?;
+        let payload_len = take_len(&mut input, MAX_CELLS)?;
+        let mut payloads = Vec::with_capacity(payload_len);
+        for _ in 0..payload_len {
+            payloads.push(take_u16(&mut input)?);
+        }
+        let numbers_len = take_len(&mut input, MAX_CELLS)?;
+        let mut numbers = Vec::with_capacity(numbers_len);
+        for _ in 0..numbers_len {
+            numbers.push(f64::from_bits(take_u64(&mut input)?));
+        }
+        let texts_len = take_len(&mut input, MAX_CELLS)?;
+        let mut texts = Vec::with_capacity(texts_len);
+        for _ in 0..texts_len {
+            let raw = take_bytes(&mut input, MAX_TEXT)?;
+            texts.push(Arc::<str>::from(std::str::from_utf8(&raw).ok()?));
+        }
+        let styles_len = take_len(&mut input, MAX_CELLS)?;
+        let mut style_ids = Vec::with_capacity(styles_len);
+        for _ in 0..styles_len {
+            style_ids.push(StyleId(take_u32(&mut input)?));
+        }
+        if !input.is_empty() {
+            return None;
+        }
+        let band = Band { rows, bits, kinds, styles, payloads, numbers, number_slots: Vec::new(), texts, text_index: Vec::new(), style_ids };
+        let valid = band.rows.iter().all(|r| {
+            let bits_end = (r.bits_at as usize).checked_add(r.words as usize).is_some_and(|end| end <= band.bits.len());
+            let cells_end = (r.cells_at as usize).checked_add(r.cells as usize).is_some_and(|end| end <= band.payloads.len());
+            let kinds_end = (r.kinds_at as usize).checked_add(r.kind_runs as usize).is_some_and(|end| end <= band.kinds.len());
+            let styles_end = (r.styles_at as usize).checked_add(r.style_runs as usize).is_some_and(|end| end <= band.styles.len());
+            let bits = r.bits(&band).iter().map(|w| w.count_ones()).sum::<u32>();
+            let kinds = r.kind_runs(&band).iter().map(|(_, n)| u32::from(*n)).sum::<u32>();
+            let styles = r.style_runs(&band).iter().map(|(_, n)| u32::from(*n)).sum::<u32>();
+            bits_end && cells_end && kinds_end && styles_end && bits == r.cells && kinds == r.cells && styles == r.cells
+        });
+        if !valid {
+            return None;
+        }
+        Some(band)
+    }
+
+    fn decode_runs(input: &mut &[u8], cap: usize) -> Option<Vec<(u16, u16)>> {
+        let len = take_len(input, cap)?;
+        let mut runs = Vec::with_capacity(len);
+        for _ in 0..len {
+            runs.push((take_u16(input)?, take_u16(input)?));
+        }
+        Some(runs)
+    }
+
+    /// The range a band's rows cover, for `used_range` without a load.
+    pub(super) fn band_bounds(band: &Band) -> Option<(u32, u32, u32, u32)> {
+        let (mut r0, mut r1, mut c0, mut c1) = (u32::MAX, 0u32, u32::MAX, 0u32);
+        for row in &band.rows {
+            let Some((first, last)) = row.column_span(band) else { continue };
+            r0 = r0.min(row.key);
+            r1 = r1.max(row.key);
+            c0 = c0.min(first);
+            c1 = c1.max(last);
+        }
+        (r0 != u32::MAX).then_some((r0, r1, c0, c1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2207,9 +3052,136 @@ mod tests {
         assert_eq!(s.len(), 2);
     }
 
+    #[test]
+    fn a_page_file_is_removed_with_its_store() {
+        let path = {
+            let mut s = CellStore::new();
+            s.set(c(0, 0), Cell::value(Value::Number(1.0)));
+            assert!(s.enable_paging());
+            let path = s.page_file.as_ref().map(|file| file.path().to_path_buf()).expect("page file");
+            assert!(path.exists());
+            path
+        };
+        assert!(!path.exists(), "dropping the store removes the spill file");
+    }
+
+    #[test]
+    fn the_page_cache_evicts_the_oldest_decoded_band() {
+        let mut s = CellStore::new();
+        for r in 0..(PAGE_CACHE_PAGES as u32 + 1) {
+            s.set(c(r * 64, 0), Cell::value(Value::Number(f64::from(r))));
+        }
+        assert!(s.enable_paging());
+        assert_eq!(s.pages.len(), PAGE_CACHE_PAGES + 1);
+        assert_eq!(s.iter().count(), PAGE_CACHE_PAGES + 1);
+        // The first band was decoded first and is past the cache window now.
+        assert!(s.pages.get(&0).is_some_and(|page| !page.is_cached()));
+        // The last one, and the rest of the window, are still decoded.
+        let last = PAGE_CACHE_PAGES as u32;
+        assert!(s.pages.get(&last).is_some_and(|page| page.is_cached()));
+        assert_eq!(s.get(c(0, 0)).map(|x| x.value), Some(Value::Number(0.0)));
+        assert!(s.pages.get(&0).is_some_and(|page| page.is_cached()));
+    }
+
+    #[test]
+    fn a_band_round_trips_through_a_page() {
+        use gridcraft_core::Array;
+        let mut batch = BandBatch::new();
+        let mut cells = vec![
+            (0, Cell { value: Value::Number(1.25), formula: None, style: StyleId(3) }),
+            (1, Cell::formula(Formula::new("=A1+1"))),
+            (2, Cell::value(Value::Text(Arc::from("hello")))),
+            (3, Cell::value(Value::Bool(true))),
+            (4, Cell::value(Value::Error(CellError::Div0))),
+            (5, Cell::value(Value::Array(Arc::new(Array::row(vec![Value::Number(2.0), Value::Text(Arc::from("x"))]))))),
+        ];
+        batch.set_row(0, &mut cells);
+        let mut cells = vec![(0, Cell::value(Value::Number(-0.0))), (1, Cell::value(Value::Text(Arc::from("hello"))))];
+        batch.set_row(1, &mut cells);
+        let mut s = CellStore::new();
+        s.insert_batch(batch);
+        let band = s.bands.get(&0).expect("band");
+        let bytes = page::encode_band(band).expect("encode");
+        let file = page::PageFile::new().expect("page file");
+        let at = file.write(&bytes).expect("write");
+        let page = page::Page::new(at, page::band_bounds(band), true, true);
+        let loaded = page.load(&file).0.expect("decode");
+        assert!(band.same_as(&loaded), "the decoded band holds the same cells");
+        for row in 0..2u32 {
+            for col in 0..6u32 {
+                assert_eq!(
+                    s.get(c(row, col)),
+                    {
+                        let mut other = CellStore::new();
+                        other.bands.insert(0, loaded.clone());
+                        other.len = s.len();
+                        other.get(c(row, col))
+                    },
+                    "row {row} col {col}"
+                );
+            }
+        }
+        // A corrupt or truncated page is refused rather than trusted.
+        let mut corrupt = bytes.clone();
+        if let Some(byte) = corrupt.first_mut() {
+            *byte ^= 0xff;
+        }
+        assert!(page::decode_band(&corrupt).is_none());
+        assert!(page::decode_band(&bytes[..bytes.len().saturating_sub(1)]).is_none());
+        let mut huge = bytes.clone();
+        huge.truncate(12);
+        if huge.len() == 12 {
+            huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        assert!(page::decode_band(&huge).is_none());
+    }
+
     /// A finished band keeps its texts but not the pointer index that only adding cells needs;
     /// the first edit rebuilds it. On a unique-key export this index was 16 bytes for every text
     /// of every band (640 MiB on the 100M-cell export).
+    /// Paging takes completed bands out of the live map and answers the same reads from the page
+    /// file; an edit brings only the touched band back, and a snapshot taken before keeps its
+    /// values.
+    #[test]
+    fn paged_bands_read_and_edit_like_live_bands() {
+        let mut s = CellStore::new();
+        for r in 0..200u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r))));
+            s.set(c(r, 1), Cell::value(Value::Text(Arc::from(if r % 2 == 0 { "even" } else { "odd" }))));
+        }
+        s.set(c(3, 2), Cell::formula(Formula::new("=A4+1")));
+        s.set(c(3, 2), Cell { value: Value::Number(4.0), formula: Some(Arc::new(Formula::new("=A4+1"))), style: StyleId(2) });
+        let snapshot = s.clone();
+        assert!(s.enable_paging(), "a temporary page file is created");
+        assert!(s.paged_band_count() > 0, "the completed bands were spilled");
+        assert_eq!(s.len(), snapshot.len());
+        assert_eq!(s.used_range(), snapshot.used_range());
+        for r in 0..200u32 {
+            assert_eq!(s.get(c(r, 0)), snapshot.get(c(r, 0)), "row {r} number");
+            assert_eq!(s.get(c(r, 1)), snapshot.get(c(r, 1)), "row {r} text");
+            assert_eq!(s.style(c(r, 0)), snapshot.style(c(r, 0)));
+            assert!(s.contains(c(r, 1)));
+        }
+        assert_eq!(s.iter_range(RangeRef::parse("A1:C50").expect("range")).count(), 101);
+        assert_eq!(s.iter().count(), 401);
+        assert_eq!(s.formulas().count(), 1);
+        assert_eq!(s.diff(&snapshot), []);
+        // Editing a paged band materializes just that band and keeps the snapshot untouched.
+        assert!(s.set_value(c(70, 0), &Value::Number(999.0)));
+        assert_eq!(s.get(c(70, 0)).map(|x| x.value), Some(Value::Number(999.0)));
+        assert_eq!(snapshot.get(c(70, 0)).map(|x| x.value), Some(Value::Number(70.0)));
+        s.set(c(71, 0), Cell::value(Value::Text(Arc::from("new"))));
+        assert_eq!(s.get(c(71, 0)).map(|x| x.value), Some(Value::Text(Arc::from("new"))));
+        assert_eq!(s.remove(c(72, 0)).map(|x| x.value), Some(Value::Number(72.0)));
+        assert_eq!(s.diff(&snapshot), [c(70, 0), c(71, 0), c(72, 0)]);
+        // A band split across two batches still merges after paging.
+        let mut batch = BandBatch::new();
+        let mut cells = vec![(4, Cell::value(Value::Number(1234.0)))];
+        batch.set_row(74, &mut cells);
+        s.insert_batch(batch);
+        assert_eq!(s.get(c(74, 4)).map(|x| x.value), Some(Value::Number(1234.0)));
+    }
+
     #[test]
     fn a_finished_band_drops_its_text_index_and_rebuilds_it_on_edit() {
         let alpha: Arc<str> = Arc::from("alpha");
