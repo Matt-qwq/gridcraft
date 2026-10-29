@@ -178,11 +178,12 @@ fn slicers_timelines_and_owner_extensions_survive_a_round_trip() {
     let (_, query_table) = target_of_kind(&u, &table, "queryTable");
     assert_eq!(u.parts.get(&query_table).unwrap(), QUERY_TABLE.as_bytes());
 
-    // Unknown chart extensions are still dropped: the chart model and its writer belong to gap #4,
-    // and a chart part has no stable identity (name or id) to hang a fragment on.
+    // Unknown chart extensions survive as well now that gap #4 landed: the chart part is kept
+    // byte-identically while the chart is untouched. Editing the chart rewrites the part from the
+    // model, which is where the unmodelled content still goes (documented in chart.rs).
     let (_, drawing) = target_of_kind(&u, &sheet, "drawing");
     let (_, chart) = target_of_kind(&u, &drawing, "chart");
-    assert!(!u.text(&chart).contains("unknownChartThing"));
+    assert!(u.text(&chart).contains("unknownChartThing"));
 
     // Reading the output keeps the same content again: the pass-through is stable.
     let (wb2, rep2) = read_xlsx(&out).unwrap();
@@ -194,6 +195,10 @@ fn slicers_timelines_and_owner_extensions_survive_a_round_trip() {
     }
     assert!(u2.text("xl/workbook.xml").contains("keep the workbook extension"));
     assert!(u2.text(&sheet_part(&u2, "Data")).contains("keep the sheet extension"));
+    // The kept chart part is stable across a second save too.
+    let (_, drawing2) = target_of_kind(&u2, &sheet_part(&u2, "Data"), "drawing");
+    let (_, chart2) = target_of_kind(&u2, &drawing2, "chart");
+    assert!(u2.text(&chart2).contains("unknownChartThing"));
 }
 
 #[test]
