@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (M20 line metadata is a chunked physical-id map; wave 0 and the beta estimate narrow) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (XLSX pass-through landed: gate #3 met, sliced off wave 1; beta total ~150–229) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -24,7 +24,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 |---|---|---|---|---|
 | **0** | **Close the base**: page-file rewrite (deferred); save streaming (S4c) is post-beta | M19 follow-up | **0–8** | S1–S4b landed 10-29; wave 0's base is closed. Start wave 1 (XLSX corpus/Excel) next. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
-| **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
+| **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair | #1 | 15–25 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. #3's pass-through half landed 10-29. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
 | **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 25–35 | Longest gate; start early in parallel with 1. |
 | **2b** | All-script text: CJK fallback confirmation, Arabic/Devanagari/Thai shaping, bidi, non-Latin PDF | #5 | 12–20 | Parallel with 2. |
@@ -67,7 +67,7 @@ and edge features. Each gate links its gap.
 | Gate | Gap | Status (2026-10-29) | Hours left |
 |---|---|---|---|
 | XLSX proven on a real-world corpus; Excel opens our output without repair | #1 | **open**; owner needed | 15–25 |
-| Unmodelled XLSX parts preserved on save | #3 | **open**; do with #1 | 6–10 |
+| Unmodelled XLSX parts preserved on save | #3 | **met 10-29** (slicers, timelines, table query tables, unknown `extLst`, strict package validator); data model and chart `extLst` remain, Excel check folded into #1 | 0–4 |
 | 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | **met 10-28** (M19/M20); M20/M19 polish in wave 0 | 0 for the gate; 20–30 polish |
 | Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **open**; longest gate | 25–35 |
 | Text in every script renders and exports | #5 | **open** | 12–20 |
@@ -76,7 +76,7 @@ and edge features. Each gate links its gap.
 | PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **open** | 12–20 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #3–#10 | **~136–209 + 20–30 base = ~155–240** |
+| **Total** | | gates #1, #4–#10 (pass-through #3 met) | **~130–199 + 20–30 base = ~150–229** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).

@@ -1,8 +1,8 @@
 # GridCraft roadmap
 
-**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~150–240 h away
+**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~150–230 h away
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** major (roadmap re-planned: large-workbook beta gate met; ordered waves, parallel plan and post-beta order set) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (XLSX pass-through keeps slicers, timelines, table query tables and unknown `extLst`; strict package validator; beta estimate narrows to ~150–230) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -26,7 +26,7 @@ This page is the summary. The detail is in:
 | **Ready for real work** | **~50%** | estimated from written weights (51.6); [target-app-parity.md](docs/target-app-parity.md) |
 | **Mainstream practitioner** | **~50%** | estimated: typical analyst/finance user, weekly features, × 0.90 interaction × 0.92 stability × 0.88 file exchange; [method](docs/target-app-parity.md#mainstream-practitioner) |
 | **Essentials user** | **~63%** | estimated: core features only, × 0.92 launch/stability × 0.95 clarity × 0.90 opening sent files; [method](docs/target-app-parity.md#essentials-user) |
-| Remaining to **beta** | **~150–240 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met |
+| Remaining to **beta** | **~150–230 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met and pass-through (#3) landed 10-29 |
 | Remaining to **full parity** | **~700–1,100 Opus 5.5 agent-hours** | estimated; sum of the dimension rows below |
 
 | Audience | Ready % | Opus 5.5 agent wall-clock hours to ~95% | Work that dominates |
@@ -129,7 +129,7 @@ The detailed queue with dependencies and the parallel plan is in
 |---|---|---|---|
 | **0** | Close the base: page-file rewrite (deferred); save streaming (S4c) is post-beta | **0–8** | S1–S4b landed 10-29; wave 0 base closed. Start wave 1 (XLSX corpus/Excel). |
 | **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
-| **1** | **XLSX corpus + Excel acceptance** (#1/#3) | 21–35 | **Owner: half a day in Excel.** The only external gate; start early. |
+| **1** | **XLSX corpus + Excel acceptance** (#1) | 15–25 | **Owner: half a day in Excel.** The only external gate; start early. #3's pass-through half landed 10-29, so this is the corpus run plus Excel acceptance. |
 | **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
 | **2** | Charts depth (#4) | 25–35 | Longest; start in parallel. |
 | **2b** | All-script text (#5) | 12–20 | Parallel. |
@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | XLSX pass-through keeps what it cannot model: slicers and their caches, timelines and their caches, table-attached query tables and unknown `extLst` children on the workbook, worksheet, table, PivotTable and pivot cache definition survive open → save with part bytes byte-identical and rels re-pointed. Every kept fragment is keyed to its owner, so a deleted, renamed or replaced table/pivot takes its extras, the parts only they reach and the rels with it instead of leaving a dangling reference. A strict package validator (every rel target exists, every part has a content type, no orphans, no case-only duplicates, no stale `Override`, no duplicate rel ids) now runs on every save in the crate's tests. The data model/Power Pivot and chart `extLst` remain dropped, and slicers are kept intact rather than editable (#3) |
 | 2026-10-29 | M19 per-sheet save: worksheet XML is deflated by a background worker as it is written, `write_zip` mixes raw and pre-deflated parts in the same order, and wasm uses inline/sequential paths (Node and native produce identical bytes). **100M save 28.42 s / 1,814.3 MiB peak** (was 26.37 s / 6,049.8), **31.7M 3.48 s / 1,283.9 MiB**; output byte-identical. 273 xlsx / 423 engine tests |
 | 2026-10-29 | M19 save peak measured after S4a: **3.92 s / 1,655.8 MiB** for 31.7M cells (`real_117m`) and **26.37 s / 6,049.8 MiB** for the 100M-cell export (`session_breakdown`, release, counting allocator). The writer's retained sheet XMLs dominate; S4b (per-sheet release) is the remaining wave-0 item |
 | 2026-10-29 | M19 writer ownership: `ZipOut::add` takes each part by value, `write_zip` drops a part as soon as its deflate worker finishes, and the zip64 decision is taken from a whole-archive bound before compression; output is byte-identical (37,153 bytes / `sha256 ae15eeb1…` pinned). 271 xlsx / 423 engine tests; per-sheet release remains, after a measured save peak |
@@ -254,6 +255,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | XLSX pass-through: slicers, timelines, table query tables and unknown `extLst` kept with owner-keyed extras and drop-with-owner rules; strict package validator on every save; gaps §3 → 0–2 h left, beta ~150–230 h |
 | 2026-10-29 | minor | M19 per-sheet save (background deflate as each sheet is written, mixed raw/packed archive, wasm inline); 100M peak 6.05→1.81 GiB at 28.42 s, 31.7M 1.66→1.28 GiB at 3.48 s, bytes identical; wave 0 base closed |
 | 2026-10-29 | minor | M19 writer ownership + measured save peak (31.7M: 3.92 s / 1.66 GiB; 100M: 26.37 s / 6.05 GiB, release counting allocator); retained sheet XMLs dominate; per-sheet release remains |
 | 2026-10-29 | minor | M19 spill beside the document (folder-then-temp, `GRIDCRAFT_SPILL`, UNC skip, Unix 0600+unlink, Windows delete-on-close, failure latch, warning); 104 model / 268 xlsx / 423 engine tests; writer peak remains |

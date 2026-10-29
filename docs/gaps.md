@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-29 · **Change:** major (roadmap re-planned: large-workbook gate met; base polish is wave 0, XLSX/Excel wave 1, then fidelity and formats; M21 post-beta) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-29 · **Change:** minor (XLSX pass-through keeps slicers, timelines, table query tables and unknown `extLst`, with a strict package validator; gaps §3 moves to 0–2 h left) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -140,13 +140,30 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   estimate is superseded by those waves.
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)
-- **Missing:** slicers and their caches, timelines, the data model, query tables attached to
-  tables, unmodelled `extLst` entries, chart details. Pass-through (#330) keeps custom XML,
-  external links, connections, sheet query tables, printer settings, form and ActiveX controls,
-  OLE objects and sheet backgrounds; never checked in Excel (repair prompts unknown).
-- **Evidence:** `crates/xlsx/src/passthrough.rs` (what is kept, and why the rest isn't).
-- **Impact:** open-edit-save still simplifies workbooks with slicers, timelines or Power Pivot.
-- **Estimate:** 6–10 h. [file-format-parity.md](file-format-parity.md)
+- **Landed (10-29):** pass-through keeps slicers and their caches, timelines and their caches,
+  table-attached query tables, and unknown `extLst` children on the workbook, worksheet, table,
+  PivotTable and pivot cache definition. Part bytes come back byte-identical, rels are re-pointed
+  with their ids preserved, and every kept fragment is keyed to its owner (`table:`, `pivot:`,
+  `pivotcache:`): a deleted, renamed or replaced owner drops its extras, the parts only they reach
+  and the rels in the same save, so no dangling relationship is written. A strict package validator
+  (every rel target exists, every part has a content type, no orphans, no case-only duplicate
+  names, no stale `Override`, no duplicate rel ids) runs inside `write_xlsx` for every save in the
+  crate's tests. The earlier set (#330) still holds: custom XML, external links, connections, sheet
+  query tables, printer settings, controls/ActiveX/OLE/backgrounds, header-footer pictures,
+  chart sheets, workbook and worksheet `extLst`.
+- **Missing:** the data model (Power Pivot `xl/model/…`, `powerPivotData`), chart `extLst` and chart
+  details (a chart part has no stable identity to key a fragment on; chart depth is #4), Strict Open
+  XML content. A renamed table or PivotTable loses its extras by policy — misattaching a query table
+  is worse than dropping it — which is a product decision worth revisiting.
+- **Not verified:** whether Excel opens a re-saved slicer/timeline workbook without a repair prompt
+  (needs the owner's Excel half-day, #1). No Excel run has happened.
+- **Evidence:** `crates/xlsx/src/passthrough.rs` (what is kept, and why the rest isn't);
+  `crates/xlsx/src/testing.rs` (`check_package`); the matrix in
+  [file-format-parity.md](file-format-parity.md).
+- **Impact:** open-edit-save no longer simplifies workbooks with slicers, timelines or query tables;
+  Power Pivot workbooks still lose the model.
+- **Estimate:** 0–2 h left of the 6–10, plus the Excel check folded into #1.
+  [file-format-parity.md](file-format-parity.md)
 
 ### 4. Charts lose options on round trip; shallow chart model (F, FF)
 - **Missing:** axis scaling, label options, error bars, per-point formatting.
