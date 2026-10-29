@@ -458,6 +458,21 @@ fn an_independent_reader_sees_a_valid_encrypted_container() {
 }
 
 #[test]
+fn an_independent_reader_sees_a_valid_standard_container() {
+    // The same container, holding Standard streams: version 3, both streams, a small
+    // `EncryptionInfo` in the mini stream and the package in regular sectors.
+    let plain = payload(9000);
+    let file = encrypt_standard_workbook(&plain, PASSWORD);
+    let (version, outside) = independently_read(&file);
+    assert_eq!(version, cfb::Version::V3);
+    let (info, package) = streams(&file).unwrap();
+    assert_eq!(outside, vec![("EncryptionInfo".to_string(), info.clone()), ("EncryptedPackage".to_string(), package.clone())]);
+    assert!(info.len() < 4096, "EncryptionInfo should live in the mini stream");
+    // And what the outside reader hands back still decrypts, and is the package.
+    assert_eq!(decrypt_streams(&outside[0].1, &outside[1].1, PASSWORD).unwrap(), plain);
+}
+
+#[test]
 fn an_independent_reader_follows_the_difat_of_a_large_encrypted_package() {
     // Past the 109 FAT sector ids the header holds, the FAT's own directory moves into DIFAT
     // sectors: a package of 8 MB needs them, and only an outside reader proves they are right.
@@ -491,4 +506,218 @@ fn a_saved_encrypted_workbook_holds_a_package_we_would_accept() {
     let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
     assert!(names.iter().any(|n| n == "[Content_Types].xml"), "{names:?}");
     crate::testing::check_package(&plain).unwrap();
+}
+
+// ---- writing: Standard encryption ---------------------------------------------------------
+
+/// A Standard-encrypted workbook as the real writer produces it (fresh salt and verifier, not the
+/// fixed-key `testing::encrypt_standard` helper the reader's tests use).
+fn encrypt_standard_workbook(package: &[u8], password: &str) -> Vec<u8> {
+    encrypt_workbook_as(package, password, EncryptionScheme::Standard).unwrap()
+}
+
+#[test]
+fn the_scheme_names_are_the_two_we_write() {
+    assert_eq!(EncryptionScheme::NAMES, ["agile", "standard"]);
+    assert_eq!(EncryptionScheme::default(), EncryptionScheme::Agile);
+    for scheme in [EncryptionScheme::Agile, EncryptionScheme::Standard] {
+        assert_eq!(EncryptionScheme::from_name(scheme.name()), Some(scheme));
+    }
+    assert_eq!(EncryptionScheme::from_name("AGILE"), Some(EncryptionScheme::Agile));
+    assert_eq!(EncryptionScheme::from_name("Standard"), Some(EncryptionScheme::Standard));
+    // No trimming, no invented aliases: a name that isn't one of the two matches nothing.
+    for unknown in ["", " agile", "rc4", "AES", "aes-256", "agile2"] {
+        assert_eq!(EncryptionScheme::from_name(unknown), None, "{unknown:?}");
+    }
+}
+
+#[test]
+fn standard_encryption_round_trips_at_every_size() {
+    // 0 to 100 kB, including the AES block boundaries and the 4096-byte ones a package hits.
+    // Standard encrypts the whole stream in one ECB pass, so a segment boundary is nothing
+    // special — the sizes are here because an off-by-one in the padding would show at each.
+    for len in [0usize, 1, 15, 16, 4095, 4096, 4097, 100 * 1024] {
+        let plain = payload(len);
+        let file = encrypt_standard_workbook(&plain, PASSWORD);
+        assert!(sniff_encrypted(&file), "a {len}-byte package");
+        assert_eq!(encryption_scheme(&file), Some(EncryptionScheme::Standard), "a {len}-byte package");
+        assert_eq!(check_encryption(&file), Ok(()), "a {len}-byte package");
+        assert_eq!(decrypt(&file, PASSWORD).unwrap(), plain, "a {len}-byte package");
+        assert_eq!(decrypt(&file, "wrong"), Err(DecryptError::WrongPassword), "a {len}-byte package");
+    }
+}
+
+#[test]
+fn every_standard_save_gets_a_fresh_salt_and_verifier() {
+    let plain = payload(100);
+    let a = encrypt_standard_workbook(&plain, PASSWORD);
+    let b = encrypt_standard_workbook(&plain, PASSWORD);
+    assert_ne!(a, b, "two saves of one package are identical");
+    let (info_a, _) = streams(&a).unwrap();
+    let (info_b, _) = streams(&b).unwrap();
+    assert_eq!(info_a.len(), info_b.len(), "the header is a fixed size");
+    assert_ne!(info_a.get(12..).map(<[u8]>::to_vec), info_b.get(12..).map(<[u8]>::to_vec), "two saves share their salt or verifier");
+    assert_eq!(decrypt(&a, PASSWORD).unwrap(), plain);
+    assert_eq!(decrypt(&b, PASSWORD).unwrap(), plain);
+}
+
+#[test]
+fn a_saved_standard_header_is_the_one_the_spec_describes() {
+    // [MS-OFFCRYPTO] 2.3.2: version 4.2, fCryptoAPI|fAES, the header, the verifier, and nothing
+    // else in `EncryptionInfo`.
+    let file = encrypt_standard_workbook(&payload(40), PASSWORD);
+    let (info, package) = streams(&file).unwrap();
+    assert_eq!(info.get(..4), Some(&[4u8, 0, 2, 0][..]), "version 4.2");
+    assert_eq!(u32_at(&info, 4), Some(F_CRYPTOAPI | F_AES), "fCryptoAPI|fAES");
+    let header_size = u32_at(&info, 8).unwrap() as usize;
+    let header = info.get(12..12 + header_size).unwrap();
+    assert_eq!(u32_at(header, 0), Some(F_CRYPTOAPI | F_AES));
+    assert_eq!(u32_at(header, 4), Some(0), "SizeExtra");
+    assert_eq!(u32_at(header, 8), Some(CALG_AES_128), "AlgID");
+    assert_eq!(u32_at(header, 12), Some(CALG_SHA1), "AlgIDHash");
+    assert_eq!(u32_at(header, 16), Some(128), "KeySize");
+    assert_eq!(u32_at(header, 20), Some(PROV_RSA_AES), "ProviderType");
+    assert_eq!(u32_at(header, 24), Some(0), "Reserved1");
+    assert_eq!(u32_at(header, 28), Some(0), "Reserved2");
+    let name = header.get(32..).unwrap();
+    let utf16: Vec<u16> = name.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    assert_eq!(utf16.last(), Some(&0), "CSPName is NUL-terminated");
+    assert_eq!(String::from_utf16(&utf16[..utf16.len() - 1]).as_deref().unwrap_or(""), STANDARD_CSP_NAME);
+    // The verifier (2.3.2.4): 16-byte salt, 16-byte encrypted verifier, hash size 20, 32-byte
+    // encrypted hash — and nothing after it.
+    let v = info.get(12 + header_size..).unwrap();
+    assert_eq!(v.len(), 72);
+    assert_eq!(u32_at(v, 0), Some(16), "SaltSize");
+    let salt = v.get(4..20).unwrap();
+    assert_eq!(u32_at(v, 36), Some(20), "VerifierHashSize");
+    // The package (2.3.2.5): the plaintext size, then one AES block per 16 plaintext bytes.
+    assert_eq!(u64::from_le_bytes(package.get(..8).and_then(|b| b.try_into().ok()).unwrap()), 40);
+    assert_eq!(package.len(), 8 + 48);
+    // Two saves never share the salt.
+    let (again, _) = streams(&encrypt_standard_workbook(&payload(40), PASSWORD)).unwrap();
+    assert_ne!(salt, again.get(12 + header_size + 4..12 + header_size + 20).unwrap());
+}
+
+#[test]
+fn standard_encryption_has_no_integrity_field_so_only_the_verifier_notices_damage() {
+    // ECMA-376 Part 1 §4.1 / [MS-OFFCRYPTO] 2.3.2 defines no data-integrity value: unlike Agile's
+    // `dataIntegrity` HMAC (2.3.4.14), the password verifier is the scheme's only check. This test
+    // pins both halves of that: what the verifier catches, and what nothing in the scheme can.
+    let plain = payload(4096 + 100);
+    let file = encrypt_standard_workbook(&plain, PASSWORD);
+    let (info, package) = streams(&file).unwrap();
+    let header_size = u32_at(&info, 8).unwrap() as usize;
+    let verifier_at = 12 + header_size;
+    let rebuild = |info: &[u8], package: &[u8]| crate::cfb::write_compound(&[("EncryptionInfo", info), ("EncryptedPackage", package)]).unwrap();
+    // A changed byte in the salt, the encrypted verifier or the encrypted verifier hash makes the
+    // verifier fail what the file says, so the file reads as a wrong password — the only verdict
+    // the scheme can give.
+    for at in [verifier_at + 4, verifier_at + 20, verifier_at + 40] {
+        let mut edited = info.clone();
+        edited[at] ^= 0x01;
+        assert_eq!(decrypt(&rebuild(&edited, &package), PASSWORD), Err(DecryptError::WrongPassword), "a changed byte at {at}");
+    }
+    // A flipped ciphertext byte is *not* detectable here: the package decrypts, with exactly one
+    // 16-byte block changed (ECB, so no other block moves). The damage is found by the package's
+    // own zip CRCs after decryption, never by the encryption layer.
+    let at = 8 + 32;
+    let mut stream = package.clone();
+    stream[at] ^= 0xFF;
+    let flipped = rebuild(&info, &stream);
+    let out = decrypt(&flipped, PASSWORD).expect("Standard has no check over the package");
+    let block = at - 8;
+    assert_eq!(out.len(), plain.len());
+    assert_eq!(out.get(..block), plain.get(..block));
+    assert_ne!(out.get(block..block + 16), plain.get(block..block + 16));
+    assert_eq!(out.get(block + 16..), plain.get(block + 16..), "ECB leaves every other block alone");
+    // Which is why the engine hands it to the zip reader, and the zip reader refuses it.
+    assert!(crate::read_xlsx(&out).is_err());
+}
+
+#[test]
+fn the_standard_derivation_agrees_with_a_second_spelling_of_the_spec() {
+    // [MS-OFFCRYPTO] 2.3.4.7 / ECMA-376 Part 1 §4.1, spelled out again here from the salted hash:
+    // H0 = SHA1(salt ‖ UTF-16LE(password)), Hn = SHA1(LE32(n-1) ‖ Hn-1) 50,000 times,
+    // Hblock = SHA1(H50000 ‖ LE32(0)), then SHA1((Hblock ⊕ 0x36…) in 64 bytes) and the 0x5C one,
+    // concatenated and cut to the key size. A change in `iterated_hash` or `standard_key` has to be
+    // wrong in two places to pass.
+    let salt = salt();
+    let password: Vec<u8> = PASSWORD.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut h = Hash::Sha1.digest(&[&salt, &password]);
+    for i in 0..50_000u32 {
+        h = Hash::Sha1.digest(&[&i.to_le_bytes(), &h]);
+    }
+    let block = Hash::Sha1.digest(&[&h, &0u32.to_le_bytes()]);
+    let expand = |pad: u8| {
+        let mut buf = [pad; 64];
+        for (b, x) in buf.iter_mut().zip(&block) {
+            *b ^= x;
+        }
+        Hash::Sha1.digest(&[&buf])
+    };
+    let mut key = expand(0x36);
+    key.extend(expand(0x5C));
+    key.truncate(STANDARD_KEY_LEN);
+    assert_eq!(standard_key(PASSWORD, &salt, STANDARD_KEY_LEN), key);
+    // And the same bytes the reader's msoffcrypto-derived vector already pins.
+    assert_eq!(key, hex("ae0b402aeb23a779471a130843e431d4"));
+}
+
+#[test]
+fn the_scheme_of_a_written_file_can_be_read_back() {
+    let plain = payload(64);
+    let agile = encrypt_workbook_as(&plain, PASSWORD, EncryptionScheme::Agile).unwrap();
+    assert_eq!(encryption_scheme(&agile), Some(EncryptionScheme::Agile));
+    let standard = encrypt_standard_workbook(&plain, PASSWORD);
+    assert_eq!(encryption_scheme(&standard), Some(EncryptionScheme::Standard));
+    assert_eq!(encryption_scheme(b"not a compound file"), None);
+    assert_eq!(encryption_scheme(b""), None);
+    // An RC4 Standard file is not a scheme we can write: it has no name here.
+    let (mut rc4, _) = crate::testing::encrypt_standard(&payload(10), PASSWORD);
+    rc4.get_mut(4..8).unwrap().copy_from_slice(&F_CRYPTOAPI.to_le_bytes());
+    let rc4_file = crate::cfb::write_compound(&[("EncryptionInfo", &rc4), ("EncryptedPackage", &[0u8; 8])]).unwrap();
+    assert_eq!(encryption_scheme(&rc4_file), None);
+}
+
+#[test]
+fn damaged_standard_files_are_errors_not_panics() {
+    let plain = payload(5000);
+    let file = encrypt_standard_workbook(&plain, PASSWORD);
+    let (info, package) = streams(&file).unwrap();
+    for cut in (0..file.len()).step_by(53) {
+        let _ = decrypt(&file[..cut], PASSWORD);
+        let _ = encryption_scheme(&file[..cut]);
+    }
+    for cut in (0..info.len()).step_by(3) {
+        let _ = decrypt_streams(&info[..cut], &package, PASSWORD);
+    }
+    for cut in (0..package.len()).step_by(29) {
+        let _ = decrypt_streams(&info, &package[..cut], PASSWORD);
+    }
+    // A stated size past the ciphertext, and a ragged ciphertext: both damage, never allocation.
+    let mut huge = package.clone();
+    huge.get_mut(..8).unwrap().copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(matches!(decrypt_streams(&info, &huge, PASSWORD), Err(DecryptError::Malformed(_))));
+    let mut ragged = package.clone();
+    ragged.truncate(ragged.len() - 3);
+    assert!(matches!(decrypt_streams(&info, &ragged, PASSWORD), Err(DecryptError::Malformed(_))));
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_build_without_a_csprng_refuses_both_schemes() {
+    // The web build has no secure random source, so neither scheme may write a file there. The
+    // seam makes the native source fail exactly as the web build's does; the refusal and its
+    // message are the ones the wasm branch returns, shared by both schemes.
+    force_no_entropy(true);
+    for scheme in [EncryptionScheme::Agile, EncryptionScheme::Standard] {
+        match encrypt_workbook_as(&payload(10), PASSWORD, scheme) {
+            Err(IoError::NoEntropy(message)) => assert_eq!(message, NO_ENTROPY, "{scheme:?}"),
+            other => panic!("{scheme:?} wrote {} bytes without a CSPRNG", other.map(|b| b.len()).unwrap_or(0)),
+        }
+    }
+    force_no_entropy(false);
+    // With the source back, a save works again: the seam is a switch, not damage.
+    assert!(encrypt_workbook_as(&payload(10), PASSWORD, EncryptionScheme::Standard).is_ok());
+    assert!(encrypt_workbook_as(&payload(10), PASSWORD, EncryptionScheme::Agile).is_ok());
 }

@@ -125,3 +125,45 @@ fn schemes_no_password_opens_are_named_before_asking_for_one() {
     assert_eq!(check_encryption(&irm), unsupported("rights-management"));
     assert_eq!(decrypt(&irm, "pw"), Err(DecryptError::Unsupported("rights-management".into())));
 }
+
+#[test]
+fn a_workbook_written_with_standard_encryption_reopens_with_the_same_cells() {
+    // `crate::encrypt_workbook_as(.., Standard)` is the writer `file.save` uses — fresh salt and
+    // verifier, AES-128-ECB over the package — not the fixed-key `testing` helper.
+    use gridcraft_core::{CellRef, Value};
+    let mut wb = gridcraft_model::Workbook::new();
+    let sh = wb.sheet_mut(0).unwrap();
+    sh.set_value(CellRef::parse("A1").unwrap(), Value::from("Legacy"));
+    sh.set_value(CellRef::parse("B2").unwrap(), Value::Number(-12.5));
+    let xlsx = crate::write_xlsx(&wb).unwrap();
+    let file = crate::encrypt_workbook_as(&xlsx, "Pa55word", crate::EncryptionScheme::Standard).unwrap();
+    assert_eq!(crate::sniff(&file), crate::Format::Encrypted);
+    assert_eq!(crate::encryption_scheme(&file), Some(crate::EncryptionScheme::Standard));
+    assert_eq!(crate::check_encryption(&file), Ok(()));
+    assert_eq!(decrypt(&file, "Pa55word").unwrap(), xlsx, "the package must come back byte for byte");
+    assert_eq!(decrypt(&file, "pa55word"), Err(DecryptError::WrongPassword));
+    let (back, _) = crate::read_xlsx(&decrypt(&file, "Pa55word").unwrap()).unwrap();
+    assert_eq!(back.active().unwrap().value(CellRef::parse("B2").unwrap()), Value::Number(-12.5));
+}
+
+#[test]
+fn standard_encryption_leaves_a_flipped_byte_to_the_zip_to_refuse() {
+    // Standard has no data-integrity field ([MS-OFFCRYPTO] 2.3.2): the verifier is the scheme's
+    // only check, so a flipped ciphertext byte decrypts to a changed package and the zip's own
+    // structure is what refuses the workbook. Pinning the honest limit of the scheme, and why
+    // Agile is the default.
+    let mut wb = gridcraft_model::Workbook::new();
+    wb.sheet_mut(0).unwrap().set_value(gridcraft_core::CellRef::parse("A1").unwrap(), gridcraft_core::Value::from("hi"));
+    let xlsx = crate::write_xlsx(&wb).unwrap();
+    let file = crate::encrypt_workbook_as(&xlsx, "pw", crate::EncryptionScheme::Standard).unwrap();
+    let (info, package) = crate::crypto::streams(&file).unwrap();
+    // A byte inside the end-of-central-directory record (the zip's own index) is the clearest
+    // case: the package decrypts, and the reader cannot find the archive's index any more.
+    let eocd = xlsx.windows(4).rposition(|w| w.starts_with(&[0x50, 0x4B, 0x05, 0x06])).expect("the package has an EOCD");
+    let mut stream = package.clone();
+    *stream.get_mut(8 + eocd).unwrap() ^= 0x01;
+    let flipped = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &stream)]).unwrap();
+    let plain = decrypt(&flipped, "pw").expect("Standard has no check over the package");
+    assert_ne!(plain, xlsx);
+    assert!(crate::read_xlsx(&plain).is_err(), "the zip's own index check has to catch it");
+}
