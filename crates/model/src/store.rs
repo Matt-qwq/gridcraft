@@ -1872,6 +1872,18 @@ impl Iterator for CellWalk<'_> {
     }
 }
 
+/// One run of a value batch that lands in one band: `values[start..end]` all map to band `key`,
+/// and `base` is the physical row of `values[start]`. A band can be fed by several runs when the
+/// row map has a gap inside it, so a plan merges them into one task.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+struct BandRun {
+    key: u32,
+    base: u32,
+    start: usize,
+    end: usize,
+}
+
 impl CellStore {
     pub fn new() -> Self {
         Self::default()
@@ -2196,15 +2208,33 @@ impl CellStore {
 
     /// Replaces the values of cells that already exist. `values` must be sorted in row-major
     /// order (the order a recalculation writes them in), so each band is looked up once.
+    ///
+    /// A batch that is not in that order is written one value at a time instead: a mapped store's
+    /// logical rows are not its physical rows, so a band-grouped walk would put a value on the
+    /// wrong row. The check is one pass over the batch.
     pub fn set_values(&mut self, values: &mut [(CellRef, Value)]) {
-        // A mapped sheet's logical rows are not in physical order, so the band-grouped fast paths
-        // cannot use the logical row as a band key. Recalculation on such a sheet takes the
-        // value-at-a-time path; a mapped sheet is one that has had a structural edit, not the
-        // common editing case.
-        if !self.row_map.is_identity() || !self.col_map.is_identity() {
+        if values.is_empty() {
+            return;
+        }
+        if !values.windows(2).all(|w| (w[0].0.row, w[0].0.col) <= (w[1].0.row, w[1].0.col)) {
             for (c, v) in values.iter() {
                 self.set_value(*c, v);
             }
+            return;
+        }
+        if !self.row_map.is_identity() || !self.col_map.is_identity() {
+            // The logical batch still arrives in row order, and inside one row segment physical
+            // rows are affine in the logical row, so the write streams band by band without an
+            // index, a sort, or a per-value map lookup. A mapped sheet is one that has had a
+            // structural edit, not the common editing case.
+            #[cfg(not(target_arch = "wasm32"))]
+            if values.len() >= PARALLEL_WRITE_MIN && values.len() <= PARALLEL_WRITE_MAX_CELLS {
+                let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
+                if threads > 1 && self.set_values_mapped_parallel(values, threads) {
+                    return;
+                }
+            }
+            self.set_values_mapped(values);
             return;
         }
         // A paged band a result lands in has to come back before either write path looks at the
@@ -2229,6 +2259,47 @@ impl CellStore {
         self.set_values_sequential(values);
     }
 
+    /// The value write on a mapped store: walk the row map's segments in logical order and each
+    /// segment's bands in physical order, taking one band borrow and one page materialize per run.
+    /// Rows the map does not cover are gaps: a value there has nowhere to go, exactly as
+    /// [`set_value`](Self::set_value) finds no cell, so no band is allocated for them.
+    fn set_values_mapped(&mut self, values: &[(CellRef, Value)]) {
+        let (Some(first), Some(last)) = (values.first(), values.last()) else { return };
+        let mut i = 0;
+        for segment in self.row_map.segments_in(first.0.row, last.0.row) {
+            // The values before this segment start on logical rows the map does not cover.
+            while i < values.len() && values[i].0.row < segment.logical {
+                i += 1;
+            }
+            let physical = |row: u32| segment.physical.saturating_add(row.saturating_sub(segment.logical));
+            let stop = i + values[i..].partition_point(|(c, _)| c.row < segment.logical_end());
+            while i < stop {
+                let key = physical(values[i].0.row) / BAND;
+                let run_end = i + values[i..stop].partition_point(|(c, _)| physical(c.row) / BAND == key);
+                // A corrupt page skips the run it would have held, not the batch.
+                if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+                    i = run_end;
+                    continue;
+                }
+                let col_map = &self.col_map;
+                if let Some(band) = self.bands.get_mut(&key) {
+                    let band = Arc::make_mut(band);
+                    let first_row = values[i].0.row;
+                    let row0 = physical(first_row) % BAND;
+                    for (c, v) in &values[i..run_end] {
+                        if let Some(col) = col_map.map(c.col) {
+                            band.set_value(row0 + (c.row - first_row), col, v);
+                        }
+                    }
+                }
+                i = run_end;
+            }
+            if i >= values.len() {
+                break;
+            }
+        }
+    }
+
     fn set_values_sequential(&mut self, values: &[(CellRef, Value)]) {
         let mut i = 0;
         while i < values.len() {
@@ -2246,6 +2317,102 @@ impl CellStore {
             }
             i = end;
         }
+    }
+
+    /// The value-only write on a mapped store, split over threads. The plan is the list of band
+    /// runs the logical batch covers: sorted by band key and merged, so a band that two row
+    /// segments feed becomes one task and its writes cannot overwrite each other. Paged bands are
+    /// materialized once here, before the workers look at the live map; a corrupt page drops its
+    /// task, not the batch. Returns false when the plan would be larger than the batch itself (or
+    /// a worker panics): the caller then streams the batch sequentially.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn set_values_mapped_parallel(&mut self, values: &[(CellRef, Value)], threads: usize) -> bool {
+        let (Some(first), Some(last)) = (values.first(), values.last()) else { return true };
+        let mut runs: Vec<BandRun> = Vec::new();
+        let mut i = 0;
+        for segment in self.row_map.segments_in(first.0.row, last.0.row) {
+            while i < values.len() && values[i].0.row < segment.logical {
+                i += 1;
+            }
+            let physical = |row: u32| segment.physical.saturating_add(row.saturating_sub(segment.logical));
+            let stop = i + values[i..].partition_point(|(c, _)| c.row < segment.logical_end());
+            while i < stop {
+                let key = physical(values[i].0.row) / BAND;
+                let run_end = i + values[i..stop].partition_point(|(c, _)| physical(c.row) / BAND == key);
+                runs.push(BandRun { key, base: physical(values[i].0.row), start: i, end: run_end });
+                // A batch that touches a band per value (a sparse sheet after a shift) would make
+                // the plan as large as the batch; streaming does the same writes with no plan.
+                if runs.len() > values.len() / 4 {
+                    return false;
+                }
+                i = run_end;
+            }
+            if i >= values.len() {
+                break;
+            }
+        }
+        runs.sort_unstable_by_key(|run| run.key);
+        let mut tasks: Vec<(u32, Vec<BandRun>)> = Vec::new();
+        for run in runs {
+            match tasks.last_mut() {
+                Some((key, list)) if *key == run.key => list.push(run),
+                _ => tasks.push((run.key, vec![run])),
+            }
+        }
+        // A paged band must be live before a worker copies it; one that fails to decode is
+        // skipped entirely, as in the sequential mapped path.
+        let mut live: Vec<(u32, Vec<BandRun>)> = Vec::with_capacity(tasks.len());
+        for (key, list) in tasks {
+            if self.pages.contains_key(&key) && self.materialize(key).is_none() {
+                continue;
+            }
+            live.push((key, list));
+        }
+        if live.is_empty() {
+            return true;
+        }
+        let bands = &self.bands;
+        let col_map = &self.col_map;
+        let chunk = live.len().div_ceil(threads);
+        let results: Vec<std::thread::Result<Vec<(u32, Arc<Band>)>>> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for part in live.chunks(chunk) {
+                handles.push(scope.spawn(move || {
+                    let mut out = Vec::with_capacity(part.len());
+                    for (key, list) in part {
+                        let Some(old) = bands.get(key) else { continue };
+                        let mut band = (**old).clone();
+                        for run in list {
+                            let Some((first_cell, _)) = values.get(run.start) else { continue };
+                            let Some(slice) = values.get(run.start..run.end) else { continue };
+                            let row0 = run.base % BAND;
+                            for (c, v) in slice {
+                                if let Some(col) = col_map.map(c.col) {
+                                    band.set_value(row0 + (c.row - first_cell.row), col, v);
+                                }
+                            }
+                        }
+                        out.push((*key, Arc::new(band)));
+                    }
+                    out
+                }));
+            }
+            handles.into_iter().map(|h| h.join()).collect()
+        });
+        let mut new_bands = Vec::with_capacity(live.len());
+        for result in results {
+            match result {
+                Ok(part) => new_bands.extend(part),
+                // A worker panicked: nothing has reached the store yet, so the sequential path can
+                // still do the whole batch.
+                Err(_) => return false,
+            }
+        }
+        // One task a band, so no insert can overwrite another run's writes.
+        for (key, band) in new_bands {
+            self.bands.insert(key, band);
+        }
+        true
     }
 
     /// The value-only write, split over threads when the batch is large. A band is independent of
@@ -4281,6 +4448,193 @@ mod tests {
         }
         assert_eq!(s.len(), 20_000);
         assert_eq!(snapshot.len(), 20_000);
+    }
+
+    /// A result batch writes through the row map: the logical rows are not the physical ones, and
+    /// neither `len` nor the bands move.
+    #[test]
+    fn set_values_writes_through_a_row_map() {
+        let mut s = CellStore::new();
+        for r in 0..200u32 {
+            s.set(c(r, 4), Cell::formula(Formula::new("=1+1")));
+        }
+        let (bands, len) = (s.band_count(), s.len());
+        s.shift_rows(1, 1);
+        assert_eq!(s.band_count(), bands, "a row insert moves the map, not the bands");
+        let mut values: Vec<(CellRef, Value)> = (0..200u32).map(|r| (c(r, 4), Value::Number(f64::from(r)))).collect();
+        s.set_values(&mut values);
+        for r in 0..200u32 {
+            // An insert at logical row 1 leaves that row a gap; the batch's value there is dropped.
+            let want = if r == 1 { None } else { Some(Value::Number(f64::from(r))) };
+            assert_eq!(s.get(c(r, 4)).map(|x| x.value), want, "row {r}");
+        }
+        assert_eq!(s.get(c(1, 4)), None, "the inserted row stays empty");
+        assert_eq!(s.len(), len);
+        assert_eq!(s.band_count(), bands);
+    }
+
+    /// A value on a logical row the map does not cover has nowhere to go: a gap row must neither
+    /// allocate a physical row nor create a band, exactly as `set_value` refuses it.
+    #[test]
+    fn set_values_skips_a_gap_row_without_allocating() {
+        let mut s = CellStore::new();
+        s.set(c(0, 0), Cell::formula(Formula::new("=1")));
+        s.shift_rows(0, 1);
+        let (next_physical, bands) = (s.row_map.next_physical, s.band_count());
+        let mut values = vec![(c(0, 0), Value::Number(1.0)), (c(1, 0), Value::Number(2.0))];
+        s.set_values(&mut values);
+        assert_eq!(s.get(c(1, 0)).map(|x| x.value), Some(Value::Number(2.0)));
+        assert_eq!(s.row_map.next_physical, next_physical, "the gap row did not allocate a physical row");
+        assert_eq!(s.band_count(), bands, "and did not create a band");
+        assert_eq!(s.len(), 1);
+    }
+
+    /// The differential proof: a streamed batch must leave exactly the store `set_value` per cell
+    /// leaves, on a store mapped along both axes (two row segments, two column segments). The
+    /// batch covers the gap row and gap column and rows/columns no cell holds.
+    #[test]
+    fn set_values_equals_value_at_a_time_on_a_mapped_store() {
+        let mut s = CellStore::new();
+        for r in 0..140u32 {
+            for col in 0..8u32 {
+                s.set(c(r, col), Cell::formula(Formula::new("=1+1")));
+                s.set_value(c(r, col), &Value::Number(f64::from(r * 10 + col)));
+            }
+        }
+        s.shift_rows(1, 1);
+        s.shift_cols(1, 1);
+        let mut slow = s.clone();
+        let mut values: Vec<(CellRef, Value)> = Vec::new();
+        for r in 0..=141u32 {
+            for col in 0..=9u32 {
+                values.push((c(r, col), Value::Number(f64::from(r * 100 + col))));
+            }
+        }
+        let mut fast = s;
+        fast.set_values(&mut values);
+        for (at, v) in values.iter() {
+            slow.set_value(*at, v);
+        }
+        assert_eq!(fast.iter().collect::<Vec<_>>(), slow.iter().collect::<Vec<_>>());
+        assert_eq!(fast, slow);
+    }
+
+    /// The batch must be in row-major order; a caller that hands in another order gets the
+    /// value-at-a-time path (the same result), never a value on a band-grouped wrong row.
+    #[test]
+    fn set_values_writes_an_unsorted_batch_like_set_value() {
+        let mut s = CellStore::new();
+        for r in 0..20u32 {
+            s.set(c(r, 0), Cell::formula(Formula::new("=1+1")));
+        }
+        s.shift_rows(1, 1);
+        let mut slow = s.clone();
+        let mut values: Vec<(CellRef, Value)> = (0..20u32).map(|r| (c(r, 0), Value::Number(f64::from(r)))).collect();
+        values.reverse();
+        let mut fast = s;
+        fast.set_values(&mut values);
+        for (at, v) in values.iter() {
+            slow.set_value(*at, v);
+        }
+        assert_eq!(fast.iter().collect::<Vec<_>>(), slow.iter().collect::<Vec<_>>());
+    }
+
+    /// A band fed by two row segments must stay one task in the parallel plan: two runs of the
+    /// same band inserted as two bands would let one run's writes win. This batch is one band
+    /// wide (64 rows by 300 columns, 19,200 values) and spans the inserted row inside band 0.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn set_values_writes_a_band_split_by_two_row_segments() {
+        let mut s = CellStore::new();
+        for r in 0..64u32 {
+            let mut cells: Vec<(u32, Cell)> = (0..300u32).map(|col| (col, Cell::value(Value::Number(f64::from(r * 1_000 + col))))).collect();
+            s.set_row(r, &mut cells);
+        }
+        s.shift_rows(30, 1);
+        let segments = s.row_map.segments_in(0, 63);
+        assert_eq!(segments.len(), 2, "the batch spans the insert point");
+        assert!(segments.iter().all(|seg| seg.physical / BAND == 0), "both runs land in band 0");
+        let mut values: Vec<(CellRef, Value)> = Vec::new();
+        for r in 0..64u32 {
+            for col in 0..300u32 {
+                values.push((c(r, col), Value::Number(f64::from(r * 1_000 + col + 7))));
+            }
+        }
+        let mut slow = s.clone();
+        assert!(s.set_values_mapped_parallel(&values, 4), "the plan fits the run budget");
+        for (at, v) in values.iter() {
+            slow.set_value(*at, v);
+        }
+        assert_eq!(s.iter().collect::<Vec<_>>(), slow.iter().collect::<Vec<_>>());
+        assert_eq!(s.band_count(), 1, "the two runs write one band");
+    }
+
+    /// A paged band a result lands in comes back once, through the map; the batch does not leave a
+    /// second copy or an undecoded page behind.
+    #[test]
+    fn set_values_materializes_a_paged_band_once() {
+        let mut s = CellStore::new();
+        for r in 0..200u32 {
+            s.set(c(r, 0), Cell::formula(Formula::new("=1+1")));
+        }
+        assert!(s.enable_paging());
+        let paged = s.paged_band_count();
+        assert_eq!(paged, 4, "200 rows over 64-row bands");
+        s.shift_rows(1, 1);
+        let mut values: Vec<(CellRef, Value)> = (0..200u32).map(|r| (c(r, 0), Value::Number(f64::from(r)))).collect();
+        s.set_values(&mut values);
+        assert_eq!(s.paged_band_count(), 0, "every touched band is live after the write");
+        for r in 0..200u32 {
+            let want = if r == 1 { None } else { Some(Value::Number(f64::from(r))) };
+            assert_eq!(s.get(c(r, 0)).map(|x| x.value), want, "row {r}");
+        }
+        assert_eq!(s.get(c(1, 0)), None, "the gap row holds nothing");
+    }
+
+    /// The mapped parallel write copies bands in workers exactly as the identity one does: the
+    /// snapshot keeps its values and every value lands.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn parallel_mapped_value_writes_keep_the_snapshot() {
+        let mut s = CellStore::new();
+        for r in 0..20_000u32 {
+            s.set(c(r, 9), Cell::formula(Formula::new("=$A$1*2")));
+        }
+        s.shift_rows(0, 1);
+        s.shift_cols(1, 1);
+        let snapshot = s.clone();
+        // Logical row 0 is the inserted gap; the formula cells live on rows 1..=20,000.
+        let mut values: Vec<(CellRef, Value)> = vec![(c(0, 10), Value::Number(-1.0))];
+        values.extend((0..20_000u32).map(|r| (c(r + 1, 10), Value::Number(f64::from(r)))));
+        let mut par = s.clone();
+        assert!(par.set_values_mapped_parallel(&values, 4), "the plan fits the run budget");
+        s.set_values(&mut values);
+        for r in 0..20_000u32 {
+            let at = c(r + 1, 10);
+            assert_eq!(s.get(at).map(|x| x.value), Some(Value::Number(f64::from(r))), "row {}", r + 1);
+            assert_eq!(par.get(at).map(|x| x.value), Some(Value::Number(f64::from(r))), "parallel row {}", r + 1);
+            assert_eq!(snapshot.get(at).map(|x| x.value), Some(Value::Empty));
+        }
+        assert_eq!(s.get(c(0, 10)), None, "the gap row was not written");
+        assert_eq!(s.len(), 20_000);
+        assert_eq!(par, s);
+    }
+
+    /// A formula that recalculates to nothing keeps its cell: the value becomes `EMPTY`, the slot,
+    /// the style and the formula stay, so `len`, `used_range` and `iter` do not change.
+    #[test]
+    fn set_values_keeps_a_cell_whose_result_is_empty() {
+        let mut s = CellStore::new();
+        s.set(c(3, 2), Cell { value: Value::Number(1.0), formula: Some(Arc::new(Formula::new("=A1"))), style: StyleId(4) });
+        s.shift_rows(1, 1);
+        let mut values = vec![(c(4, 2), Value::Empty)];
+        s.set_values(&mut values);
+        let got = s.get(c(4, 2)).expect("the cell keeps its slot");
+        assert_eq!(got.value, Value::Empty);
+        assert!(got.formula.is_some(), "the formula stays");
+        assert_eq!(got.style, StyleId(4), "so does the style");
+        assert_eq!(s.len(), 1);
+        assert!(s.contains(c(4, 2)));
     }
 
     /// A band copied for a value edit shares the formulas of its rows; changing one formula in
