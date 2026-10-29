@@ -411,3 +411,85 @@ fn a_data_integrity_file_written_by_another_implementation_reads() {
     // And a wrong password is still its own failure, not corruption.
     assert_eq!(decrypt_streams(&info, &package, "wrong"), Err(DecryptError::WrongPassword));
 }
+
+// ---- the container, through a third-party reader --------------------------------------------
+
+/// The two streams as an independent CFB reader sees them, with the container's version. The
+/// `cfb` crate (MIT, mdsteele/rust-cfb) shares no code with this crate: it parses the header,
+/// the FAT, the DIFAT, the mini stream and the directory tree itself, and rejects a directory
+/// whose name order is wrong while doing it.
+///
+/// Its `permissive` mode is the fair oracle, not `strict`: strict additionally demands that the
+/// mini FAT hold no more entries than the mini stream has 64-byte sectors, but a mini FAT lives
+/// in whole 512-byte sectors (128 entries) so its last sector is padding whenever the mini stream
+/// is smaller — the usual case.
+fn independently_read(bytes: &[u8]) -> (cfb::Version, Vec<(String, Vec<u8>)>) {
+    use std::io::Read as _;
+    let mut cf = cfb::CompoundFile::open(std::io::Cursor::new(bytes)).expect("the independent CFB reader rejects our container");
+    let version = cf.version();
+    let mut streams = vec![];
+    for name in ["EncryptionInfo", "EncryptedPackage"] {
+        let stated = cf.entry(name).unwrap_or_else(|e| panic!("the independent reader has no {name}: {e}")).len();
+        let mut stream = cf.open_stream(name).unwrap_or_else(|e| panic!("the independent reader can't open {name}: {e}"));
+        let mut data = vec![];
+        stream.read_to_end(&mut data).unwrap_or_else(|e| panic!("the independent reader can't read {name}: {e}"));
+        assert_eq!(data.len() as u64, stated, "{name}: the directory states {stated} bytes");
+        streams.push((name.to_string(), data));
+    }
+    (version, streams)
+}
+
+#[test]
+fn an_independent_reader_sees_a_valid_encrypted_container() {
+    let plain = payload(9000);
+    let file = encrypt(&plain, PASSWORD);
+    // Header: the compound-file signature, version 3 and the 512-byte sector shift Excel writes.
+    assert_eq!(file.get(..8), Some(&crate::cfb::SIGNATURE[..]));
+    assert_eq!(u16::from_le_bytes([file[26], file[27]]), 3);
+    assert_eq!(u16::from_le_bytes([file[28], file[29]]), 0xFFFE);
+    assert_eq!(u16::from_le_bytes([file[30], file[31]]), 9);
+    let (version, outside) = independently_read(&file);
+    assert_eq!(version, cfb::Version::V3);
+    // Exactly the two streams, holding exactly what our own reader reads from them: one in the
+    // mini stream, one in regular sectors.
+    let (info, package) = streams(&file).unwrap();
+    assert_eq!(outside, vec![("EncryptionInfo".to_string(), info), ("EncryptedPackage".to_string(), package)]);
+    assert!(outside[0].1.len() < 4096, "EncryptionInfo should live in the mini stream");
+    assert!(outside[1].1.len() > 4096, "EncryptedPackage should live in regular sectors");
+}
+
+#[test]
+fn an_independent_reader_follows_the_difat_of_a_large_encrypted_package() {
+    // Past the 109 FAT sector ids the header holds, the FAT's own directory moves into DIFAT
+    // sectors: a package of 8 MB needs them, and only an outside reader proves they are right.
+    let plain = payload(8_000_000);
+    let file = encrypt_workbook_with_spin(&plain, PASSWORD, 1000).unwrap();
+    let fat_sectors = u32::from_le_bytes([file[44], file[45], file[46], file[47]]);
+    let difat_sectors = u32::from_le_bytes([file[72], file[73], file[74], file[75]]);
+    assert!(fat_sectors > 109, "{fat_sectors} FAT sectors");
+    assert!(difat_sectors > 0, "the header names no DIFAT sector");
+    let (version, outside) = independently_read(&file);
+    assert_eq!(version, cfb::Version::V3);
+    let (_, package) = streams(&file).unwrap();
+    assert_eq!(outside[1].1, package);
+    assert_eq!(decrypt(&file, PASSWORD).unwrap(), plain);
+}
+
+#[test]
+fn a_saved_encrypted_workbook_holds_a_package_we_would_accept() {
+    use gridcraft_core::{CellRef, Value};
+    let mut wb = gridcraft_model::Workbook::new();
+    wb.sheet_mut(0).unwrap().set_value(CellRef::parse("A1").unwrap(), Value::Number(42.0));
+    let xlsx = crate::write_xlsx(&wb).unwrap();
+    let file = encrypt_workbook_with_spin(&xlsx, PASSWORD, 1000).unwrap();
+    // An outside reader unbundles the package, and decrypting what it read gives the zip back.
+    let (_, outside) = independently_read(&file);
+    let plain = decrypt_streams(&outside[0].1, &outside[1].1, PASSWORD).unwrap();
+    assert_eq!(plain, xlsx);
+    // The plaintext we encrypt is a package this crate accepts: the content-types part is there
+    // and the strict validator passes on every part and relationship.
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&plain)).unwrap();
+    let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+    assert!(names.iter().any(|n| n == "[Content_Types].xml"), "{names:?}");
+    crate::testing::check_package(&plain).unwrap();
+}

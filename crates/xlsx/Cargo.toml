@@ -32,3 +32,8 @@ sha2 = { workspace = true }
 # so a password-protected save is refused there instead of made with weak entropy.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 getrandom = { workspace = true }
+
+[dev-dependencies]
+# An independent Compound File Binary reader, used only to prove the encrypted container is valid
+# to software that isn't ours (a test oracle; it ships nowhere).
+cfb = "0.15"
