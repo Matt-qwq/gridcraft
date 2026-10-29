@@ -282,10 +282,18 @@ fn a_slicer_and_a_timeline_are_placed_where_the_model_says() {
     let tl = &report.pivot_timelines[0];
     assert_eq!((tl.anchor.cell, tl.anchor.width, tl.anchor.height), (at("H3"), 240.0, 96.0));
 
-    // A second save draws the same frames: the anchor is the model's, not a fresh guess.
+    // A second save draws the same frames: the anchor is the model's, not a fresh guess. The kept
+    // sheet extension the first save's file carried is replaced, not written a second time.
     let out2 = write_xlsx(&back).unwrap();
     check_package(&out2).unwrap();
-    assert_eq!(text(&unpack(&out2), "xl/drawings/"), drawing);
+    let parts2 = unpack(&out2);
+    assert_eq!(text(&parts2, "xl/drawings/"), drawing);
+    let sx = String::from_utf8_lossy(&parts2["xl/worksheets/sheet2.xml"]).into_owned();
+    assert_eq!(sx.matches("<x14:slicerList>").count(), 1, "one slicerList: {sx}");
+    assert_eq!(sx.matches("<x15:timelineRefs>").count(), 1, "one timelineRefs: {sx}");
+    let wbx = String::from_utf8_lossy(&parts2["xl/workbook.xml"]).into_owned();
+    assert_eq!(wbx.matches("<x14:slicerCaches>").count(), 1, "one slicerCaches list: {wbx}");
+    assert_eq!(wbx.matches("<x15:timelineCacheRefs>").count(), 1, "one timelineCacheRefs list: {wbx}");
 }
 
 #[test]
