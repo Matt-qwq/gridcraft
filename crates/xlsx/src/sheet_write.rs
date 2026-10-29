@@ -300,7 +300,9 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
     }
 
     s.push_str("<sheetData>");
-    let mut store = sheet.cells.iter().peekable();
+    // A save walks every cell once, so it scans without filling the page cache: the viewport's
+    // working set stays where it was, and the sheet's tail is not left resident.
+    let mut store = sheet.cells.iter_scan(RangeRef::all()).peekable();
     let mut sparse = additions.into_iter().peekable();
     let mut info_rows = sheet.rows.iter().peekable();
     loop {

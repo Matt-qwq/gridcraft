@@ -1464,3 +1464,43 @@ fn a_partial_sheet_filter_is_not_folded_into_a_table() {
     assert!(t.filter.is_empty(), "the criteria landed on the wrong table column: {:?}", t.filter);
     assert!(b.autofilter.is_none(), "a sheet filter inside a table would be invalid");
 }
+
+/// A paged sheet saves to the same bytes as the live one: the writer's scan decodes pages without
+/// caching them, and the file it writes reopens with the same cells.
+#[test]
+fn a_paged_sheet_saves_to_the_same_bytes() {
+    let mut wb = Workbook::new();
+    {
+        let s = wb.sheet_mut(0).expect("the workbook has a sheet");
+        for row in 0..200u32 {
+            s.cells.set(CellRef::new(row, 0), Cell::value(Value::Number(f64::from(row))));
+            s.cells.set(CellRef::new(row, 1), Cell::value(Value::Text(Arc::from(format!("r{row}").as_str()))));
+        }
+        s.cells.set(CellRef::new(2, 2), Cell { value: Value::Number(3.0), formula: Some(Arc::new(Formula::new("=A3+1"))), style: StyleId(2) });
+        s.set_value(at("D1"), Value::text("styled"));
+    }
+    let live = write_xlsx(&wb).unwrap();
+    // Page the sheet, then read one cell the way a viewport would: the save must leave the cache
+    // exactly as it found it, which only an uncached scan of the pages can do.
+    let cached = {
+        let s = wb.sheet_mut(0).expect("the workbook has a sheet");
+        assert!(s.cells.enable_paging_with_cache(64 << 20), "a page file is created");
+        assert!(s.cells.paged_band_count() > 0, "the sheet was spilled");
+        assert_eq!(s.cells.get(CellRef::new(0, 0)).map(|cell| cell.value), Some(Value::Number(0.0)));
+        s.cells.page_cache_stats().expect("the sheet pages")
+    };
+    assert_eq!((cached.hits, cached.misses), (0, 1), "the read primed one band");
+    let paged = write_xlsx(&wb).unwrap();
+    let after = wb.sheet(0).expect("the sheet").cells.page_cache_stats().expect("the sheet pages");
+    assert_eq!(
+        (after.bytes, after.entries, after.hits, after.misses),
+        (cached.bytes, cached.entries, cached.hits, cached.misses),
+        "the save neither filled nor evicted the page cache"
+    );
+    assert_eq!(paged, live, "a paged sheet writes the same bytes");
+    let (back, rep) = read_xlsx(&paged).unwrap();
+    assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+    let (original, _) = read_xlsx(&live).unwrap();
+    assert_eq!(back.sheet(0).unwrap().cells.iter().collect::<Vec<_>>(), original.sheet(0).unwrap().cells.iter().collect::<Vec<_>>());
+    assert_eq!(write_xlsx(&wb).unwrap(), paged, "the uncached scan is repeatable");
+}

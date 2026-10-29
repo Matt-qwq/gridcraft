@@ -1832,49 +1832,69 @@ impl PartialEq for CellStore {
     }
 }
 
-/// Walks one packed row, in column order, without allocating.
-struct PackedRow<'a> {
-    band: &'a Band,
-    row: u32,
-    cells: &'a BandRow,
+/// Where a walk over one packed row is: the column it will look at next, the last column the walk
+/// was asked for, and the index of the next stored cell. Plain numbers, so a walker can own the
+/// band its row lives in and still keep its place across `next()` calls.
+#[derive(Clone, Copy, Debug)]
+struct PackCursor {
     col: u32,
     hi: u32,
     i: usize,
 }
 
-impl Iterator for PackedRow<'_> {
-    type Item = (CellRef, Cell);
-    fn next(&mut self) -> Option<(CellRef, Cell)> {
-        while self.col <= self.hi && self.i < self.cells.cells as usize {
-            let slot = self.col - self.cells.first;
+impl PackCursor {
+    /// The cursor for the physical columns `c0..=c1` of `cells`, clipped to what the row holds.
+    fn new(band: &Band, cells: &BandRow, c0: u32, c1: u32) -> PackCursor {
+        let (lo, hi) = match cells.column_span(band) {
+            Some(_) => (c0.max(cells.first), c1.min(cells.first.saturating_add(cells.columns()).saturating_sub(1))),
+            None => (1, 0),
+        };
+        let col = lo.max(cells.first);
+        let i = cells.rank_before(band, col);
+        PackCursor { col, hi, i }
+    }
+
+    /// The next stored cell at or after the cursor, moving past it.
+    fn next(&mut self, band: &Band, cells: &BandRow, row: u32) -> Option<(CellRef, Cell)> {
+        while self.col <= self.hi && self.i < cells.cells as usize {
+            let slot = self.col - cells.first;
             let word = (slot / 64) as usize;
-            let w = *self.cells.bits(self.band).get(word)?;
+            let w = *cells.bits(band).get(word)?;
             let masked = w & (!0u64 << (slot % 64));
             if masked == 0 {
-                self.col = self.cells.first + (word as u32 + 1) * 64;
+                self.col = cells.first + (word as u32 + 1) * 64;
                 continue;
             }
-            let col = self.cells.first + word as u32 * 64 + masked.trailing_zeros();
+            let col = cells.first + word as u32 * 64 + masked.trailing_zeros();
             if col > self.hi {
                 return None;
             }
-            let cell = self.band.cell_at(self.cells, self.i, col);
+            let cell = band.cell_at(cells, self.i, col);
             self.col = col + 1;
             self.i += 1;
-            return Some((CellRef::new(self.row, col), cell));
+            return Some((CellRef::new(row, col), cell));
         }
         None
     }
 }
 
+/// Walks one packed row, in column order, without allocating.
+struct PackedRow<'a> {
+    band: &'a Band,
+    row: u32,
+    cells: &'a BandRow,
+    at: PackCursor,
+}
+
+impl Iterator for PackedRow<'_> {
+    type Item = (CellRef, Cell);
+    fn next(&mut self) -> Option<(CellRef, Cell)> {
+        self.at.next(self.band, self.cells, self.row)
+    }
+}
+
 fn packed_row<'a>(band: &'a Band, row: u32, cells: &'a BandRow, c0: u32, c1: u32) -> PackedRow<'a> {
-    let (lo, hi) = match cells.column_span(band) {
-        Some(_) => (c0.max(cells.first), c1.min(cells.first.saturating_add(cells.columns()).saturating_sub(1))),
-        None => (1, 0),
-    };
-    let col = lo.max(cells.first);
-    let i = cells.rank_before(band, col);
-    PackedRow { band, row, cells, col, hi, i }
+    PackedRow { band, row, cells, at: PackCursor::new(band, cells, c0, c1) }
 }
 
 /// Walks a row range over live and paged bands one band at a time, so a whole-column read does not
@@ -1954,6 +1974,183 @@ impl Iterator for CellWalk<'_> {
     }
 }
 
+/// Walks a row range like [`CellWalk`], one band at a time and one packed row at a time, reading
+/// paged bands **without caching them**. The band is the only page it holds: its rows are followed
+/// through a [`PackCursor`], so a band with a 16,384-column row costs a cursor, not a `Vec` of its
+/// cells, and a corrupt page is a skipped band, never a panic. This is the scan a save or an export
+/// wants; [`CellWalk`] stays the read path, because a viewport reads its rows again.
+struct ScanWalk<'a> {
+    store: &'a CellStore,
+    r: RangeRef,
+    segments: std::vec::IntoIter<RowSegment>,
+    segment: Option<RowSegment>,
+    keys: std::vec::IntoIter<u32>,
+    col_segments: Vec<ColSegment>,
+    /// The one band being walked; paged bands are decoded into it and dropped with the next one.
+    band: Option<Arc<Band>>,
+    /// The key `band` sits at, for the physical row its rows carry.
+    key: u32,
+    /// Index into `band.rows` of the row being walked.
+    row_ix: usize,
+    /// Index into `col_segments` of the run being walked.
+    col_ix: usize,
+    /// The logical row of `band.rows[row_ix]`.
+    logical: u32,
+    /// The place inside the current row's packed columns; `None` while a row or run is set up.
+    cursor: Option<PackCursor>,
+}
+
+impl<'a> ScanWalk<'a> {
+    fn new(store: &'a CellStore, r: RangeRef) -> ScanWalk<'a> {
+        ScanWalk {
+            store,
+            r,
+            segments: store.row_map.segments_in(r.start.row, r.end.row).into_iter(),
+            segment: None,
+            keys: Vec::new().into_iter(),
+            col_segments: store.col_map.segments_in(r.start.col, r.end.col),
+            band: None,
+            key: 0,
+            row_ix: 0,
+            col_ix: 0,
+            logical: 0,
+            cursor: None,
+        }
+    }
+
+    /// Loads the next band that holds data in the current row run, decoding it if it is paged.
+    /// False when the walk is over. A band that cannot be decoded is skipped as if it were not
+    /// there, exactly as a corrupt page reads as missing on the cached path.
+    fn next_band(&mut self) -> bool {
+        loop {
+            let key = match self.keys.next() {
+                Some(key) => key,
+                None => {
+                    let Some(segment) = self.next_segment() else { return false };
+                    self.keys = self.store.bands_in(segment.physical, segment.physical_end()).into_iter();
+                    self.segment = Some(segment);
+                    continue;
+                }
+            };
+            let Some(band) = self.store.scan_band(key) else { continue };
+            self.band = Some(band);
+            self.key = key;
+            self.row_ix = 0;
+            self.col_ix = 0;
+            self.logical = 0;
+            self.cursor = None;
+            return true;
+        }
+    }
+
+    fn next_segment(&mut self) -> Option<RowSegment> {
+        loop {
+            let segment = self.segments.next()?;
+            if segment.len > 0 {
+                return Some(segment);
+            }
+        }
+    }
+
+    /// Moves `row_ix` to the next row of `band` that the row map puts inside the range, in band
+    /// order, and sets its logical row. False when the band holds no such row any more.
+    fn begin_row(&mut self, band: &Band) -> bool {
+        let Some(segment) = self.segment else { return false };
+        let start = segment.physical;
+        let end = segment.physical_end();
+        while let Some(cells) = band.rows.get(self.row_ix) {
+            let physical = self.key.saturating_mul(BAND).saturating_add(cells.key);
+            if physical < start || physical >= end {
+                self.row_ix += 1;
+                continue;
+            }
+            let logical = segment.logical.saturating_add(physical - start);
+            if logical < self.r.start.row || logical > self.r.end.row {
+                self.row_ix += 1;
+                continue;
+            }
+            self.logical = logical;
+            self.col_ix = 0;
+            self.cursor = None;
+            return true;
+        }
+        false
+    }
+
+    /// Sets the cursor to the column run at `col_ix`, skipping the empty ones. False when the row
+    /// has no run left.
+    fn begin_run(&mut self, band: &Band, cells: &BandRow) -> bool {
+        while let Some(columns) = self.col_segments.get(self.col_ix) {
+            let first = columns.physical;
+            let last = columns.physical.saturating_add(columns.len).saturating_sub(1);
+            if first <= last {
+                self.cursor = Some(PackCursor::new(band, cells, first, last));
+                return true;
+            }
+            self.col_ix += 1;
+        }
+        false
+    }
+}
+
+impl Iterator for ScanWalk<'_> {
+    type Item = (CellRef, Cell);
+
+    fn next(&mut self) -> Option<(CellRef, Cell)> {
+        if self.col_segments.is_empty() {
+            return None;
+        }
+        'band: loop {
+            let Some(band) = self.band.clone() else {
+                if !self.next_band() {
+                    return None;
+                }
+                continue 'band;
+            };
+            loop {
+                if self.cursor.is_none() {
+                    if self.col_ix == 0 && !self.begin_row(&band) {
+                        self.band = None;
+                        continue 'band;
+                    }
+                    let Some(cells) = band.rows.get(self.row_ix) else {
+                        self.band = None;
+                        continue 'band;
+                    };
+                    if !self.begin_run(&band, cells) {
+                        self.row_ix += 1;
+                        self.col_ix = 0;
+                        continue;
+                    }
+                }
+                let Some(cells) = band.rows.get(self.row_ix) else {
+                    self.band = None;
+                    continue 'band;
+                };
+                let Some(columns) = self.col_segments.get(self.col_ix).copied() else {
+                    self.cursor = None;
+                    continue;
+                };
+                let Some(cursor) = self.cursor.as_mut() else { continue };
+                if let Some((at, cell)) = cursor.next(&band, cells, self.logical) {
+                    let col = columns.logical.saturating_add(at.col.saturating_sub(columns.physical));
+                    if col >= self.r.start.col && col <= self.r.end.col {
+                        return Some((CellRef::new(self.logical, col), cell));
+                    }
+                    continue;
+                }
+                // The run is walked out: the next column run of this row, or the next row.
+                self.cursor = None;
+                self.col_ix += 1;
+                if self.col_ix >= self.col_segments.len() {
+                    self.row_ix += 1;
+                    self.col_ix = 0;
+                }
+            }
+        }
+    }
+}
+
 /// One run of a value batch that lands in one band: `values[start..end]` all map to band `key`,
 /// and `base` is the physical row of `values[start]`. A band can be fed by several runs when the
 /// row map has a gap inside it, so a plan merges them into one task.
@@ -1985,6 +2182,19 @@ impl CellStore {
         }
         let page = self.pages.get(&key)?;
         self.load_page(key, page)
+    }
+
+    /// The band at `key` for a scan: a live band as it is, or a paged band decoded straight from
+    /// the page file. Nothing is installed in the cache and nothing is charged to its budget, so a
+    /// full-sheet scan neither evicts the working set the viewport reads nor leaves the sheet's
+    /// tail resident. A page that cannot be read is missing, exactly as it is on the cached path.
+    fn scan_band(&self, key: u32) -> Option<Arc<Band>> {
+        if let Some(band) = self.bands.get(&key) {
+            return Some(band.clone());
+        }
+        let page = self.pages.get(&key)?;
+        let file = self.page_file.as_deref()?;
+        page.decode(file)
     }
 
     /// Decodes a paged band through the page cache: a fresh decode pays its heap bytes into the
@@ -2898,6 +3108,32 @@ impl CellStore {
 
     pub fn iter_range(&self, r: RangeRef) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
         CellWalk::new(self, r)
+    }
+
+    /// Walks `r` in logical row-major order like [`iter_range`](Self::iter_range), but decodes
+    /// paged bands **without caching them**. This is the contract of the save/export scanner: one
+    /// band and one row are held at a time (so however wide the sheet is the walk stays flat), the
+    /// page cache's bytes and entries are exactly what they were before it ran, and a page that
+    /// cannot be decoded is a skipped band rather than an error or a panic. What it yields is
+    /// `iter_range`'s walk cell for cell, formula values included.
+    ///
+    /// [`iter`](Self::iter) stays the viewport and random-access path: its reads are expected to
+    /// repeat, so they pay for the cache. A scan reads every cell once and would only evict the
+    /// working set (and leave the sheet's tail resident) if it went through it.
+    pub fn iter_scan(&self, r: RangeRef) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
+        ScanWalk::new(self, r)
+    }
+
+    /// [`iter_scan`](Self::iter_scan) as a callback: `f` sees every cell in the same order and
+    /// stops the walk by returning false (the band being walked is dropped on the way out). No
+    /// collection is built per band, so an exporter can write as it goes.
+    pub fn visit_scan(&self, r: RangeRef, f: &mut dyn FnMut(CellRef, Cell) -> bool) -> bool {
+        for (at, cell) in self.iter_scan(r) {
+            if !f(at, cell) {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (CellRef, Cell)> + '_ {
@@ -4785,6 +5021,135 @@ mod tests {
     #[test]
     fn a_store_without_paging_has_no_page_cache() {
         assert!(CellStore::new().page_cache_stats().is_none());
+    }
+
+    /// The uncached scan yields exactly the cached walk: live, paged, and mapped-and-paged, with a
+    /// row as wide as the grid and a formula cell whose cached value a writer has to see.
+    #[test]
+    fn iter_scan_matches_iter_range() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            for col in 0..4u32 {
+                s.set(c(row, col), Cell { value: Value::Number(f64::from(row * 10 + col)), formula: None, style: StyleId(col % 3) });
+            }
+            s.set(c(row, 5), Cell::value(Value::Text(Arc::from(format!("r{row}").as_str()))));
+        }
+        // One row spanning every column the grid has.
+        let mut wide: Vec<(u32, Cell)> = (0..gridcraft_core::MAX_COLS).map(|col| (col, Cell::value(Value::Number(f64::from(col))))).collect();
+        s.set_row(250, &mut wide);
+        s.set(c(251, 0), Cell { value: Value::Number(3.0), formula: Some(Arc::new(Formula::new("=1+2"))), style: StyleId(2) });
+        let live: Vec<(CellRef, Cell)> = s.iter_range(RangeRef::all()).collect();
+        assert!(live.iter().any(|(at, _)| at.col == gridcraft_core::MAX_COLS - 1), "the wide row is in the walk");
+        assert_eq!(s.iter_scan(RangeRef::all()).collect::<Vec<_>>(), live, "a live store scans like it walks");
+
+        let mut paged = s.clone();
+        assert!(paged.enable_paging_with_cache(64 << 20), "a temporary page file is created");
+        assert!(paged.paged_band_count() > 0, "the bands were spilled");
+        assert!(paged.bands.is_empty(), "every band is on the page file");
+        assert_eq!(paged.iter_scan(RangeRef::all()).collect::<Vec<_>>(), live, "a paged store scans like a live one");
+
+        // A mapped store applies the row and column maps the same way on both paths.
+        let mut mapped = paged.clone();
+        mapped.shift_rows(1, 1);
+        mapped.shift_cols(1, 1);
+        let walked: Vec<(CellRef, Cell)> = mapped.iter_range(RangeRef::all()).collect();
+        assert_eq!(mapped.iter_scan(RangeRef::all()).collect::<Vec<_>>(), walked, "a mapped paged store scans like it walks");
+        let mut live_mapped = s.clone();
+        live_mapped.shift_rows(1, 1);
+        live_mapped.shift_cols(1, 1);
+        assert_eq!(mapped.iter_scan(RangeRef::all()).collect::<Vec<_>>(), live_mapped.iter_range(RangeRef::all()).collect::<Vec<_>>());
+    }
+
+    /// A scan decodes each paged band once and leaves the cache exactly as it found it: a save must
+    /// not evict the viewport's working set or leave the sheet's tail resident.
+    #[test]
+    fn a_scan_decodes_each_paged_band_once_without_caching() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+            s.set(c(row, 1), Cell::value(Value::Text(Arc::from(format!("r{row}").as_str()))));
+        }
+        assert!(s.enable_paging_with_cache(64 << 20), "a temporary page file is created");
+        let bands = s.paged_band_count();
+        assert!(bands >= 4, "200 rows over 64-row bands");
+        // Prime the cache the way a viewport would, so a scan that went through it would show.
+        assert!(s.get(c(0, 0)).is_some());
+        let before = s.page_cache_stats().expect("the store pages");
+        assert_eq!((before.hits, before.misses), (0, 1));
+        let decodes = s.page_file.as_ref().map(|file| file.decodes()).unwrap_or(0);
+
+        assert_eq!(s.iter_scan(RangeRef::all()).count(), 400);
+
+        let after = s.page_cache_stats().expect("the store pages");
+        assert_eq!(s.page_file.as_ref().map(|file| file.decodes()).unwrap_or(0), decodes + bands as u64, "each band decoded exactly once");
+        assert_eq!(after.bytes, before.bytes, "the scan charged nothing to the budget");
+        assert_eq!(after.entries, before.entries, "the scan queued nothing");
+        assert_eq!(
+            (after.hits, after.misses, after.evictions),
+            (before.hits, before.misses, before.evictions),
+            "the scan was neither a hit nor a miss"
+        );
+        assert_eq!(after.corrupt, before.corrupt);
+        assert!(s.pages.get(&0).is_some_and(|page| page.is_cached()), "the primed band is still cached");
+    }
+
+    /// `visit_scan` stops on the first `false` and leaves no decoded band behind; the full walk
+    /// reads every cell.
+    #[test]
+    fn visit_scan_stops_on_false_and_drops_the_band() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging_with_cache(64 << 20), "a temporary page file is created");
+        assert!(s.paged_band_count() > 0);
+        let mut seen: Vec<CellRef> = Vec::new();
+        let completed = s.visit_scan(RangeRef::all(), &mut |at, _| {
+            seen.push(at);
+            seen.len() < 3
+        });
+        assert!(!completed, "returning false stops the walk");
+        assert_eq!(seen, [c(0, 0), c(1, 0), c(2, 0)]);
+        assert!(s.pages.values().all(|page| !page.is_cached()), "the stopped scan left no band in the cache");
+        let stats = s.page_cache_stats().expect("the store pages");
+        assert_eq!((stats.bytes, stats.entries, stats.misses), (0, 0, 0));
+        let mut count = 0usize;
+        assert!(s.visit_scan(RangeRef::all(), &mut |_, _| {
+            count += 1;
+            true
+        }));
+        assert_eq!(count, 200, "the full walk visits every cell");
+    }
+
+    /// A page that cannot be decoded is a skipped band: the rest of the sheet still scans, nothing
+    /// panics and nothing is cached.
+    #[test]
+    fn a_scan_skips_a_page_it_cannot_decode() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging_with_cache(64 << 20), "a temporary page file is created");
+        assert_eq!(s.paged_band_count(), 4);
+        // Pages are appended in band order, so band 0's page starts at offset 0. Overwrite it with
+        // bytes that are not a page.
+        let path = s.page_file.as_ref().map(|file| file.path().to_path_buf()).expect("page file");
+        let len = s.pages.get(&0).map(|page| page.page_len()).expect("the first page");
+        let zeros = vec![0u8; len];
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).expect("open the page file");
+            file.seek(SeekFrom::Start(0)).expect("seek");
+            file.write_all(&zeros).expect("overwrite the first page");
+            file.flush().expect("flush");
+        }
+        let rows: Vec<u32> = s.iter_scan(RangeRef::all()).map(|(at, _)| at.row).collect();
+        assert_eq!(rows, (64..200).collect::<Vec<_>>(), "only the corrupt band's rows are missing");
+        assert!(s.pages.values().all(|page| !page.is_cached()), "a skipped page is not remembered");
+        assert_eq!(s.page_cache_stats().expect("the store pages").corrupt, 0, "the scan does not count cache corruption");
+        // The cached path still refuses the page the same way: it is missing, not a panic.
+        assert_eq!(s.get(c(0, 0)), None);
+        assert!(s.get(c(64, 0)).is_some());
     }
 
     /// The `GRIDCRAFT_PAGE_CACHE_MB` value is clamped before it becomes bytes; the environment
