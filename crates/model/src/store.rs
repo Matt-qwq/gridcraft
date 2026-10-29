@@ -2432,15 +2432,21 @@ impl CellStore {
     /// The cells of `r` that carry a formula, in row-major order.
     pub fn formula_cells(&self, r: RangeRef) -> impl Iterator<Item = CellRef> + '_ {
         let mut out = Vec::new();
+        // A whole-column range is millions of rows over a few thousand bands: resolve a band's
+        // page and `Arc` once, not once per row. Rows arrive in physical order inside a segment,
+        // so the last key covers every row of its band.
+        let mut current: Option<(u32, Option<Arc<Band>>)> = None;
         for segment in self.row_map.segments_in(r.start.row, r.end.row) {
             for offset in 0..segment.len {
                 let logical = segment.logical.saturating_add(offset);
                 let physical = segment.physical.saturating_add(offset);
                 let key = physical / BAND;
-                if self.pages.get(&key).is_some_and(|page| !page.has_formulas()) {
-                    continue;
+                if current.as_ref().is_none_or(|(k, _)| *k != key) {
+                    // A page that says it holds no formula is skipped without decoding it.
+                    let band = if self.pages.get(&key).is_some_and(|page| !page.has_formulas()) { None } else { self.band_arc(key) };
+                    current = Some((key, band));
                 }
-                let Some(band) = self.band_arc(key) else { continue };
+                let Some(band) = current.as_ref().and_then(|(_, band)| band.as_ref()) else { continue };
                 let Some(row) = band.row(physical % BAND) else { continue };
                 for (col, _) in row.formulas() {
                     let Some(logical_col) = self.col_map.inverse(*col) else { continue };
@@ -2456,15 +2462,19 @@ impl CellStore {
     /// Whether the block holds a cell whose value the store cannot give: a formula (it holds the
     /// value the file cached) or an array. Cheap next to reading the block: one check a row.
     pub fn has_owned_cells(&self, r: RangeRef) -> bool {
+        // Same band cache as `formula_cells`: every whole-column `SUM`/`COUNT` pays this gate
+        // before folding, and resolving the band per row cost 25 ms a million rows.
+        let mut current: Option<(u32, Option<Arc<Band>>)> = None;
         for segment in self.row_map.segments_in(r.start.row, r.end.row) {
             for offset in 0..segment.len {
-                let logical = segment.logical.saturating_add(offset);
                 let physical = segment.physical.saturating_add(offset);
                 let key = physical / BAND;
-                if self.pages.get(&key).is_some_and(|page| !page.has_owned()) {
-                    continue;
+                if current.as_ref().is_none_or(|(k, _)| *k != key) {
+                    // A page that says it holds no formula or array is not decoded at all.
+                    let band = if self.pages.get(&key).is_some_and(|page| !page.has_owned()) { None } else { self.band_arc(key) };
+                    current = Some((key, band));
                 }
-                let Some(band) = self.band_arc(key) else { continue };
+                let Some(band) = current.as_ref().and_then(|(_, band)| band.as_ref()) else { continue };
                 let Some(row) = band.row(physical % BAND) else { continue };
                 let owned = row.extras.as_ref().is_some_and(|e| {
                     e.formulas.iter().any(|(c, _)| self.col_map.inverse(*c).is_some_and(|col| (r.start.col..=r.end.col).contains(&col)))
@@ -2473,7 +2483,6 @@ impl CellStore {
                 if owned {
                     return true;
                 }
-                let _ = logical;
             }
         }
         false
@@ -4418,6 +4427,38 @@ mod tests {
         assert_eq!(s.get(c(15, 8)).and_then(|x| x.formula).map(|f| f.text.clone()), Some("1/0".to_string()));
         assert!(s.set_value(c(15, 8), &Value::Error(gridcraft_core::CellError::Div0)), "the mapped formula cell takes a value");
         assert_eq!(s.get(c(15, 8)).map(|x| x.value), Some(Value::Error(gridcraft_core::CellError::Div0)));
+    }
+
+    /// The owned-cell gate answers the same on a mapped and a paged store, and a band whose page
+    /// says it holds no formula or array is skipped without a decode: a whole-column `SUM` pays
+    /// one band lookup per band instead of one per row.
+    #[test]
+    fn the_owned_cell_gate_reads_a_band_once() {
+        let mut s = CellStore::new();
+        for r in 0..300u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r))));
+        }
+        s.set(c(130, 1), Cell { value: Value::Number(3.0), formula: Some(Arc::new(Formula::new("=A1+1"))), style: StyleId(0) });
+        let narrow = RangeRef::parse("A1:A300").expect("range");
+        let wide = RangeRef::parse("A1:B300").expect("range");
+        assert!(!s.has_owned_cells(narrow));
+        assert!(s.has_owned_cells(wide));
+        // Through a row map the band cache still has to find the formula, at its new logical row.
+        s.shift_rows(1, 1);
+        assert!(!s.has_owned_cells(narrow), "the formula moved out of column A");
+        assert!(s.has_owned_cells(wide), "and is still inside the block");
+        assert_eq!(s.formula_cells(wide).collect::<Vec<_>>(), [c(131, 1)]);
+        // Paging keeps the flag on the pages that hold a formula; the ones without are skipped
+        // without being decoded, so the gate stays a comparison per band.
+        assert!(s.enable_paging());
+        assert!(s.paged_band_count() > 0);
+        let decodes = || s.page_file.as_ref().map_or(0, |file| file.decodes());
+        let before = decodes();
+        assert!(!s.has_owned_cells(RangeRef::parse("A1:A100").expect("range")), "the first bands hold no formula");
+        assert_eq!(decodes(), before, "a page without a formula or array is not decoded to answer the gate");
+        assert!(!s.has_owned_cells(narrow));
+        assert!(s.has_owned_cells(wide));
+        assert_eq!(s.formula_cells(wide).collect::<Vec<_>>(), [c(131, 1)]);
     }
 
     #[test]
