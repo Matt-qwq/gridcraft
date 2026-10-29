@@ -172,6 +172,9 @@ pub struct Out {
     /// Authors of threaded comments, in first-use order; written to `xl/persons/person.xml`.
     pub persons: Vec<String>,
     pub table_id: u32,
+    /// The `id` each written table part got: `(sheet, model table name, id)`. A table slicer cache
+    /// names its table by that id (`tableSlicerCache/@tableId`), and only the table writer knows it.
+    pub table_ids: Vec<(usize, String, u32)>,
     pub dynamic_arrays: bool,
     pub needs_calc: bool,
     pub cell_pictures: crate::richdata::PicturesOut,
@@ -200,6 +203,7 @@ impl Default for Out {
             comments: 0,
             persons: vec![],
             table_id: 0,
+            table_ids: vec![],
             dynamic_arrays: false,
             needs_calc: false,
             cell_pictures: Default::default(),
@@ -394,6 +398,7 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
         comments: 0,
         persons: vec![],
         table_id: 0,
+        table_ids: vec![],
         dynamic_arrays: false,
         needs_calc: false,
         cell_pictures: Default::default(),
@@ -421,7 +426,11 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
     let mut pivots = crate::pivot::PivotWriter::default();
     let mut sheets_xml = String::new();
     let mut sheet_id = 1usize;
+    // The `sheetId` each model sheet is written with: a slicer/timeline cache names its PivotTable's
+    // sheet by it (`pivotTable/@tabId`), and only the workbook assembly knows it.
+    let mut sheet_ids: Vec<u32> = Vec::with_capacity(wb.sheets.len());
     for (i, sheet) in wb.sheets.iter().enumerate() {
+        sheet_ids.push(sheet_id as u32);
         let (before, next) = kept.sheet_entries(i, false, sheet_id);
         sheets_xml.push_str(&before);
         sheet_id = next;
@@ -561,6 +570,7 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
     w.push_str(&pivots.workbook_xml(&mut wb_rels));
     // The modelled slicer and timeline caches (parts, workbook relationships and the extension
     // that lists them); the kept path wrote none of them, it was stripped on read.
+    slicers.set_sheet_ids(sheet_ids);
     let model_exts = slicers.finish(wb, &mut out, &mut wb_rels, &pivots);
     let exts = crate::passthrough::workbook_elements(wb, crate::passthrough::CALC_SLOT);
     let kept_exts = &kept.ext;

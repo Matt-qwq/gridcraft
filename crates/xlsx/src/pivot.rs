@@ -491,6 +491,18 @@ pub fn source_fields(wb: &Workbook, pt: &PivotTable, default_sheet: usize) -> Op
     Some((si, header_names(wb.sheet(si)?, r)))
 }
 
+/// The source sheet, range and absolute column of one field of a PivotTable's source, when the
+/// cache can be written at all. A timeline reads its date bounds from that column.
+pub fn source_column(wb: &Workbook, pt: &PivotTable, default_sheet: usize, field: &str) -> Option<(usize, RangeRef, u32)> {
+    let (si, r, _) = resolve_source(wb, &pt.source, default_sheet, 0)?;
+    if r.count() > MAX_SOURCE_CELLS {
+        return None;
+    }
+    let names = header_names(wb.sheet(si)?, r);
+    let col = names.iter().position(|n| n.eq_ignore_ascii_case(field))?;
+    Some((si, r, r.start.col.saturating_add(col as u32)))
+}
+
 fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize, slicer_fields: &[String]) -> Option<Cache> {
     let (si, r, source_xml) = resolve_source(wb, &pt.source, pivot_sheet, 0)?;
     if r.count() > MAX_SOURCE_CELLS {

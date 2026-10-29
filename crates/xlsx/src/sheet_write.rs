@@ -53,7 +53,7 @@ fn table_name(name: &str, used: &mut HashSet<String>, n: u32) -> String {
 }
 
 /// Column names for a table: one per column of its range, unique and non-empty.
-fn table_columns(t: &Table) -> Vec<String> {
+pub(crate) fn table_columns(t: &Table) -> Vec<String> {
     let w = t.range.width() as usize;
     let mut used = HashSet::new();
     (0..w)
@@ -68,6 +68,13 @@ fn table_columns(t: &Table) -> Vec<String> {
             name
         })
         .collect()
+}
+
+/// Whether a table reaches the file. A table with nothing but a header (or a header and a totals
+/// row) has no data rows and is not a table the format can hold; a table slicer cache must not name
+/// one that is not written.
+pub(crate) fn table_is_written(t: &Table) -> bool {
+    t.range.height() > t.header_row as u32 + t.totals_row as u32 || (t.header_row && t.range.height() > t.totals_row as u32)
 }
 
 pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slicers: &crate::slicer::SlicerWriter) -> (String, Rels) {
@@ -103,11 +110,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
     };
     // Table header cells must hold the column names.
     let mut overrides: BTreeMap<CellRef, String> = BTreeMap::new();
-    let tables: Vec<(&Table, Vec<String>)> = folded
-        .iter()
-        .filter(|t| t.range.height() > t.header_row as u32 + t.totals_row as u32 || (t.header_row && t.range.height() > t.totals_row as u32))
-        .map(|t| (t, table_columns(t)))
-        .collect();
+    let tables: Vec<(&Table, Vec<String>)> = folded.iter().filter(|t| table_is_written(t)).map(|t| (t, table_columns(t))).collect();
     for (t, cols) in &tables {
         if t.header_row {
             for (i, name) in cols.iter().enumerate() {
@@ -544,8 +547,9 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
         }
     }
 
-    // Drawing: pictures, charts, shapes.
-    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.kept_charts.is_empty() || !sheet.shapes.is_empty() {
+    // Drawing: pictures, charts, shapes, and the frames that place slicers and timelines.
+    let frames = slicers.frames(si);
+    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.kept_charts.is_empty() || !sheet.shapes.is_empty() || !frames.is_empty() {
         out.drawings += 1;
         let dn = out.drawings;
         let mut drels = Rels::default();
@@ -603,6 +607,9 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
         for sh in &sheet.shapes {
             objs.push(Obj::Shape(sh));
         }
+        for f in &frames {
+            objs.push(Obj::Widget { name: f.name, anchor: f.anchor, timeline: f.timeline });
+        }
         out.part(&format!("xl/drawings/drawing{dn}.xml"), Some(CT_DRAWING), crate::drawing::write_drawing(sheet, &wb.theme, &objs).into_bytes());
         if !drels.is_empty() {
             out.part(&format!("xl/drawings/_rels/drawing{dn}.xml.rels"), None, drels.xml().into_bytes());
@@ -642,6 +649,9 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
             out.table_id += 1;
             let n = out.tables;
             let name = table_name(&t.name, &mut used_names, out.table_id);
+            // A table slicer cache names its table by this id; record it under the model's name (the
+            // slicer's `table`), which is what the slicer model holds.
+            out.table_ids.push((si, t.name.clone(), out.table_id));
             // What the table owned in the source file (its query table, its extensions) hangs off
             // its name: a renamed or deleted table takes it with it.
             let mut trels = Rels::default();

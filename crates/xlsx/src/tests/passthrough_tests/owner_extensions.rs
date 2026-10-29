@@ -8,21 +8,25 @@ const NS_X14: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/m
 const NS_X15: &str = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main";
 const REL_SLICER: &str = "http://schemas.microsoft.com/office/2007/relationships/slicer";
 const REL_SLICER_CACHE: &str = "http://schemas.microsoft.com/office/2007/relationships/slicerCache";
-const REL_TIMELINE: &str = "http://schemas.microsoft.com/office/2011/relationships/timeline";
-const REL_TIMELINE_CACHE: &str = "http://schemas.microsoft.com/office/2011/relationships/timelineCache";
-const EXT_SLICER_CACHES: &str = "{BBE1A952-6BD2-4e30-A5A6-4D6A0A0D6F2B}";
-const EXT_TIMELINES: &str = "{7E03D99C-DC04-49d9-9315-930204A7B6E9}";
-const EXT_PIVOT_SLICER_CACHE: &str = "{A8765BA9-456A-4dab-B4F3-ACF838C121DE}";
+const REL_TIMELINE: &str = "http://schemas.microsoft.com/office/2010/relationships/Timeline";
+const REL_TIMELINE_CACHE: &str = "http://schemas.microsoft.com/office/2010/relationships/TimelineCache";
+const EXT_SLICER_CACHES: &str = "{BBE1A952-AA13-448E-AADC-164F8A28A991}";
+const EXT_TIMELINE_CACHE_REFS: &str = "{D0CA8CA8-9F24-4464-BF8E-62219DCF47F9}";
+const EXT_SLICER_LIST: &str = "{A8765BA9-456A-4DAB-B4F3-ACF838C121DE}";
+const EXT_TIMELINE_REFS: &str = "{7E03D99C-DC04-49d9-9315-930204A7B6E9}";
+const EXT_PIVOT_SLICER_CACHE: &str = EXT_SLICER_LIST;
+const CT_TIMELINE_CACHE: &str = "application/vnd.ms-excel.TimelineCache+xml";
+const CT_TIMELINE: &str = "application/vnd.ms-excel.Timeline+xml";
 const EXT_PIVOT_MODELLED: &str = "{962EF5D1-5CA2-4c93-8EF4-DBF5C05439D2}";
 
-const SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="Slicer_Region" sourceName="Region"><pivotTables><pivotTable tabId="0" name="PivotTable1"/></pivotTables><data><tabular pivotCacheId="1"/></data><slicers><slicer r:id="rId1"/></slicers></slicerCacheDefinition>"#;
+const SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="Slicer_Region" sourceName="Region"><pivotTables><pivotTable tabId="1" name="PivotTable1"/></pivotTables><data><tabular pivotCacheId="1"/></data></slicerCacheDefinition>"#;
 const SLICER: &str = r#"<?xml version="1.0"?><slicers xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><slicer name="Region" cache="Slicer_Region" caption="Region"/></slicers>"#;
-const TIMELINE: &str = r#"<?xml version="1.0"?><timelines xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><timeline name="Date" cache="Timeline_Date" caption="Date"/></timelines>"#;
-const TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Date" sourceName="Date"><pivotTables><pivotTable tabId="0" name="PivotTable1"/></pivotTables><state scrollPosition="0"/></timelineCacheDefinition>"#;
+const TIMELINE: &str = r#"<?xml version="1.0"?><timelines xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"><timeline name="Amount" cache="Timeline_Amount" caption="Amount" level="2" selectionLevel="2"/></timelines>"#;
+const TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Amount" sourceName="Amount"><pivotTables><pivotTable tabId="1" name="PivotTable1"/></pivotTables><state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="unknown"><bounds startDate="1900-01-10T00:00:00" endDate="1900-02-09T00:00:00"/></state></timelineCacheDefinition>"#;
 /// A slicer cache whose data lives in an `<olap>` block: not modelled, so kept as it came.
-const OLAP_SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="Slicer_Region" sourceName="Region"><pivotTables><pivotTable tabId="0" name="PivotTable1"/></pivotTables><data><olap><pivotCacheId>1</pivotCacheId></olap></data><slicers><slicer r:id="rId1"/></slicers></slicerCacheDefinition>"#;
+const OLAP_SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="Slicer_Region" sourceName="Region"><pivotTables><pivotTable tabId="1" name="PivotTable1"/></pivotTables><data><olap><pivotCacheId>1</pivotCacheId></olap></data></slicerCacheDefinition>"#;
 /// A timeline cache with a selected date range: not modelled, so kept as it came.
-const SELECTED_TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Date" sourceName="Date"><pivotTables><pivotTable tabId="0" name="PivotTable1"/></pivotTables><state scrollPosition="0" selectionStartDate="2024-01-01T00:00:00" selectionEndDate="2024-03-31T00:00:00"/></timelineCacheDefinition>"#;
+const SELECTED_TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Amount" sourceName="Amount"><pivotTables><pivotTable tabId="1" name="PivotTable1"/></pivotTables><state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="unknown"><selection startDate="1900-01-10T00:00:00" endDate="1900-02-09T00:00:00"/><bounds startDate="1900-01-10T00:00:00" endDate="1900-02-09T00:00:00"/></state></timelineCacheDefinition>"#;
 const QUERY_TABLE: &str = r#"<?xml version="1.0"?><queryTable xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="SalesQuery" connectionId="1" autoFormatId="16" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="0"/>"#;
 const PIVOT_CACHE: &str = r#"<?xml version="1.0"?><pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" saveData="0" refreshOnLoad="1" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3"><cacheSource type="worksheet"><worksheetSource ref="A1:B5" sheet="Data"/></cacheSource><cacheFields count="2"><cacheField name="Region" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="1"><s v="North"/><s v="South"/></sharedItems></cacheField><cacheField name="Amount" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0"/></cacheField></cacheFields><extLst><ext uri="{33333333-4444-5555-6666-777777777777}"><x99:cacheThing xmlns:x99="urn:example:cache">keep the cache extension</x99:cacheThing></ext></extLst></pivotCacheDefinition>"#;
 const PIVOT_TABLE: &str = r#"<?xml version="1.0"?><pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="PivotTable1" cacheId="1" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3"><location ref="E3:F6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="2"><pivotField axis="axisRow" showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><rowItems count="1"><i><x/></i></rowItems><colItems count="1"><i/></colItems><dataFields count="1"><dataField name="Sum of Amount" fld="1" baseField="0" baseItem="0"/></dataFields><extLst><ext uri="{A8765BA9-456A-4dab-B4F3-ACF838C121DE}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:slicerCacheData><x14:slicerCache r:id="rId2"/></x14:slicerCacheData></ext><ext uri="{962EF5D1-5CA2-4c93-8EF4-DBF5C05439D2}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:pivotTableDefinition hideValuesRow="1"/></ext><ext uri="{22222222-3333-4444-5555-666666666666}"><x99:pivotThing xmlns:x99="urn:example:pivot">keep the pivot extension</x99:pivotThing></ext></extLst></pivotTableDefinition>"#;
@@ -40,17 +44,17 @@ fn extension_package() -> Vec<u8> {
 /// model must keep them byte for byte.
 fn extension_package_with(slicer_cache: &str, timeline_cache: &str) -> Vec<u8> {
     let workbook = format!(
-        r#"<?xml version="1.0"?><workbook xmlns="{NS_MAIN}" xmlns:r="{NS_R}" xmlns:x14="{NS_X14}" xmlns:x15="{NS_X15}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId2"/></pivotCaches><extLst><ext uri="{EXT_SLICER_CACHES}" xmlns:x14="{NS_X14}"><x14:slicerCaches><x14:slicerCache r:id="rId3"/></x14:slicerCaches></ext><ext uri="{EXT_TIMELINES}" xmlns:x15="{NS_X15}"><x15:timelineCacheRefs><x15:timelineCacheRef r:id="rId4"/></x15:timelineCacheRefs></ext><ext uri="{{11111111-2222-3333-4444-555555555555}}"><x99:workbookThing xmlns:x99="urn:example:workbook">keep the workbook extension</x99:workbookThing></ext></extLst></workbook>"#
+        r#"<?xml version="1.0"?><workbook xmlns="{NS_MAIN}" xmlns:r="{NS_R}" xmlns:x14="{NS_X14}" xmlns:x15="{NS_X15}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId2"/></pivotCaches><extLst><ext uri="{EXT_SLICER_CACHES}" xmlns:x14="{NS_X14}"><x14:slicerCaches><x14:slicerCache r:id="rId3"/></x14:slicerCaches></ext><ext uri="{EXT_TIMELINE_CACHE_REFS}" xmlns:x15="{NS_X15}"><x15:timelineCacheRefs><x15:timelineCacheRef r:id="rId4"/></x15:timelineCacheRefs></ext><ext uri="{{11111111-2222-3333-4444-555555555555}}"><x99:workbookThing xmlns:x99="urn:example:workbook">keep the workbook extension</x99:workbookThing></ext></extLst></workbook>"#
     );
     let sheet = format!(
-        r#"<?xml version="1.0"?><worksheet xmlns="{NS_MAIN}" xmlns:r="{NS_R}" xmlns:x14="{NS_X14}" xmlns:x15="{NS_X15}"><dimension ref="A1:B5"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Region</t></is></c><c r="B1" t="inlineStr"><is><t>Amount</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>North</t></is></c><c r="B2"><v>10</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>South</t></is></c><c r="B3"><v>20</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>North</t></is></c><c r="B4"><v>30</v></c></row><row r="5"><c r="A5" t="inlineStr"><is><t>South</t></is></c><c r="B5"><v>40</v></c></row></sheetData><drawing r:id="rId6"/><tableParts count="1"><tablePart r:id="rId1"/></tableParts><extLst><ext uri="{EXT_TIMELINES}" xmlns:x15="{NS_X15}"><x15:timelines><x15:timeline r:id="rId5"/></x15:timelines></ext><ext uri="{{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}}"><x99:sheetThing xmlns:x99="urn:example:sheet">keep the sheet extension</x99:sheetThing></ext></extLst></worksheet>"#
+        r#"<?xml version="1.0"?><worksheet xmlns="{NS_MAIN}" xmlns:r="{NS_R}" xmlns:x14="{NS_X14}" xmlns:x15="{NS_X15}"><dimension ref="A1:B5"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Region</t></is></c><c r="B1" t="inlineStr"><is><t>Amount</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>North</t></is></c><c r="B2"><v>10</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>South</t></is></c><c r="B3"><v>20</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>North</t></is></c><c r="B4"><v>30</v></c></row><row r="5"><c r="A5" t="inlineStr"><is><t>South</t></is></c><c r="B5"><v>40</v></c></row></sheetData><drawing r:id="rId6"/><tableParts count="1"><tablePart r:id="rId1"/></tableParts><extLst><ext uri="{EXT_SLICER_LIST}" xmlns:x14="{NS_X14}"><x14:slicerList><x14:slicer r:id="rId7"/></x14:slicerList></ext><ext uri="{EXT_TIMELINE_REFS}" xmlns:x15="{NS_X15}"><x15:timelineRefs><x15:timelineRef r:id="rId5"/></x15:timelineRefs></ext><ext uri="{{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}}"><x99:sheetThing xmlns:x99="urn:example:sheet">keep the sheet extension</x99:sheetThing></ext></extLst></worksheet>"#
     );
     let drawing = r#"<?xml version="1.0"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"><xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>8</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>10</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
     let chart = format!(
         r#"<?xml version="1.0"?><c:chartSpace xmlns:c="{NS_C}"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numRef><c:f>Data!$B$2:$B$5</c:f></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart><c:extLst><c:ext uri="{{C3380CC4-5D21-4A18-A83A-4E5A6B4C5A11}}"><c15:unknownChartThing xmlns:c15="http://schemas.microsoft.com/office/drawing/2012/chart">keep the chart extension</c15:unknownChartThing></c:ext></c:extLst></c:chartSpace>"#
     );
     let content_types = format!(
-        r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="{CT_PREFIX}.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="{CT_PREFIX}.spreadsheetml.worksheet+xml"/><Override PartName="/xl/tables/table1.xml" ContentType="{CT_PREFIX}.spreadsheetml.table+xml"/><Override PartName="/xl/queryTables/queryTable2.xml" ContentType="{CT_PREFIX}.spreadsheetml.queryTable+xml"/><Override PartName="/xl/pivotTables/pivotTable1.xml" ContentType="{CT_PREFIX}.spreadsheetml.pivotTable+xml"/><Override PartName="/xl/pivotCache/pivotCacheDefinition1.xml" ContentType="{CT_PREFIX}.spreadsheetml.pivotCacheDefinition+xml"/><Override PartName="/xl/slicerCaches/slicerCache1.xml" ContentType="application/vnd.ms-excel.slicerCache+xml"/><Override PartName="/xl/slicers/slicer1.xml" ContentType="application/vnd.ms-excel.slicer+xml"/><Override PartName="/xl/timelines/timeline1.xml" ContentType="application/vnd.ms-excel.timeline+xml"/><Override PartName="/xl/timelineCaches/timelineCache1.xml" ContentType="application/vnd.ms-excel.timelineCache+xml"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="{CT_PREFIX}.drawing+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="{CT_PREFIX}.drawingml.chart+xml"/></Types>"#
+        r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="{CT_PREFIX}.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="{CT_PREFIX}.spreadsheetml.worksheet+xml"/><Override PartName="/xl/tables/table1.xml" ContentType="{CT_PREFIX}.spreadsheetml.table+xml"/><Override PartName="/xl/queryTables/queryTable2.xml" ContentType="{CT_PREFIX}.spreadsheetml.queryTable+xml"/><Override PartName="/xl/pivotTables/pivotTable1.xml" ContentType="{CT_PREFIX}.spreadsheetml.pivotTable+xml"/><Override PartName="/xl/pivotCache/pivotCacheDefinition1.xml" ContentType="{CT_PREFIX}.spreadsheetml.pivotCacheDefinition+xml"/><Override PartName="/xl/slicerCaches/slicerCache1.xml" ContentType="application/vnd.ms-excel.slicerCache+xml"/><Override PartName="/xl/slicers/slicer1.xml" ContentType="application/vnd.ms-excel.slicer+xml"/><Override PartName="/xl/timelines/timeline1.xml" ContentType="{CT_TIMELINE}"/><Override PartName="/xl/timelineCaches/timelineCache1.xml" ContentType="{CT_TIMELINE_CACHE}"/><Override PartName="/xl/drawings/drawing1.xml" ContentType="{CT_PREFIX}.drawing+xml"/><Override PartName="/xl/charts/chart1.xml" ContentType="{CT_PREFIX}.drawingml.chart+xml"/></Types>"#
     );
     make_zip(&[
         ("[Content_Types].xml", content_types.as_bytes()),
@@ -74,6 +78,7 @@ fn extension_package_with(slicer_cache: &str, timeline_cache: &str) -> Vec<u8> {
                 ("rId2", "pivotTable", "../pivotTables/pivotTable1.xml"),
                 ("rId5", REL_TIMELINE, "../timelines/timeline1.xml"),
                 ("rId6", "drawing", "../drawings/drawing1.xml"),
+                ("rId7", REL_SLICER, "../slicers/slicer1.xml"),
             ])
             .as_bytes(),
         ),
@@ -91,7 +96,6 @@ fn extension_package_with(slicer_cache: &str, timeline_cache: &str) -> Vec<u8> {
         ),
         ("xl/pivotCache/pivotCacheDefinition1.xml", PIVOT_CACHE.as_bytes()),
         ("xl/slicerCaches/slicerCache1.xml", slicer_cache.as_bytes()),
-        ("xl/slicerCaches/_rels/slicerCache1.xml.rels", rels(&[("rId1", REL_SLICER, "../slicers/slicer1.xml")]).as_bytes()),
         ("xl/slicers/slicer1.xml", SLICER.as_bytes()),
         ("xl/timelines/timeline1.xml", TIMELINE.as_bytes()),
         ("xl/timelineCaches/timelineCache1.xml", timeline_cache.as_bytes()),
@@ -103,7 +107,11 @@ fn extension_package_with(slicer_cache: &str, timeline_cache: &str) -> Vec<u8> {
 
 /// The part the first relationship of `kind` on `owner` points at.
 fn target_of_kind(u: &Unpacked, owner: &str, kind: &str) -> (String, String) {
-    let r = u.rels(owner).into_iter().find(|r| r.1.ends_with(&format!("/{kind}"))).unwrap_or_else(|| panic!("{owner}: no {kind} relationship"));
+    let r = u
+        .rels(owner)
+        .into_iter()
+        .find(|r| r.1.rsplit('/').next().is_some_and(|k| k.eq_ignore_ascii_case(kind)))
+        .unwrap_or_else(|| panic!("{owner}: no {kind} relationship"));
     (r.0, r.2)
 }
 
@@ -147,7 +155,7 @@ fn slicers_timelines_and_owner_extensions_survive_a_round_trip() {
     assert_eq!(sl.pivot_tables, ["PivotTable1"]);
     assert_eq!(sheet.pivot_timelines.len(), 1, "{:?}", rep.warnings);
     assert_eq!(sheet.pivot_timelines[0].unit, gridcraft_model::TimeUnit::Months);
-    assert_eq!(sheet.pivot_timelines[0].field, "Date");
+    assert_eq!(sheet.pivot_timelines[0].field, "Amount");
 
     let out = write_xlsx(&wb).unwrap();
     let u = Unpacked::new(&out);
@@ -165,34 +173,38 @@ fn slicers_timelines_and_owner_extensions_survive_a_round_trip() {
     }
     let cache = only_part(&u, "xl/slicerCaches/", ".xml");
     assert!(cache.contains("name=\"Slicer_Region\"") && cache.contains("sourceName=\"Region\""), "{cache}");
-    assert!(cache.contains("<pivotTable tabId=\"0\" name=\"PivotTable1\"/>"), "{cache}");
+    assert!(cache.contains("<pivotTable tabId=\"1\" name=\"PivotTable1\"/>"), "tabId is a sheetId: {cache}");
     assert!(cache.contains("<i x=\"0\" s=\"1\"/><i x=\"1\" s=\"1\"/>"), "{cache}");
     let slicer = only_part(&u, "xl/slicers/", ".xml");
     assert!(slicer.contains("name=\"Region\"") && slicer.contains("caption=\"Region\""), "{slicer}");
     assert!(slicer.contains("columnCount=\"1\""), "{slicer}");
     let timeline = only_part(&u, "xl/timelines/", ".xml");
-    assert!(timeline.contains("name=\"Date\"") && timeline.contains("level=\"2\""), "{timeline}");
+    assert!(timeline.contains("name=\"Amount\"") && timeline.contains("level=\"2\"") && timeline.contains("selectionLevel=\"2\""), "{timeline}");
     only_part(&u, "xl/timelineCaches/", ".xml");
 
     // The extensions that name them are written once from the model, and the unknown ones are kept.
     let wbx = u.text("xl/workbook.xml");
     assert!(wbx.contains(EXT_SLICER_CACHES) && wbx.contains("slicerCaches"), "{wbx}");
-    assert!(wbx.contains(EXT_TIMELINES) && wbx.contains("timelineCacheRefs"), "{wbx}");
+    assert!(wbx.contains(EXT_TIMELINE_CACHE_REFS) && wbx.contains("timelineCacheRefs"), "{wbx}");
     assert!(wbx.contains("keep the workbook extension"), "{wbx}");
     let (_, cache_part) = target_of_kind(&u, "xl/workbook.xml", "slicerCache");
     assert_eq!(cache_part, "xl/slicerCaches/slicerCache1.xml", "the cache keeps the part it names");
     let (_, timeline_cache) = target_of_kind(&u, "xl/workbook.xml", "timelineCache");
     let tcx = u.parts.get(&timeline_cache).map(|d| String::from_utf8_lossy(d).into_owned()).unwrap_or_default();
-    assert!(tcx.contains("name=\"Timeline_Date\"") && tcx.contains("sourceName=\"Date\""), "{tcx}");
-    assert!(tcx.contains("<state scrollPosition=\"0\"/>"), "{tcx}");
+    assert!(tcx.contains("name=\"Timeline_Amount\"") && tcx.contains("sourceName=\"Amount\""), "{tcx}");
+    assert!(tcx.contains("filterType=\"unknown\"") && tcx.contains("<bounds startDate="), "{tcx}");
 
-    // The worksheet's timeline and its own unknown extension.
+    // The worksheet's slicer list, its timeline references, and its own unknown extension.
     let sheet_part_name = sheet_part(&u, "Data");
     let sx = u.text(&sheet_part_name);
-    assert!(sx.contains("timelines") && sx.contains("keep the sheet extension"), "{sx}");
-    let timeline_id = attr_of(&sx[sx.find("<x15:timeline ").unwrap()..], "x15:timeline", "r:id");
+    assert!(sx.contains("slicerList") && sx.contains("timelineRefs") && sx.contains("keep the sheet extension"), "{sx}");
+    let slicer_ref = attr_of(&sx[sx.find("<x14:slicer ").unwrap()..], "x14:slicer", "r:id");
+    let (sy, slicer_part) = u.target(&sheet_part_name, &slicer_ref);
+    assert_eq!(sy, REL_SLICER, "{sy}");
+    assert!(slicer_part.starts_with("xl/slicers/"), "{slicer_part}");
+    let timeline_id = attr_of(&sx[sx.find("<x15:timelineRef ").unwrap()..], "x15:timelineRef", "r:id");
     let (ty, timeline_part) = u.target(&sheet_part_name, &timeline_id);
-    assert!(ty.ends_with("/timeline"), "{ty}");
+    assert_eq!(ty, REL_TIMELINE, "{ty}");
     assert!(timeline_part.starts_with("xl/timelines/"), "{timeline_part}");
 
     // The PivotTable keeps the extension that names its modelled slicer cache (written from the
@@ -252,7 +264,7 @@ fn slicers_timelines_and_owner_extensions_survive_a_round_trip() {
         assert_eq!(u.find(data).len(), 1, "kept part missing or duplicated: {}", String::from_utf8_lossy(data));
     }
     assert!(u.text("xl/workbook.xml").contains("slicerCaches") && u.text("xl/workbook.xml").contains("timelineCacheRefs"));
-    assert!(u.text(&sheet_part(&u, "Data")).contains("timelines"));
+    assert!(u.text(&sheet_part(&u, "Data")).contains("timelineRef") && u.text(&sheet_part(&u, "Data")).contains("slicerList"));
 }
 
 #[test]
@@ -265,7 +277,8 @@ fn a_deleted_pivottable_takes_its_slicer_and_timeline_caches_with_it() {
     assert_eq!(kept_parts(&u), ["xl/queryTables/queryTable2.xml"], "a PivotTable's caches went with it");
     assert!(!u.text("xl/workbook.xml").contains("slicerCaches"));
     assert!(!u.text("xl/workbook.xml").contains("timelineCache"));
-    assert!(!u.text(&sheet_part(&u, "Data")).contains("timelines"));
+    assert!(!u.text(&sheet_part(&u, "Data")).contains("timelineRef"));
+    assert!(!u.text(&sheet_part(&u, "Data")).contains("slicerList"));
     // An extension that names no part is kept: it may be anything.
     assert!(u.text("xl/workbook.xml").contains("keep the workbook extension"));
     assert!(u.text(&sheet_part(&u, "Data")).contains("keep the sheet extension"));
@@ -306,7 +319,8 @@ fn a_renamed_pivottable_loses_its_slicer_and_timeline_caches() {
     // longer exists is worse than no slicer, and a part nothing relates to is a repair prompt.
     assert_eq!(kept_parts(&u), ["xl/queryTables/queryTable2.xml"], "{:?}", kept_parts(&u));
     assert!(!u.text("xl/workbook.xml").contains("slicerCaches"));
-    assert!(!u.text(&sheet_part(&u, "Data")).contains("timelines"));
+    assert!(!u.text(&sheet_part(&u, "Data")).contains("timelineRef"));
+    assert!(!u.text(&sheet_part(&u, "Data")).contains("slicerList"));
     // The PivotTable itself still saves, with no extension pointing at a part the file lacks.
     let sheet = sheet_part(&u, "Data");
     let (_, pivot) = target_of_kind(&u, &sheet, "pivotTable");

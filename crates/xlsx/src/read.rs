@@ -37,6 +37,9 @@ pub struct Ctx<'a> {
     /// Whether the sheet part being read had an `<extLst>`: the pass-through scans the part again
     /// only when it has one.
     pub sheet_ext: bool,
+    /// The anchors drawings give slicer and timeline views, by view name. A slicer part carries no
+    /// position, so the model takes the anchor from here.
+    pub widget_frames: Vec<crate::drawing::WidgetFrame>,
 }
 
 impl Ctx<'_> {
@@ -187,6 +190,7 @@ fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadRepor
         cell_pictures: vec![],
         cf_ext_ids: vec![],
         sheet_ext: false,
+        widget_frames: vec![],
     };
     let root_rels = cx.pkg.rels("")?;
     let wb_part = find_rel(&root_rels, "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
