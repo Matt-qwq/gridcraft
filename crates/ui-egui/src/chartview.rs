@@ -2,8 +2,9 @@
 //! we paint with egui), pictures and shapes.
 
 use egui::epaint::{PathShape, PathStroke};
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
+use egui::{Align2, Color32, CursorIcon, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
 use gridcraft_chart::{HAlign, Prim, VAlign};
+use gridcraft_engine::core::CellRef;
 use gridcraft_engine::model::{Anchor, ShapeKind, Sheet, Workbook};
 
 use crate::SheetApp;
@@ -243,7 +244,196 @@ fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Sh
 pub(crate) fn anchor_rect(geo: &Geo, sh: &Sheet, a: &Anchor) -> Rect {
     let x = geo.x(sh, a.cell.col) + a.dx * geo.z;
     let y = geo.y(sh, a.cell.row) + a.dy * geo.z;
-    Rect::from_min_size(pos2(x, y), vec2(a.width * geo.z, a.height.max(1.0) * geo.z))
+    Rect::from_min_size(pos2(x, y), vec2(a.width.max(1.0) * geo.z, a.height.max(1.0) * geo.z))
+}
+
+// ------------------------------------------------------------------ moving and resizing
+
+/// The smallest width or height (sheet points) an object can be dragged to. Both ends are held
+/// apart by this much, so a stray pointer can never turn a chart into a line.
+pub const OBJECT_MIN_SIZE: f32 = 20.0;
+/// The largest size `object.move` stores (it clamps to this), so a wild drag asks for nothing more.
+pub const OBJECT_MAX_SIZE: f32 = 10_000.0;
+/// Side of a resize handle's hit box (screen points).
+const HANDLE_SIZE: f32 = 11.0;
+
+/// A resize handle of a selected object: the corner or edge it grabs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    Nw,
+    N,
+    Ne,
+    E,
+    Se,
+    S,
+    Sw,
+    W,
+}
+
+/// Which edges of an object a drag moves. A move drags all four.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Edges {
+    pub left: bool,
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+}
+
+impl Edges {
+    /// A whole-object move: every edge follows the pointer.
+    pub const MOVE: Edges = Edges { left: true, top: true, right: true, bottom: true };
+}
+
+impl Handle {
+    pub fn edges(self) -> Edges {
+        let (l, t, r, b) = match self {
+            Handle::Nw => (true, true, false, false),
+            Handle::N => (false, true, false, false),
+            Handle::Ne => (false, true, true, false),
+            Handle::E => (false, false, true, false),
+            Handle::Se => (false, false, true, true),
+            Handle::S => (false, false, false, true),
+            Handle::Sw => (true, false, false, true),
+            Handle::W => (true, false, false, false),
+        };
+        Edges { left: l, top: t, right: r, bottom: b }
+    }
+
+    /// The resize cursor for the handle. On a right-to-left sheet the drawing is mirrored, so a
+    /// top-left handle sits on the screen's top right: the diagonal cursors swap with it.
+    pub fn cursor(self, rtl: bool) -> CursorIcon {
+        match self {
+            Handle::N | Handle::S => CursorIcon::ResizeVertical,
+            Handle::E | Handle::W => CursorIcon::ResizeHorizontal,
+            Handle::Nw | Handle::Se if rtl => CursorIcon::ResizeNeSw,
+            Handle::Ne | Handle::Sw if rtl => CursorIcon::ResizeNwSe,
+            Handle::Nw | Handle::Se => CursorIcon::ResizeNwSe,
+            Handle::Ne | Handle::Sw => CursorIcon::ResizeNeSw,
+        }
+    }
+}
+
+/// Centre of each of the eight handles, in the order `Handle` is listed.
+const HANDLES: [Handle; 8] = [Handle::Nw, Handle::N, Handle::Ne, Handle::E, Handle::Se, Handle::S, Handle::Sw, Handle::W];
+
+pub fn handle_centres(r: Rect) -> [Pos2; 8] {
+    [r.left_top(), r.center_top(), r.right_top(), r.right_center(), r.right_bottom(), r.center_bottom(), r.left_bottom(), r.left_center()]
+}
+
+/// The handle under `p`, if any. Only a selected object shows handles; the caller checks that.
+pub fn handle_at(r: Rect, p: Pos2) -> Option<Handle> {
+    let side = vec2(HANDLE_SIZE, HANDLE_SIZE);
+    handle_centres(r).into_iter().zip(HANDLES).find(|(c, _)| Rect::from_center_size(*c, side).contains(p)).map(|(_, h)| h)
+}
+
+/// An object's frame in sheet units (points): its top-left corner and size.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Frame {
+    pub x: f64,
+    pub y: f64,
+    pub w: f32,
+    pub h: f32,
+}
+
+pub fn frame_of(sh: &Sheet, a: &Anchor) -> Frame {
+    Frame { x: sh.col_left(a.cell.col) + f64::from(a.dx), y: sh.row_top(a.cell.row) + f64::from(a.dy), w: a.width, h: a.height }
+}
+
+/// The anchor (top-left cell, its pixel offset, and the size) that describes `f`. A frame on or
+/// past the sheet's left/top edge anchors at the first cell with a zero offset.
+pub fn anchor_of(sh: &Sheet, f: Frame) -> (CellRef, f32, f32, f32, f32) {
+    let x = if f.x.is_finite() { f.x.max(0.0) } else { 0.0 };
+    let y = if f.y.is_finite() { f.y.max(0.0) } else { 0.0 };
+    let col = sh.col_at(x);
+    let row = sh.row_at(y);
+    let dx = (x - sh.col_left(col)).max(0.0) as f32;
+    let dy = (y - sh.row_top(row)).max(0.0) as f32;
+    let w = finite_size(f.w);
+    let h = finite_size(f.h);
+    (CellRef::new(row, col), dx, dy, w, h)
+}
+
+fn finite_size(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(OBJECT_MIN_SIZE, OBJECT_MAX_SIZE) } else { OBJECT_MIN_SIZE }
+}
+
+/// The frame a drag leaves the object in: `orig` moved or resized by `delta` sheet points, with
+/// the edges `e` names moving. Dragging a left or top edge holds the opposite edge still, so the
+/// anchor moves with it. The minimum size is always kept, and with `keep_ratio` (Shift) the other
+/// dimension follows the dragged one at the size's original proportions.
+pub fn drag_frame(orig: Frame, e: Edges, delta: egui::Vec2, keep_ratio: bool) -> Frame {
+    let (dx, dy) = if delta.x.is_finite() && delta.y.is_finite() { (f64::from(delta.x), f64::from(delta.y)) } else { (0.0, 0.0) };
+    let min = f64::from(OBJECT_MIN_SIZE);
+    let w0 = f64::from(orig.w.clamp(OBJECT_MIN_SIZE, OBJECT_MAX_SIZE));
+    let h0 = f64::from(orig.h.clamp(OBJECT_MIN_SIZE, OBJECT_MAX_SIZE));
+    let x0 = if orig.x.is_finite() { orig.x.max(0.0) } else { 0.0 };
+    let y0 = if orig.y.is_finite() { orig.y.max(0.0) } else { 0.0 };
+    let right = x0 + w0;
+    let bottom = y0 + h0;
+    let moves_x = e.left && e.right;
+    let moves_y = e.top && e.bottom;
+    let mut w = if e.right && !e.left {
+        w0 + dx
+    } else if e.left && !e.right {
+        w0 - dx
+    } else {
+        w0
+    };
+    let mut h = if e.bottom && !e.top {
+        h0 + dy
+    } else if e.top && !e.bottom {
+        h0 - dy
+    } else {
+        h0
+    };
+    // The minimum size wins over the pointer: the edge that is not dragged stays put.
+    w = w.max(min);
+    h = h.max(min);
+    if keep_ratio {
+        let ratio = w0 / h0;
+        let (horizontal, vertical) = (e.left != e.right, e.top != e.bottom);
+        if horizontal && vertical {
+            if (w / w0 - 1.0).abs() >= (h / h0 - 1.0).abs() {
+                h = (w / ratio).max(min);
+            } else {
+                w = (h * ratio).max(min);
+            }
+        } else if horizontal {
+            h = (w / ratio).max(min);
+        } else if vertical {
+            w = (h * ratio).max(min);
+        }
+    }
+    w = finite_size(w as f32) as f64;
+    h = finite_size(h as f32) as f64;
+    let mut x = if moves_x {
+        x0 + dx
+    } else if e.left {
+        right - w
+    } else {
+        x0
+    };
+    let mut y = if moves_y {
+        y0 + dy
+    } else if e.top {
+        bottom - h
+    } else {
+        y0
+    };
+    // Nothing goes above or left of the sheet: the near edge stops at the first cell's origin.
+    if x < 0.0 {
+        x = 0.0;
+        if !moves_x {
+            w = (right - x).max(min);
+        }
+    }
+    if y < 0.0 {
+        y = 0.0;
+        if !moves_y {
+            h = (bottom - y).max(min);
+        }
+    }
+    Frame { x, y, w: w as f32, h: h as f32 }
 }
 
 /// The shapes one floating object painted (indices into the painter's layer) and its logical
@@ -490,11 +680,13 @@ pub fn slicer_click(geo: &Geo, sh: &Sheet, wb: &Workbook, si: usize, p: Pos2) ->
     None
 }
 
+/// The frame and eight drag handles of the selected object, in theme colours.
 fn selection_frame(p: &Painter, r: Rect) {
-    p.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_gray(120)), StrokeKind::Outside);
-    for c in [r.left_top(), r.center_top(), r.right_top(), r.left_center(), r.right_center(), r.left_bottom(), r.center_bottom(), r.right_bottom()] {
-        p.circle_filled(c, 4.0, Color32::WHITE);
-        p.circle_stroke(c, 4.0, Stroke::new(1.0, Color32::from_gray(100)));
+    let t = theme::Tokens::get(p.ctx());
+    p.rect_stroke(r, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Outside);
+    for c in handle_centres(r) {
+        p.circle_filled(c, 4.0, t.window);
+        p.circle_stroke(c, 4.0, Stroke::new(1.0, t.accent));
     }
     let _ = Align2::CENTER_CENTER;
 }
@@ -529,4 +721,106 @@ pub fn hit(app: &SheetApp, geo: &Geo, sh: &Sheet, p: Pos2) -> Option<(&'static s
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame() -> Frame {
+        Frame { x: 300.0, y: 200.0, w: 300.0, h: 200.0 }
+    }
+
+    #[test]
+    fn each_handle_grabs_its_own_edges() {
+        let r = Rect::from_min_size(pos2(100.0, 100.0), vec2(200.0, 100.0));
+        for (h, at) in [
+            (Handle::Nw, r.left_top()),
+            (Handle::N, r.center_top()),
+            (Handle::Ne, r.right_top()),
+            (Handle::E, r.right_center()),
+            (Handle::Se, r.right_bottom()),
+            (Handle::S, r.center_bottom()),
+            (Handle::Sw, r.left_bottom()),
+            (Handle::W, r.left_center()),
+        ] {
+            assert_eq!(handle_at(r, at), Some(h), "{h:?}");
+        }
+        // The middle of the object is a move, not a resize.
+        assert_eq!(handle_at(r, r.center()), None);
+    }
+
+    #[test]
+    fn a_corner_drag_holds_the_opposite_corner() {
+        let f = drag_frame(frame(), Handle::Nw.edges(), vec2(40.0, 20.0), false);
+        assert_eq!((f.x, f.y), (340.0, 220.0), "the dragged corner follows the pointer");
+        assert!((f.w - 260.0).abs() < 0.01 && (f.h - 180.0).abs() < 0.01, "the far corner stays: {f:?}");
+        let r = drag_frame(frame(), Handle::Se.edges(), vec2(40.0, 20.0), false);
+        assert_eq!((r.x, r.y), (300.0, 200.0));
+        assert!((r.w - 340.0).abs() < 0.01 && (r.h - 220.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_move_keeps_the_size() {
+        let f = drag_frame(frame(), Edges::MOVE, vec2(-50.0, 30.0), false);
+        assert_eq!((f.x, f.y), (250.0, 230.0));
+        assert_eq!((f.w, f.h), (300.0, 200.0));
+    }
+
+    #[test]
+    fn shift_keeps_the_ratio_in_the_dragged_direction() {
+        let f = drag_frame(frame(), Handle::Se.edges(), vec2(120.0, 0.0), true);
+        assert!((f.w / f.h - 1.5).abs() < 1e-4, "{f:?}");
+        assert!(f.w > 300.0 && f.h > 200.0);
+        // An edge handle takes the other dimension with it.
+        let f = drag_frame(frame(), Handle::S.edges(), vec2(0.0, 40.0), true);
+        assert!((f.w / f.h - 1.5).abs() < 1e-4, "{f:?}");
+    }
+
+    #[test]
+    fn the_minimum_size_wins_over_the_pointer() {
+        let f = drag_frame(frame(), Handle::Se.edges(), vec2(-1000.0, -1000.0), false);
+        assert_eq!((f.x, f.y), (300.0, 200.0));
+        assert_eq!((f.w, f.h), (OBJECT_MIN_SIZE, OBJECT_MIN_SIZE));
+        let f = drag_frame(frame(), Handle::Nw.edges(), vec2(1000.0, 1000.0), false);
+        assert_eq!((f.w, f.h), (OBJECT_MIN_SIZE, OBJECT_MIN_SIZE));
+        // Held at the opposite corner.
+        assert!((f.x + f64::from(f.w) - 600.0).abs() < 0.01 && (f.y + f64::from(f.h) - 400.0).abs() < 0.01, "{f:?}");
+    }
+
+    #[test]
+    fn hostile_pointer_numbers_are_rejected() {
+        let f = drag_frame(Frame { x: f64::NAN, y: f64::INFINITY, ..frame() }, Handle::Se.edges(), vec2(f32::NAN, f32::INFINITY), false);
+        assert!(f.x.is_finite() && f.y.is_finite() && f.w.is_finite() && f.h.is_finite(), "{f:?}");
+        assert_eq!((f.x, f.y), (0.0, 0.0));
+        // A squeezed or wild size is normalised, never stored as NaN or past the command's limit.
+        for (w, h) in [(0.0, -5.0), (f32::NAN, f32::INFINITY), (1e12, 1e12)] {
+            let f = drag_frame(Frame { w, h, ..frame() }, Edges::MOVE, vec2(0.0, 0.0), false);
+            assert!(f.w >= OBJECT_MIN_SIZE && f.w <= OBJECT_MAX_SIZE && f.h >= OBJECT_MIN_SIZE && f.h <= OBJECT_MAX_SIZE, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_goes_off_the_top_left_of_the_sheet() {
+        let f = drag_frame(frame(), Edges::MOVE, vec2(-500.0, -500.0), false);
+        assert_eq!((f.x, f.y), (0.0, 0.0));
+        assert_eq!((f.w, f.h), (300.0, 200.0), "a move keeps the size");
+        // Dragging the left edge past the sheet start pins it there instead of growing.
+        let f = drag_frame(Frame { x: 50.0, y: 50.0, w: 300.0, h: 200.0 }, Handle::W.edges(), vec2(-100.0, 0.0), false);
+        assert_eq!(f.x, 0.0);
+        assert!((f.w - 350.0).abs() < 0.01, "the right edge stays at 350: {f:?}");
+    }
+
+    #[test]
+    fn a_frame_round_trips_through_its_anchor() {
+        let sh = Sheet::new("S");
+        let a = Anchor { cell: CellRef::new(2, 3), dx: 7.0, dy: 5.0, width: 320.0, height: 180.0, ..Anchor::default() };
+        let f = frame_of(&sh, &a);
+        let (cell, dx, dy, w, h) = anchor_of(&sh, f);
+        assert_eq!(cell, a.cell);
+        assert!((dx - a.dx).abs() < 0.01 && (dy - a.dy).abs() < 0.01 && (w - a.width).abs() < 0.01 && (h - a.height).abs() < 0.01);
+        // A frame left of the first column anchors at A1 with a zero offset.
+        let (cell, dx, dy, w, _) = anchor_of(&sh, Frame { x: 0.0, y: 0.0, ..f });
+        assert_eq!((cell, dx, dy, w), (CellRef::new(0, 0), 0.0, 0.0, 320.0));
+    }
 }

@@ -80,13 +80,32 @@ pub enum Drag {
         grab: CellRef,
         to: Option<CellRef>,
     },
-    Object {
-        kind: &'static str,
-        id: u32,
-        start: Pos2,
-        orig: (CellRef, f32, f32, f32, f32),
-        resize: bool,
-    },
+    /// Moving or resizing a floating object (chart, picture, shape, slicer). `orig` is the frame
+    /// when the drag began, `handle` the edge grabbed (`None` moves the whole object), and `steps`
+    /// the drag's own undo entries so far (`0`: the first move is about to be recorded).
+    Object(ObjectDrag),
+}
+
+/// A drag of a floating object in progress.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectDrag {
+    pub kind: &'static str,
+    pub id: u32,
+    /// Where the pointer pressed, in sheet units (`Geo::mirror_pos` applied).
+    pub start: Pos2,
+    pub orig: crate::chartview::Frame,
+    pub handle: Option<crate::chartview::Handle>,
+    /// Undo entries this drag has recorded, so only its first one starts a new entry.
+    pub steps: u32,
+}
+
+impl ObjectDrag {
+    pub fn new(kind: &'static str, id: u32, start: Pos2, orig: crate::chartview::Frame, handle: Option<crate::chartview::Handle>) -> ObjectDrag {
+        ObjectDrag { kind, id, start, orig, handle, steps: 0 }
+    }
+    fn edges(&self) -> crate::chartview::Edges {
+        self.handle.map_or(crate::chartview::Edges::MOVE, |h| h.edges())
+    }
 }
 
 #[derive(Default)]
@@ -1955,8 +1974,23 @@ fn hidden_around(i: u32, size: impl Fn(u32) -> f32) -> (bool, bool) {
 
 // ------------------------------------------------------------------ interaction
 
-/// How close (in points) a press must be to an object's bottom-right corner to resize it instead of moving it.
-const OBJECT_RESIZE_RADIUS: f32 = 10.0;
+/// The toast shown while an object is dragged: its size, or its position.
+fn object_toast(kind: &str, f: &crate::chartview::Frame, moving: bool) -> String {
+    if moving {
+        format!("{} at {:.0}, {:.0}", object_name(kind), f.x.round(), f.y.round())
+    } else {
+        format!("{} {:.0} × {:.0}", object_name(kind), f.w.round(), f.h.round())
+    }
+}
+
+fn object_name(kind: &str) -> &'static str {
+    match kind {
+        "chart" => "Chart",
+        "image" => "Picture",
+        "slicer" => "Slicer",
+        _ => "Shape",
+    }
+}
 
 /// Decide after interaction so drag start and release use the new state in the same frame.
 fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: &Geo, sh: &Sheet) {
@@ -1990,11 +2024,11 @@ fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: 
             Drag::Select => Some(CursorIcon::Cell),
             Drag::Rows(_) | Drag::Cols(_) => Some(CursorIcon::Default),
             Drag::Fill { .. } => Some(CursorIcon::Crosshair),
-            Drag::Move { .. } | Drag::MoveCols { .. } | Drag::Object { resize: false, .. } => Some(CursorIcon::Move),
+            Drag::Move { .. } | Drag::MoveCols { .. } => Some(CursorIcon::Move),
             Drag::ResizeCol { .. } => Some(CursorIcon::ResizeColumn),
             Drag::ResizeRow { .. } => Some(CursorIcon::ResizeRow),
             Drag::Freeze { cols, .. } => Some(if cols { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical }),
-            Drag::Object { resize: true, .. } => Some(CursorIcon::ResizeNwSe),
+            Drag::Object(ref d) => Some(d.handle.map_or(CursorIcon::Move, |h| h.cursor(geo.rtl))),
         };
         if let Some(cursor) = cursor {
             ctx.set_cursor_icon(cursor);
@@ -2024,9 +2058,11 @@ fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: 
     let on_handle = handle.contains(p) && handle_panes.iter().any(|r| r.contains(p));
     let on_cur_border = on_border(cur_rect, p) && border_panes.iter().any(|r| r.contains(p));
     let selected_object = crate::chartview::hit(app, geo, sh, p).filter(|&(_, id, _)| app.selected_chart == Some(id));
-    let near_corner = selected_object.is_some_and(|(_, _, rect)| (p - rect.right_bottom()).length() < OBJECT_RESIZE_RADIUS);
-    if app.grid.drag == Drag::None && near_corner {
-        ctx.set_cursor_icon(CursorIcon::ResizeNwSe);
+    let handle = selected_object.and_then(|(_, _, rect)| crate::chartview::handle_at(rect, p));
+    if app.grid.drag == Drag::None
+        && let Some(h) = handle
+    {
+        ctx.set_cursor_icon(h.cursor(geo.rtl));
     } else if (in_col_header && col_edge(geo, sh, p.x).is_some()) || (in_row_header && row_edge(geo, sh, p.y).is_some()) {
         let near_col_edge = in_col_header && col_edge(geo, sh, p.x).is_some();
         // Just past a hidden column or row, Excel shows a split cursor: dragging or
@@ -2152,6 +2188,7 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         if let Some(p) = at
             && let Some((kind, id, rect)) = crate::chartview::hit(app, geo, sh, p)
         {
+            let handle = if app.selected_chart == Some(id) { crate::chartview::handle_at(rect, p) } else { None };
             app.selected_chart = Some(id);
             if kind == "shape"
                 && resp.double_clicked()
@@ -2164,10 +2201,12 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 app.grid.pane = Some("formatChart".into());
             }
             if primary_drag {
-                let a = object_anchor(sh, kind, id);
-                let resize = (p - rect.right_bottom()).length() < OBJECT_RESIZE_RADIUS;
-                if let Some(a) = a {
-                    app.grid.drag = Drag::Object { kind, id, start: p, orig: (a.cell, a.dx, a.dy, a.width, a.height), resize };
+                // A handle belongs to the object that was selected before this press: the first
+                // press on an object selects it, the next one moves or resizes it.
+                if app.grid.drag == Drag::None
+                    && let Some(a) = object_anchor(sh, kind, id)
+                {
+                    app.grid.drag = Drag::Object(ObjectDrag::new(kind, id, p, crate::chartview::frame_of(sh, &a), handle));
                 }
             }
             return;
@@ -2437,6 +2476,17 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             geo.row_at(sh, p.y.clamp(geo.cells.top() + 1.0, geo.cells.bottom() - 1.0)),
             geo.col_at(sh, p.x.clamp(geo.cells.left() + 1.0, geo.cells.right() - 1.0)),
         );
+        // Esc ends an object drag where it started. The drag records one undo entry, so one undo
+        // puts the object back and the workbook is not left dirty by a cancelled drag.
+        if matches!(app.grid.drag, Drag::Object(_)) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if let Drag::Object(d) = std::mem::take(&mut app.grid.drag)
+                && d.steps > 0
+            {
+                let _ = app.session.run("edit.undo", json!({}));
+            }
+            app.toast = None;
+            return;
+        }
         match app.grid.drag.clone() {
             Drag::Select => {
                 select_to_pointer(app, geo, sh, wb, p);
@@ -2508,20 +2558,27 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 app.grid.drag = Drag::Move { grab, to: Some(src.start.offset_clamped(dr, dc)) };
                 scroll_by(app, auto);
             }
-            Drag::Object { kind, id, start, orig, resize } => {
-                let d = (p - start) / geo.z;
-                let (cell, dx, dy, w, h) = orig;
-                let params = if resize {
-                    json!({"kind": kind, "id": id, "width": (w + d.x).max(20.0), "height": (h + d.y).max(20.0)})
-                } else {
-                    // Re-anchor at the cell under the new top-left.
-                    let x0 = sh.col_left(cell.col) as f32 + dx + d.x;
-                    let y0 = sh.row_top(cell.row) as f32 + dy + d.y;
-                    let nc = CellRef::new(sh.row_at(y0.max(0.0) as f64), sh.col_at(x0.max(0.0) as f64));
-                    json!({"kind": kind, "id": id, "at": nc.a1(), "dx": x0.max(0.0) - sh.col_left(nc.col) as f32, "dy": y0.max(0.0) - sh.row_top(nc.row) as f32})
-                };
+            Drag::Object(d) => {
+                let shift = ctx.input(|i| i.modifiers.shift);
+                let delta = (p - d.start) / geo.z;
+                let f = crate::chartview::drag_frame(d.orig, d.edges(), delta, shift);
+                let (cell, dx, dy, w, h) = crate::chartview::anchor_of(sh, f);
+                let params = json!({"kind": d.kind, "id": d.id, "at": cell.a1(), "dx": dx, "dy": dy, "width": w, "height": h});
+                let before = app.session.active().map(|x| x.revision).unwrap_or(0);
                 let _ = app.session.run("object.move", params);
-                coalesce_last_undo(app);
+                let changed = app.session.active().map(|x| x.revision).unwrap_or(0) != before;
+                let mut d = d;
+                if changed {
+                    // One drag is one undo step: its first change opens the entry, later changes
+                    // join it rather than piling up a step per frame.
+                    if d.steps > 0 {
+                        coalesce_last_undo(app);
+                    }
+                    d.steps = d.steps.saturating_add(1);
+                }
+                app.toast = Some((object_toast(d.kind, &f, d.handle.is_none()), crate::now_ms()));
+                app.grid.drag = Drag::Object(d);
+                scroll_by(app, auto);
             }
             Drag::None => {}
         }
@@ -2529,6 +2586,18 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
 
     // Release.
     if resp.drag_stopped() || (!pointer.any_down() && app.grid.drag != Drag::None && !resp.dragged()) {
+        // Esc mid-drag (egui ends the drag on Esc too): the object goes back, and the drag's own
+        // undo entry is dropped with it, so a cancelled drag leaves no step behind.
+        if matches!(app.grid.drag, Drag::Object(_)) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if let Drag::Object(d) = std::mem::take(&mut app.grid.drag)
+                && d.steps > 0
+            {
+                let _ = app.session.run("edit.undo", json!({}));
+            }
+            app.toast = None;
+            app.grid.drag_select = false;
+            return;
+        }
         match std::mem::take(&mut app.grid.drag) {
             Drag::Select => {
                 if resp.drag_stopped()
@@ -2870,6 +2939,58 @@ fn object_anchor(sh: &Sheet, kind: &str, id: u32) -> Option<gridcraft_engine::mo
     }
 }
 
+/// The kind of object `id` names on `sh`, as `object.move` spells it.
+fn object_kind(sh: &Sheet, id: u32) -> Option<&'static str> {
+    if sh.charts.iter().any(|o| o.id == id) {
+        Some("chart")
+    } else if sh.images.iter().any(|o| o.id == id) {
+        Some("image")
+    } else if sh.slicers.iter().any(|o| o.id == id) {
+        Some("slicer")
+    } else if sh.shapes.iter().any(|o| o.id == id) {
+        Some("shape")
+    } else {
+        None
+    }
+}
+
+/// Arrow keys on a selected object: moves it by 10 points (1 with Ctrl/Cmd), or resizes it from
+/// the edge they point at with Shift. One key press is one undo step. Returns whether an object
+/// took the key, so the cells' cursor stays put.
+fn nudge_selected_object(app: &mut SheetApp, sh: &Sheet, key: egui::Key, shift: bool, fine: bool) -> bool {
+    let Some(id) = app.selected_chart else { return false };
+    let Some(kind) = object_kind(sh, id) else { return false };
+    let Some(anchor) = object_anchor(sh, kind, id) else { return false };
+    let (dx, dy) = match key {
+        egui::Key::ArrowLeft => (-1.0, 0.0),
+        egui::Key::ArrowRight => (1.0, 0.0),
+        egui::Key::ArrowUp => (0.0, -1.0),
+        egui::Key::ArrowDown => (0.0, 1.0),
+        _ => return false,
+    };
+    // Arrows follow the screen: on a right-to-left sheet the drawing is mirrored.
+    let delta = if sh.right_to_left { vec2(-dx, dy) } else { vec2(dx, dy) } * if fine { 1.0 } else { 10.0 };
+    let edges = if !shift {
+        crate::chartview::Edges::MOVE
+    } else if delta.x != 0.0 {
+        // Resizing from the edge the arrow points at: grow towards it, shrink away from it.
+        if delta.x > 0.0 {
+            crate::chartview::Edges { right: true, ..Default::default() }
+        } else {
+            crate::chartview::Edges { left: true, ..Default::default() }
+        }
+    } else if delta.y > 0.0 {
+        crate::chartview::Edges { bottom: true, ..Default::default() }
+    } else {
+        crate::chartview::Edges { top: true, ..Default::default() }
+    };
+    let f = crate::chartview::drag_frame(crate::chartview::frame_of(sh, &anchor), edges, delta, false);
+    let (cell, adx, ady, w, h) = crate::chartview::anchor_of(sh, f);
+    let _ = app.session.run("object.move", json!({"kind": kind, "id": id, "at": cell.a1(), "dx": adx, "dy": ady, "width": w, "height": h}));
+    app.toast = Some((object_toast(kind, &f, !shift), crate::now_ms()));
+    true
+}
+
 fn delete_selected_object(app: &mut SheetApp, sh: &Sheet) -> bool {
     let Some(id) = app.selected_chart else { return false };
     let kind = if sh.charts.iter().any(|object| object.id == id) {
@@ -2993,6 +3114,13 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                 }
                 let cmd = m.command;
                 let shift = m.shift;
+                // A selected object takes the arrows: move it, or resize it with Shift (Ctrl or
+                // Cmd for one-point steps), as Excel does. Escape below drops the selection.
+                if matches!(key, Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight)
+                    && nudge_selected_object(app, sh, key, shift, cmd || m.ctrl)
+                {
+                    continue;
+                }
                 let mv = |app: &mut SheetApp, dr: i64, dc: i64| {
                     let _ = app.session.run("selection.move", json!({"dr": dr, "dc": dc, "extend": shift, "jump": cmd}));
                     app.grid.ensure_visible = true;
@@ -3052,6 +3180,8 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                     Key::Escape => {
                         app.session.clipboard = None;
                         app.session.format_painter = None;
+                        // Excel: Escape leaves the object and returns to the cells.
+                        app.selected_chart = None;
                     }
                     Key::Space if !cmd && !shift && is_checkbox(sh, app) => app.run_or_alert("cell.toggleCheckbox", json!({})),
                     Key::F8 if m.alt => {
