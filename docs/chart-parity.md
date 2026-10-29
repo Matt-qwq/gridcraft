@@ -1,6 +1,6 @@
 # Chart parity
 
-> **Last reviewed:** 2026-10-31 · **Last updated:** 2026-10-31 · **Change:** major (edits are patched into the kept chart part, so unmodelled XML survives an edit; unmodelled chart *kinds* keep their frame and part; secondary-axis options modelled and drawn; category-axis bounds and crossing drawn) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (the Format pane drives the four chart formatting commands, and charts, pictures, shapes and slicers resize from eight handles with Shift, a minimum size and Esc; an edit is patched into the kept chart part, so unmodelled XML survives it; unmodelled chart *kinds* keep their frame and part; secondary-axis options modelled and drawn; category-axis bounds and crossing drawn) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Excel's chart types and chart elements against GridCraft. Part of
 [target-app-parity.md](target-app-parity.md). **Breadth ~50%, ready ~40%, 25–40 h** (estimated).
@@ -37,19 +37,19 @@ edit into a kept part), the option matrix below, merged PRs #62, #116,
 
 | Element | Excel | GridCraft |
 |---|---|---|
-| Move and resize the chart object | yes | yes (corner handle, Format Chart Area Size fields) |
+| Move and resize the chart object | yes | yes (#190): eight handles (corners and edge midpoints) work on charts, pictures, shapes and slicers; a left/top drag carries the anchor, Shift keeps the aspect ratio, a 20-point minimum size holds, Esc cancels the drag and arrow keys nudge (Shift+arrow resizes); the Format Chart Area Size fields stay. Dragging stops at the sheet's top-left |
 | Chart title, axis titles | text, linked to cells, full formatting | text only |
 | Legend | position, overlay, formatting, per-entry delete | position only |
-| Data labels | value, category, series, percentage, from cells, callouts, position | value, percentage, series, category and legend key; position, separator, number format; per series; per point shown/deleted. No from-cells or callouts |
+| Data labels | value, category, series, percentage, from cells, callouts, position | value, percentage, series, category and legend key; position, separator, number format; per series; per point shown/deleted. No from-cells or callouts. The Format pane's Data Labels section sets all of it through `chart.setDataLabels` |
 | Gridlines | major/minor per axis, formatting | one on/off flag (major, value axis) |
-| Axis options | min/max/units, log scale, reverse order, crossing point, display units, date axis, number format | min/max, major unit, log base, reverse order, crossing point, display units (nine built-ins) and number format; read, written and drawn on the value axis, the category axis and the secondary value axis. Date-axis units are kept, not editable |
+| Axis options | min/max/units, log scale, reverse order, crossing point, display units, date axis, number format | min/max, major unit, log base, reverse order, crossing point, display units (nine built-ins) and number format; read, written and drawn on the value axis, the category axis and the secondary axis. The Format pane's Format Axis section drives all of it (`chart.setAxis`), showing **Auto** per field, and offers only the fields the axis kind can store |
 | Secondary axis | any series | line series in combo charts; its own bounds, unit, log scale, reverse, crossing, display units and number format are modelled (`y2_axis`; `chart.setAxis` `axis: "y2"`), written and drawn |
 | Multi-level category axis (a category range two or more columns wide beside the values: year beside month) | the outer levels grouped under the labels with separators | read (`multiLvlStrRef`), drawn (rows under the labels; columns beside them in bar charts; up to three outer levels), written back with Excel's level caches |
 | Trendlines | linear, exponential, logarithmic, polynomial, power, moving average, equation and R² | all six types, several per series, name, forward/backward forecast, set intercept, equation and R² label, line colour/width/dash; read, written and drawn on 2-D column, bar, line, area, scatter and bubble series; `chart.addElement` `trendline` adds/removes them. No Format Trendline pane, label position/number format not kept |
-| Error bars | fixed, %, standard deviation/error, custom | each series: fixed, percentage, standard deviation, standard error and custom (plus/minus references or array constants), both/plus/minus directions, end caps on/off; read, written and drawn on 2-D column/bar/line/area/scatter/bubble. Line colour/width is not modelled (drawn in the series colour) |
+| Error bars | fixed, %, standard deviation/error, custom | each series: fixed, percentage, standard deviation, standard error and custom (plus/minus references or array constants), both/plus/minus directions, end caps on/off; read, written and drawn on 2-D column/bar/line/area/scatter/bubble. The Format pane's Error Bars section sets the four numeric kinds, amount, direction and caps; custom bars need the command. Line colour/width is not modelled (drawn in the series colour) |
 | Up/down bars, high-low lines, drop lines, series lines | yes | **missing** |
 | Data table under the chart | yes | **missing** |
-| Per-series / per-point fill, line, marker, effects | Format pane for every element | series colour; per-point fill, line and marker colour plus label deletion, read, written and drawn (pie, doughnut, treemap, sunburst, column, bar, line, scatter, bubble). No effects, pattern fills or a per-element Format pane |
+| Per-series / per-point fill, line, marker, effects | Format pane for every element | series colour; per-point fill, line and marker colour plus label deletion, read, written and drawn (pie, doughnut, treemap, sunburst, column, bar, line, scatter, bubble). The Format pane's Data Point section sets a point's fill, line and marker (markers only where they are drawn) and clears the point, disabled on chartex charts. No effects, pattern fills or a per-element Format pane |
 | Chart styles and colour palettes | ~16 styles × colour sets | style number stored, own palettes |
 | Chart sheets | yes | **kept, not editable**: not shown, and written back unchanged in their place on save (#727); left out when a sheet they plot is deleted or renamed. No F11 / Move Chart > New sheet |
 | Chart templates (`.crtx`) | yes | **missing** |
@@ -154,21 +154,29 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
 
 ## Work (40–60 h)
 
-1. Chart resizing (#190): 1–2 h.
-2. ~~Preserve unmodelled chart XML when the chart *is* edited~~ (landed 10-31: field-level
+1. ~~Chart resizing (#190)~~ **done 10-30**: eight handles on charts, pictures, shapes and slicers,
+   Shift keeps the aspect ratio, a 20 pt minimum, Esc cancels, one undo step per drag, arrow-key
+   nudging, and the size round-trips through XLSX.
+2. ~~Preserve unmodelled chart XML when the chart *is* edited~~ (landed 10-30: field-level
    patching, unmodelled kinds kept whole, secondary-axis options, category bounds and crossing).
-3. Remaining axis and label work: date-axis units as an option, minor units and gridlines,
-   gridline and tick-label formatting, callouts and from-cells labels: 4–6 h.
-4. Error-bar line formatting; Format Trendline pane: 2–4 h.
-5. Per-element Format pane parity, smoothed lines, exploded pie, pie/bar of pie, 100% variants: 8–12 h.
-6. 3-D column/bar/pie/area, surface and contour, Pareto: 8–12 h.
-7. Chart sheets, templates and PivotChart field buttons: 5–8 h. Filled map: owner decision on boundary data.
+3. ~~The Format pane for what the four commands store~~ **done 10-30**: Chart Elements selection,
+   Format Axis, Format Data Labels, Error Bars and Data Point, all through the commands, with the
+   reason shown where a control cannot apply.
+4. Remaining axis and label work: date-axis units as an option, minor units and gridlines, gridline
+   and tick-label formatting, callouts and from-cells labels: 4–6 h.
+5. Error-bar line formatting, custom error-bar references in the pane, Format Trendline pane: 2–4 h.
+6. Per-element Format pane parity (shapes, pictures, slicers, clicking a chart element), smoothed
+   lines, exploded pie, pie/bar of pie, 100% variants: 8–12 h.
+7. 3-D column/bar/pie/area, surface and contour, Pareto: 8–12 h.
+8. Chart sheets, templates and PivotChart field buttons: 5–8 h. Filled map: owner decision on
+   boundary data.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-31 | major | Field-level pass-through: an edit is patched into the kept chart part (`crates/xlsx/src/chart_patch.rs`), so manual layouts, date-axis units, minor units and gridline formatting, label callouts and leader lines, error-bar line styles, title run formatting, `dTable`, `printSettings` and `extLst` survive an edit as well as an open → save; only the changed element is rewritten, and turning labels off keeps the label element with Excel's delete flag. Charts of unmodelled kinds (3-D, surface, pie of pie, bar of pie, Pareto, filled map) keep their frame and their part (`Sheet::kept_charts`) instead of being dropped. Secondary value axis modelled (`Chart::y2_axis`, `chart.setAxis` `axis: "y2"`), written and drawn; category-axis bounds crop/extend the drawn axis and a category crossing is drawn, so `chart.setAxis` accepts both |
+| 2026-10-30 | major | Format pane and chart resize: a Chart Elements selection (chart area, either axis, each series) with Format Axis (bounds with Auto, major unit, log base, reverse, crossing, display units, number format), Data Labels (five parts, position, separator, format, per series and per point), Error Bars (kind, amount, direction, caps) and Data Point (fill/line/marker, hide label, clear) — every control through a command, with the reason shown where one cannot apply. Charts, pictures, shapes and slicers resize from all eight handles with Shift, a 20 pt minimum, Esc and one undo step per drag, and the size survives save/reopen (`ui-egui` 979 tests) |
+| 2026-10-30 | major | Field-level pass-through: an edit is patched into the kept chart part (`crates/xlsx/src/chart_patch.rs`), so manual layouts, date-axis units, minor units and gridline formatting, label callouts and leader lines, error-bar line styles, title-run and legend-entry formatting, series `extLst` and `printSettings` survive it; unmodelled kinds keep their frame and their part; the secondary axis is modelled, written and drawn; category-axis bounds crop or extend the drawn axis |
 | 2026-10-30 | major | Axis scaling (bounds, major unit, log, reverse, crossing, display units, number format), data-label options (five parts, position, separator, format, per series and per point), error bars (fixed, %, standard deviation/error, custom; both directions; caps) and per-point fill/line/marker model, round-trip and draw; `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars`, `chart.formatPoint`; unedited chart parts are written back byte for byte so unmodelled XML survives; option matrix added |
 | 2026-10-26 | minor | Round-trip measured across 25 kinds: a stock chart without 3–4 series is refused instead of saving as a line chart, chartex kinds no longer change style 1 → 2 on the first save; the rest of the diffs are representation or file-format limits, tabulated |
 | 2026-10-18 | trivial | Stale notes: stock/combo, treemap/sunburst, box and waterfall kinds survive XLSX round-trip (PRs #158, #161) |
