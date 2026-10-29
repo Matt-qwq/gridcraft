@@ -103,11 +103,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
   file is a temporary beside the system temp directory (not the document), the cache budget is a
-  page count (not a byte count), and a save decodes the whole model transiently; the per-band value
-  dictionaries still cost full price when values do not repeat;
-  page-aware compaction landed 10-29 (O(1) identity early-out, gap-scoped page candidates,
-  snapshot-safe replacement, `document.compact` and a save hook); a page-file rewrite and
-  byte budget remain;
+  a save walks every page through the caching reader and thrashes the viewport cache, and the XLSX
+  writer retains every sheet's XML (the real save peak); the per-band value dictionaries still cost
+  full price when values do not repeat;
+  page-aware compaction and the 64 MiB byte-budget page cache landed 10-29 (identity early-out,
+  gap-scoped candidates, snapshot-safe page replacement, `document.compact` and a save hook,
+  `PageCacheStats`); a page-file rewrite remains;
   whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
   a ten-row used range in 0.0 ms). The 159 cells that still differ from the cached values of the
   1.28 GB report are Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the
@@ -117,8 +118,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Impact:** finance and data users routinely have big workbooks.
 - **Status (10-29): the large-workbook beta gate is met.** Recalc, edit latency, 1M-row operations,
   bounded data commands and memory all pass their targets; M19 cold paging and the M20 row/column
-  maps landed. Remaining work is base hardening, not capacity: M19 spill placement/byte
-  budget/flat-memory save (and the deferred M20 page-file rewrite) are wave 0 in
+  maps landed. Remaining work is base hardening, not capacity: M19 spill placement, flat-memory
+  save/scan (and the deferred page-file rewrite) are wave 0 in
   [`roadmap.md`](roadmap.md#execution-queue). The M21 Parquet read half is post-beta. The old
   estimate is superseded by those waves.
 

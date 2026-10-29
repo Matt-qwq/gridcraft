@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M19 spill-beside-document, byte-budget LRU, flat-memory save/scan; M20 page-file rewrite deferred to M19 | M19 follow-up | **15–25** | M20 (maps, line metadata, UI geometry cache, page-aware compaction, mapped value writes) landed by 10-29. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: M19 spill-beside-document, flat-memory save/scan; M20 page-file rewrite deferred to M19 | M19 follow-up | **12–20** | M20 and the M19 byte-budget cache landed by 10-29. This is the last large-workbook debt before beta evidence. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -104,7 +104,7 @@ to check our files (gate #1/#8), and Windows machines with the reported GPU driv
 | M16 | Get & Transform, data model | not started |
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | landed (10-24/27): whole-column folds and recalc kernels; remaining work in gaps |
-| M19 | Cold paging: bands leave memory when unused | **landed (10-28)**: compressed pages + 4,096-band LRU; spill-beside-document, byte budget and save/scan remain |
+| M19 | Cold paging: bands leave memory when unused | **landed (10-28/29)**: compressed pages + byte-budget cache; spill-beside-document, flat-memory save/scan and page-file rewrite remain |
 | M20 | Append-style structural edits (segments, no whole-sheet shifts) | **complete (10-29)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20, chunked line metadata, cached UI geometry, page-aware `compact` with `document.compact`/save caller, mapped value writes (35/33 ms per 1M), packed column walk and `diff_logical`; only M19's page-file rewrite/byte budget remain |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading/linked tables are post-beta (not a beta gate) |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
@@ -526,12 +526,21 @@ than trusted; the temporary file is removed with the last store that owns it, an
 file that no reopen reads. The B2 1M×10 sheet stays live (it is 55 MB), so Remove Duplicates is still
 12 s; only the package-size threshold crosses into paging.
 
+**Byte budget (10-29).** The decoded-band cache now has a byte budget instead of a page count:
+**64 MiB** by default (`GRIDCRAFT_PAGE_CACHE_MB`, clamped 8–512), shared by every clone and undo
+snapshot through the page file. A band is charged its measured heap bytes only by the call that
+decodes it; `Weak<Page>` + generation make an eviction subtract once, a dead page's charge is
+released when it reaches the front, and a single oversize band is kept and reported rather than
+thrashing. `PageCacheStats` exposes budget/bytes/entries/hits/misses/evictions/corrupt/
+spill-failures/max-entry. Compaction-primed pages are charged and evictable; `Page::decode` stays
+uncached. Model tests are **93** (64 store), engine **422**. No peak-memory benchmark was rerun.
+
 **Scope (remaining).** The file is a temporary beside the system temp directory, not beside the
-document; a byte-budget LRU (the phase's “few hundred MB”) is a fixed page count with the same
-effect at the export's density but not at every density; a save touches every page and so decodes
-the whole model transiently; and a spill file left by a crash is not cleaned on the next open. Bands
-outside the working set do leave memory, decompressed when the viewport, calculation or a command
-touches them, which is the phase's core.
+document; a save walks every page through the caching `band_arc` and so thrashes the viewport's
+cache, and the XLSX writer itself retains every sheet's XML (the real save peak); a spill file left
+by a crash is not cleaned on the next open; and a page-file rewrite (bytes appended by compaction)
+is deferred. Bands outside the working set do leave memory, decompressed when the viewport,
+calculation or a command touches them, which is the phase's core.
 
 **Acceptance.**
 - Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size: **16.7 MiB live,
@@ -766,6 +775,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M19 byte-budget page cache: 64 MiB default (`GRIDCRAFT_PAGE_CACHE_MB` clamped 8–512), per-page-file sharing, decode-time heap charging with generation/`Weak` eviction, `PageCacheStats`, compaction-primed pages charged; 93 model / 422 engine tests; spill placement, save/scan and page-file rewrite remain |
 | 2026-10-29 | minor | M20 mapped value writes complete: `set_values` streams through row-map runs with a run-merged parallel plan (1M values: 131→35 ms row insert, 116→33 ms column insert), `visit_packed` follows column runs (30.6→2.5–3.3 ns/cell), the owned/formula gate resolves a band once (9.5→0.84 ms/1M), and `diff_logical` is the map-independent diagnostic; 87 model / 422 engine tests |
 | 2026-10-29 | minor | M20 page-aware compaction: O(1) identity early-out, page candidates from map gaps (never a full sweep), snapshot-safe page replacement, `document.compact` (noundo) and a `file.save` hook; 71 model / 422 engine tests; page-file rewrite/byte budget stay in M19 |
 | 2026-10-29 | minor | M20 UI line geometry is cached per (document, revision, sheet): scrolling/selection/zoom reuse the `LineIndex` and outline axes, an edit or sheet switch rebuilds them; 26 targeted grid tests. 1M custom heights: clone 0.13 ms, insert/delete 0.013/0.007 ms (`linebench`) |
