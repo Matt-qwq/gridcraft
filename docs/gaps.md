@@ -353,8 +353,16 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   content/relationship types and `pivotTable/@tabId` (a `sheetId`, not a sheet index). The writer
   omits the optional `mc:AlternateContent` fallback shape because the specification does not define
   its content, and it refuses a timeline whose field holds no dates (no bounds to write).
-- **Missing:** the slicer/timeline **UI** (the model, commands and file format exist, the widgets are
-  not drawn); a filter on a field outside Rows/Columns is drawn as an extra page-filter row
+- **Landed 10-30 (UI):** a slicer draws on the sheet as Excel draws it — a caption band with a filter
+  button and value tiles in the model's column count, selected tiles accent-filled with a check, an
+  `N of M` footer and wheel scrolling when the body overflows, and the same eight resize handles as
+  charts and pictures. A timeline draws its caption, unit and a range track. Clicking a tile runs
+  `slicer.toggle`, the filter button `slicer.clear`, a drag or an arrow nudge `slicer.move` (now with
+  `dx`/`dy`, so it no longer has to snap to a cell, and it reaches timelines too), Delete removes it,
+  a right-click menu carries delete/select-all/clear and a Slicer Styles submenu, and Tab/Enter move
+  between tiles without the grid stealing the keys.
+- **Missing:** timeline **date-range** selection (the model has no state for it, so the track means
+  "full range" and its handles are deliberately not draggable); a filter on a field outside Rows/Columns is drawn as an extra page-filter row
   (`PivotFilter` has no flag to distinguish it); timeline date ranges are kept but not editable;
   calculated items, PivotCharts, value/label filters, number grouping, GETPIVOTDATA and data-model
   pivots; a table slicer is still not written to XLSX; `pivot.filter` does not sync a slicer's tiles.
@@ -363,7 +371,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
   never been opened in Excel — gate #1.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 12–19 h for beta (25–40 h full).
+- **Estimate:** 8–14 h for beta (22–35 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
