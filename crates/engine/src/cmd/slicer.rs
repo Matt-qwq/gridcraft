@@ -13,7 +13,7 @@
 
 use std::collections::HashSet;
 
-use gridcraft_core::{CellRef, RangeRef, Value};
+use gridcraft_core::{CellRef, DateSystem, RangeRef, Value};
 use gridcraft_model::*;
 use serde_json::{Value as Json, json};
 
@@ -60,6 +60,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{slicer?: id | name, selected?: [tile labels] | null (all)} → {slicer, selected, pivots}; stops with the first label that is not a tile",
             has_doc,
             set_selection
+        ),
+        cmd!(
+            "slicer.setRange",
+            "Set Timeline Range",
+            [],
+            None,
+            "{slicer?: id | name | timeline?: name, start?: \"2024-01-01\", end?: \"2024-01-01\"} (a timeline's dates; both ends are included and both are clamped to the field's own first and last date, which `clamped` reports; null for both shows every date) → {timeline, start, end, pivots, clamped}",
+            has_doc,
+            set_range
         ),
         cmd!(
             "slicer.setStyle",
@@ -313,16 +322,8 @@ fn find_timeline(s: &Session, p: &Json) -> Option<(usize, usize)> {
 fn apply_pivot_slicer(wb: &mut Workbook, widget: &PivotSlicer) -> Result<usize> {
     let keys: Option<HashSet<String>> =
         if widget.all_selected() { None } else { Some(widget.items.iter().filter(|i| i.selected).map(|i| i.value.key()).collect()) };
-    let mut targets = vec![];
-    for (si, sheet) in wb.sheets.iter().enumerate() {
-        for (pi, pt) in sheet.pivots.iter().enumerate() {
-            if widget.pivot_tables.iter().any(|n| n.eq_ignore_ascii_case(&pt.name)) {
-                targets.push((si, pi));
-            }
-        }
-    }
     let mut refreshed = 0;
-    for (si, pi) in targets {
+    for (si, pi) in widget_targets(wb, &widget.pivot_tables) {
         let Some(pt) = wb.sheet(si).and_then(|s| s.pivots.get(pi)).cloned() else { continue };
         let Ok(src) = pv::read_source(wb, &pt.source, si) else { continue };
         let Some(col) = src.col(&widget.field) else { continue };
@@ -344,25 +345,101 @@ fn apply_pivot_slicer(wb: &mut Workbook, widget: &PivotSlicer) -> Result<usize> 
                 Some(out)
             }
         };
-        if let Some(p) = wb.sheet_mut(si).and_then(|s| s.pivots.get_mut(pi)) {
-            let at = p.filters.iter().position(|f| f.source_col.eq_ignore_ascii_case(&widget.field));
-            match (&labels, at) {
-                (Some(sel), Some(i)) => {
-                    if let Some(f) = p.filters.get_mut(i) {
-                        f.selected = Some(sel.clone());
-                    }
-                }
-                (Some(sel), None) => p.filters.push(PivotFilter { source_col: widget.field.clone(), selected: Some(sel.clone()) }),
-                (None, Some(i)) => {
-                    p.filters.remove(i);
-                }
-                (None, None) => {}
-            }
-        }
-        pv::refresh(wb, si, pi, false).map_err(EngineError::Other)?;
+        filter_pivot_field(wb, si, pi, &widget.field, labels)?;
         refreshed += 1;
     }
     Ok(refreshed)
+}
+
+/// Applies a timeline's date range to every report it filters, through the same filter path a
+/// slicer's tiles use: the source rows whose date is inside the range contribute their item
+/// labels, and that label set becomes the field's [`PivotFilter`] before the report is re-rendered.
+/// No range removes the filter (`None` = every date). A period the range only partly covers still
+/// shows whole, because the filter is the report's own items — the representation the rest of the
+/// pivot model filters by — not a per-row date test.
+fn apply_pivot_timeline(wb: &mut Workbook, widget: &PivotTimeline) -> Result<usize> {
+    let mut refreshed = 0;
+    for (si, pi) in widget_targets(wb, &widget.pivot_tables) {
+        let Some(pt) = wb.sheet(si).and_then(|s| s.pivots.get(pi)).cloned() else { continue };
+        let Ok(src) = pv::read_source(wb, &pt.source, si) else { continue };
+        let Some(col) = src.col(&widget.field) else { continue };
+        let labels = match widget.range {
+            None => None,
+            Some(range) => {
+                // The grouping `pivot.refresh` labels this field with: its axis grouping when it is
+                // in Rows or Columns, nothing otherwise (the cell's own text).
+                let group = pt
+                    .rows
+                    .iter()
+                    .chain(pt.columns.iter())
+                    .find(|f| f.source_col.eq_ignore_ascii_case(&widget.field))
+                    .map(|f| f.date_group)
+                    .unwrap_or_default();
+                Some(range_labels(wb, &src, col, group, range))
+            }
+        };
+        filter_pivot_field(wb, si, pi, &widget.field, labels)?;
+        refreshed += 1;
+    }
+    Ok(refreshed)
+}
+
+/// The item labels a range selects: one per distinct label of the source rows whose date is inside
+/// the range, labelled the way the report labels that field ([`PivotDateGroup`] when it is on an
+/// axis). Bounded like every other item list.
+fn range_labels(wb: &Workbook, src: &pv::Source, col: usize, group: PivotDateGroup, range: TimelineRange) -> Vec<String> {
+    const MAX: usize = 100_000;
+    let fmt = src.formats.get(col).cloned().unwrap_or_default();
+    let mut out: Vec<String> = vec![];
+    for row in &src.rows {
+        let Some(v) = row.get(col) else { continue };
+        let Value::Number(n) = v.scalar() else { continue };
+        if !range.contains(n) {
+            continue;
+        }
+        let label = pv::item_label(wb, v, group, &fmt);
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(&label)) {
+            out.push(label);
+            if out.len() >= MAX {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// The reports a widget filters, as `(sheet, index)` into its sheet's `pivots`.
+fn widget_targets(wb: &Workbook, pivots: &[String]) -> Vec<(usize, usize)> {
+    let mut out = vec![];
+    for (si, sheet) in wb.sheets.iter().enumerate() {
+        for (pi, pt) in sheet.pivots.iter().enumerate() {
+            if pivots.iter().any(|n| n.eq_ignore_ascii_case(&pt.name)) {
+                out.push((si, pi));
+            }
+        }
+    }
+    out
+}
+
+/// Writes `labels` as a report's filter on `field` (`None` removes the field's filter) and
+/// re-renders it: the one filter path a slicer's tiles and a timeline's range both use.
+fn filter_pivot_field(wb: &mut Workbook, si: usize, pi: usize, field: &str, labels: Option<Vec<String>>) -> Result<()> {
+    if let Some(p) = wb.sheet_mut(si).and_then(|s| s.pivots.get_mut(pi)) {
+        let at = p.filters.iter().position(|f| f.source_col.eq_ignore_ascii_case(field));
+        match (&labels, at) {
+            (Some(sel), Some(i)) => {
+                if let Some(f) = p.filters.get_mut(i) {
+                    f.selected = Some(sel.clone());
+                }
+            }
+            (Some(sel), None) => p.filters.push(PivotFilter { source_col: field.to_string(), selected: Some(sel.clone()) }),
+            (None, Some(i)) => {
+                p.filters.remove(i);
+            }
+            (None, None) => {}
+        }
+    }
+    pv::refresh(wb, si, pi, false).map(|_| ()).map_err(EngineError::Other)
 }
 
 /// Removes a PivotTable slicer's filter from the reports it filtered (deleting the slicer leaves
@@ -642,6 +719,121 @@ fn set_selection(s: &mut Session, p: &Json) -> Result<Json> {
         reapply_slicer(&mut cx.wb, sheet, id);
         cx.structural = true;
         Ok(json!({"slicer": id}))
+    })
+}
+
+/// A date parameter of a timeline range: an ISO date text that names its year (`2024-01-31`,
+/// `1/31/2024`), or null/absent for "no date". Serial numbers and year-less dates are refused:
+/// a range is a statement about a calendar, not an offset.
+fn date_param(cmd: &str, name: &str, v: Option<&Json>, sys: DateSystem) -> Result<Option<f64>> {
+    match v {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(s)) => {
+            let parsed = gridcraft_core::parse::parse_input(s, sys);
+            match parsed.value {
+                Value::Number(n) if n.is_finite() && parsed.format.is_some_and(|f| f.contains('y')) => Ok(Some(n)),
+                _ => Err(bad(cmd, format!("`{name}` is not a date with a year (e.g. \"2024-01-31\"): `{s}`"))),
+            }
+        }
+        Some(_) => Err(bad(cmd, format!("`{name}` is an ISO date string, or null for every date"))),
+    }
+}
+
+/// A date as the command reports it: `2024-01-31`, with the time when the date has one.
+fn iso_text(wb: &Workbook, serial: f64) -> Option<String> {
+    let d = gridcraft_core::date::datetime_from_serial(wb.date_system, serial)?;
+    Some(if d.hour == 0 && d.minute == 0 && d.second == 0 {
+        format!("{:04}-{:02}-{:02}", d.year, d.month, d.day)
+    } else {
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute, d.second)
+    })
+}
+
+/// The first and last date the timeline's field holds, in its report's source: what the timeline
+/// cache's `bounds` are written from, so a range is clamped to dates the file can show.
+fn field_bounds(wb: &Workbook, src: &pv::Source, col: usize) -> Option<(f64, f64)> {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for row in &src.rows {
+        let Some(Value::Number(n)) = row.get(col).map(|v| v.scalar()) else { continue };
+        if !n.is_finite() || gridcraft_core::date::datetime_from_serial(wb.date_system, n).is_none() {
+            continue;
+        }
+        lo = lo.min(n);
+        hi = hi.max(n);
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
+/// The dates a timeline shows. One undo step: the model's range, the bound reports' filters and
+/// their cells move together.
+///
+/// Refused: no timeline (a pivot slicer has tiles, not a range), only one of the two dates, a
+/// start after its end, a field that holds no dates, and a date text without a year. A range that
+/// runs past the field's own first or last date is **clamped** to it (reported by `clamped`) rather
+/// than refused, so a drag past the end of the axis still lands on a date the file can show.
+/// `start: null, end: null` clears the range and removes the report's filter.
+fn set_range(s: &mut Session, p: &Json) -> Result<Json> {
+    const C: &str = "slicer.setRange";
+    let Some((si, wi)) = find_timeline(s, p) else {
+        return Err(if find_pivot_slicer(s, p).is_some() {
+            bad(C, "a date range needs a timeline, not a slicer")
+        } else {
+            bad(C, "no timeline on this sheet (pass `slicer` or `timeline`)")
+        });
+    };
+    let d = s.doc()?;
+    let mut widget = d.wb.sheet(si).and_then(|sh| sh.pivot_timelines.get(wi)).cloned().ok_or_else(|| bad(C, "no timeline"))?;
+    let start = date_param(C, "start", p.get("start"), d.wb.date_system)?;
+    let end = date_param(C, "end", p.get("end"), d.wb.date_system)?;
+    let wanted = match (start, end) {
+        (None, None) => None,
+        (Some(a), Some(b)) => {
+            if a > b {
+                return Err(bad(C, "`start` is after `end`"));
+            }
+            Some((a, b))
+        }
+        _ => return Err(bad(C, "pass both `start` and `end`, or null for both to show every date")),
+    };
+    let mut clamped = false;
+    let range = match wanted {
+        None => None,
+        Some((a, b)) => {
+            // The date axis the range is drawn on: the timeline's own field in its report's source.
+            let (psi, pi) = widget
+                .pivot_tables
+                .iter()
+                .find_map(|name| {
+                    d.wb.sheets
+                        .iter()
+                        .enumerate()
+                        .find_map(|(si, sh)| sh.pivots.iter().position(|pt| pt.name.eq_ignore_ascii_case(name)).map(|pi| (si, pi)))
+                })
+                .ok_or_else(|| bad(C, "the timeline's PivotTable is gone"))?;
+            let pt = d.wb.sheet(psi).and_then(|sh| sh.pivots.get(pi)).cloned().ok_or_else(|| bad(C, "the timeline's PivotTable is gone"))?;
+            let src = pv::read_source(&d.wb, &pt.source, psi).map_err(|e| bad(C, e))?;
+            let col = src.col(&widget.field).ok_or_else(|| bad(C, format!("the report's source has no field `{}`", widget.field)))?;
+            if !src.dates.get(col).copied().unwrap_or(false) {
+                return Err(bad(C, format!("a timeline needs a field of dates; `{}` holds none", widget.field)));
+            }
+            let (lo, hi) = field_bounds(&d.wb, &src, col).ok_or_else(|| bad(C, format!("`{}` holds no dates to filter", widget.field)))?;
+            let (start, end) = (a.clamp(lo, hi), b.clamp(lo, hi));
+            clamped = start != a || end != b;
+            Some(TimelineRange::new(start, end))
+        }
+    };
+    let name = widget.name.clone();
+    widget.range = range;
+    edit(s, |cx| {
+        if let Some(slot) = cx.sheet_mut(si)?.pivot_timelines.get_mut(wi) {
+            *slot = widget.clone();
+        }
+        let pivots = apply_pivot_timeline(&mut cx.wb, &widget)?;
+        cx.structural = pivots > 0;
+        let shown = widget.range.map(|r| (iso_text(&cx.wb, r.start), iso_text(&cx.wb, r.end)));
+        let (start, end) = shown.unwrap_or((None, None));
+        Ok(json!({"timeline": name, "start": start, "end": end, "pivots": pivots, "clamped": clamped}))
     })
 }
 

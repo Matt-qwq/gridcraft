@@ -5868,3 +5868,140 @@ fn insert_timeline_lands_and_goes_with_its_report() {
     let d = s.doc().unwrap();
     assert!(d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap().pivot_timelines.is_empty());
 }
+
+/// Data on Sheet1 with a date column, and a report on "Report" whose dates are in Rows grouped by
+/// month, so a timeline's range shows as a set of month items: Jan 10, Feb 20, Apr 30, May 40.
+fn timeline_session() -> Session {
+    let mut s = self::s();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["Region", "Amount", "Date"],
+            ["East", 10, 45658],   // 2025-01-01
+            ["West", 20, 45700],   // 2025-02-12
+            ["East", 30, 45750],   // 2025-04-03
+            ["North", 40, 45800],  // 2025-05-23
+        ]}),
+    )
+    .unwrap();
+    s.execute("home.numberFormat", json!({"range": "C2:C5", "format": "yyyy-mm-dd"})).unwrap();
+    s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
+    s.execute(
+        "insert.pivotTable",
+        json!({"source": "Sheet1!A1:C5", "destination": "Report!A1", "name": "P1",
+               "rows": [{"field": "Date", "group": "months"}], "values": ["Amount"]}),
+    )
+    .unwrap();
+    s
+}
+
+#[test]
+fn a_timeline_range_filters_the_report_and_survives_undo_save_and_reopen() {
+    let mut s = timeline_session();
+    s.execute("insert.timeline", json!({"field": "Date", "name": "ByDate"})).unwrap();
+    let before = sheet_texts(&s, "Report");
+    for month in ["Jan", "Feb", "Apr", "May"] {
+        assert!(before.iter().any(|t| t == month), "{month} missing before filtering: {before:?}");
+    }
+    // A range of whole months keeps those months and hides the others.
+    let r = s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2025-01-01", "end": "2025-02-28"})).unwrap();
+    assert_eq!(r["pivots"], 1, "{r}");
+    assert_eq!((r["start"].as_str(), r["end"].as_str()), (Some("2025-01-01"), Some("2025-02-28")), "{r}");
+    assert_eq!(r["clamped"], json!(false), "{r}");
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "Jan") && shown.iter().any(|t| t == "Feb"), "{shown:?}");
+    assert!(!shown.iter().any(|t| t == "Apr" || t == "May"), "{shown:?}");
+    assert!(shown.iter().any(|t| t == "30"), "the totals are the visible months': {shown:?}");
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(sh.pivot_timelines[0].range, Some(gridcraft_model::TimelineRange::new(45_658.0, 45_716.0)));
+        // The report's own filter is the two months, through the path a slicer's selection uses.
+        let date_filter = sh.pivots[0].filters.iter().find(|f| f.source_col == "Date");
+        assert_eq!(date_filter.and_then(|f| f.selected.clone()), Some(vec!["Jan".to_string(), "Feb".to_string()]));
+    }
+    // One undo step restores the rows and the timeline's state.
+    s.execute("edit.undo", json!({})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "Apr") && shown.iter().any(|t| t == "May"), "{shown:?}");
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(sh.pivot_timelines[0].range, None, "undo restores the range too");
+        assert!(!sh.pivots[0].filters.iter().any(|f| f.source_col == "Date"), "and removes the filter");
+    }
+    // Applying it again and reopening keeps the range, the filter and the cells.
+    s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2025-01-01", "end": "2025-02-28"})).unwrap();
+    reopen(&mut s);
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(sh.pivot_timelines[0].range, Some(gridcraft_model::TimelineRange::new(45_658.0, 45_716.0)), "the saved range is read back");
+        assert_eq!(sh.pivot_timelines[0].field, "Date");
+    }
+    let shown = sheet_texts(&s, "Report");
+    assert!(!shown.iter().any(|t| t == "Apr" || t == "May"), "the saved report is filtered: {shown:?}");
+    // A refresh uses the report's own filter, not just the saved cells.
+    s.execute("pivot.refresh", json!({"pivot": "P1"})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "Jan") && !shown.iter().any(|t| t == "May"), "refresh keeps the range: {shown:?}");
+    // Clearing shows every date again and removes the report's filter.
+    let r = s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": null, "end": null})).unwrap();
+    assert_eq!((r["start"].clone(), r["end"].clone()), (json!(null), json!(null)), "{r}");
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "Apr") && shown.iter().any(|t| t == "May"), "{shown:?}");
+    let d = s.doc().unwrap();
+    let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+    assert_eq!(sh.pivot_timelines[0].range, None);
+    assert!(!sh.pivots[0].filters.iter().any(|f| f.source_col == "Date"), "clearing removes the filter");
+}
+
+#[test]
+fn a_timeline_range_refuses_what_it_cannot_show_and_clamps_what_it_can() {
+    let mut s = timeline_session();
+    s.execute("insert.timeline", json!({"field": "Date", "name": "ByDate"})).unwrap();
+    // An inverted range is named, not silently swapped.
+    let e = s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2025-05-01", "end": "2025-01-01"})).unwrap_err();
+    assert!(e.to_string().contains("after"), "{e}");
+    // Both ends, or neither: one end alone is not a range.
+    let e = s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2025-01-01"})).unwrap_err();
+    assert!(e.to_string().contains("both"), "{e}");
+    let e = s.execute("slicer.setRange", json!({"slicer": "ByDate", "end": "2025-01-01"})).unwrap_err();
+    assert!(e.to_string().contains("both"), "{e}");
+    // Dates must name a calendar: text that is not a date, a number, and a date without a year.
+    for p in [
+        json!({"slicer": "ByDate", "start": "soon", "end": "2025-02-01"}),
+        json!({"slicer": "ByDate", "start": 45658, "end": "2025-02-01"}),
+        json!({"slicer": "ByDate", "start": "1/15", "end": "2025-02-01"}),
+    ] {
+        let e = s.execute("slicer.setRange", p.clone()).unwrap_err();
+        assert!(e.to_string().contains("date") || e.to_string().contains("year"), "{p}: {e}");
+    }
+    // A slicer is not a timeline, and a sheet without one says so.
+    s.execute("insert.slicer", json!({"field": "Region", "name": "Regions"})).unwrap();
+    let e = s.execute("slicer.setRange", json!({"slicer": "Regions", "start": "2025-01-01", "end": "2025-02-01"})).unwrap_err();
+    assert!(e.to_string().contains("timeline"), "{e}");
+    // A range past the field's own dates is clamped to them, and the report says so.
+    let r = s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2024-06-01", "end": "2026-01-01"})).unwrap();
+    assert_eq!(r["clamped"], json!(true), "{r}");
+    assert_eq!((r["start"].as_str(), r["end"].as_str()), (Some("2025-01-01"), Some("2025-05-23")), "{r}");
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(sh.pivot_timelines[0].range, Some(gridcraft_model::TimelineRange::new(45_658.0, 45_800.0)));
+    }
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "Jan") && shown.iter().any(|t| t == "May"), "{shown:?}");
+    // A range inside a gap between source dates is still a range: the report shows nothing.
+    s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2025-03-01", "end": "2025-03-31"})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(!shown.iter().any(|t| t == "Jan" || t == "Feb" || t == "Apr" || t == "May"), "{shown:?}");
+    // A field that holds no dates (a file can bring such a timeline) is refused by name.
+    {
+        let si = s.doc().unwrap().wb.sheet_index("Report").unwrap();
+        let sh = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb).sheet_mut(si).unwrap();
+        sh.pivot_timelines[0].field = "Region".into();
+    }
+    let e = s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2025-01-01", "end": "2025-02-01"})).unwrap_err();
+    assert!(e.to_string().contains("dates"), "{e}");
+}
