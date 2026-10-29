@@ -123,16 +123,14 @@ pub fn run(root: &Path, rest: &[&str]) -> Result<(), String> {
             [(table_path.as_path(), rustfmt(&render_table(&entries))?), (tests_path.as_path(), rustfmt(&render_tests(&entries, &probe))?)];
         if rest.contains(&"--check") {
             for (path, expected) in &generated {
-                let on_disk = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-                if on_disk != *expected {
-                    return Err(format!("{} is out of date — run `cargo xtask keytips` and commit the result", path.display()));
-                }
+                crate::eol::verify(path, expected, "`cargo xtask keytips`")?;
                 println!("keytips: {} up to date", path.display());
             }
             return Ok(());
         }
         for (path, content) in &generated {
-            fs::write(path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
+            let text = crate::eol::for_write(path, content);
+            fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
             println!("keytips: wrote {}", path.display());
         }
         Ok(())

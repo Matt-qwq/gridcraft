@@ -105,16 +105,14 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     }
     let text = render(&entries());
     if check {
-        let current = std::fs::read_to_string(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-        if current != text {
-            return Err(format!("{} is out of date; run `cargo xtask parity`", out.display()));
-        }
+        crate::eol::verify(&out, &text, "`cargo xtask parity`")?;
         println!("{} ({} up to date)", summary_line(), out.display());
         return Ok(());
     }
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
+    let text = crate::eol::for_write(&out, &text);
     std::fs::write(&out, text).map_err(|e| format!("write {}: {e}", out.display()))?;
     println!("{} -> {}", summary_line(), out.display());
     Ok(())
