@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** major (a shaping + bidi engine lands in `core::text`, so §5 has one wiring task left; a documentation-derived formula oracle suite lands and §6 closes; encryption hardening — OS CSPRNG, integrity HMAC verified on read, web refuses a password save — leaves §7 at 10–21 h; the chart Format pane and drag-resize landed, §4 2–6 h; slicers and timelines modelled, §8 14–22 h) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** major (chartex parts are patched and per-point data labels are modelled — §4 down to 1–3 h; a shaping + bidi engine lands in `core::text`, so §5 has one wiring task left; a documentation-derived formula oracle suite lands and §6 closes; encryption hardening — OS CSPRNG, integrity HMAC verified on read, web refuses a password save — leaves §7 at 10–21 h; the chart Format pane and drag-resize landed, §4 2–6 h; slicers and timelines modelled, §8 14–22 h) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -193,8 +193,21 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   each series, with per-field Auto; an option the chart kind cannot store is not offered and the
   section shows the command's reason (chartex charts, a pie's axes, bounds on a label axis, error
   bars on a radar).
-- **Missing:** chartex (`chartExN.xml`) options on modelled chartex kinds are regenerated, not
-  patched; per-point label text/position/prefix and per-point marker size are not modelled;
+- **Landed (10-30, chartex + point labels):** a modelled **chartex** chart (histogram, waterfall,
+  box & whisker, funnel, treemap, sunburst) is now **patched** instead of regenerated — an edit
+  rewrites only the element it touched (titles, legend position, gridlines, `cx:valScaling`,
+  per-series fill/outline and label flags, `quartileMethod`) and every other element, including the
+  hidden `_xlchart` name table, stays byte-identical; a change the part cannot express (data
+  reference, kind, series set) regenerates it. **Per-point data labels** are modelled (`PointLabel`:
+  rich text or a `strRef`, the four show flags, position) on `Series::point_labels`, read from
+  `c:dLbl` inside a series and inside a `dPt`, written back with `idx`/`tx`/`dLblPos`/`show*`, drawn
+  at the right point and exposed as `chart.setDataLabels` with `point` + `text`.
+- **Corrected (10-30):** the claim that a chart's custom error-bar references are lost on an edit was
+  **wrong** — they already survived read → edit → save byte-for-byte; a regression test now pins
+  read → patch → save → read.
+- **Missing:** chartex `styleN.xml`/`colorsN.xml` are still written from defaults (only `chartExN.xml`
+  is kept); per-point label prefix/suffix and per-point label formatting are not modelled, nor is
+  per-point marker size;
   date-axis units are kept but not editable; custom error-bar references are carried by the command
   but not wired in the pane; a chart element cannot be selected by clicking it (the selection is a
   dropdown); no command moves a series onto the secondary axis (so it applies to charts read from
@@ -208,7 +221,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   lines (#62), Switch Row/Column (#116) and trendlines (read, written, drawn) landed; multi-level
   category axes (year beside month) are read, drawn and written back.
 - **Impact:** charts are in most business workbooks.
-- **Estimate:** 2–6 h for beta (40–60 h full). [chart-parity.md](chart-parity.md)
+- **Estimate:** 1–3 h for beta (35–50 h full). [chart-parity.md](chart-parity.md)
 
 ### 5. Text in non-Latin scripts doesn't render or export (L)
 - **Landed 10-29 (font discovery + PDF embedding):** `gridcraft-core::fonts` finds a font file
