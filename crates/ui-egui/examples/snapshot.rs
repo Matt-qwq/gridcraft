@@ -3,10 +3,10 @@
 //! `cargo run --release -p gridcraft-ui-egui --example snapshot -- [--sample sales] [--in file.xlsx]
 //!  [--size 1440x900] [--scale 2] [--cmd 'id={json}']... [--tab Insert] [--dark] [--language en|es|zh|ja|ko|ru|pt|de|cs|fr|tr]
 //!  [--dialog 'name={json}'] [--hf-edit header|footer] [--pane formatChart] [--chart <id>|last]
-//!  [--drag se=120x60] out.png
+//!  [--drag se=120x60] [--format chart|axisX|axisY|seriesN] [--expand 'Axis Options'] out.png
 //!
 //! `--drag` leaves a chart resize in progress (the handle pressed and moved, not released), so a
-//! snapshot can show what a drag looks like.`
+//! snapshot can show what a drag looks like.
 
 use gridcraft_engine::Session;
 use gridcraft_ui_egui::SheetApp;
@@ -24,6 +24,8 @@ fn main() {
     let mut pane: Option<String> = None;
     let mut chart: Option<u32> = None;
     let mut chart_last = false;
+    let mut format: Option<String> = None;
+    let mut expand: Vec<String> = vec![];
     let mut drag: Option<String> = None;
     let mut dialog: Option<String> = None;
     let mut language: Option<String> = None;
@@ -76,6 +78,16 @@ fn main() {
                 i += 1;
                 drag = args.get(i).cloned();
             }
+            "--format" => {
+                i += 1;
+                format = args.get(i).cloned();
+            }
+            "--expand" => {
+                i += 1;
+                if let Some(t) = args.get(i) {
+                    expand.push(t.clone());
+                }
+            }
             "--dialog" => {
                 i += 1;
                 dialog = args.get(i).cloned();
@@ -126,6 +138,9 @@ fn main() {
                 }
                 app.grid.pane = pane;
                 app.selected_chart = chart;
+                if let Some(f) = &format {
+                    app.format_selection = gridcraft_ui_egui::chart_format::Selection::parse(f);
+                }
                 if let Some(d) = &dialog {
                     let (name, p) =
                         d.split_once('=').map(|(a, b)| (a, serde_json::from_str(b).unwrap_or(json!({})))).unwrap_or((d.as_str(), json!({})));
@@ -148,6 +163,17 @@ fn main() {
     }
     if let Some(spec) = drag {
         resize_drag(&mut harness, &spec);
+    }
+    // Open named collapsing sections (the Format pane's "Axis Options", "Data Labels"…).
+    for title in expand {
+        use egui_kittest::kittest::Queryable as _;
+        let found = harness.query_by_label_contains(&title).or_else(|| harness.query_by_label(&title));
+        if let Some(node) = found {
+            node.click();
+            harness.run_steps(2);
+        } else {
+            eprintln!("{title:?}: no such section");
+        }
     }
     let img = harness.render().expect("render");
     img.save(&out).expect("save png");

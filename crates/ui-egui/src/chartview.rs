@@ -254,8 +254,9 @@ pub(crate) fn anchor_rect(geo: &Geo, sh: &Sheet, a: &Anchor) -> Rect {
 pub const OBJECT_MIN_SIZE: f32 = 20.0;
 /// The largest size `object.move` stores (it clamps to this), so a wild drag asks for nothing more.
 pub const OBJECT_MAX_SIZE: f32 = 10_000.0;
-/// Side of a resize handle's hit box (screen points).
-const HANDLE_SIZE: f32 = 11.0;
+/// Side of a resize handle's hit box (screen points): wide enough that a press a few pixels inside the
+/// corner, as people aim, grabs the handle rather than moving the object.
+const HANDLE_SIZE: f32 = 16.0;
 
 /// A resize handle of a selected object: the corner or edge it grabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
