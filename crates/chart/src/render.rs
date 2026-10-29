@@ -11,7 +11,7 @@ use gridcraft_model::{
 use crate::axis::{Fmt, Scale, axis_scale, clean, fixed_scale, format_number};
 use crate::resolve::{MAX_POINTS, MAX_SERIES, MAX_TRENDLINES, series_color};
 use crate::trend::{auto_name, fit_trendline, moving_average};
-use crate::{ChartData, ErrorBarsData, HAlign, Measure, PointStyle, Prim, Rgba, SeriesData, VAlign};
+use crate::{ChartData, ErrorBarsData, HAlign, Measure, PointLabelData, PointStyle, Prim, Rgba, SeriesData, VAlign};
 
 pub(crate) const TEXT: Rgba = [0x59, 0x59, 0x59, 0xFF];
 const DARK_TEXT: Rgba = [0x26, 0x26, 0x26, 0xFF];
@@ -153,6 +153,20 @@ fn series_labels<'a>(chart: &'a Chart, s: &'a SeriesData) -> &'a LabelOptions {
     s.labels.as_ref().unwrap_or(&chart.labels)
 }
 
+/// The own label of point `j` in series `s` (the list is sorted by index).
+fn point_label(s: &SeriesData, j: usize) -> Option<&PointLabelData> {
+    s.point_labels.binary_search_by_key(&j, |l| l.index).ok().and_then(|i| s.point_labels.get(i))
+}
+
+/// The position point `j`'s label is drawn at: the point's own, else the options' (`Auto` then
+/// picks the chart type's usual place).
+fn point_position(chart: &Chart, s: &SeriesData, j: usize, o: &LabelOptions) -> LabelPosition {
+    match point_label(s, j).map(|l| l.position).filter(|p| *p != LabelPosition::Auto) {
+        Some(p) => p,
+        None => resolved_position(chart, o),
+    }
+}
+
 /// The position a label is drawn at: `Auto` picks the chart type's usual place.
 fn resolved_position(chart: &Chart, o: &LabelOptions) -> LabelPosition {
     if o.position != LabelPosition::Auto {
@@ -177,32 +191,44 @@ fn label_text(chart: &Chart, data: &ChartData, s: &SeriesData, j: usize, total: 
     if o.hidden {
         return None;
     }
+    let own = point_label(s, j);
+    // A point's own flags override the series' and the chart's; an unset one follows them.
+    let show = |flag: fn(&PointLabelData) -> Option<bool>, inherited: bool| own.and_then(flag).unwrap_or(inherited);
+    let show_value = show(|l| l.show_value, o.show_value);
+    let show_series = show(|l| l.show_series, o.show_series);
+    let show_category = show(|l| l.show_category, o.show_category);
+    let show_percentage = show(|l| l.show_percentage, o.show_percentage);
     let sep = o.separator.as_deref().filter(|s| !s.is_empty()).unwrap_or(", ");
     let fmt = o.number_format.as_deref().unwrap_or(&s.number_format);
     let v = s.values.get(j).copied().flatten();
     let mut parts: Vec<String> = Vec::new();
-    if o.show_series && !s.name.is_empty() {
+    // A point's own text ("Value From Cells" or typed text) leads the label.
+    if let Some(t) = own.and_then(|l| l.text.as_deref()).filter(|t| !t.is_empty()) {
+        parts.push(t.to_string());
+    }
+    if show_series && !s.name.is_empty() {
         parts.push(s.name.clone());
     }
-    if o.show_category {
+    if show_category {
         parts.push(cat_label(data, j));
     }
-    if (o.show_value || !o.shows_anything())
+    // The chart's or the series' options asking for nothing has always meant "show the value";
+    // a point whose own flags are all off asks for nothing and shows nothing.
+    let own_turns_off = own.is_some_and(|l| l.has_flags()) && !(show_value || show_series || show_category || show_percentage);
+    let default_value = !o.shows_anything() && !own_turns_off;
+    if (show_value || (default_value && parts.is_empty()))
         && let Some(v) = v
     {
         parts.push(format_number(v, fmt, None));
     }
-    if o.show_percentage
-        && let Some(v) = v
-    {
+    if show_percentage && let Some(v) = v {
         let sum = total.unwrap_or_else(|| s.values.iter().flatten().map(|v| v.abs()).sum::<f64>());
         if sum.is_finite() && sum > 0.0 {
             parts.push(format!("{}%", format_number(v.abs() / sum * 100.0, "General", None)));
         }
     }
-    if parts.is_empty() {
-        parts.extend(v.map(|v| format_number(v, fmt, None)));
-    }
+    // A label whose parts are all switched off on purpose (a point's own `showVal=0` with nothing
+    // else) shows nothing; the value fallback above already covers "no part asked at all".
     if parts.is_empty() { None } else { Some(parts.join(sep)) }
 }
 
@@ -395,6 +421,7 @@ fn sanitize(d: &ChartData) -> ChartData {
                     minus: e.minus.iter().take(MAX_POINTS).copied().collect(),
                 }),
                 points: s.points.iter().take(MAX_POINTS).copied().collect(),
+                point_labels: s.point_labels.iter().take(MAX_POINTS).cloned().collect(),
             })
             .collect(),
     }
@@ -1375,7 +1402,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                             && let Some(text) = label_text(chart, data, s, j, None)
                         {
                             let o = series_labels(chart, s);
-                            let below = resolved_position(chart, o) == LabelPosition::Bottom;
+                            let below = point_position(chart, s, j, o) == LabelPosition::Bottom;
                             let (y, va) = if below { (vpos(t, &sc) + 5.0, VAlign::Top) } else { (vpos(t, &sc) - 5.0, VAlign::Bottom) };
                             area_labels.push((c, y, text, point_fill(s, j), va));
                         }
@@ -1398,10 +1425,10 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                 1 => {
                     let k = slot_of.get(i).copied().unwrap_or(0) as f32;
                     let o = series_labels(chart, s);
-                    let pos = resolved_position(chart, o);
-                    let inside = matches!(pos, LabelPosition::Center | LabelPosition::InsideEnd | LabelPosition::InsideBase);
                     for (j, sp) in row.iter().enumerate().filter(|(j, _)| in_window(*j)) {
                         let Some((b, t)) = sp else { continue };
+                        let pos = point_position(chart, s, j, o);
+                        let inside = matches!(pos, LabelPosition::Center | LabelPosition::InsideEnd | LabelPosition::InsideBase);
                         let (pb, pt) = (vpos(*b, &sc), vpos(*t, &sc));
                         let c = center(j);
                         let lo = pb.min(pt);
@@ -1475,10 +1502,9 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                     }
                     if labels_on {
                         let o = series_labels(chart, s);
-                        let pos = resolved_position(chart, o);
                         for (j, p) in pts.iter().enumerate() {
                             let (Some(p), Some(text)) = (p, label_text(chart, data, s, j, None)) else { continue };
-                            let (x, y, ha, va) = match pos {
+                            let (x, y, ha, va) = match point_position(chart, s, j, o) {
                                 LabelPosition::Bottom => (p[0], p[1] + 3.0, HAlign::Center, VAlign::Top),
                                 LabelPosition::Left => (p[0] - 3.0, p[1], HAlign::Right, VAlign::Middle),
                                 LabelPosition::Right => (p[0] + 3.0, p[1], HAlign::Left, VAlign::Middle),
@@ -1621,11 +1647,10 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         }
         if chart.data_labels && pts.len() <= MAX_LABELS {
             let o = series_labels(chart, s);
-            let pos = resolved_position(chart, o);
             for (j, (p, raw)) in px.iter().zip(pts).enumerate() {
                 let (Some(p), Some(_)) = (p, raw) else { continue };
                 let Some(text) = label_text(chart, data, s, j, None) else { continue };
-                let (x, y, ha, va) = match pos {
+                let (x, y, ha, va) = match point_position(chart, s, j, o) {
                     LabelPosition::Bottom => (p[0], p[1] + 6.0, HAlign::Center, VAlign::Top),
                     LabelPosition::Left => (p[0] - 4.0, p[1], HAlign::Right, VAlign::Middle),
                     LabelPosition::Right => (p[0] + 4.0, p[1], HAlign::Left, VAlign::Middle),
@@ -1858,7 +1883,7 @@ fn pie(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, inner: f32, nam
             let deleted = s.points.iter().any(|p| p.index == j && p.no_label);
             if !deleted && vals.len() <= MAX_LABELS {
                 let o = series_labels(chart, s);
-                let pos = resolved_position(chart, o);
+                let pos = point_position(chart, s, j, o);
                 let text = if names { Some(cat_label(data, j)) } else { label_text(chart, data, s, j, Some(total)) };
                 if let Some(t) = text {
                     let mid = a + sweep / 2.0;

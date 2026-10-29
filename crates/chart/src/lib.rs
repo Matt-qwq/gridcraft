@@ -162,6 +162,39 @@ pub struct SeriesData {
     pub error_bars: Option<ErrorBarsData>,
     /// Per-point formatting overrides, with colours resolved, by point index.
     pub points: Vec<PointStyle>,
+    /// Per-point data labels (text, position, what they show), by point index.
+    #[serde(default)]
+    pub point_labels: Vec<PointLabelData>,
+}
+
+/// One point's own data label, with a cell reference already resolved to its text.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PointLabelData {
+    pub index: usize,
+    /// The label's text (a literal, or what the referenced cell holds); empty draws nothing.
+    pub text: Option<String>,
+    /// `Auto` keeps the series' or the chart's position.
+    pub position: LabelPosition,
+    /// Each flag overrides the series' or the chart's option when it is set.
+    pub show_value: Option<bool>,
+    pub show_series: Option<bool>,
+    pub show_category: Option<bool>,
+    pub show_percentage: Option<bool>,
+}
+
+impl PointLabelData {
+    /// Whether any show flag is set (to either value).
+    pub fn has_flags(&self) -> bool {
+        self.show_value.is_some() || self.show_series.is_some() || self.show_category.is_some() || self.show_percentage.is_some()
+    }
+}
+
+impl SeriesData {
+    /// The own label of point `j`, if any. The list is sorted by index.
+    pub fn point_label(&self, j: usize) -> Option<&PointLabelData> {
+        self.point_labels.binary_search_by_key(&j, |l| l.index).ok().and_then(|i| self.point_labels.get(i))
+    }
 }
 
 /// A series' error bars: the model's settings plus the custom amounts resolved against the
@@ -207,6 +240,7 @@ impl Default for SeriesData {
             labels: None,
             error_bars: None,
             points: vec![],
+            point_labels: vec![],
         }
     }
 }

@@ -13,10 +13,11 @@
 
 use std::collections::BTreeMap;
 
-use gridcraft_model::{AxisCrossing, AxisOptions, Chart, DisplayUnits, LabelOptions, PointFormat, Series, Workbook};
+use gridcraft_model::{AxisCrossing, AxisOptions, Chart, DisplayUnits, LabelOptions, PointFormat, PointLabel, Series, Workbook};
 
 use crate::chart::{
-    cat_data, dlbls_xml, err_bars_children, label_children, num_data, point_xml, scaling_xml, series_sp_pr, series_tx_xml, title_xml, trendline_xml,
+    MAX_POINTS, cat_data, dlbls_xml, err_bars_children, label_children, num_data, point_xml, scaling_xml, series_sp_pr, series_tx_xml, title_xml,
+    trendline_xml,
 };
 use crate::drawing::srgb;
 use crate::xml::{esc, esc_attr, num};
@@ -28,26 +29,26 @@ const MAX_NODES: usize = 50_000;
 /// Largest chart part the patcher works on. A real chart part is a few kilobytes; a huge one (a
 /// hostile file, or a cache with a million points) is regenerated from the model instead, so the
 /// span tree and the rendered copy stay bounded.
-const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------- span tree
 
 /// An element of the kept XML: where it starts and ends, so it can be copied or replaced byte for
 /// byte. Children are the direct children only.
 #[derive(Clone, Debug)]
-struct Node {
-    name: String,
+pub(crate) struct Node {
+    pub(crate) name: String,
     /// Offset of `<`.
-    start: usize,
+    pub(crate) start: usize,
     /// Offset just past the element's name in the opening tag (its attributes start here).
     name_end: usize,
     /// Offset just past the opening tag's `>`.
-    open_end: usize,
+    pub(crate) open_end: usize,
     /// Offset of the closing `</name>` (equal to `open_end` when self-closing).
-    close_start: usize,
+    pub(crate) close_start: usize,
     /// Offset just past the element.
-    end: usize,
-    children: Vec<Node>,
+    pub(crate) end: usize,
+    pub(crate) children: Vec<Node>,
 }
 
 fn local_name(raw: &str) -> &str {
@@ -74,7 +75,7 @@ fn tag_end(xml: &str, lt: usize) -> Option<usize> {
 /// Splits a chart part into a span tree. `None` for anything the scanner does not fully
 /// understand (an unbalanced or mismatched tag, a part nested too deeply or too large): the caller
 /// then regenerates the part from the model.
-fn scan(xml: &str) -> Option<Vec<Node>> {
+pub(crate) fn scan(xml: &str) -> Option<Vec<Node>> {
     let mut roots: Vec<Node> = Vec::new();
     let mut stack: Vec<Node> = Vec::new();
     let mut nodes = 0usize;
@@ -145,7 +146,7 @@ fn scan(xml: &str) -> Option<Vec<Node>> {
 }
 
 /// Value of attribute `key` of `n` (matched by local name).
-fn attr<'a>(xml: &'a str, n: &Node, key: &str) -> Option<&'a str> {
+pub(crate) fn attr<'a>(xml: &'a str, n: &Node, key: &str) -> Option<&'a str> {
     let body = xml.get(n.name_end..n.open_end)?;
     let mut i = 0usize;
     while let Some(eq) = body.get(i..)?.find('=') {
@@ -163,12 +164,12 @@ fn attr<'a>(xml: &'a str, n: &Node, key: &str) -> Option<&'a str> {
     None
 }
 
-fn child<'a>(n: &'a Node, name: &str) -> Option<&'a Node> {
+pub(crate) fn child<'a>(n: &'a Node, name: &str) -> Option<&'a Node> {
     n.children.iter().find(|c| c.name == name)
 }
 
 /// `n`'s direct children named `name`, in document order.
-fn kids<'a>(n: &'a Node, name: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
+pub(crate) fn kids<'a>(n: &'a Node, name: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
     n.children.iter().filter(move |c| c.name == name)
 }
 
@@ -311,8 +312,36 @@ const DLBLS_ORDER: &[&str] = &[
     "leaderLines",
     "extLst",
 ];
+/// CT_DLbl's sequence: the index, deletion, the text, the position and the show flags, then the
+/// formatting and callout parts the model leaves alone.
+const DLABEL_ORDER: &[&str] = &[
+    "idx",
+    "delete",
+    "layout",
+    "tx",
+    "numFmt",
+    "spPr",
+    "txPr",
+    "dLblPos",
+    "showLegendKey",
+    "showVal",
+    "showCatName",
+    "showSerName",
+    "showPercent",
+    "showBubbleSize",
+    "separator",
+    "showLeaderLines",
+    "leaderLines",
+    "extLst",
+];
+
+/// The point index a `dLbl` names, if it has one.
+fn dlbl_index(xml: &str, n: &Node) -> Option<u32> {
+    child(n, "idx").and_then(|i| attr(xml, i, "val")).and_then(|v| v.trim().parse::<u32>().ok())
+}
+
 /// A DrawingML shape's properties: the fill comes before the outline.
-const SPPR_ORDER: &[&str] = &[
+pub(crate) const SPPR_ORDER: &[&str] = &[
     "xfrm",
     "custGeom",
     "prstGeom",
@@ -365,7 +394,7 @@ fn group_order(group: &Node) -> &'static [&'static str] {
 
 /// The edits to one element's children.
 #[derive(Default)]
-struct ParentEdits {
+pub(crate) struct ParentEdits {
     order: &'static [&'static str],
     /// Managed child elements: the new text (`Some`) or removal (`None`).
     edits: Vec<(&'static str, Option<String>)>,
@@ -394,31 +423,46 @@ impl ParentEdits {
 
 /// The whole patch: elements to replace and elements whose children change.
 #[derive(Default)]
-struct Plan {
+pub(crate) struct Plan {
     replace: BTreeMap<usize, String>,
     children: BTreeMap<usize, ParentEdits>,
+    /// Changed attributes (`None` removes one) of an element's opening tag.
+    attrs: BTreeMap<usize, Vec<(String, Option<String>)>>,
 }
 
 impl Plan {
-    fn edits(&mut self, parent: &Node, order: &'static [&'static str]) -> &mut ParentEdits {
+    pub(crate) fn edits(&mut self, parent: &Node, order: &'static [&'static str]) -> &mut ParentEdits {
         self.children.entry(parent.start).or_insert_with(|| ParentEdits::new(order))
     }
 
     /// Replaces (or removes) child element `tag` of `parent`.
-    fn set(&mut self, parent: &Node, order: &'static [&'static str], tag: &'static str, text: Option<String>) {
+    pub(crate) fn set(&mut self, parent: &Node, order: &'static [&'static str], tag: &'static str, text: Option<String>) {
         self.edits(parent, order).set(tag, text);
     }
 
     /// Adds repeated element `xml` at the schema position of `tag`.
-    fn add(&mut self, parent: &Node, order: &'static [&'static str], tag: &str, xml: String) {
+    pub(crate) fn add(&mut self, parent: &Node, order: &'static [&'static str], tag: &str, xml: String) {
         let pe = self.edits(parent, order);
         let rank = pe.rank(tag);
         pe.extra.push((rank, xml));
     }
 
     /// Replaces the whole element `node`.
-    fn replace(&mut self, node: &Node, text: String) {
+    pub(crate) fn replace(&mut self, node: &Node, text: String) {
         self.replace.insert(node.start, text);
+    }
+
+    /// Sets (or removes, with `None`) one attribute of `node`'s opening tag.
+    pub(crate) fn set_attr(&mut self, node: &Node, key: &str, value: Option<String>) {
+        let list = self.attrs.entry(node.start).or_default();
+        match list.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            Some(slot) => slot.1 = value,
+            None => {
+                if let Some(v) = value {
+                    list.push((key.to_string(), Some(v)));
+                }
+            }
+        }
     }
 }
 
@@ -434,12 +478,112 @@ fn place_extra<'a>(before: &mut BTreeMap<usize, Vec<(usize, &'a str)>>, n: &Node
     before.entry(at).or_default().push((rank, text));
 }
 
+/// The opening tag of `n` with `edits` applied: attributes keep their order, a new one goes last.
+/// Rebuilt only for an element whose attributes changed; every other tag is copied as it was.
+fn open_tag(xml: &str, n: &Node, edits: &[(String, Option<String>)]) -> String {
+    let Some((name, self_closing, mut attrs)) = raw_attrs(xml, n) else {
+        // Attributes the parser does not understand (an unquoted value, say): keep the tag's bytes
+        // and append the changes before its `>`, so the edit is not silently dropped.
+        let raw = xml.get(n.start..n.open_end).unwrap_or_default();
+        let self_closing = raw.trim_end().ends_with("/>");
+        let mut out = raw.trim_end().trim_end_matches('>').trim_end_matches('/').trim_end().to_string();
+        for (key, value) in edits {
+            if let Some(v) = value {
+                out.push(' ');
+                out.push_str(key);
+                out.push_str("=\"");
+                out.push_str(v);
+                out.push('\"');
+            }
+        }
+        out.push_str(if self_closing { "/>" } else { ">" });
+        return out;
+    };
+    let mut removed: Vec<&str> = Vec::new();
+    for (key, value) in edits {
+        match attrs.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            Some(slot) => match value {
+                Some(v) => slot.1 = v.clone(),
+                None => removed.push(key.as_str()),
+            },
+            None => {
+                if let Some(v) = value {
+                    attrs.push((key.clone(), v.clone()));
+                }
+            }
+        }
+    }
+    attrs.retain(|(k, _)| !removed.iter().any(|r| r.eq_ignore_ascii_case(k)));
+    let mut out = format!("<{name}");
+    for (k, v) in attrs {
+        out.push(' ');
+        out.push_str(&k);
+        out.push_str("=\"");
+        out.push_str(&v);
+        out.push('\"');
+    }
+    out.push_str(if self_closing { "/>" } else { ">" });
+    out
+}
+
+/// The name, self-closing flag and attributes of `n`'s opening tag. Malformed attributes make the
+/// caller copy the tag unchanged.
+fn raw_attrs(xml: &str, n: &Node) -> Option<(String, bool, Vec<(String, String)>)> {
+    // `name_end` is just past the qualified name, so the name starts after the `<`.
+    let name: String = xml.get(n.start + 1..n.name_end)?.to_string();
+    let body = xml.get(n.name_end..n.open_end)?;
+    let self_closing = body.trim_end().trim_end_matches('>').trim_end().ends_with('/');
+    let mut attrs: Vec<(String, String)> = Vec::new();
+    let mut i = 0usize;
+    loop {
+        while body.as_bytes().get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let tail = body.get(i..)?;
+        if tail.is_empty() || tail.starts_with('/') || tail.starts_with('>') {
+            break;
+        }
+        let key_end = tail.find(|c: char| c.is_whitespace() || c == '=' || c == '/' || c == '>')?;
+        let key: String = tail.get(..key_end)?.to_string();
+        i += key_end;
+        while body.as_bytes().get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if body.as_bytes().get(i) != Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        while body.as_bytes().get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let q = *body.as_bytes().get(i)?;
+        if q != b'"' && q != b'\'' {
+            return None;
+        }
+        i += 1;
+        let after = body.get(i..)?;
+        let len = after.find(q as char)?;
+        attrs.push((key, after.get(..len)?.to_string()));
+        i += len + 1;
+    }
+    Some((name, self_closing, attrs))
+}
+
+/// [`render`] for a root the caller reached through [`scan`] itself.
+pub(crate) fn render_node(xml: &str, n: &Node, plan: &Plan) -> String {
+    render(xml, n, plan)
+}
+
 /// Renders `n` with the plan applied. Every byte outside a patched element is copied as it was:
 /// the gaps between children, the opening tags and the text all come straight from the input.
 fn render(xml: &str, n: &Node, plan: &Plan) -> String {
     if let Some(r) = plan.replace.get(&n.start) {
         return r.clone();
     }
+    let open = match plan.attrs.get(&n.start) {
+        Some(edits) => open_tag(xml, n, edits),
+        None => xml.get(n.start..n.open_end).unwrap_or_default().to_string(),
+    };
     let empty = ParentEdits::default();
     let pe = plan.children.get(&n.start).unwrap_or(&empty);
     // New elements go before the first child the schema puts after them.
@@ -455,7 +599,7 @@ fn render(xml: &str, n: &Node, plan: &Plan) -> String {
         place_extra(&mut before, n, pe, text, *rank);
     }
     let mut out = String::with_capacity(n.end.saturating_sub(n.start) + 64);
-    push(&mut out, xml.get(n.start..n.open_end));
+    out.push_str(&open);
     let mut pos = n.open_end;
     for (i, c) in n.children.iter().enumerate() {
         if pe.remove.contains(&i) {
@@ -567,25 +711,63 @@ fn label_option_tags() -> [&'static str; 9] {
     ["numFmt", "dLblPos", "showLegendKey", "showVal", "showCatName", "showSerName", "showPercent", "showBubbleSize", "separator"]
 }
 
-/// Whether a `dLbl` child is the deleted-point marker the model owns (nothing but an index and a
-/// delete flag); a label with text or formatting of its own is left alone.
-fn is_deleted_label(xml: &str, n: &Node) -> bool {
-    let Some(idx) = child(n, "idx") else { return false };
-    if attr(xml, idx, "val").is_none() || child(n, "delete").is_none() {
-        return false;
-    }
-    n.children.iter().all(|c| matches!(c.name.as_str(), "idx" | "delete"))
+/// The `dLbl` children the model owns: the point's index, its deletion and its label. Anything else
+/// in the element (layout, text formatting, a callout's leader lines) is somebody else's and stays.
+fn is_own_label_child(name: &str) -> bool {
+    matches!(name, "idx" | "delete" | "tx" | "dLblPos" | "showVal" | "showCatName" | "showSerName" | "showPercent")
 }
 
-/// The label options and deleted-point indices each side writes for a group (`series: None`) or a
+/// [`is_own_label_child`] for a whole element: nothing in it would be lost by rebuilding it.
+fn is_own_label(n: &Node) -> bool {
+    n.children.iter().all(|c| is_own_label_child(&c.name))
+}
+
+/// What the model says about one point's label: deletion (the point format) and the label record.
+#[derive(Clone, Default, PartialEq)]
+struct PointLabelState {
+    index: u32,
+    no_label: bool,
+    label: Option<PointLabel>,
+}
+
+/// A group's or a series' label state: the options, plus each point's own label.
+#[derive(Clone, Default, PartialEq)]
+struct LabelState {
+    /// The chart-wide switch is off: the part's label element is marked deleted.
+    labels_off: bool,
+    options: Option<LabelOptions>,
+    points: Vec<PointLabelState>,
+}
+
+impl LabelState {
+    fn point(&self, index: u32) -> Option<&PointLabelState> {
+        self.points.iter().find(|p| p.index == index)
+    }
+}
+
+/// The label options and per-point labels each side writes for a group (`series: None`) or a
 /// series.
-fn label_state<'a>(c: &'a Chart, s: Option<&'a Series>) -> Option<(Option<&'a LabelOptions>, Vec<u32>)> {
+fn label_state(c: &Chart, s: Option<&Series>) -> Option<LabelState> {
     match s {
-        None => (c.data_labels && !c.labels.hidden).then(|| (Some(&c.labels), Vec::new())),
+        None => {
+            let options = (c.data_labels && !c.labels.hidden).then(|| c.labels.clone());
+            let state = LabelState { labels_off: !c.data_labels, options, points: Vec::new() };
+            (state.options.is_some()).then_some(state)
+        }
         Some(s) => {
-            let deleted: Vec<u32> = s.points.iter().filter(|p| p.no_label).map(|p| p.index).collect();
-            let labels = s.labels.as_ref().filter(|_| c.data_labels);
-            (labels.is_some() || !deleted.is_empty()).then_some((labels, deleted))
+            let options = s.labels.as_ref().filter(|_| c.data_labels).cloned();
+            let mut points: Vec<PointLabelState> = Vec::new();
+            let mut indices: Vec<u32> = s.points.iter().filter(|p| p.no_label).map(|p| p.index).collect();
+            indices.extend(s.point_labels.iter().map(|l| l.index));
+            indices.sort_unstable();
+            indices.dedup();
+            indices.truncate(MAX_POINTS);
+            for idx in indices {
+                let no_label = s.points.iter().any(|p| p.index == idx && p.no_label);
+                let label = s.point_labels.iter().find(|l| l.index == idx).cloned();
+                points.push(PointLabelState { index: idx, no_label, label });
+            }
+            (options.is_some() || !points.is_empty()).then_some(LabelState { labels_off: !c.data_labels, options, points })
         }
     }
 }
@@ -596,8 +778,10 @@ fn patch_dlbls(
     xml: &str,
     parent: &Node,
     parent_order: &'static [&'static str],
-    then: Option<(Option<&LabelOptions>, &[u32])>,
-    now: Option<(Option<&LabelOptions>, &[u32])>,
+    then: Option<&LabelState>,
+    now: Option<&LabelState>,
+    wb: &Workbook,
+    si: usize,
 ) {
     let existing = child(parent, "dLbls");
     match (existing, now) {
@@ -611,11 +795,18 @@ fn patch_dlbls(
                 pe.set(tag, None);
             }
         }
-        (None, Some((labels, deleted))) => plan.set(parent, parent_order, "dLbls", Some(dlbls_xml(labels, deleted))),
-        (Some(d), Some((labels, deleted))) => {
-            let then_deleted = then.map(|(_, d)| d).unwrap_or(&[]);
+        (None, Some(state)) => {
+            let (deleted, labels): (Vec<u32>, Vec<PointLabel>) = own_points(state);
+            let mut text = dlbls_xml(state.options.as_ref(), &deleted, &labels, wb, si);
+            if state.labels_off {
+                // The element the writer builds carries no options; the switch-off flag goes first.
+                text = text.replacen("<c:dLbls>", "<c:dLbls><c:delete val=\"1\"/>", 1);
+            }
+            plan.set(parent, parent_order, "dLbls", Some(text));
+        }
+        (Some(d), Some(state)) => {
             let pe = plan.edits(d, DLBLS_ORDER);
-            match labels {
+            match state.options.as_ref() {
                 Some(l) => {
                     for (tag, text) in label_children(l) {
                         pe.set(tag, text);
@@ -627,22 +818,89 @@ fn patch_dlbls(
                     }
                 }
                 None => {
-                    pe.set("delete", None);
+                    pe.set("delete", state.labels_off.then(|| "<c:delete val=\"1\"/>".to_string()));
                     for tag in label_option_tags() {
                         pe.set(tag, None);
                     }
                 }
             }
-            if then_deleted != deleted {
-                // The deleted-point markers are ours; a `dLbl` with text or formatting is not.
-                let ours: Vec<usize> =
-                    d.children.iter().enumerate().filter(|(_, c)| c.name == "dLbl" && is_deleted_label(xml, c)).map(|(i, _)| i).collect();
-                pe.remove.extend(ours);
-                let rank = pe.rank("dLbl");
-                for idx in deleted {
-                    pe.extra.push((rank, format!("<c:dLbl><c:idx val=\"{idx}\"/><c:delete val=\"1\"/></c:dLbl>")));
+            let before = then.cloned().unwrap_or_default();
+            patch_point_labels(plan, xml, d, &before, state, wb, si);
+        }
+    }
+}
+
+/// The deleted indices and label records of a state, as the writer spells them.
+fn own_points(state: &LabelState) -> (Vec<u32>, Vec<PointLabel>) {
+    let mut deleted = Vec::new();
+    let mut labels = Vec::new();
+    for p in &state.points {
+        if p.no_label {
+            deleted.push(p.index);
+        }
+        if let Some(l) = &p.label {
+            labels.push(l.clone());
+        }
+    }
+    (deleted, labels)
+}
+
+/// Patches each point's own `<c:dLbl>`: its deletion, its text, position and show flags. Only a
+/// point whose model changed is touched, and a `dLbl` the model does not own (a callout layout,
+/// rich-text formatting, leader lines) keeps everything outside the model's children.
+fn patch_point_labels(plan: &mut Plan, xml: &str, dlbls: &Node, then: &LabelState, now: &LabelState, wb: &Workbook, si: usize) {
+    let mut indices: Vec<u32> = then.points.iter().chain(&now.points).map(|p| p.index).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices.truncate(MAX_POINTS);
+    for idx in indices {
+        let a = then.point(idx);
+        let b = now.point(idx);
+        if a == b {
+            continue;
+        }
+        let node = dlbls.children.iter().find(|n| n.name == "dLbl" && dlbl_index(xml, n) == Some(idx));
+        match (node, b) {
+            (Some(n), Some(b)) => {
+                let pe = plan.edits(n, DLABEL_ORDER);
+                pe.set("delete", b.no_label.then(|| "<c:delete val=\"1\"/>".to_string()));
+                let label = b.label.as_ref().filter(|_| !b.no_label);
+                pe.set("tx", label.and_then(|l| l.text.as_deref()).map(|t| crate::chart::label_tx_xml(t, wb, si)));
+                pe.set(
+                    "dLblPos",
+                    label
+                        .map(|l| l.position)
+                        .filter(|p| *p != gridcraft_model::LabelPosition::Auto)
+                        .map(|p| format!("<c:dLblPos val=\"{}\"/>", crate::chart::label_position_file(p))),
+                );
+                for (tag, value) in [
+                    ("showVal", label.and_then(|l| l.show_value)),
+                    ("showCatName", label.and_then(|l| l.show_category)),
+                    ("showSerName", label.and_then(|l| l.show_series)),
+                    ("showPercent", label.and_then(|l| l.show_percentage)),
+                ] {
+                    pe.set(tag, value.map(|v| format!("<c:{tag} val=\"{}\"/>", v as u8)));
                 }
             }
+            (Some(n), None) => {
+                // The point no longer carries a label: drop the children the model owns. When
+                // nothing else is in the element, the whole `dLbl` goes.
+                if is_own_label(n) {
+                    if let Some(i) = dlbls.children.iter().position(|c| c.start == n.start) {
+                        plan.edits(dlbls, DLBLS_ORDER).remove.push(i);
+                    }
+                } else {
+                    let pe = plan.edits(n, DLABEL_ORDER);
+                    for tag in ["delete", "tx", "dLblPos", "showVal", "showCatName", "showSerName", "showPercent"] {
+                        pe.set(tag, None);
+                    }
+                }
+            }
+            (None, Some(b)) => {
+                let label = b.label.as_ref();
+                plan.add(dlbls, DLBLS_ORDER, "dLbl", crate::chart::dlbl_xml(idx, b.no_label, label, wb, si));
+            }
+            (None, None) => {}
         }
     }
 }
@@ -870,8 +1128,8 @@ fn patch_series(
     patch_points(plan, xml, ser, &then.points, &now.points, wb);
     let before = label_state(then_chart, Some(then));
     let after = label_state(now_chart, Some(now));
-    if before.as_ref().map(|(l, d)| (l.map(label_children), d.clone())) != after.as_ref().map(|(l, d)| (l.map(label_children), d.clone())) {
-        patch_dlbls(plan, xml, ser, SER_ORDER, before.as_ref().map(|(l, d)| (*l, d.as_slice())), after.as_ref().map(|(l, d)| (*l, d.as_slice())));
+    if before != after {
+        patch_dlbls(plan, xml, ser, SER_ORDER, before.as_ref(), after.as_ref(), wb, si);
     }
 }
 
@@ -963,16 +1221,9 @@ pub fn patch_chart(xml: &str, then: &Chart, now: &Chart, wb: &Workbook, si: usiz
     // Chart-level labels: one `<c:dLbls>` per group.
     let then_group = label_state(then, None);
     let now_group = label_state(now, None);
-    if then_group.as_ref().map(|(l, _)| l.map(label_children)) != now_group.as_ref().map(|(l, _)| l.map(label_children)) {
+    if then_group.as_ref().map(|s| s.options.as_ref().map(label_children)) != now_group.as_ref().map(|s| s.options.as_ref().map(label_children)) {
         for g in &groups {
-            patch_dlbls(
-                &mut plan,
-                xml,
-                g,
-                group_order(g),
-                then_group.as_ref().map(|(l, d)| (*l, d.as_slice())),
-                now_group.as_ref().map(|(l, d)| (*l, d.as_slice())),
-            );
+            patch_dlbls(&mut plan, xml, g, group_order(g), then_group.as_ref(), now_group.as_ref(), wb, si);
         }
     }
 

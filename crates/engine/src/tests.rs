@@ -5550,14 +5550,96 @@ fn chart_options_are_refused_where_they_cannot_be_saved() {
     assert!(pie.execute("chart.setAxis", json!({"min": 1})).is_err(), "a pie has no axes");
     assert!(pie.execute("chart.setErrorBars", json!({"type": "fixed", "value": 1})).is_err(), "no error bars on a pie");
 
-    // A histogram keeps its options in a chartex part, which GridCraft regenerates: refuse rather
-    // than store an option that the next save drops.
+    // A histogram keeps its options in a chartex part. The options the part has an element for are
+    // stored (and patched into the part); the rest are refused with a reason.
     let mut h = s();
     chart_data(&mut h);
     h.execute("insert.chart", json!({"type": "histogram", "range": "A1:B7"})).unwrap();
-    assert!(h.execute("chart.setAxis", json!({"min": 1})).is_err());
-    assert!(h.execute("chart.setDataLabels", json!({"percentage": true})).is_err());
+    h.execute("chart.setAxis", json!({"min": 1, "max": 9, "majorUnit": 2, "reversed": true})).unwrap();
+    let c = &h.doc().unwrap().wb.active().unwrap().charts[0];
+    assert_eq!((c.y_axis.min, c.y_axis.max, c.y_axis.major_unit), (Some(1.0), Some(9.0), Some(2.0)));
+    assert!(c.y_axis.reversed);
+    assert!(h.execute("chart.setAxis", json!({"axis": "x", "min": 1})).is_err(), "a chartex category axis has no bounds");
+    assert!(h.execute("chart.setAxis", json!({"crosses": "max"})).is_err(), "no crossing point in a chartex part");
+    assert!(h.execute("chart.setAxis", json!({"displayUnits": "millions"})).is_err(), "no display units in a chartex part");
+    assert!(h.execute("chart.setAxis", json!({"numberFormat": "0"})).is_err(), "no number format in a chartex part");
+    h.execute("chart.setDataLabels", json!({"value": true, "categoryName": true, "position": "outsideEnd"})).unwrap();
+    let l = h.doc().unwrap().wb.active().unwrap().charts[0].series[0].labels.clone().expect("series labels");
+    assert!(l.show_value && l.show_category && !l.hidden);
+    assert!(h.execute("chart.setDataLabels", json!({"percentage": true})).is_err(), "a chartex label has no percentage");
+    assert!(h.execute("chart.setDataLabels", json!({"separator": " / "})).is_err(), "no separator in a chartex part");
+    assert!(h.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "text": "x"})).is_err(), "no per-point labels");
     assert!(h.execute("chart.formatPoint", json!({"series": 0, "point": 0, "fill": "FF0000"})).is_err());
+    // A treemap has no value axis at all.
+    let mut t = s();
+    chart_data(&mut t);
+    t.execute("insert.chart", json!({"type": "treemap", "range": "A1:B7"})).unwrap();
+    assert!(t.execute("chart.setAxis", json!({"min": 1})).is_err(), "a treemap has no axes");
+}
+
+#[test]
+fn a_chartex_axis_and_label_option_survive_a_save() {
+    let mut h = s();
+    chart_data(&mut h);
+    h.execute("insert.chart", json!({"type": "histogram", "range": "A1:B7"})).unwrap();
+    h.execute("chart.setAxis", json!({"axis": "y", "min": 2, "max": 18, "majorUnit": 4})).unwrap();
+    h.execute("chart.setDataLabels", json!({"value": true, "categoryName": true, "position": "outsideEnd"})).unwrap();
+    let r = h.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    h.execute("file.open", json!({"name": "histogram.xlsx", "base64": b64})).unwrap();
+    let c = h.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    assert_eq!(c.kind, gridcraft_model::ChartKind::Histogram);
+    assert_eq!((c.y_axis.min, c.y_axis.max, c.y_axis.major_unit), (Some(2.0), Some(18.0), Some(4.0)));
+    assert!(c.data_labels);
+    let l = c.series[0].labels.as_ref().expect("the series labels came back");
+    assert!(l.show_value && l.show_category && l.position == gridcraft_model::LabelPosition::OutsideEnd);
+}
+
+#[test]
+fn a_point_label_is_set_for_exactly_one_point() {
+    use gridcraft_model::{LabelPosition, PointLabel};
+    let mut s = s();
+    chart_data(&mut s);
+    s.execute("insert.chart", json!({"type": "column", "range": "A1:E7"})).unwrap();
+    // A text and a position for one point of one series.
+    s.execute("chart.setDataLabels", json!({"series": 1, "point": 2, "text": "Data!$C$3", "position": "top"})).unwrap();
+    let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    assert!(c.data_labels, "labelling a point turns labels on");
+    assert_eq!(c.series[1].point_labels.len(), 1);
+    assert_eq!(
+        c.series[1].point_labels[0],
+        PointLabel { index: 2, text: Some("Data!$C$3".into()), position: LabelPosition::Top, ..PointLabel::default() }
+    );
+    for (i, se) in c.series.iter().enumerate() {
+        if i != 1 {
+            assert!(se.point_labels.is_empty(), "series {i} got a point label");
+        }
+    }
+    // Show flags are per point too, and the point's deletion is cleared.
+    assert!(s.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "deletePoint": 0})).is_err());
+    s.execute("chart.setDataLabels", json!({"deletePoint": 0})).unwrap();
+    s.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "value": true})).unwrap();
+    let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    let p = c.series[0].point(0).copied().expect("point format");
+    assert!(!p.no_label, "labelling the point shows its label again");
+    assert_eq!(c.series[0].point_label(0).and_then(|l| l.show_value), Some(true));
+    // The label is stored in the file and read back with the same text and position.
+    let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    s.execute("file.open", json!({"name": "pointlabels.xlsx", "base64": b64})).unwrap();
+    let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    let l = c.series[1].point_labels[0].clone();
+    assert_eq!((l.index, l.text.as_deref(), l.position), (2, Some("Data!$C$3"), LabelPosition::Top));
+    // A point needs a series, and a point label has no legend key, separator or number format.
+    assert!(s.execute("chart.setDataLabels", json!({"point": 0, "text": "x"})).is_err());
+    assert!(s.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "legendKey": true})).is_err());
+    assert!(s.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "separator": " / "})).is_err());
+    assert!(s.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "numberFormat": "0.0"})).is_err());
+    assert!(s.execute("chart.setDataLabels", json!({"text": "x"})).is_err(), "`text` needs `point`");
+    // `on: false` on a point hides just that label.
+    s.execute("chart.setDataLabels", json!({"series": 1, "point": 1, "on": false})).unwrap();
+    assert!(s.doc().unwrap().wb.active().unwrap().charts[0].series[1].point(1).is_some_and(|p| p.no_label));
+    assert!(s.doc().unwrap().wb.active().unwrap().charts[0].series[1].point_labels.iter().all(|l| l.index != 1));
 }
 
 #[test]

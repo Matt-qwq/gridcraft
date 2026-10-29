@@ -7,7 +7,7 @@ use gridcraft_core::{RangeRef, Value, category_levels};
 use gridcraft_formula::{Expr, SheetSel};
 use gridcraft_model::{
     AxisCrossing, AxisOptions, Chart, ChartKind, Color, DefinedName, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions,
-    LabelPosition, LegendPos, LineDash, PointFormat, Series, Trendline, TrendlineKind, Workbook,
+    LabelPosition, LegendPos, LineDash, PointFormat, PointLabel, Series, Trendline, TrendlineKind, Workbook,
 };
 
 use crate::drawing::{dml_color, srgb};
@@ -133,19 +133,33 @@ fn read_series(s: &El) -> Series {
         .and_then(dml_color)
         .or_else(|| sp.and_then(|p| p.path(&["ln", "solidFill"])).and_then(dml_color))
         .or_else(|| s.path(&["marker", "spPr", "solidFill"]).and_then(dml_color));
-    let mut points: Vec<PointFormat> = s.kids("dPt").filter_map(read_point).collect();
-    // A per-point data label that is deleted: Excel keeps these in the series' `<c:dLbls>`.
-    for dl in s.path(&["dLbls"]).into_iter().flat_map(|d| d.kids("dLbl")) {
-        let Some(idx) = dl.child_val("idx").and_then(|v| v.trim().parse::<u32>().ok()) else { continue };
-        if !bool_val(dl, "delete") {
-            continue;
+    let mut points: Vec<PointFormat> = s.kids("dPt").take(MAX_POINTS).filter_map(read_point).collect();
+    let mut point_labels: Vec<PointLabel> = Vec::new();
+    // A per-point label stored inside its `dPt` (`c:dPt/c:dLbl`).
+    for dpt in s.kids("dPt").take(MAX_POINTS) {
+        let (Some(idx), Some(dl)) = (dpt.child_val("idx").and_then(|v| v.trim().parse::<u32>().ok()), dpt.child("dLbl")) else { continue };
+        let label = read_dlbl(dl, idx);
+        if !label.is_empty() {
+            set_label(&mut point_labels, label);
         }
-        match points.iter_mut().find(|p| p.index == idx) {
-            Some(p) => p.no_label = true,
-            None => points.push(PointFormat { index: idx, no_label: true, ..PointFormat::default() }),
+    }
+    // Per-point labels live in the series' `<c:dLbls>`: Excel keeps deleted labels and custom
+    // label text there.
+    for dl in s.path(&["dLbls"]).into_iter().flat_map(|d| d.kids("dLbl")).take(MAX_POINTS) {
+        let Some(idx) = dl.child_val("idx").and_then(|v| v.trim().parse::<u32>().ok()) else { continue };
+        if bool_val(dl, "delete") {
+            match points.iter_mut().find(|p| p.index == idx) {
+                Some(p) => p.no_label = true,
+                None => points.push(PointFormat { index: idx, no_label: true, ..PointFormat::default() }),
+            }
+        }
+        let label = read_dlbl(dl, idx);
+        if !label.is_empty() {
+            set_label(&mut point_labels, label);
         }
     }
     points.sort_by_key(|p| p.index);
+    point_labels.sort_by_key(|l| l.index);
     Series {
         name,
         categories: data_ref(s.child("cat")).or_else(|| data_ref(s.child("xVal"))),
@@ -164,11 +178,64 @@ fn read_series(s: &El) -> Series {
         }),
         error_bars: s.child("errBars").and_then(read_error_bars),
         points,
+        point_labels,
+    }
+}
+
+/// Stores a per-point label, replacing an entry for the same point (a file may split a point's
+/// label over its `dPt` and its series `dLbls`).
+fn set_label(labels: &mut Vec<PointLabel>, label: PointLabel) {
+    match labels.iter_mut().find(|l| l.index == label.index) {
+        Some(slot) => *slot = label,
+        None => labels.push(label),
+    }
+}
+
+/// Longest per-point label text read from a file or written back (characters).
+const MAX_LABEL_TEXT: usize = 1024;
+
+/// A `c:dLbl`'s text: rich-text runs, or a reference to the cell it takes its text from.
+fn read_label_text(dl: &El) -> Option<String> {
+    let tx = dl.child("tx")?;
+    if let Some(rich) = tx.child("rich") {
+        let mut s = String::new();
+        for (p, para) in rich.kids("p").take(64).enumerate() {
+            if p > 0 {
+                s.push('\n');
+            }
+            for t in para.kids("r").filter_map(|r| r.child("t")).take(1024) {
+                let room = MAX_LABEL_TEXT.saturating_sub(s.chars().count());
+                if room == 0 {
+                    break;
+                }
+                s.extend(t.text.chars().take(room));
+            }
+        }
+        return Some(s).filter(|s| !s.is_empty());
+    }
+    if let Some(f) = tx.path(&["strRef", "f"]) {
+        let text: String = f.text.trim().chars().take(MAX_LABEL_TEXT).collect();
+        return Some(chart_ref_from_file(&text)).filter(|s| !s.is_empty());
+    }
+    // A reference without one (a cache only): show what the file cached.
+    tx.path(&["strRef", "strCache", "pt", "v"]).map(|v| v.text.chars().take(MAX_LABEL_TEXT).collect())
+}
+
+/// A `c:dLbl` as the model's per-point label: its text, position and show flags.
+fn read_dlbl(dl: &El, index: u32) -> PointLabel {
+    PointLabel {
+        index,
+        text: read_label_text(dl),
+        show_value: dl.child("showVal").map(|c| c.flag("val", true)),
+        show_series: dl.child("showSerName").map(|c| c.flag("val", true)),
+        show_category: dl.child("showCatName").map(|c| c.flag("val", true)),
+        show_percentage: dl.child("showPercent").map(|c| c.flag("val", true)),
+        position: dl.child_val("dLblPos").and_then(label_position).unwrap_or_default(),
     }
 }
 
 /// `c:dLblPos` → [`LabelPosition`].
-fn label_position(v: &str) -> Option<LabelPosition> {
+pub(crate) fn label_position(v: &str) -> Option<LabelPosition> {
     Some(match v {
         "ctr" => LabelPosition::Center,
         "inEnd" => LabelPosition::InsideEnd,
@@ -183,7 +250,7 @@ fn label_position(v: &str) -> Option<LabelPosition> {
     })
 }
 
-fn label_position_file(p: LabelPosition) -> &'static str {
+pub(crate) fn label_position_file(p: LabelPosition) -> &'static str {
     match p {
         LabelPosition::Auto | LabelPosition::Center => "ctr",
         LabelPosition::InsideEnd => "inEnd",
@@ -528,7 +595,7 @@ const MAX_CACHE: u64 = 100_000;
 
 /// Most per-point formatting records written for one series (a file or a command may carry more
 /// than the model caps; the rest are dropped rather than growing the part without bound).
-const MAX_POINTS: usize = 4096;
+pub(crate) const MAX_POINTS: usize = 4096;
 
 /// The sheet and range a same-workbook reference (`Sheet1!$B$2:$B$9`) names.
 fn ref_target(wb: &Workbook, sheet_idx: usize, f: &str) -> Option<(usize, RangeRef)> {
@@ -788,8 +855,8 @@ fn series_xml(s: &Series, idx: usize, g: G, labels_on: bool, wb: &Workbook, si: 
     let no_label: Vec<u32> = s.points.iter().filter(|p| p.no_label).map(|p| p.index).collect();
     // Labels are a chart-wide switch: a series' own options are written only while they are on.
     let labels = s.labels.as_ref().filter(|_| labels_on);
-    if labels.is_some() || !no_label.is_empty() {
-        x.push_str(&dlbls_xml(labels, &no_label));
+    if labels.is_some() || !no_label.is_empty() || !s.point_labels.is_empty() {
+        x.push_str(&dlbls_xml(labels, &no_label, &s.point_labels, wb, si));
     }
     if !matches!(g, G::Pie | G::Doughnut | G::Radar) {
         for t in &s.trendlines {
@@ -885,12 +952,62 @@ pub(crate) fn trendline_xml(t: &Trendline, wb: &Workbook) -> String {
     x
 }
 
-/// `<c:dLbls>` in CT_DLbls order: deleted points, then the options. `labels` absent writes the
-/// deleted points only (a series with no options of its own).
-pub(crate) fn dlbls_xml(labels: Option<&LabelOptions>, deleted: &[u32]) -> String {
+/// `c:tx` of a point's data label: a reference to the cell it takes its text from, or literal
+/// text as one rich-text run.
+pub(crate) fn label_tx_xml(t: &str, wb: &Workbook, si: usize) -> String {
+    let t = t.trim();
+    let plain: String = t.chars().take(MAX_LABEL_TEXT).collect();
+    if is_ref(t) || is_defined_name(wb, si, t) {
+        let mut s = format!("<c:tx><c:strRef><c:f>{}</c:f>", esc(&chart_ref_to_file(wb, si, t)));
+        if let Some(v) = ref_values(wb, si, t).and_then(|v| v.into_iter().next()) {
+            let _ = write!(s, "<c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>{}</c:v></c:pt></c:strCache>", esc(&v.display()));
+        }
+        s.push_str("</c:strRef></c:tx>");
+        return s;
+    }
+    let lit = plain.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(&plain);
+    format!("<c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>{}</a:t></a:r></a:p></c:rich></c:tx>", esc(lit))
+}
+
+/// `<c:dLbl>` in CT_DLbl order: idx, delete, tx, dLblPos, the show flags.
+pub(crate) fn dlbl_xml(index: u32, no_label: bool, label: Option<&PointLabel>, wb: &Workbook, si: usize) -> String {
+    let index = index.min(MAX_POINTS as u32);
+    let mut x = format!("<c:dLbl><c:idx val=\"{index}\"/>");
+    if no_label {
+        x.push_str("<c:delete val=\"1\"/>");
+    } else if let Some(l) = label {
+        if let Some(t) = l.text.as_deref().filter(|t| !t.trim().is_empty()) {
+            x.push_str(&label_tx_xml(t, wb, si));
+        }
+        if l.position != LabelPosition::Auto {
+            let _ = write!(x, "<c:dLblPos val=\"{}\"/>", label_position_file(l.position));
+        }
+        for (tag, v) in
+            [("showVal", l.show_value), ("showCatName", l.show_category), ("showSerName", l.show_series), ("showPercent", l.show_percentage)]
+        {
+            if let Some(v) = v {
+                let _ = write!(x, "<c:{tag} val=\"{}\"/>", v as u8);
+            }
+        }
+    }
+    x.push_str("</c:dLbl>");
+    x
+}
+
+/// `<c:dLbls>` in CT_DLbls order: per-point labels, then the options. `labels` absent writes the
+/// per-point labels only (a series with no options of its own).
+pub(crate) fn dlbls_xml(labels: Option<&LabelOptions>, deleted: &[u32], point_labels: &[PointLabel], wb: &Workbook, si: usize) -> String {
     let mut x = String::from("<c:dLbls>");
-    for idx in deleted.iter().take(MAX_POINTS) {
-        let _ = write!(x, "<c:dLbl><c:idx val=\"{idx}\"/><c:delete val=\"1\"/></c:dLbl>");
+    // Deleted points and per-point labels share the `dLbl` elements: one per point, in index order.
+    let deleted: std::collections::BTreeSet<u32> = deleted.iter().copied().collect();
+    let mut indices: Vec<u32> = deleted.iter().copied().chain(point_labels.iter().map(|l| l.index)).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices.truncate(MAX_POINTS);
+    for idx in indices {
+        let no_label = deleted.contains(&idx);
+        let label = point_labels.iter().find(|l| l.index == idx);
+        x.push_str(&dlbl_xml(idx, no_label, label, wb, si));
     }
     if let Some(l) = labels {
         for (_, text) in label_children(l) {
@@ -976,7 +1093,7 @@ fn group_xml(g: G, series: &[(usize, &Series)], ch: &Chart, axes: (u32, u32), wb
     // Group-level labels: the chart's options when they show something, else the plain value label.
     // `labels.hidden` means the file had no group-level labels (only some series had them):
     // writing no group record keeps it that way.
-    let dl = if ch.data_labels && !ch.labels.hidden { dlbls_xml(Some(&ch.labels), &[]) } else { String::new() };
+    let dl = if ch.data_labels && !ch.labels.hidden { dlbls_xml(Some(&ch.labels), &[], &[], wb, si) } else { String::new() };
     let ax = format!("<c:axId val=\"{}\"/><c:axId val=\"{}\"/>", axes.0, axes.1);
     match g {
         G::Bar { bar, grouping } => {

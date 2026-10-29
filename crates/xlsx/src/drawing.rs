@@ -206,7 +206,6 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                         // be written back on its own: those parts are not kept, and its `r:id`s
                         // would dangle.
                         let rels = cx.pkg.rels(&target)?;
-                        let linked = !rels.is_empty();
                         // A kept part is written back on its own, so it may only carry relationships
                         // GridCraft writes again: a chartex part's style and colour parts are.
                         let kept_ok = rels.is_empty()
@@ -225,9 +224,11 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                                 Some(mut ch) => {
                                     ch.id = cx.next_object_id();
                                     ch.anchor = anchor;
-                                    // Classic chart parts are kept so unmodelled options survive a save;
-                                    // a chartex part refers to hidden defined names, which are not kept.
-                                    if !chartex && !linked {
+                                    // The part is kept so the options GridCraft does not model survive
+                                    // a save: a classic part is patched element by element, a
+                                    // chartex part too (its hidden `_xlchart` names are recorded on
+                                    // it by the reader and written again).
+                                    if kept_ok {
                                         ch.keep_part(text.into());
                                     }
                                     sheet.charts.push(ch);

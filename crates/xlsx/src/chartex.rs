@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use gridcraft_core::RangeRef;
 use gridcraft_formula::{Expr, SheetSel};
-use gridcraft_model::{Chart, ChartKind, LegendPos, QuartileMethod, Series, Workbook};
+use gridcraft_model::{Anchor, AxisOptions, Chart, ChartKind, LabelOptions, LegendPos, QuartileMethod, Series, Workbook};
 
 use crate::drawing::{dml_color, srgb};
 use crate::xml::{El, esc, esc_attr};
@@ -17,6 +17,9 @@ pub const CT_STYLE: &str = "application/vnd.ms-office.chartstyle+xml";
 pub const CT_COLORS: &str = "application/vnd.ms-office.chartcolorstyle+xml";
 pub const REL_STYLE: &str = "http://schemas.microsoft.com/office/2011/relationships/chartStyle";
 pub const REL_COLORS: &str = "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle";
+
+#[path = "chartex_patch.rs"]
+mod chartex_patch;
 
 /// The `mc:Choice` requirement for a kind's drawing frame: (prefix, namespace). Funnel charts
 /// came in a later revision of the format.
@@ -59,6 +62,37 @@ fn text(tx: &El) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// A series' `<cx:dataLabels>`: what its labels show and where. A record with every part off means
+/// the series' labels are switched off.
+fn read_labels(d: &El) -> LabelOptions {
+    let vis = d.child("visibility");
+    let flag = |k: &str| vis.and_then(|v| v.attr_bool(k)).unwrap_or(false);
+    let options = LabelOptions {
+        show_value: flag("value"),
+        show_category: flag("categoryName"),
+        show_series: flag("seriesName"),
+        position: d.attr("pos").and_then(crate::chart::label_position).unwrap_or_default(),
+        ..LabelOptions::default()
+    };
+    if options.shows_anything() { options } else { LabelOptions { hidden: true, ..options } }
+}
+
+/// The value axis' options from `<cx:valScaling>`. A chartex category axis carries only a gap width,
+/// so nothing of `x_axis` is read.
+fn read_val_scaling(plot: &El) -> AxisOptions {
+    let Some(sc) = plot.kids("axis").find(|a| a.attr("id") == Some("1")).and_then(|a| a.child("valScaling")) else {
+        return AxisOptions::default();
+    };
+    AxisOptions {
+        min: sc.attr_f64("min"),
+        max: sc.attr_f64("max"),
+        major_unit: sc.attr_f64("majorUnit").filter(|u| *u > 0.0),
+        log_base: sc.attr_f64("logBase").filter(|b| (2.0..=1000.0).contains(b)),
+        reversed: sc.attr("orientation") == Some("maxMin"),
+        ..AxisOptions::default()
+    }
+}
+
 pub fn read_chartex(root: &El) -> Option<Chart> {
     let chart = root.child("chart")?;
     let plot = chart.child("plotArea")?;
@@ -90,7 +124,8 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
         kind.get_or_insert(k);
         let id = s.child_val("dataId").unwrap_or("");
         let (cat, val) = data.iter().find(|(i, _, _)| i == id).map(|(_, c, v)| (c.clone(), v.clone())).unwrap_or_default();
-        data_labels |= s.path(&["dataLabels", "visibility"]).is_some_and(|v| v.flag("value", false));
+        let labels = s.child("dataLabels").map(read_labels);
+        data_labels |= labels.as_ref().is_some_and(|l| l.shows_anything());
         series.push(Series {
             quartiles: match s.path(&["layoutPr", "statistics"]).and_then(|el| el.attr("quartileMethod")) {
                 Some("inclusive") => QuartileMethod::Inclusive,
@@ -99,6 +134,7 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
             name: s.child("tx").and_then(text),
             categories: cat,
             values: val.unwrap_or_default(),
+            labels,
             // The default colour (the series' theme accent, which the writer spells out) isn't kept.
             color: s
                 .path(&["spPr", "solidFill"])
@@ -129,6 +165,7 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
         style: 2,
         x_title: axis_title("0"),
         y_title: axis_title("1"),
+        y_axis: read_val_scaling(plot),
         source: None,
         by_rows: false,
         pivot: None,
@@ -262,13 +299,19 @@ fn fill_xml(color: &str, line: bool) -> String {
 /// Light grey for gridlines and the chart border: the text colour at a quarter strength.
 const GREY: &str = "<a:schemeClr val=\"tx1\"><a:lumMod val=\"25000\"/><a:lumOff val=\"75000\"/></a:schemeClr>";
 
-fn accent(i: usize) -> String {
+pub(crate) fn accent(i: usize) -> String {
     format!("<a:schemeClr val=\"accent{}\"/>", i % 6 + 1)
 }
 
 /// Chartex part XML for a model chart on sheet `si`. The references it uses are appended to
 /// `names` (see [`NAME_PREFIX`]).
 pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<String>) -> String {
+    // A part read from a file is written back as it was when nothing changed, and patched field by
+    // field when something the part stores changed: everything GridCraft does not model in it
+    // survives. A change it cannot express regenerates the part from the model.
+    if let Some(text) = kept_part(wb, si, ch, names) {
+        return text;
+    }
     let hierarchy = matches!(ch.kind, ChartKind::Treemap | ChartKind::Sunburst);
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<cx:chartSpace xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:cx=\"http://schemas.microsoft.com/office/drawing/2014/chartex\"><cx:chartData>",
@@ -319,8 +362,8 @@ pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<Strin
             }
             _ => {}
         }
-        if ch.data_labels {
-            s.push_str("<cx:dataLabels><cx:visibility seriesName=\"0\" categoryName=\"0\" value=\"1\"/></cx:dataLabels>");
+        if let Some(l) = chartex_patch::effective(ch, ser) {
+            s.push_str(&chartex_patch::labels_xml(l));
         }
         let _ = write!(s, "<cx:dataId val=\"{i}\"/>");
         match ch.kind {
@@ -359,7 +402,8 @@ pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<Strin
         if ch.kind != ChartKind::Funnel {
             let _ = write!(
                 s,
-                "<cx:axis id=\"1\"><cx:valScaling/>{}{}<cx:tickLabels/></cx:axis>",
+                "<cx:axis id=\"1\">{}{}{}<cx:tickLabels/></cx:axis>",
+                chartex_patch::val_scaling_xml(&ch.y_axis),
                 title(ch.y_title.as_deref()),
                 if ch.gridlines {
                     format!("<cx:majorGridlines><cx:spPr><a:ln w=\"9525\"><a:solidFill>{GREY}</a:solidFill></a:ln></cx:spPr></cx:majorGridlines>")
@@ -386,6 +430,142 @@ pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<Strin
         "</cx:chart><cx:spPr><a:solidFill><a:schemeClr val=\"bg1\"/></a:solidFill><a:ln w=\"9525\"><a:solidFill>{GREY}</a:solidFill></a:ln></cx:spPr></cx:chartSpace>"
     );
     s
+}
+
+/// The model as the chartex part read it, with its hidden `_xlchart` names resolved to references
+/// (the reading workbook kept the names, not the references).
+fn resolve_names(as_read: &Chart, names: &[(String, String)]) -> Chart {
+    let resolve = |f: &mut String| {
+        if let Some((_, r)) = names.iter().find(|(n, _)| n.eq_ignore_ascii_case(f)) {
+            *f = r.clone();
+        }
+    };
+    let mut then = as_read.clone();
+    for s in &mut then.series {
+        resolve(&mut s.values);
+        if let Some(c) = &mut s.categories {
+            resolve(c);
+        }
+        if let Some(n) = &mut s.name {
+            resolve(n);
+        }
+    }
+    then
+}
+
+/// Whether `a` and `b` are the same chart apart from the kept part, the object id and the anchor
+/// (which live in the drawing part, not in the chart part).
+fn same_chart(a: &Chart, b: &Chart) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    for c in [&mut a, &mut b] {
+        c.id = 0;
+        c.anchor = Anchor::default();
+        c.part = None;
+    }
+    a == b
+}
+
+/// The index of a `_xlchart.v1.N` name, when it is one.
+fn name_index(name: &str) -> Option<usize> {
+    let prefix = NAME_PREFIX.to_ascii_lowercase();
+    if !name.to_ascii_lowercase().starts_with(&prefix) {
+        return None;
+    }
+    let n: usize = name.get(prefix.len()..)?.trim().parse().ok()?;
+    (n <= 100_000).then_some(n)
+}
+
+/// Registers a kept chartex part's hidden `_xlchart` names again and renumbers them to the global
+/// sequence the writer allocates (`names`), so the part's data references stay valid. A part whose
+/// names are in ascending order — how both Excel and GridCraft write them — keeps its bytes.
+fn resolve_part_names(part: &str, table: &[(String, String)], names: &mut Vec<String>) -> Option<String> {
+    let roots = crate::chart_patch::scan(part)?;
+    let space = roots.iter().find(|n| n.name == "chartSpace")?;
+    let prefix = NAME_PREFIX.to_ascii_lowercase();
+    // The raw `<cx:f>` texts, in document order, with the byte spans of the element and its text.
+    let mut refs: Vec<(usize, usize, usize, usize, &str)> = Vec::new();
+    let mut stack: Vec<&crate::chart_patch::Node> = vec![space];
+    while let Some(n) = stack.pop() {
+        if n.name == "f"
+            && let Some(text) = part.get(n.open_end..n.close_start)
+            && text.to_ascii_lowercase().starts_with(&prefix)
+        {
+            refs.push((n.start, n.open_end, n.close_start, n.end, text));
+        }
+        stack.extend(&n.children);
+    }
+    refs.sort_by_key(|r| r.0);
+    if refs.is_empty() {
+        return Some(part.to_string());
+    }
+    // Each name keeps the index it had (a file numbers its names in any order, and Excel's own
+    // order is not the document's); a name whose index is taken by a different reference, or lacks
+    // one, is renumbered.
+    let mut assigned: Vec<(&str, String)> = Vec::new();
+    for (_, _, _, _, old) in &refs {
+        if assigned.iter().any(|(o, _)| o.eq_ignore_ascii_case(old)) {
+            continue;
+        }
+        let reference = table.iter().find(|(n, _)| n.eq_ignore_ascii_case(old)).map(|(_, r)| r.clone())?;
+        let new = match name_index(old) {
+            Some(n) if n >= names.len() && n <= names.len().saturating_add(4096) => {
+                // Fill the gap with the references those names stood for, when the file has them.
+                while names.len() < n {
+                    let gap = format!("{NAME_PREFIX}{}", names.len());
+                    let filler = table.iter().find(|(name, _)| name.eq_ignore_ascii_case(&gap)).map(|(_, r)| r.clone());
+                    names.push(filler.unwrap_or_else(|| reference.clone()));
+                }
+                names.push(reference);
+                format!("{NAME_PREFIX}{n}")
+            }
+            Some(n) if names.get(n) == Some(&reference) => format!("{NAME_PREFIX}{n}"),
+            _ => {
+                let n = names.len();
+                names.push(reference);
+                format!("{NAME_PREFIX}{n}")
+            }
+        };
+        assigned.push((old, new));
+    }
+    // Replace the texts that moved (or only the ones that differ).
+    let mut out = String::with_capacity(part.len() + 32);
+    let mut pos = 0usize;
+    for (_, open_end, close_start, end, old) in refs {
+        let Some((_, new)) = assigned.iter().find(|(o, _)| o.eq_ignore_ascii_case(old)) else { continue };
+        if new == old {
+            continue;
+        }
+        out.push_str(part.get(pos..open_end)?);
+        out.push_str(new);
+        out.push_str(part.get(close_start..end)?);
+        pos = end;
+    }
+    out.push_str(part.get(pos..)?);
+    Some(out)
+}
+
+/// A chartex part read from a file, written back unchanged or patched, with its hidden names
+/// registered again. `None` when the kept part cannot be used, so the caller regenerates it.
+fn kept_part(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<String>) -> Option<String> {
+    let (part, as_read) = ch.kept_part()?;
+    // A chart switched from a classic kind keeps that chart's part; it is not a chartex part.
+    if !part.contains("office/drawing/2014/chartex") {
+        return None;
+    }
+    let table = ch.part_chart_names();
+    let then = resolve_names(as_read, table);
+    let text = if same_chart(&then, ch) { part.to_string() } else { chartex_patch::patch_chartex(part, &then, ch, wb, si)? };
+    // A name with no reference (a name the reader skipped) regenerates the part instead; drop any
+    // indices reserved before that was found.
+    let before = names.len();
+    match resolve_part_names(&text, table, names) {
+        Some(out) => Some(out),
+        None => {
+            names.truncate(before);
+            None
+        }
+    }
 }
 
 #[cfg(test)]

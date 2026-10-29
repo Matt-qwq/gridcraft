@@ -1561,3 +1561,64 @@ fn a_category_crossing_moves_the_value_axis_to_a_category() {
     let far = verticals(&render(&last, &d, 640.0, 400.0, &m));
     assert!(far.first().is_some_and(|x| *x > xs.first().copied().unwrap_or(0.0)), "crossing at 6 is right of 3: {far:?}");
 }
+
+#[test]
+fn point_labels_draw_their_own_text_and_position() {
+    let mut c = chart(ChartKind::LineMarkers);
+    c.data_labels = true;
+    c.labels = LabelOptions::values();
+    // The two labelled points share a value, so only the label position moves one.
+    let mut s = series("East", &[10.5, 12.5, 12.5, 16.5], [200, 80, 40, 255], ChartKind::LineMarkers);
+    s.number_format = "0.0".into();
+    s.point_labels = vec![
+        // The series shows values, so a point with its own text keeps its value unless it says not.
+        PointLabelData { index: 1, text: Some("Above".into()), show_value: Some(false), position: LabelPosition::Top, ..PointLabelData::default() },
+        PointLabelData {
+            index: 2,
+            text: Some("Below".into()),
+            show_value: Some(false),
+            position: LabelPosition::Bottom,
+            ..PointLabelData::default()
+        },
+        // Every part switched off for this point: its label shows nothing.
+        PointLabelData { index: 3, text: None, show_value: Some(false), ..PointLabelData::default() },
+    ];
+    let d = ChartData { categories: vec!["A".into(), "B".into(), "C".into(), "D".into()], series: vec![s], ..ChartData::default() };
+    let prims = render(&c, &d, 640.0, 400.0, &ApproxMeasure);
+    let t = texts(&prims);
+    assert!(t.contains(&"Above") && t.contains(&"Below"), "both point texts are drawn: {t:?}");
+    // The point without an override still shows the value label the options ask for.
+    assert!(t.contains(&"10.5"), "{t:?}");
+    let pos = |needle: &str| {
+        prims
+            .iter()
+            .find_map(|p| match p {
+                Prim::Text { text, x, y, .. } if text == needle => Some((*x, *y)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{needle}` not drawn"))
+    };
+    let (ax, ay) = pos("Above");
+    let (bx, by) = pos("Below");
+    assert!(ax < bx, "each label sits at its own point: {ax} {bx}");
+    assert!(by > ay + 4.0, "a Bottom label is drawn below a Top one: {ay} {by}");
+    // The point whose parts are switched off shows no value at all.
+    assert!(!t.contains(&"16.5"), "a point with every part off still draws a label: {t:?}");
+}
+
+#[test]
+fn a_point_flag_overrides_the_series_labels() {
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.data_labels = true;
+    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    let mut s = series("East", &[7.0, 9.0, 11.0], [200, 80, 40, 255], ChartKind::ColumnClustered);
+    s.number_format = "General".into();
+    s.point_labels = vec![PointLabelData { index: 1, text: None, show_value: Some(false), show_category: Some(true), ..PointLabelData::default() }];
+    let d = ChartData { categories: vec!["A".into(), "B".into(), "C".into()], series: vec![s], ..ChartData::default() };
+    let prims = render(&c, &d, 640.0, 400.0, &ApproxMeasure);
+    let t = texts(&prims);
+    // The overridden point shows its category instead of its value; the others keep the value.
+    assert!(t.contains(&"B"), "{t:?}");
+    assert!(!t.contains(&"9"), "the point's value is switched off: {t:?}");
+    assert!(t.contains(&"7") && t.contains(&"11"), "{t:?}");
+}

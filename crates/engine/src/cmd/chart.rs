@@ -5,7 +5,7 @@
 
 use gridcraft_model::{
     AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions, LabelPosition,
-    PointFormat, Series,
+    PointFormat, PointLabel, Series,
 };
 use serde_json::{Value as Json, json};
 
@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Format Data Labels",
             ["Chart Design", "Chart Layouts"],
             None,
-            "{chart?, series?: index (default every series), on?: bool (default true), value?, percentage?, seriesName?, categoryName?, legendKey?, position?: auto|center|insideEnd|insideBase|outsideEnd|bestFit|left|right|top|bottom, separator?, numberFormat?, deletePoint?: index (hides that label), showPoint?: index}",
+            "{chart?, series?: index (default every series), point?: index (needs series: that point's own label), text?: reference or text for the point's label, on?: bool (default true), value?, percentage?, seriesName?, categoryName?, legendKey?, position?: auto|center|insideEnd|insideBase|outsideEnd|bestFit|left|right|top|bottom, separator?, numberFormat?, deletePoint?: index (hides that label), showPoint?: index}",
             has_doc,
             set_data_labels
         ),
@@ -195,7 +195,27 @@ fn set_axis(s: &mut Session, p: &Json) -> Result<Json> {
     let units = p.get("displayUnits").map(units_param).transpose()?;
     let number_format = p.get("numberFormat").and_then(Json::as_str).map(str::to_string);
     with_chart(s, p, |c| {
-        require_classic(c, CMD, true)?;
+        require_axes(c, CMD)?;
+        if c.kind.is_chartex() {
+            // A chartex value axis carries bounds, a unit, a log base and a direction; a category
+            // axis carries only a gap width, and there is no crossing, display-unit or number-format
+            // element at all.
+            if !chartex_value_axis(c) {
+                return Err(bad(CMD, "this chart type has no value axis GridCraft can save"));
+            }
+            if axis_sel != AxisSel::Y {
+                return Err(bad(CMD, "a chartex category axis has no options GridCraft can save"));
+            }
+            if crosses.is_some() {
+                return Err(bad(CMD, "a chartex value axis has no crossing point"));
+            }
+            if units.is_some() {
+                return Err(bad(CMD, "a chartex value axis has no display units GridCraft can save"));
+            }
+            if number_format.is_some() {
+                return Err(bad(CMD, "a chartex value axis has no number format GridCraft can save"));
+            }
+        }
         // A category axis of labels has no log scale, display units or axis-value crossing, and
         // cropping its categories by bound is not drawn: refuse rather than store a dead option.
         if value_axis && c.kind == ChartKind::Radar && crosses.is_some() {
@@ -256,17 +276,28 @@ fn set_axis(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
-/// Refuses an option command on a chart whose part GridCraft regenerates without it: a chartex
-/// chart keeps its options in `chartExN.xml`, and a pie has no axes. Better a clear error than an
-/// option that is stored, then lost on the next save.
-fn require_classic(c: &Chart, cmd: &str, axes: bool) -> Result<()> {
+/// Refuses an option on a chart whose kind cannot store it. A chartex part is patched for the
+/// options it has an element for (bounds, unit, log base, direction, label parts and position,
+/// colours, quartiles); the commands refuse the rest with a reason the pane shows, rather than
+/// storing an option the next save drops.
+fn require_classic(c: &Chart, cmd: &str) -> Result<()> {
     if c.kind.is_chartex() {
-        return Err(bad(cmd, "this chart type keeps its options in a chartex part, which GridCraft does not model"));
+        return Err(bad(cmd, "this chart type keeps its options in a chartex part, which has no element for it"));
     }
-    if axes && matches!(c.kind, ChartKind::Pie | ChartKind::Doughnut) {
+    Ok(())
+}
+
+/// Refuses an axis option on a chart that has no axes.
+fn require_axes(c: &Chart, cmd: &str) -> Result<()> {
+    if matches!(c.kind, ChartKind::Pie | ChartKind::Doughnut) {
         return Err(bad(cmd, "this chart type has no axes"));
     }
     Ok(())
+}
+
+/// Whether a chartex chart has the value axis the option commands address.
+fn chartex_value_axis(c: &Chart) -> bool {
+    matches!(c.kind, ChartKind::Histogram | ChartKind::BoxWhisker | ChartKind::Waterfall)
 }
 
 /// Whether error bars can be saved and drawn on every group of `c` (the writer and renderer draw
@@ -312,6 +343,8 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
     let cmd = "chart.setDataLabels";
     let on = bool_param(p, "on").unwrap_or(true);
     let series = u32_param(p, "series").map(|i| i as usize);
+    let point = u32_param(p, "point");
+    let text = p.get("text").and_then(Json::as_str).map(str::to_string);
     let position = p.get("position").map(position_param).transpose()?;
     let separator = p.get("separator").and_then(Json::as_str).map(str::to_string);
     let number_format = p.get("numberFormat").and_then(Json::as_str).map(str::to_string);
@@ -319,15 +352,45 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
     let show = u32_param(p, "showPoint");
     let flags = ["value", "percentage", "seriesName", "categoryName", "legendKey"].iter().map(|k| (*k, bool_param(p, k))).collect::<Vec<_>>();
     let any_flag = flags.iter().any(|(_, v)| v.is_some());
-    if !on && (position.is_some() || separator.is_some() || number_format.is_some() || any_flag || delete.is_some() || show.is_some()) {
+    let other_options =
+        position.is_some() || separator.is_some() || number_format.is_some() || any_flag || delete.is_some() || show.is_some() || text.is_some();
+    if !on && other_options {
         return Err(bad(cmd, "`on: false` turns labels off; remove the other options"));
     }
+    if point.is_some() {
+        if series.is_none() {
+            return Err(bad(cmd, "`point` needs `series`: a label belongs to one point of one series"));
+        }
+        if delete.is_some() || show.is_some() {
+            return Err(bad(cmd, "give either `point` or `deletePoint`/`showPoint`"));
+        }
+        if p.get("legendKey").is_some() {
+            return Err(bad(cmd, "a point's label has no legend key in GridCraft's model"));
+        }
+        if separator.is_some() {
+            return Err(bad(cmd, "a point's label has no separator of its own in GridCraft's model"));
+        }
+        if number_format.is_some() {
+            return Err(bad(cmd, "a point's label has no number format of its own in GridCraft's model"));
+        }
+    } else if text.is_some() {
+        return Err(bad(cmd, "`text` needs `point`: it sets one point's label"));
+    }
     with_chart(s, p, |c| {
-        require_classic(c, cmd, false)?;
         if let Some(i) = series
             && i >= c.series.len()
         {
             return Err(bad(cmd, "no such series"));
+        }
+        if c.kind.is_chartex() {
+            if delete.is_some() || show.is_some() {
+                return Err(bad(cmd, "a chartex chart has no per-point labels GridCraft can save"));
+            }
+            return set_chartex_labels(c, cmd, on, series, point, &flags, position, separator.clone(), number_format.clone());
+        }
+        if let (Some(i), Some(pi)) = (series, point) {
+            set_one_point_label(c, i, pi, on, text, position, &flags, any_flag);
+            return Ok(());
         }
         // A series can hide its labels while the chart keeps them: `on: false` with a series.
         if let Some(i) = series {
@@ -397,6 +460,121 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
+/// Sets (or hides) one point's own label: its text, position and show flags (`c:dLbl`).
+#[allow(clippy::too_many_arguments)]
+fn set_one_point_label(
+    c: &mut Chart,
+    series: usize,
+    pi: u32,
+    on: bool,
+    text: Option<String>,
+    position: Option<LabelPosition>,
+    flags: &[(&str, Option<bool>)],
+    any_flag: bool,
+) {
+    let Some(se) = c.series.get_mut(series) else { return };
+    if !on {
+        // `on: false` for one point hides its label, the model's per-point deletion.
+        let mut pt = se.point(pi as usize).copied().unwrap_or(PointFormat { index: pi, ..PointFormat::default() });
+        pt.index = pi;
+        pt.no_label = true;
+        se.set_point(pt);
+        return;
+    }
+    let mut label = se.point_label(pi as usize).cloned().unwrap_or(PointLabel { index: pi, ..PointLabel::default() });
+    label.index = pi;
+    if let Some(t) = text {
+        label.text = Some(t).filter(|t| !t.is_empty());
+    }
+    if let Some(v) = position {
+        label.position = v;
+    }
+    for (key, value) in flags {
+        let Some(v) = value else { continue };
+        match *key {
+            "value" => label.show_value = Some(*v),
+            "percentage" => label.show_percentage = Some(*v),
+            "seriesName" => label.show_series = Some(*v),
+            "categoryName" => label.show_category = Some(*v),
+            _ => {}
+        }
+    }
+    let given = any_flag || label.text.is_some() || label.position != LabelPosition::Auto;
+    if !given {
+        // Nothing asked for: the point's label shows again (the way `showPoint` does).
+        if let Some(pt) = se.point(pi as usize).copied()
+            && pt.no_label
+        {
+            se.set_point(PointFormat { no_label: false, ..pt });
+        }
+        c.data_labels = true;
+        return;
+    }
+    se.set_point_label(label);
+    if let Some(pt) = se.point(pi as usize).copied()
+        && pt.no_label
+    {
+        se.set_point(PointFormat { no_label: false, ..pt });
+    }
+    c.data_labels = true;
+}
+
+/// A chartex chart's labels: one `<cx:dataLabels>` per series, holding the value, category and
+/// series-name flags and a position. The part has no percentage, legend key, separator, number
+/// format or per-point label, so those are refused.
+#[allow(clippy::too_many_arguments)]
+fn set_chartex_labels(
+    c: &mut Chart,
+    cmd: &str,
+    on: bool,
+    series: Option<usize>,
+    point: Option<u32>,
+    flags: &[(&str, Option<bool>)],
+    position: Option<LabelPosition>,
+    separator: Option<String>,
+    number_format: Option<String>,
+) -> Result<()> {
+    if point.is_some() {
+        return Err(bad(cmd, "a chartex chart has no per-point labels GridCraft can save"));
+    }
+    if let Some((key, _)) = flags.iter().find(|(k, v)| v.is_some() && matches!(*k, "percentage" | "legendKey")) {
+        return Err(bad(cmd, format!("a chartex data label has no `{key}`: Excel's chartex part stores the value, category and series name only")));
+    }
+    if separator.is_some() {
+        return Err(bad(cmd, "a chartex data label has no separator"));
+    }
+    if number_format.is_some() {
+        return Err(bad(cmd, "a chartex data label has no number format"));
+    }
+    let targets: Vec<usize> = match series {
+        Some(i) => vec![i],
+        None => (0..c.series.len()).collect(),
+    };
+    for i in targets {
+        let Some(se) = c.series.get_mut(i) else { continue };
+        let mut o = se.labels.clone().unwrap_or_else(|| c.labels.clone());
+        o.hidden = !on;
+        if on {
+            apply_label_options(&mut o, flags, position, separator.clone(), number_format.clone());
+            if !o.shows_anything() && !flags.iter().any(|(_, v)| v.is_some()) {
+                o = LabelOptions::values();
+            }
+        }
+        se.labels = Some(o);
+    }
+    match series {
+        Some(_) if on => c.data_labels = true,
+        Some(_) => {}
+        None => {
+            c.data_labels = on;
+            if let Some(o) = c.series.first().and_then(|se| se.labels.clone()) {
+                c.labels = o;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Applies the show flags, position, separator and format to one label options record.
 fn apply_label_options(
     o: &mut LabelOptions,
@@ -445,7 +623,7 @@ fn set_error_bars(s: &mut Session, p: &Json) -> Result<Json> {
         Some("none") => {
             let series = u32_param(p, "series").map(|i| i as usize);
             return with_chart(s, p, |c| {
-                require_classic(c, cmd, false)?;
+                require_classic(c, cmd)?;
                 if !supports_error_bars(c) {
                     return Err(bad(cmd, "error bars are only drawn on 2-D column, bar, line, area, scatter and bubble charts"));
                 }
@@ -468,7 +646,7 @@ fn set_error_bars(s: &mut Session, p: &Json) -> Result<Json> {
     };
     let bars = ErrorBars { direction, kind, no_end_cap: bool_param(p, "noEndCap").unwrap_or(false) };
     with_chart(s, p, |c| {
-        require_classic(c, cmd, false)?;
+        require_classic(c, cmd)?;
         if !supports_error_bars(c) {
             return Err(bad(cmd, "error bars are only drawn on 2-D column, bar, line, area, scatter and bubble charts"));
         }
@@ -496,7 +674,7 @@ fn format_point(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(bad(cmd, "give a fill, line, marker colour, deleteLabel or clear"));
     }
     with_chart(s, p, |c| {
-        require_classic(c, cmd, false)?;
+        require_classic(c, cmd)?;
         if marker.is_some() {
             use ChartKind::*;
             let plot = gridcraft_chart::series_plot_kind(c, si);

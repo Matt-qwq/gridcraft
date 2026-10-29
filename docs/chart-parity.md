@@ -1,6 +1,6 @@
 # Chart parity
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (the Format pane drives the four chart formatting commands, and charts, pictures, shapes and slicers resize from eight handles with Shift, a minimum size and Esc; an edit is patched into the kept chart part, so unmodelled XML survives it; unmodelled chart *kinds* keep their frame and part; secondary-axis options modelled and drawn; category-axis bounds and crossing drawn) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (a chartex part read from a file is now kept and patched element by element like a classic part, so its own `chartEx` options survive an edit; per-point data-label text (rich text or a cell reference), position and show flags are modelled, read, patched and drawn; custom error-bar references read from a file verified through read → patch → save) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Excel's chart types and chart elements against GridCraft. Part of
 [target-app-parity.md](target-app-parity.md). **Breadth ~50%, ready ~40%, 25–40 h** (estimated).
@@ -81,17 +81,19 @@ reopen gives the same option (`crates/xlsx/src/tests/chart_options_roundtrip.rs`
 | Category-axis crossing | `x_axis.crosses` | yes | `c:crosses`, `c:crossesAt` | yes | a `crossesAt` category puts the value-axis line at that category (Excel's "Crosses at category"), on column and bar charts too; a scatter chart moves its value axis along the numeric X axis |
 | Secondary value axis | `y2_axis` (all the value-axis rows above) | yes | the second group's `c:valAx` | yes | labels drawn on the right, its display unit named beside them. Only a chart with a series on the secondary axis has one (`chart.setAxis` refuses otherwise) |
 | Category-axis display units / log | — | read as none | not written | no | Excel does not offer these on a category axis |
-| Data-label parts | `show_value`, `show_percentage`, `show_series`, `show_category`, `show_legend_key` | yes | `c:dLbls/c:show*` | yes | chart-level and per series; whichever flags are set are composed |
-| Data-label position | `position` (auto, centre, inside/outside end, base, best fit, four sides) | yes | `c:dLblPos` | yes | `auto` keeps Excel's per-chart default |
+| Data-label parts | `show_value`, `show_percentage`, `show_series`, `show_category`, `show_legend_key` | yes | `c:dLbls/c:show*` | yes | chart-level, per series and per point (`PointLabel::show_*` overrides one point); whichever flags are set are composed |
+| Data-label position | `position` (auto, centre, inside/outside end, base, best fit, four sides) | yes | `c:dLblPos` | yes | `auto` keeps Excel's per-chart default; a point's own `c:dLbl/c:dLblPos` overrides it |
 | Data-label separator | `separator` | yes | `c:separator` | yes | default `, ` |
 | Data-label number format | `number_format` | yes | `c:numFmt` | yes | else the series' own format |
 | Series label visibility | `Series::labels.hidden` | yes (`c:dLbls/c:delete`) | yes | yes | one series hides its labels while the chart keeps theirs; a chart that labels only some series is read this way |
 | Per-point label deletion | `Series::points[].no_label` | yes (`dLbls/c:dLbl` and `dPt/c:dLbl`) | `c:dLbls/c:dLbl/c:delete` | yes | written even when labels are off |
+| Per-point label text | `Series::point_labels[].text`: rich text or a cell reference (`strRef`) | yes (`c:dLbl/c:tx`) | `c:dLbl/c:tx/c:rich` or `c:strRef` with a one-point cache | yes (a reference resolves to the cell's value) | `chart.setDataLabels` `point` + `text`; the point's own show flags and position travel with it |
 | Error bars: kind | fixed, percentage, standard deviation (sample, n−1), standard error, custom | yes | `c:errBars/c:errValType`, `c:val`, `c:plus`, `c:minus` | yes | custom refs and `{…}` constants are resolved like series values |
 | Error bars: direction, caps | both / plus / minus, `no_end_cap` | yes | `c:errBarType`, `c:noEndCap` | yes | |
 | Error bars: scope | per series | yes | on that series | yes | column, bar, line, area, scatter, bubble (as Excel allows) |
 | Per-point fill / line / marker | `fill`, `line`, `marker` | yes | `c:dPt/c:spPr`, `c:marker` | yes | the right slice, bar or marker takes the colour; markers only on line/scatter/bubble/radar points, as the format stores them |
 | Unmodelled chart XML | — | kept whole | patched: only the elements an edit touched are rewritten (`crates/xlsx/src/chart_patch.rs`) | — | leader lines, manual layout, title run formatting, date-axis units, minor units and gridline formatting, `extLst`, `printSettings`, `dTable` and error-bar line styles survive an edit as well as an open → save |
+| Unmodelled chartex XML | — | kept whole (`Chart::part`, with the hidden `_xlchart.v1.N` names it refers to) | patched: title, legend, gridlines, value-axis scaling, series fill, series data labels and box & whisker quartiles are rewritten in place; every other byte is the file's (`crates/xlsx/src/chartex_patch.rs`) | — | `cx:units`, `cx:binning`, `cx:subtotals`, per-point `cx:dataLabel` formatting, tick-label formatting, `cx:extLst` and the plot layout survive an edit; a chartex option with no element (percentage labels, a crossing, display units, a value-axis number format, a category-axis option, per-point labels) is refused by the command with a reason |
 | Unmodelled chart kinds | 3-D column/bar/line/area/pie, surface, pie of pie, bar of pie, Pareto, filled map | kept whole (`Sheet::kept_charts`) | the part byte for byte, with its drawing frame | no (the frame is kept, the plot is not drawn) | rebuilding one from the 2-D model would silently lose it; opening warns |
 
 Everything else in a classic chart part survives a save, edited or not. What an edit still costs:
@@ -99,16 +101,21 @@ a changed chart title, legend, series name, category or value reference, trendli
 amount, or a re-coloured series rewrites that one element from the model, so formatting stored
 *inside* it (rich title runs, legend entry layout, a trendline label's formatting, an error bar's
 line style) goes with it. A change the part cannot express — a different chart kind, a different set
-of series — regenerates the whole part, which is where unmodelled XML is still lost. Per-point label
-text and position, prefix/suffix, marker size and per-point label formatting are not modelled: they
-are kept while their element is untouched and are lost when that point's format is edited. chartex
-(`chartExN.xml`) options are not modelled at all: a chartex chart is regenerated from the model, so
-its options are lost on save unless the chart is of a kind GridCraft cannot model, which is kept
-whole (see `KeptChart`).
+of series, or a chartex chart's data reference — regenerates the whole part, which is where
+unmodelled XML is still lost. Per-point label prefix/suffix, marker size and per-point label
+formatting (font, fill, callout shape) are not modelled: they are kept while their element is
+untouched and are lost when that point's label is edited. A kept chartex part's own `cx:chartSpace`
+options are patched like a classic part's; the chartex *style* and *colour* parts (`styleN.xml`,
+`colorsN.xml`) are still written from GridCraft's defaults, so a theme change made in Excel is lost
+on save. A chartex chart of a kind GridCraft cannot model is kept whole (see `KeptChart`), and that
+part's hidden names are not re-defined.
 
 A part is patched only when it is a classic chart whose root declares the `c:` prefix, whose series
 still match the model one for one, and that is under 4 MB (a hostile or huge part is regenerated
 instead). A chart whose groups carry no `axId` (rare) is regenerated when an axis option changes.
+A chartex part is patched under the same size and depth caps; its hidden `_xlchart.v1.N` names are
+recorded on the kept part, written again with their references, and kept at the index they had when
+that index is free.
 
 A kept part also keeps its caches: cell edits do not refresh the `numCache`/`strCache` in a part
 written back unchanged or patched, so a viewer that trusts caches (Word, PowerPoint) can show older
@@ -119,17 +126,18 @@ stale in the saved file, and Excel refreshes them when it opens the workbook.
 ## XLSX round-trip
 
 Charts are read from and written to DrawingML chart parts. The options in the matrix above are
-modelled in both directions. A classic chart part read from a file is kept (`Chart::part`) and
-written back from the file: byte for byte while the chart is untouched, and by patching only the
-elements an edit changed when it is edited (`crates/xlsx/src/chart_patch.rs`; tests in
-`crates/xlsx/src/tests/chart_options_roundtrip.rs`). chartex parts (`chartExN.xml`) are regenerated
-from the model, because their hidden defined names are not kept. A chart of a kind GridCraft cannot
-model is not read into the model at all: its part and drawing frame are kept whole
+modelled in both directions. A chart part read from a file is kept (`Chart::part`) and written back
+from the file: byte for byte while the chart is untouched, and by patching only the elements an edit
+changed when it is edited (`crates/xlsx/src/chart_patch.rs` for classic parts,
+`crates/xlsx/src/chartex_patch.rs` for chartex parts; tests in
+`crates/xlsx/src/tests/chart_options_roundtrip.rs`). A chartex part's hidden `_xlchart.v1.N` names
+are recorded on the kept part and written again with their references. A chart of a kind GridCraft
+cannot model is not read into the model at all: its part and drawing frame are kept whole
 (`Sheet::kept_charts`, `crates/xlsx/src/tests/chart_unmodelled_kinds.rs`).
 
 | Difference after save and reopen (kept parts) | Why | Status |
 |---|---|---|
-| a chartex chart's options | the part is regenerated; its hidden `_xlchart.v1.N` names are not kept | by design |
+| a chartex chart's style and colour parts | GridCraft writes its own `styleN.xml`/`colorsN.xml`; Excel's are not kept | by design |
 | a secondary value axis left automatic reads back as `crosses: max` | that is Excel's own crossing for a secondary value axis (it keeps the hidden secondary category axis on the right), and it is what a combo chart created here writes | by design (same picture) |
 
 **Measured (10-26).** Each of the 25 kinds created by `insert.chart`, saved, reopened and compared
@@ -163,8 +171,9 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
    Format Axis, Format Data Labels, Error Bars and Data Point, all through the commands, with the
    reason shown where a control cannot apply.
 4. Remaining axis and label work: date-axis units as an option, minor units and gridlines, gridline
-   and tick-label formatting, callouts and from-cells labels: 4–6 h.
-5. Error-bar line formatting, custom error-bar references in the pane, Format Trendline pane: 2–4 h.
+   and tick-label formatting, per-point label prefix/suffix, callout shapes: 4–6 h.
+5. Error-bar line formatting, custom error-bar references in the pane (the references themselves do
+   survive read → patch → save), Format Trendline pane: 2–4 h.
 6. Per-element Format pane parity (shapes, pictures, slicers, clicking a chart element), smoothed
    lines, exploded pie, pie/bar of pie, 100% variants: 8–12 h.
 7. 3-D column/bar/pie/area, surface and contour, Pareto: 8–12 h.
@@ -175,6 +184,7 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | chartex parts read from a file are kept and patched element by element (title, legend, gridlines, value-axis scaling, series fill, series data labels, box & whisker quartiles), with their hidden `_xlchart` names written again, so `cx:units`, `cx:binning`, per-point `cx:dataLabel` formatting and `cx:extLst` survive an edit; per-point data-label text (rich text or a `strRef`), position and show flags modelled, read, written, patched and drawn, with `chart.setDataLabels` `point`/`text`; custom error-bar references read from a file verified through read → patch → save (they already survived) |
 | 2026-10-30 | major | Format pane and chart resize: a Chart Elements selection (chart area, either axis, each series) with Format Axis (bounds with Auto, major unit, log base, reverse, crossing, display units, number format), Data Labels (five parts, position, separator, format, per series and per point), Error Bars (kind, amount, direction, caps) and Data Point (fill/line/marker, hide label, clear) — every control through a command, with the reason shown where one cannot apply. Charts, pictures, shapes and slicers resize from all eight handles with Shift, a 20 pt minimum, Esc and one undo step per drag, and the size survives save/reopen (`ui-egui` 979 tests) |
 | 2026-10-30 | major | Field-level pass-through: an edit is patched into the kept chart part (`crates/xlsx/src/chart_patch.rs`), so manual layouts, date-axis units, minor units and gridline formatting, label callouts and leader lines, error-bar line styles, title-run and legend-entry formatting, series `extLst` and `printSettings` survive it; unmodelled kinds keep their frame and their part; the secondary axis is modelled, written and drawn; category-axis bounds crop or extend the drawn axis |
 | 2026-10-30 | major | Axis scaling (bounds, major unit, log, reverse, crossing, display units, number format), data-label options (five parts, position, separator, format, per series and per point), error bars (fixed, %, standard deviation/error, custom; both directions; caps) and per-point fill/line/marker model, round-trip and draw; `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars`, `chart.formatPoint`; unedited chart parts are written back byte for byte so unmodelled XML survives; option matrix added |

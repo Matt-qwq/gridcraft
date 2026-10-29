@@ -629,6 +629,47 @@ pub struct PointFormat {
     pub no_label: bool,
 }
 
+/// A point's own data label (`c:dLbl`): its text and what it shows. Excel stores one per point in
+/// the series' `c:dLbls`, beside the series-wide options.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PointLabel {
+    /// 0-based point index within the series (`c:idx`).
+    pub index: u32,
+    /// `c:tx`: a cell reference (`Data!$C$2`) or literal text; `None` composes the label from the
+    /// show flags instead.
+    pub text: Option<String>,
+    /// `None` follows the series' or the chart's label options.
+    pub show_value: Option<bool>,
+    pub show_series: Option<bool>,
+    pub show_category: Option<bool>,
+    pub show_percentage: Option<bool>,
+    /// `Auto` keeps the series' or the chart's position (`c:dLblPos` absent).
+    pub position: LabelPosition,
+}
+
+impl PointLabel {
+    /// Whether any of the show flags is set (to either value).
+    pub fn has_flags(&self) -> bool {
+        self.show_value.is_some() || self.show_series.is_some() || self.show_category.is_some() || self.show_percentage.is_some()
+    }
+
+    /// Whether the label shows anything at all: a text, a flag switched on, or a position.
+    pub fn shows_anything(&self) -> bool {
+        self.text.as_deref().is_some_and(|t| !t.is_empty())
+            || self.show_value == Some(true)
+            || self.show_series == Some(true)
+            || self.show_category == Some(true)
+            || self.show_percentage == Some(true)
+            || self.position != LabelPosition::Auto
+    }
+
+    /// Nothing but its index: the record carries no label and is dropped.
+    pub fn is_empty(&self) -> bool {
+        !self.shows_anything() && !self.has_flags()
+    }
+}
+
 /// The chart part a chart was read from, kept so that everything GridCraft does not model in it
 /// survives an open → save. Opaque to the model (not part of the JSON format); the xlsx crate
 /// writes it back byte for byte while the chart still matches what was read.
@@ -637,6 +678,17 @@ pub struct ChartPart {
     pub xml: std::sync::Arc<str>,
     /// The model as read, without this field: an edit makes the part stale.
     as_read: Box<Chart>,
+    /// A chartex part's hidden `_xlchart.v1.N` names and the references they stood for, as the
+    /// reading workbook defined them. A chartex part refers to its data through these names, so a
+    /// kept part is only valid while the names are written again.
+    names: Vec<(String, String)>,
+}
+
+impl ChartPart {
+    /// Most hidden chartex names kept from a file.
+    const MAX_NAMES: usize = 4096;
+    /// Longest chartex name or reference kept (characters).
+    const MAX_NAME_CHARS: usize = 4096;
 }
 
 impl std::fmt::Debug for ChartPart {
@@ -710,6 +762,9 @@ pub struct Series {
     /// Per-point formatting overrides (a slice, a bar, a marker), sorted by index.
     #[serde(default)]
     pub points: Vec<PointFormat>,
+    /// Per-point data labels (text, position, what they show), sorted by index.
+    #[serde(default)]
+    pub point_labels: Vec<PointLabel>,
 }
 
 impl Series {
@@ -726,6 +781,28 @@ impl Series {
             None => self.points.push(p),
         }
         self.points.sort_by_key(|x| x.index);
+    }
+
+    /// The per-point data label for point `j`, if the file or an edit stored one.
+    pub fn point_label(&self, j: usize) -> Option<&PointLabel> {
+        let j = u32::try_from(j).ok()?;
+        self.point_labels.iter().find(|l| l.index == j)
+    }
+
+    /// Stores a point's label, replacing an entry for the same point; a record that carries nothing
+    /// is dropped instead.
+    pub fn set_point_label(&mut self, label: PointLabel) {
+        match self.point_labels.iter_mut().find(|x| x.index == label.index) {
+            Some(_) if label.is_empty() => {
+                let index = label.index;
+                self.point_labels.retain(|x| x.index != index);
+                return;
+            }
+            Some(slot) => *slot = label,
+            None if !label.is_empty() => self.point_labels.push(label),
+            None => return,
+        }
+        self.point_labels.sort_by_key(|x| x.index);
     }
 }
 
@@ -835,12 +912,34 @@ pub struct Chart {
 }
 
 impl Chart {
-    /// Keeps the chart part `xml`, read into `self`, for a later save. Classic DrawingML charts
-    /// only: a chartex part refers to hidden defined names, which the model does not keep.
+    /// Keeps the chart part `xml`, read into `self`, for a later save.
     pub fn keep_part(&mut self, xml: std::sync::Arc<str>) {
         let mut as_read = self.clone();
         as_read.part = None;
-        self.part = Some(Box::new(ChartPart { xml, as_read: Box::new(as_read) }));
+        self.part = Some(Box::new(ChartPart { xml, as_read: Box::new(as_read), names: Vec::new() }));
+    }
+
+    /// Records the workbook's hidden chartex names (`_xlchart.v1.3` → `Data!$B$2:$B$5`) on the kept
+    /// part, so a chartex part can be written back with its data references intact.
+    pub fn keep_chart_names(&mut self, names: &[(String, String)]) {
+        let Some(part) = self.part.as_deref_mut() else { return };
+        // Only a chartex part refers to data through these names.
+        if !part.xml.contains("chartex") {
+            return;
+        }
+        part.names = names
+            .iter()
+            .take(ChartPart::MAX_NAMES)
+            .map(|(n, r)| (n.chars().take(ChartPart::MAX_NAME_CHARS).collect(), r.chars().take(ChartPart::MAX_NAME_CHARS).collect()))
+            .collect();
+    }
+
+    /// The chartex names recorded on the kept part (empty for a classic part).
+    pub fn part_chart_names(&self) -> &[(String, String)] {
+        match self.part.as_deref() {
+            Some(part) => &part.names,
+            None => &[],
+        }
     }
 
     /// The chart part as read and the model it was read as, so an edit can patch the fields it

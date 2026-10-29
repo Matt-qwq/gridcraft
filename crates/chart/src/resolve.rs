@@ -2,10 +2,10 @@
 
 use gridcraft_calc::evaluate;
 use gridcraft_core::{CellRef, RangeRef, Value, category_levels, number_to_text};
-use gridcraft_model::{Chart, ChartKind, ErrorBars, PointFormat, Theme, Workbook, style::apply_tint};
+use gridcraft_model::{Chart, ChartKind, ErrorBars, PointFormat, PointLabel, Theme, Workbook, style::apply_tint};
 use gridcraft_numfmt::{NumberFormat, format_value};
 
-use crate::{ChartData, ErrorBarsData, PointStyle, Rgba, SeriesData, TrendlineData};
+use crate::{ChartData, ErrorBarsData, PointLabelData, PointStyle, Rgba, SeriesData, TrendlineData};
 
 /// Cap on points per series (keeps whole-column references from exploding).
 pub(crate) const MAX_POINTS: usize = 100_000;
@@ -135,6 +135,42 @@ fn point_styles(points: &[PointFormat], theme: &Theme) -> Vec<PointStyle> {
         .collect();
     // Sorted by index, so a lookup is a binary search: a file may list its points in any order.
     out.sort_by_key(|p| p.index);
+    out
+}
+
+/// Longest per-point label text drawn (characters).
+const MAX_LABEL_CHARS: usize = 1024;
+
+/// A point's own label, its text resolved: a literal as it is, a reference as the first value of
+/// the cell it names.
+fn point_labels(wb: &Workbook, sheet: usize, labels: &[PointLabel]) -> Vec<PointLabelData> {
+    let text = |l: &PointLabel| -> Option<String> {
+        let t = l.text.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
+        let plain = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t);
+        let s = if parse_ref(wb, sheet, plain).is_some() {
+            eval_list(wb, sheet, plain).into_iter().next().map(|v| v.display()).unwrap_or_default()
+        } else {
+            plain.to_string()
+        };
+        Some(s.chars().take(MAX_LABEL_CHARS).collect())
+    };
+    let mut out: Vec<PointLabelData> = labels
+        .iter()
+        .take(MAX_POINT_STYLES)
+        .filter_map(|l| {
+            let index = usize::try_from(l.index).ok()?;
+            Some(PointLabelData {
+                index,
+                text: text(l),
+                position: l.position,
+                show_value: l.show_value,
+                show_series: l.show_series,
+                show_category: l.show_category,
+                show_percentage: l.show_percentage,
+            })
+        })
+        .collect();
+    out.sort_by_key(|l| l.index);
     out
 }
 
@@ -305,6 +341,7 @@ pub fn resolve(wb: &Workbook, sheet: usize, chart: &Chart) -> ChartData {
             labels: s.labels.clone(),
             error_bars: s.error_bars.as_ref().map(|e| error_bars(wb, sheet, e)),
             points: point_styles(&s.points, &wb.theme),
+            point_labels: point_labels(wb, sheet, &s.point_labels),
         });
     }
     let n = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
