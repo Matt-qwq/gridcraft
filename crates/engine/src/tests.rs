@@ -4543,6 +4543,81 @@ fn save_with_a_password_round_trips_and_picks_the_right_format() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_standard_scheme_is_written_on_request_and_kept_on_save() {
+    // Standard (AES-128/SHA-1, [MS-OFFCRYPTO] 2.3.2) is written only when asked for; Agile stays
+    // the default, and a file written in either scheme opens with its password.
+    const PW: &str = "synthetic-pw-5526";
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("gridcraft-save-standard-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("Legacy.xlsx");
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "=SUM(1,2,3)"})).unwrap();
+
+    // An unknown scheme is an error naming both accepted values, and writes nothing.
+    let err = s.execute("file.saveAs", json!({"path": path, "password": PW, "encryption": "rc4"})).unwrap_err().to_string();
+    assert!(err.contains("agile") && err.contains("standard"), "{err}");
+    assert![err.contains("file.saveAs")];
+    assert!(!path.exists(), "a refused save left a file behind");
+    // ... whatever the password situation is: the name is checked before anything is written.
+    let err = s.execute("file.save", json!({"path": dir.join("Other.xlsx"), "encryption": "rot13"})).unwrap_err().to_string();
+    assert!(err.contains("standard"), "{err}");
+    assert!(!dir.join("Other.xlsx").exists());
+
+    // Asked for, Standard is what the file gets, and it opens with its password.
+    s.execute("file.saveAs", json!({"path": path, "password": PW, "encryption": "standard"})).unwrap();
+    let bytes = crate::io::read_file(&path.to_string_lossy()).unwrap();
+    assert_eq!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Encrypted);
+    assert_eq!(gridcraft_xlsx::encryption_scheme(&bytes), Some(gridcraft_xlsx::EncryptionScheme::Standard));
+    assert!(gridcraft_xlsx::decrypt(&bytes, PW).is_ok(), "the saved file decrypts with its password");
+    let err = crate::io::open_bytes_with_password("Legacy.xlsx", &bytes, Some("nope")).unwrap_err().to_string();
+    assert!(err.contains(crate::io::WRONG_PASSWORD), "{err}");
+    let (wb, _) = crate::io::open_bytes_with_password("Legacy.xlsx", &bytes, Some(PW)).unwrap();
+    assert_eq!(
+        wb.active().unwrap().cell(CellRef::parse("A1").unwrap()).and_then(|c| c.formula).map(|f| f.text.clone()).as_deref(),
+        Some("SUM(1,2,3)")
+    );
+
+    // An ordinary Save keeps the document's scheme: no silent switch to Agile.
+    s.execute("file.save", json!({})).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(gridcraft_xlsx::encryption_scheme(&bytes), Some(gridcraft_xlsx::EncryptionScheme::Standard));
+
+    // A workbook opened with a Standard password saves back as Standard with that password.
+    let mut opened = Session::new();
+    let r = opened.execute("file.open", json!({"path": path, "password": PW})).unwrap();
+    assert_eq!(r["warnings"][0], crate::io::DECRYPTED_NOTICE);
+    opened.execute("cell.set", json!({"cell": "A1", "input": "7"})).unwrap();
+    opened.execute("file.save", json!({})).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(gridcraft_xlsx::encryption_scheme(&bytes), Some(gridcraft_xlsx::EncryptionScheme::Standard));
+    let (wb, _) = crate::io::open_bytes_with_password("Legacy.xlsx", &bytes, Some(PW)).unwrap();
+    assert_eq!(wb.active().unwrap().value(CellRef::parse("A1").unwrap()), Value::Number(7.0));
+    assert!(!serde_json::to_string(&opened.journal).unwrap().contains(PW), "the password never reaches the journal");
+
+    // An explicit scheme changes it, and the password still protects the file.
+    s.execute("file.save", json!({"encryption": "agile"})).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(gridcraft_xlsx::encryption_scheme(&bytes), Some(gridcraft_xlsx::EncryptionScheme::Agile));
+    assert!(crate::io::open_bytes_with_password("Legacy.xlsx", &bytes, Some(PW)).is_ok());
+
+    // `file.saveBytes` honours the scheme and never echoes the password.
+    let out = s.execute("file.saveBytes", json!({"password": PW, "encryption": "standard"})).unwrap();
+    let encoded = crate::io::base64_decode(out["base64"].as_str().unwrap()).unwrap();
+    assert_eq!(gridcraft_xlsx::encryption_scheme(&encoded), Some(gridcraft_xlsx::EncryptionScheme::Standard));
+    assert!(!serde_json::to_string(&out).unwrap().contains(PW));
+
+    // `""` still removes the protection from a Standard file, and the next Save keeps it off.
+    opened.execute("file.save", json!({"password": ""})).unwrap();
+    assert_eq!(gridcraft_xlsx::sniff(&std::fs::read(&path).unwrap()), gridcraft_xlsx::Format::Xlsx, "the file is still protected");
+    opened.execute("file.save", json!({})).unwrap();
+    assert_eq!(gridcraft_xlsx::sniff(&std::fs::read(&path).unwrap()), gridcraft_xlsx::Format::Xlsx);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn a_damaged_encrypted_file_is_a_clean_error() {
     const PW: &str = "pw-5525";
     let whole = encrypted_book(PW);

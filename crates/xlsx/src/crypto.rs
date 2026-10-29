@@ -8,6 +8,11 @@
 //! on save and **verified on read** once the password is known ([MS-OFFCRYPTO] 2.3.4.14), so a
 //! corrupted or truncated package is an error instead of a silently damaged workbook.
 //!
+//! Both schemes can be written. Agile is the default (it is the stronger one); Standard
+//! ([MS-OFFCRYPTO] 2.3.2) is written on request for readers that know only Excel 2007's form. It
+//! has **no integrity field**: its verifier is the only check in the scheme, so damage to the
+//! ciphertext is left to the package's own zip CRCs once it is decrypted.
+//!
 //! Clean-room from Microsoft's public [MS-OFFCRYPTO] specification. Every read is
 //! bounds-checked, and the costly inputs (spin count, stated sizes) are capped.
 
@@ -22,6 +27,17 @@ use crate::xml::El;
 const MAX_SPIN_COUNT: u32 = 10_000_000;
 /// Standard encryption always iterates this many times.
 const STANDARD_SPIN_COUNT: u32 = 50_000;
+/// Standard encryption's package key: AES-128, the only AES key size Excel 2007 wrote
+/// ([MS-OFFCRYPTO] 2.3.2.3).
+const STANDARD_KEY_LEN: usize = 16;
+/// `CALG_AES_128`, `CALG_SHA1` and `PROV_RSA_AES`: the CryptoAPI identifiers a Standard header
+/// names ([MS-OFFCRYPTO] 2.3.2.3).
+const CALG_AES_128: u32 = 0x660E;
+const CALG_SHA1: u32 = 0x8004;
+const PROV_RSA_AES: u32 = 0x18;
+/// The CryptoAPI provider `PROV_RSA_AES` selects. Its Windows name is part of the header
+/// (`CSPName` must name the provider `ProviderType` names, 2.3.2.3), so it is a format constant.
+const STANDARD_CSP_NAME: &str = "Microsoft Enhanced RSA and AES Cryptographic Provider";
 /// Agile packages are encrypted in segments of this many bytes, each with its own IV.
 pub(crate) const SEGMENT: usize = 4096;
 /// AES block size.
@@ -85,6 +101,19 @@ pub fn check_encryption(bytes: &[u8]) -> Result<(), DecryptError> {
     match scheme(&info)? {
         Scheme::Agile(xml) => agile_descriptor(xml).map(|_| ()),
         Scheme::Standard(info) => standard_header(info).map(|_| ()),
+    }
+}
+
+/// The scheme a password-protected workbook uses, when it is one this crate can open (RC4,
+/// Extensible and certificate-only encryption are not). A caller that re-saves a file can write
+/// the same scheme back instead of changing it without being asked.
+pub fn encryption_scheme(bytes: &[u8]) -> Option<EncryptionScheme> {
+    let (info, _) = streams(bytes).ok()?;
+    // The version names a scheme; the header decides whether it is one we can open (an AES-less
+    // Standard header is RC4, whatever its version says).
+    match scheme(&info).ok()? {
+        Scheme::Agile(xml) => agile_descriptor(xml).ok().map(|_| EncryptionScheme::Agile),
+        Scheme::Standard(info) => standard_header(info).ok().map(|_| EncryptionScheme::Standard),
     }
 }
 
@@ -308,6 +337,16 @@ impl Aes {
             prev = *b;
         }
         Ok(())
+    }
+
+    /// ECB encryption: each block on its own, the plaintext zero-padded to whole blocks. This is
+    /// Standard encryption's mode for its verifier fields and for the whole package
+    /// ([MS-OFFCRYPTO] 2.3.2): no IV, no chaining, so no block depends on any other.
+    fn encrypt_ecb(&self, data: &[u8]) -> Vec<u8> {
+        let mut v = pad_to_blocks(data);
+        let (blocks, _) = v.as_chunks_mut::<BLOCK>();
+        blocks.iter_mut().for_each(|b| self.encrypt_block(b));
+        v
     }
 }
 
@@ -533,21 +572,67 @@ fn agile(xml: &[u8], package: &[u8], password: &str) -> Result<Vec<u8>, DecryptE
     Ok(out)
 }
 
-// ---- writing: Agile encryption ------------------------------------------------------------
+// ---- writing -------------------------------------------------------------------------------
 
 /// The largest package an encrypted workbook holds (the compound writer's own cap).
 const MAX_PACKAGE: usize = 1 << 30;
 
-/// `package` (an `.xlsx` zip) wrapped as Excel stores a password-protected workbook: Agile
-/// encryption ([MS-OFFCRYPTO] 2.3.4) with AES-256-CBC, SHA-512 and a data-integrity HMAC, in a
-/// compound file holding `EncryptionInfo` and `EncryptedPackage`.
+/// The scheme a save writes. Agile (Excel 2010 onward) is the default: AES-256, SHA-512 and a
+/// data-integrity HMAC over the package. Standard (Excel 2007, [MS-OFFCRYPTO] 2.3.2) is AES-128
+/// with SHA-1 and no integrity field; it is written for a reader or an intake process that knows
+/// only the older form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EncryptionScheme {
+    #[default]
+    Agile,
+    Standard,
+}
+
+impl EncryptionScheme {
+    /// The names a caller may ask for, in the order `file.save`'s param doc lists them.
+    pub const NAMES: [&'static str; 2] = ["agile", "standard"];
+
+    /// The scheme `name` asks for (ASCII case-insensitive), or `None` for a name no scheme has.
+    pub fn from_name(name: &str) -> Option<EncryptionScheme> {
+        if name.eq_ignore_ascii_case("agile") {
+            Some(EncryptionScheme::Agile)
+        } else if name.eq_ignore_ascii_case("standard") {
+            Some(EncryptionScheme::Standard)
+        } else {
+            None
+        }
+    }
+
+    /// How [`EncryptionScheme::from_name`] spells this scheme.
+    pub fn name(self) -> &'static str {
+        match self {
+            EncryptionScheme::Agile => "agile",
+            EncryptionScheme::Standard => "standard",
+        }
+    }
+}
+
+/// `package` (an `.xlsx` zip) wrapped as Excel stores a password-protected workbook, encrypted
+/// with the scheme asked for: Agile encryption ([MS-OFFCRYPTO] 2.3.4) with AES-256-CBC, SHA-512
+/// and a data-integrity HMAC, or Standard encryption ([MS-OFFCRYPTO] 2.3.2) with AES-128-ECB and
+/// SHA-1, in a compound file holding `EncryptionInfo` and `EncryptedPackage`.
 ///
-/// Salts, the verifier, the package key and the HMAC key are random: they come from the operating
-/// system's CSPRNG (see [`random_bytes`]), so two saves of the same workbook share no bytes and no
-/// two files share a key. Only Agile is written: Standard encryption (the AES-128/SHA-1 or RC4
-/// form Excel 2007 wrote) is not, and neither is Extensible or certificate encryption.
+/// Salts, verifiers and (for Agile) the package and HMAC keys are random: they come from the
+/// operating system's CSPRNG (see [`random_bytes`]), so two saves of the same workbook share no
+/// bytes and no two files share a key. A build without a CSPRNG refuses **both** schemes rather
+/// than writing predictable key material.
+///
+/// RC4, Extensible and certificate encryption are never written.
+pub fn encrypt_workbook_as(package: &[u8], password: &str, scheme: EncryptionScheme) -> Result<Vec<u8>, IoError> {
+    match scheme {
+        EncryptionScheme::Agile => encrypt_workbook_with_spin(package, password, SAVE_SPIN_COUNT),
+        EncryptionScheme::Standard => encrypt_standard(package, password),
+    }
+}
+
+/// [`encrypt_workbook_as`] with the default scheme, Agile.
 pub fn encrypt_workbook(package: &[u8], password: &str) -> Result<Vec<u8>, IoError> {
-    encrypt_workbook_with_spin(package, password, SAVE_SPIN_COUNT)
+    encrypt_workbook_as(package, password, EncryptionScheme::Agile)
 }
 
 /// [`encrypt_workbook`] with an explicit spin count (tests use a small one to stay fast).
@@ -633,6 +718,63 @@ pub(crate) fn encrypt_workbook_with_spin(package: &[u8], password: &str, spin: u
         .map_err(|e| failed(format!("can't write the encrypted workbook: {e}")))
 }
 
+/// Standard encryption ([MS-OFFCRYPTO] 2.3.2, ECMA-376 Part 1 §4.1): the package key comes
+/// straight from the password (SHA-1, 50,000 rounds, [MS-OFFCRYPTO] 2.3.4.7), the verifier and
+/// the whole package are AES-128 in ECB mode, and there is no package key and **no data-integrity
+/// field** — the verifier is the scheme's only check.
+fn encrypt_standard(package: &[u8], password: &str) -> Result<Vec<u8>, IoError> {
+    let failed = |m: String| IoError::Format(m);
+    if package.len() > MAX_PACKAGE {
+        return Err(IoError::TooLarge("a workbook larger than 1 GiB can't be password-protected".into()));
+    }
+    // Only two values are random: the salt and the verifier. There is no package key to draw.
+    let salt: [u8; 16] = random_bytes()?;
+    let verifier: [u8; 16] = random_bytes()?;
+    let aes = Aes::new(&standard_key(password, &salt, STANDARD_KEY_LEN)).map_err(|e| failed(e.to_string()))?;
+
+    // EncryptionHeader (2.3.2.3): Flags, SizeExtra, AlgID, AlgIDHash, KeySize, ProviderType,
+    // Reserved1, Reserved2, then the CSP name as UTF-16LE with its terminating NUL.
+    let mut header = Vec::with_capacity(96);
+    for word in [
+        F_CRYPTOAPI | F_AES,
+        0,
+        CALG_AES_128,
+        CALG_SHA1,
+        u32::try_from(STANDARD_KEY_LEN * 8).map_err(|_| failed("a Standard key size that isn't a u32".into()))?,
+        PROV_RSA_AES,
+        0,
+        0,
+    ] {
+        header.extend_from_slice(&word.to_le_bytes());
+    }
+    header.extend(STANDARD_CSP_NAME.encode_utf16().flat_map(u16::to_le_bytes));
+    header.extend_from_slice(&0u16.to_le_bytes());
+    let header_size = u32::try_from(header.len()).map_err(|_| failed("a Standard encryption header too large".into()))?;
+
+    // EncryptionInfo (2.3.2.2): version 4.2, then the flags, the header's size and the header,
+    // then the verifier (2.3.2.4): its size and salt, the encrypted verifier, the hash size and
+    // the encrypted SHA-1 of the verifier padded to one AES block.
+    let mut info = Vec::with_capacity(8 + header.len() + 72);
+    info.extend_from_slice(&[4, 0, 2, 0]);
+    info.extend_from_slice(&(F_CRYPTOAPI | F_AES).to_le_bytes());
+    info.extend_from_slice(&header_size.to_le_bytes());
+    info.extend_from_slice(&header);
+    info.extend_from_slice(&16u32.to_le_bytes());
+    info.extend_from_slice(&salt);
+    info.extend_from_slice(&aes.encrypt_ecb(&verifier));
+    // SHA-1's digest is 20 bytes; the encrypted field is 32 (2.3.2.4).
+    info.extend_from_slice(&20u32.to_le_bytes());
+    info.extend_from_slice(&aes.encrypt_ecb(&Hash::Sha1.digest(&[&verifier])));
+
+    // EncryptedPackage (2.3.2.5): the plaintext length, then the package encrypted block by
+    // block — ECB, so Standard has no IV and no per-segment key — zero-padded to whole AES
+    // blocks.
+    let mut stream = (package.len() as u64).to_le_bytes().to_vec();
+    stream.extend(aes.encrypt_ecb(package));
+    crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &stream)])
+        .map_err(|e| failed(format!("can't write the encrypted workbook: {e}")))
+}
+
 /// Zero-pads `data` up to a whole number of AES blocks.
 fn pad_to_blocks(data: &[u8]) -> Vec<u8> {
     let mut v = data.to_vec();
@@ -675,6 +817,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// from a seed that could repeat: a spreadsheet's key material must not be predictable.
 #[cfg(not(target_arch = "wasm32"))]
 fn random_bytes<const N: usize>() -> Result<[u8; N], IoError> {
+    // A `cfg(test)` seam: a test makes the source fail exactly as the web build's does, to prove
+    // that both schemes refuse a save where there is no CSPRNG. Production builds never read it.
+    #[cfg(test)]
+    if no_entropy_forced() {
+        return Err(IoError::NoEntropy(NO_ENTROPY));
+    }
     let mut out = [0u8; N];
     getrandom::fill(&mut out).map_err(|_| {
         IoError::NoEntropy("saving an encrypted workbook needs a secure random source, and the operating system's random number generator failed")
@@ -682,12 +830,34 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], IoError> {
     Ok(out)
 }
 
+/// What a build without a secure random source says. Both schemes draw from [`random_bytes`], so
+/// both refuse a save with this one message instead of writing a file whose salts repeat. The
+/// web branch returns it, and a native test reaches it through the seam below.
+#[cfg(any(target_arch = "wasm32", test))]
+const NO_ENTROPY: &str = "saving an encrypted workbook needs a secure random source this build does not have";
+
 /// The web build has no secure random source this crate can reach: `getrandom`'s `wasm_js`
 /// backend would pull in `wasm-bindgen`/`js-sys` glue, and this repository is Rust only. Refusing
 /// the save is the honest answer — a file whose salts repeat is worse than no file.
 #[cfg(target_arch = "wasm32")]
 fn random_bytes<const N: usize>() -> Result<[u8; N], IoError> {
-    Err(IoError::NoEntropy("saving an encrypted workbook needs a secure random source this build does not have"))
+    Err(IoError::NoEntropy(NO_ENTROPY))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// The seam above, per thread: a test running in parallel with this one is unaffected.
+    static FORCE_NO_ENTROPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn no_entropy_forced() -> bool {
+    FORCE_NO_ENTROPY.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn force_no_entropy(on: bool) {
+    FORCE_NO_ENTROPY.with(|f| f.set(on));
 }
 
 /// Standard base64 with padding, as Agile's XML stores every binary value.

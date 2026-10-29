@@ -119,6 +119,10 @@ pub struct DocState {
     /// protection back instead of silently dropping it. `None` for an unencrypted document; never
     /// serialized, never in the journal, and never in a message.
     pub password: Option<String>,
+    /// The encryption scheme the document's file was written with (Agile unless a Standard file
+    /// was opened), so an ordinary Save writes the same scheme back. An `encryption` param on a
+    /// save overrides it.
+    pub encryption: io::EncryptionScheme,
     /// Whether the scripts stored in this workbook may run (`automate.runScript`). A workbook
     /// that arrives already carrying scripts (opened from a file) starts untrusted until the
     /// user trusts it in this session (`automate.trustScripts`); one with no scripts starts
@@ -210,6 +214,7 @@ impl DocState {
             unlocked_ranges: vec![],
             content_kind: None,
             password: None,
+            encryption: io::EncryptionScheme::default(),
             scripts_trusted,
             history_dropped: 0,
         }
