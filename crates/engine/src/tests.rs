@@ -4481,7 +4481,7 @@ fn an_opened_encrypted_workbook_saves_back_encrypted() {
 
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Encrypted, "the saved file lost its protection");
-    assert!(gridcraft_xlsx::decrypt(&bytes, PW).is_err() == false);
+    assert!(gridcraft_xlsx::decrypt(&bytes, PW).is_ok(), "the saved file still decrypts with its password");
     let (wb, _) = crate::io::open_bytes_with_password("Secret.xlsx", &bytes, Some(PW)).unwrap();
     assert_eq!(wb.active().unwrap().value(gridcraft_core::CellRef::parse("A1").unwrap()), Value::Number(43.0));
     // Still no password, still no workbook.
@@ -5602,12 +5602,23 @@ fn sheet_texts(s: &Session, name: &str) -> Vec<String> {
 /// cell inside it, so Insert ▸ Slicer binds to the report.
 fn pivot_session() -> Session {
     let mut s = s();
-    s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Amount"], ["East", 10], ["West", 20], ["East", 30], ["North", 40]]}))
-        .unwrap();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["Region", "Amount", "Date"],
+            ["East", 10, 45658],
+            ["West", 20, 45700],
+            ["East", 30, 45750],
+            ["North", 40, 45800],
+        ]}),
+    )
+    .unwrap();
+    // Date-format the timeline column so the source knows it holds dates, as a real sheet would.
+    s.execute("home.numberFormat", json!({"range": "C2:C5", "format": "yyyy-mm-dd"})).unwrap();
     s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
     s.execute(
         "insert.pivotTable",
-        json!({"source": "Sheet1!A1:B5", "destination": "Report!A1", "name": "P1", "rows": ["Region"], "values": ["Amount"]}),
+        json!({"source": "Sheet1!A1:C5", "destination": "Report!A1", "name": "P1", "rows": ["Region"], "values": ["Amount"]}),
     )
     .unwrap();
     s
@@ -5729,14 +5740,17 @@ fn slicer_look_and_place_commands_stay_inside_the_workbook() {
 #[test]
 fn insert_timeline_lands_and_goes_with_its_report() {
     let mut s = pivot_session();
-    let r = s.execute("insert.timeline", json!({"field": "Region", "unit": "quarters", "name": "ByDate"})).unwrap();
+    // A field that holds no dates is refused: a timeline is a date axis.
+    let e = s.execute("insert.timeline", json!({"field": "Region"})).unwrap_err();
+    assert!(e.to_string().contains("dates"), "{e}");
+    let r = s.execute("insert.timeline", json!({"field": "Date", "unit": "quarters", "name": "ByDate"})).unwrap();
     let id = r["timeline"].as_u64().unwrap();
     {
         let d = s.doc().unwrap();
         let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
         assert_eq!(sh.pivot_timelines.len(), 1);
         assert_eq!(sh.pivot_timelines[0].unit, gridcraft_model::TimeUnit::Quarters);
-        assert_eq!(sh.pivot_timelines[0].field, "Region");
+        assert_eq!(sh.pivot_timelines[0].field, "Date");
     }
     // An unknown unit is refused.
     assert!(s.execute("insert.timeline", json!({"unit": "fortnights"})).is_err());

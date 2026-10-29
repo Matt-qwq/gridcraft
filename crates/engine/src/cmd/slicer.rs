@@ -531,6 +531,12 @@ fn insert_timeline(s: &mut Session, p: &Json) -> Result<Json> {
         Some(u) => TimeUnit::parse(u).ok_or_else(|| bad(C, format!("unknown time unit `{u}` (years|quarters|months|days)")))?,
         None => TimeUnit::Months,
     };
+    // A timeline is a date axis: its cache needs the field's date bounds, so a field that holds no
+    // dates is refused here rather than held in the model and dropped when the file is written.
+    let is_date = src.col(&field).and_then(|i| src.dates.get(i)).copied().unwrap_or(false);
+    if !is_date {
+        return Err(bad(C, format!("a timeline needs a field of dates; `{field}` holds none")));
+    }
     let at = cell_param_on(s, p, "at", psi)?.unwrap_or_else(|| beside_pivot(&pt));
     let width = f64_param(p, "width").unwrap_or(240.0).clamp(60.0, 10000.0) as f32;
     let height = f64_param(p, "height").unwrap_or(96.0).clamp(40.0, 10000.0) as f32;

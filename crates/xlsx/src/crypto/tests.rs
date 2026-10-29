@@ -209,7 +209,7 @@ fn agile_encryption_round_trips_at_every_size() {
     for len in [0usize, 1, 15, 16, 17, 4095, 4096, 4097, 8192, 10_000] {
         let plain = payload(len);
         let file = encrypt(&plain, PASSWORD);
-        assert_eq!(sniff_encrypted(&file), true, "a {len}-byte package");
+        assert!(sniff_encrypted(&file), "a {len}-byte package");
         assert_eq!(decrypt(&file, PASSWORD).unwrap(), plain, "a {len}-byte package");
         assert_eq!(decrypt(&file, "wrong"), Err(DecryptError::WrongPassword));
         assert_eq!(check_encryption(&file), Ok(()));
@@ -292,9 +292,8 @@ fn a_truncated_or_mangled_encrypted_workbook_is_an_error() {
     for cut in (0..good.len()).step_by(37) {
         // A cut inside the final sector's padding still reads: the streams are complete. Any
         // other cut is an error, never a panic and never a short package passed off as whole.
-        match decrypt(&good[..cut], PASSWORD) {
-            Ok(out) => assert_eq!(out, plain, "{cut} of {}", good.len()),
-            Err(_) => {}
+        if let Ok(out) = decrypt(&good[..cut], PASSWORD) {
+            assert_eq!(out, plain, "{cut} of {}", good.len());
         }
         let _ = check_encryption(&good[..cut]);
     }

@@ -5,6 +5,9 @@
 //! Salts and keys are fixed so the output is deterministic. This is not an encryptor for real
 //! use: a fixed key protects nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Each helper is used by some crates' test suites and not others (the module is compiled into
+// every test build through the `test-support` feature), so "never used" is normal here.
+#![allow(dead_code)]
 
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 
