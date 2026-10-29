@@ -94,6 +94,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Insert inheritance, delete, undo and a mapped-sheet XLSX round trip are covered (model 62,
   engine 419, xlsx 265 tests). The UI also caches the derived `LineIndex`/outline axes per
   `(document, revision, sheet)`, so a 1M-custom-height sheet no longer rebuilds them every frame.
+- **Landed (10-29): byte-budget page cache and uncached save scan.** The decoded-band cache is
+  64 MiB by default (`GRIDCRAFT_PAGE_CACHE_MB` clamped 8–512), shared per page file, charged at
+  decode with generation/`Weak` eviction and `PageCacheStats`. `iter_scan`/`visit_scan` decode one
+  band at a time without touching it, and the XLSX writer uses that path: a save leaves the
+  viewport's cache exactly unchanged and no longer collects a 16k-wide band.
 - **Landed (10-29): mapped value writes and packed folds.** `set_values` streams through the row
   map's logical runs and keeps a run-merged parallel plan; 1M values after a row insert write in
   **35 ms** (was 131–135), after a column insert 33 ms (was 116–142). `visit_packed` follows the
@@ -102,10 +107,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   contract; `diff_logical` is the O(cells) map-independent diagnostic for tests/fuzz.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
-  file is a temporary beside the system temp directory (not the document), the cache budget is a
-  a save walks every page through the caching reader and thrashes the viewport cache, and the XLSX
-  writer retains every sheet's XML (the real save peak); the per-band value dictionaries still cost
-  full price when values do not repeat;
+  file is a temporary beside the system temp directory (not the document), and the XLSX writer
+  retains every sheet's XML (the real save peak); the per-band value dictionaries still cost full
+  price when values do not repeat;
   page-aware compaction and the 64 MiB byte-budget page cache landed 10-29 (identity early-out,
   gap-scoped candidates, snapshot-safe page replacement, `document.compact` and a save hook,
   `PageCacheStats`); a page-file rewrite remains;

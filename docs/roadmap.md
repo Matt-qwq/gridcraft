@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M19 spill-beside-document, flat-memory save/scan; M20 page-file rewrite deferred to M19 | M19 follow-up | **12–20** | M20 and the M19 byte-budget cache landed by 10-29. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: M19 spill-beside-document, writer peak (S4a/S4b); M20 page-file rewrite deferred to M19 | M19 follow-up | **10–18** | M20, the byte-budget cache and the uncached save scan landed by 10-29. This is the last large-workbook debt before beta evidence. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -535,12 +535,19 @@ thrashing. `PageCacheStats` exposes budget/bytes/entries/hits/misses/evictions/c
 spill-failures/max-entry. Compaction-primed pages are charged and evictable; `Page::decode` stays
 uncached. Model tests are **93** (64 store), engine **422**. No peak-memory benchmark was rerun.
 
+**Uncached save scan (10-29).** `CellStore::iter_scan`/`visit_scan` walk the row and column maps
+one band and one packed row at a time, decoding paged bands through `Page::decode` instead of the
+cache; the XLSX writer now uses it. A save no longer thrashes the viewport's page cache or leaves
+the sheet's tail resident, and a 16,384-column band no longer allocates a band-sized `Vec`. A model
+test pins that a full scan decodes each band once and leaves `PageCacheStats` exactly unchanged; an
+XLSX test pins byte-identical output and unchanged stats after save. Model tests **97**, xlsx
+**266** (2 ignored), engine **422**. No save-peak benchmark was run.
+
 **Scope (remaining).** The file is a temporary beside the system temp directory, not beside the
-document; a save walks every page through the caching `band_arc` and so thrashes the viewport's
-cache, and the XLSX writer itself retains every sheet's XML (the real save peak); a spill file left
-by a crash is not cleaned on the next open; and a page-file rewrite (bytes appended by compaction)
-is deferred. Bands outside the working set do leave memory, decompressed when the viewport,
-calculation or a command touches them, which is the phase's core.
+document; the XLSX writer still retains every sheet's XML (the real save peak, S4a/S4b); a spill
+file left by a crash is not cleaned on the next open; and a page-file rewrite (bytes appended by
+compaction) is deferred. Bands outside the working set do leave memory, decompressed when the
+viewport, calculation or a command touches them, which is the phase's core.
 
 **Acceptance.**
 - Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size: **16.7 MiB live,
@@ -775,6 +782,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M19 uncached save scan: `iter_scan`/`visit_scan` decode one band at a time without touching the page cache, and the XLSX writer uses it (cache stats unchanged, decodes = paged band count, byte-identical output); 97 model / 266 xlsx / 422 engine tests |
 | 2026-10-29 | minor | M19 byte-budget page cache: 64 MiB default (`GRIDCRAFT_PAGE_CACHE_MB` clamped 8–512), per-page-file sharing, decode-time heap charging with generation/`Weak` eviction, `PageCacheStats`, compaction-primed pages charged; 93 model / 422 engine tests; spill placement, save/scan and page-file rewrite remain |
 | 2026-10-29 | minor | M20 mapped value writes complete: `set_values` streams through row-map runs with a run-merged parallel plan (1M values: 131→35 ms row insert, 116→33 ms column insert), `visit_packed` follows column runs (30.6→2.5–3.3 ns/cell), the owned/formula gate resolves a band once (9.5→0.84 ms/1M), and `diff_logical` is the map-independent diagnostic; 87 model / 422 engine tests |
 | 2026-10-29 | minor | M20 page-aware compaction: O(1) identity early-out, page candidates from map gaps (never a full sweep), snapshot-safe page replacement, `document.compact` (noundo) and a `file.save` hook; 71 model / 422 engine tests; page-file rewrite/byte budget stay in M19 |

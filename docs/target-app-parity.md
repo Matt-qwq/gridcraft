@@ -213,7 +213,7 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Packed walk / owned gate | Dense block **2.5–3.3 ns/cell** on identity or a mapped column (was 30.6); owned/formula gate over 1M paged rows **0.84 ms** (was 9.5) | fine | measured 2026-10-29, `_gridcraft-bench` release probe |
 | Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
-Work: M19 polish (spill placement, flat-memory save, the deferred page-file rewrite), then M17
+Work: M19 polish (spill placement, writer peak S4a/S4b, the deferred page-file rewrite), then M17
 zone maps and the M21 Parquet read half after beta. The
 old streaming/threading/whole-column items are landed; keep the measured workbooks and
 `cargo xtask bench` as the regression net.
