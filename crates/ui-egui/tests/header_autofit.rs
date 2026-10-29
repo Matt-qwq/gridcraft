@@ -155,7 +155,12 @@ fn dragging_a_boundary_inside_a_multi_area_selection_resizes_every_selected_line
 
 #[test]
 fn table_filter_autofit_works_through_command_and_header_double_click() {
-    for zoom in [50, 100, 200] {
+    // The header must clear the dropdown slot at every zoom. AutoFit measures the font the
+    // grid draws with (`Session::text_width`), so this check uses that measure too;
+    // `approx_text_width` is only the headless fallback, and on Windows it is wider than the
+    // real face, so the old assertion failed at 50% and 100% even though the drawn text
+    // cleared the dropdown by several pixels.
+    for zoom in [50, 75, 100, 150, 200] {
         for double_click in [false, true] {
             let mut h = harness("A:A");
             h.state_mut().session.execute("range.setValues", json!({"range":"A1", "values":[["Quarterly Revenue"], ["1"], ["2"]]})).unwrap();
@@ -183,8 +188,44 @@ fn table_filter_autofit_works_through_command_and_header_double_click() {
             let rect = geo.cell_rect(sheet, cell);
             let button = gridcraft_ui_egui::grid::filter_button_rect(&geo, sheet, cell);
             let style = app.session.active().unwrap().wb.styles.get(sheet.style_id(cell));
-            let text_width = gridcraft_engine::cmd::format::approx_text_width("Quarterly Revenue", style.font.size, style.font.bold) * geo.z;
-            assert!(rect.left() + text_width + 2.5 * geo.z < button.left(), "heading overlaps filter: zoom={zoom}, double_click={double_click}");
+            let measure = app.session.text_width.as_ref().expect("logic() installs the grid's font measure");
+            let text = "Quarterly Revenue";
+            let drawn = measure(text, &style.font, true);
+            let text_width = drawn * geo.z;
+            let slot = sheet.filter_button_space(cell);
+            // Excel keeps the dropdown the same width on screen below 100%, so AutoFit reserves
+            // more points as the zoom drops (12.5 pt at 100%, 25 pt at 50%). This is the zoom
+            // case a constant-slot fit would fail; above 100% the slot stays 12.5 pt.
+            if zoom <= 100 {
+                let screen_slot = slot * geo.z;
+                let at_100 = 12.5 * 96.0 / 72.0 * gridcraft_ui_egui::grid::DISPLAY_SCALE;
+                assert!(
+                    (screen_slot - at_100).abs() < 0.01,
+                    "the dropdown must keep its screen width below 100%: zoom={zoom}, slot {screen_slot}px, 100% slot {at_100}px"
+                );
+            } else {
+                assert!((slot - 12.5 * 96.0 / 72.0).abs() < 0.01, "above 100% the reserved dropdown slot stays 12.5 pt: zoom={zoom}, slot {slot}");
+            }
+            // AutoFit must reserve the text, its padding and the dropdown slot, in points; the
+            // slot is wider below 100% so the dropdown keeps its screen width. This catches a
+            // fit that assumed 100%.
+            assert!(
+                sheet.col_width(0) >= drawn + 6.0 + slot,
+                "AutoFit left the dropdown slot out: zoom={zoom}, double_click={double_click}, column {}, text {drawn}, slot {slot}",
+                sheet.col_width(0)
+            );
+            // What the user sees: the heading ends before the slot clips it and before the button.
+            let heading_right = rect.left() + text_width;
+            assert!(
+                heading_right + 2.5 * geo.z < rect.right() - slot * geo.z,
+                "heading is clipped by the filter slot: zoom={zoom}, double_click={double_click}, heading ends at {heading_right}, slot starts at {}",
+                rect.right() - slot * geo.z
+            );
+            assert!(
+                heading_right + 2.5 * geo.z < button.left(),
+                "heading overlaps filter: zoom={zoom}, double_click={double_click}, heading ends at {heading_right}, button starts at {}",
+                button.left()
+            );
             assert_eq!(app.session.active().unwrap().undo.len(), 1);
             h.state_mut().session.execute("edit.undo", json!({})).unwrap();
             assert_eq!(sizes(&h, false)[0], 100.0);
