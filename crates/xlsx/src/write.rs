@@ -415,6 +415,9 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
     let mut wb_rels = Rels::default();
     // Kept content first: the chart sheets among the worksheets need their relationship ids.
     let kept = crate::passthrough::write_workbook(wb, &mut wb_rels, &mut out);
+    // Modelled slicers claim their part names after the kept parts (which keep their own names),
+    // and decide which widgets can be written before any sheet XML names them.
+    let mut slicers = crate::slicer::SlicerWriter::new(wb, &mut out);
     let mut pivots = crate::pivot::PivotWriter::default();
     let mut sheets_xml = String::new();
     let mut sheet_id = 1usize;
@@ -422,8 +425,8 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
         let (before, next) = kept.sheet_entries(i, false, sheet_id);
         sheets_xml.push_str(&before);
         sheet_id = next;
-        let (xml, mut rels) = crate::sheet_write::write_sheet(wb, i, i == active, &mut out);
-        pivots.add_sheet(wb, i, &mut out, &mut rels);
+        let (xml, mut rels) = crate::sheet_write::write_sheet(wb, i, i == active, &mut out, &slicers);
+        pivots.add_sheet(wb, i, &mut out, &mut rels, &slicers);
         let name = format!("xl/worksheets/sheet{}.xml", i + 1);
         if precompress_sheets {
             out.part_precompressed(&name, Some(CT_WORKSHEET), xml.into_bytes())?;
@@ -556,16 +559,19 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
     }
     w.push_str("/>");
     w.push_str(&pivots.workbook_xml(&mut wb_rels));
+    // The modelled slicer and timeline caches (parts, workbook relationships and the extension
+    // that lists them); the kept path wrote none of them, it was stripped on read.
+    let model_exts = slicers.finish(wb, &mut out, &mut wb_rels, &pivots);
     let exts = crate::passthrough::workbook_elements(wb, crate::passthrough::CALC_SLOT);
     let kept_exts = &kept.ext;
-    if !exts.is_empty() || !kept_exts.is_empty() {
-        let _ = write!(w, "<extLst>{exts}{kept_exts}</extLst>");
+    if !exts.is_empty() || !kept_exts.is_empty() || !model_exts.is_empty() {
+        let _ = write!(w, "<extLst>{model_exts}{exts}{kept_exts}</extLst>");
     }
     w.push_str("</workbook>");
 
     // Workbook-level parts.
     let (styles, fmt_ids) = crate::styles::write_styles(wb, &out.dxfs, &pivots.number_formats(wb));
-    pivots.finish(wb, &mut out, &|code: &str| crate::tables::builtin_id(code).or_else(|| fmt_ids.get(code).copied()));
+    pivots.finish(wb, &mut out, &|code: &str| crate::tables::builtin_id(code).or_else(|| fmt_ids.get(code).copied()), slicers.links());
     out.part("xl/styles.xml", Some("application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"), styles.into_bytes());
     wb_rels.add("styles", "styles.xml");
     if wb.styles.iter().any(|(_, st)| st.num_fmt.as_str() == "checkbox") {

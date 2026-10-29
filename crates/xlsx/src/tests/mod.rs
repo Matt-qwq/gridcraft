@@ -28,6 +28,7 @@ mod shape_text_rtl;
 mod shared_media;
 mod shared_ranges;
 mod sheet_names;
+mod slicer_tests;
 mod smooth_roundtrip;
 mod streaming;
 mod trendline_roundtrip;

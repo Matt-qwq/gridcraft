@@ -70,7 +70,7 @@ fn table_columns(t: &Table) -> Vec<String> {
         .collect()
 }
 
-pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (String, Rels) {
+pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slicers: &crate::slicer::SlicerWriter) -> (String, Rels) {
     let mut rels = Rels::default();
     let Some(sheet) = wb.sheet(si) else { return (String::new(), rels) };
     let nstyles = wb.styles.len() as u32;
@@ -666,8 +666,11 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         .filter(|(_, cf)| !cf.ranges.is_empty() && matches!(cf.rule, CfRule::DataBar { gradient: false, .. }))
         .map(|(i, cf)| (cf, prio.get(i).copied().unwrap_or(1)))
         .collect();
+    // The modelled timelines of this sheet, with their own relationships (written from the model;
+    // the kept copy of this extension was stripped on read).
+    let model_exts = slicers.sheet_ext(si, &mut rels);
     let kept_exts = kept.ext_elements();
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || !kept_exts.is_empty() {
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || !kept_exts.is_empty() || !model_exts.is_empty() {
         s.push_str("<extLst>");
     }
     if !solid_bars.is_empty() {
@@ -705,7 +708,8 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         }
         s.push_str("</x14:sparklineGroups></ext>");
     }
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || !kept_exts.is_empty() {
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || !kept_exts.is_empty() || !model_exts.is_empty() {
+        s.push_str(&model_exts);
         s.push_str(&kept_exts);
         s.push_str("</extLst>");
     }
@@ -1527,7 +1531,7 @@ mod perf {
         let mut out = crate::write::Out::default();
         for (i, sheet) in wb.sheets.iter().enumerate() {
             let t = std::time::Instant::now();
-            let (xml, _) = write_sheet(&wb, i, i == wb.active_sheet, &mut out);
+            let (xml, _) = write_sheet(&wb, i, i == wb.active_sheet, &mut out, &crate::slicer::SlicerWriter::default());
             println!(
                 "  {:<28} {:>10.1} MB xml   {:>8.2?}   {:.0} ns a cell",
                 sheet.name.chars().take(28).collect::<String>(),
@@ -1544,7 +1548,13 @@ mod perf {
         // costs and what it buys, on this file's real text rather than a synthetic row.
         if let Some(sheet) = wb.sheets.iter().max_by_key(|s| s.cells.len()) {
             let mut out = crate::write::Out::default();
-            let (xml, _) = write_sheet(&wb, wb.sheets.iter().position(|s| std::ptr::eq(&**s, &**sheet)).unwrap_or(0), false, &mut out);
+            let (xml, _) = write_sheet(
+                &wb,
+                wb.sheets.iter().position(|s| std::ptr::eq(&**s, &**sheet)).unwrap_or(0),
+                false,
+                &mut out,
+                &crate::slicer::SlicerWriter::default(),
+            );
             let data = xml.as_bytes();
             println!("  {} ({:.0} MB), through the zip writer:", sheet.name, data.len() as f64 / 1048576.0);
             for level in [1, 3, 6, 9] {

@@ -5579,3 +5579,178 @@ fn labels_on_one_series_only_survive_a_save() {
         }
     }
 }
+
+/// Every non-empty display text on a sheet's used range, for "what does the report show" checks.
+fn sheet_texts(s: &Session, name: &str) -> Vec<String> {
+    let d = s.doc().unwrap();
+    let Some(si) = d.wb.sheet_index(name) else { return vec![] };
+    let Some(sh) = d.wb.sheet(si) else { return vec![] };
+    let Some(r) = sh.used_range() else { return vec![] };
+    let mut out = vec![];
+    for row in r.start.row..=r.end.row {
+        for col in r.start.col..=r.end.col {
+            let t = crate::display::cell_text(&d.wb, sh, CellRef::new(row, col));
+            if !t.is_empty() {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Data on Sheet1, a PivotTable on a "Report" sheet (rows Region, values Amount) with the active
+/// cell inside it, so Insert ▸ Slicer binds to the report.
+fn pivot_session() -> Session {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Amount"], ["East", 10], ["West", 20], ["East", 30], ["North", 40]]}))
+        .unwrap();
+    s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
+    s.execute(
+        "insert.pivotTable",
+        json!({"source": "Sheet1!A1:B5", "destination": "Report!A1", "name": "P1", "rows": ["Region"], "values": ["Amount"]}),
+    )
+    .unwrap();
+    s
+}
+
+#[test]
+fn pivot_slicer_selection_filters_the_report_and_survives_undo_save_and_reopen() {
+    let mut s = pivot_session();
+    // The active cell is in the report: Insert ▸ Slicer binds to it, with the report's first field.
+    let r = s.execute("insert.slicer", json!({})).unwrap();
+    let slicer = r["slicer"].as_u64().unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(sh.pivot_slicers.len(), 1);
+        let sl = &sh.pivot_slicers[0];
+        assert_eq!((sl.name.as_str(), sl.field.as_str(), sl.caption.as_str()), ("Region", "Region", "Region"));
+        assert_eq!(sl.items.iter().map(|i| i.label()).collect::<Vec<_>>(), ["East", "West", "North"]);
+        assert!(sl.all_selected());
+    }
+    // Selecting East filters the report: West and North are gone from its cells.
+    let r = s.execute("slicer.setSelection", json!({"slicer": slicer, "selected": ["East"]})).unwrap();
+    assert_eq!(r["pivots"], 1, "{r}");
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "East"), "{shown:?}");
+    assert!(!shown.iter().any(|t| t == "West" || t == "North"), "{shown:?}");
+    // One undo step brings the rows back with the tiles.
+    s.execute("edit.undo", json!({})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "West") && shown.iter().any(|t| t == "North"), "{shown:?}");
+    {
+        let d = s.doc().unwrap();
+        let sl = &d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap().pivot_slicers[0];
+        assert!(sl.all_selected(), "undo restores the tile selection too");
+    }
+    // Applying it again and reopening the file keeps the tiles and the filter.
+    s.execute("slicer.setSelection", json!({"slicer": "Region", "selected": ["East"]})).unwrap();
+    reopen(&mut s);
+    let shown = sheet_texts(&s, "Report");
+    assert!(!shown.iter().any(|t| t == "West" || t == "North"), "the saved report is filtered: {shown:?}");
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        let sl = &sh.pivot_slicers[0];
+        assert_eq!(sl.selected_labels(), Some(vec!["East".into()]), "the tile selection is saved");
+        assert_eq!(sl.items.iter().map(|i| i.label()).collect::<Vec<_>>(), ["East", "West", "North"]);
+        assert!(sh.pivots[0].filters.iter().any(|f| f.source_col == "Region" && f.selected.as_deref() == Some(&["East".to_string()][..])));
+    }
+    // A refresh after reopening keeps the filter (it lives in the report, not only in its cells).
+    s.execute("pivot.refresh", json!({"pivot": "P1"})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(!shown.iter().any(|t| t == "West" || t == "North"), "refresh keeps the slicer filter: {shown:?}");
+    // All tiles back: the filter goes away.
+    s.execute("slicer.setSelection", json!({"slicer": "Region", "selected": null})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "West") && shown.iter().any(|t| t == "North"), "{shown:?}");
+    // A label that is not a tile is an error, not a silent empty selection.
+    let e = s.execute("slicer.setSelection", json!({"slicer": "Region", "selected": ["Nowhere"]})).unwrap_err();
+    assert!(e.to_string().contains("Nowhere"), "{e}");
+}
+
+#[test]
+fn every_label_of_a_pivot_slicer_comes_from_the_selected_tiles() {
+    // Nothing selected is a filter that hides every row (Excel's "clear all buttons"), not "no
+    // filter". `slicer.clear` selects everything again.
+    let mut s = pivot_session();
+    s.execute("insert.slicer", json!({"field": "Region"})).unwrap();
+    s.execute("slicer.setSelection", json!({"slicer": "Region", "selected": []})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(!shown.iter().any(|t| t == "East" || t == "West" || t == "North"), "{shown:?}");
+    s.execute("slicer.clear", json!({"slicer": "Region"})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "East") && shown.iter().any(|t| t == "West"), "{shown:?}");
+    // `slicer.toggle` drives the same filter: one tile on, then the only tile off clears it.
+    s.execute("slicer.toggle", json!({"slicer": "Region", "value": "West"})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "West") && !shown.iter().any(|t| t == "East"), "{shown:?}");
+    s.execute("slicer.toggle", json!({"slicer": "Region", "value": "West"})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "East") && shown.iter().any(|t| t == "North"), "{shown:?}");
+}
+
+#[test]
+fn slicer_look_and_place_commands_stay_inside_the_workbook() {
+    let mut s = pivot_session();
+    s.execute("insert.slicer", json!({"field": "Region", "at": "D3", "width": 200})).unwrap();
+    // A known style is accepted; an unknown one is refused rather than written into the file.
+    s.execute("slicer.setStyle", json!({"slicer": "Region", "style": "SlicerStyleDark4"})).unwrap();
+    let e = s.execute("slicer.setStyle", json!({"slicer": "Region", "style": "ExcelOwnStyle"})).unwrap_err();
+    assert!(e.to_string().contains("unknown slicer style"), "{e}");
+    // Moving and resizing, with hostile numbers clamped.
+    let r = s.execute("slicer.move", json!({"slicer": "Region", "at": "F4", "width": 1.0, "height": -5.0})).unwrap();
+    assert_eq!(r["at"], "F4", "{r}");
+    {
+        let d = s.doc().unwrap();
+        let anchor = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap().pivot_slicers[0].anchor;
+        assert_eq!(anchor.cell, CellRef::parse("F4").unwrap());
+        assert_eq!(anchor.width, 60.0, "the width is clamped to the minimum");
+        assert_eq!(anchor.height, 40.0, "the height is clamped to the minimum");
+    }
+    // Moving with nothing to change is an error, not a no-op command in the journal.
+    assert!(s.execute("slicer.move", json!({"slicer": "Region"})).is_err());
+    // Deleting the slicer removes it and its filter.
+    s.execute("slicer.setSelection", json!({"slicer": "Region", "selected": ["East"]})).unwrap();
+    s.execute("slicer.delete", json!({"slicer": "Region"})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert!(sh.pivot_slicers.is_empty());
+        assert!(!sh.pivots[0].filters.iter().any(|f| f.source_col == "Region"), "its filter goes with it");
+    }
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "West"), "{shown:?}");
+    // No slicer left: the selection command names the problem.
+    let e = s.execute("slicer.setSelection", json!({"selected": ["East"]})).unwrap_err();
+    assert!(e.to_string().contains("slicer"), "{e}");
+}
+
+#[test]
+fn insert_timeline_lands_and_goes_with_its_report() {
+    let mut s = pivot_session();
+    let r = s.execute("insert.timeline", json!({"field": "Region", "unit": "quarters", "name": "ByDate"})).unwrap();
+    let id = r["timeline"].as_u64().unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(sh.pivot_timelines.len(), 1);
+        assert_eq!(sh.pivot_timelines[0].unit, gridcraft_model::TimeUnit::Quarters);
+        assert_eq!(sh.pivot_timelines[0].field, "Region");
+    }
+    // An unknown unit is refused.
+    assert!(s.execute("insert.timeline", json!({"unit": "fortnights"})).is_err());
+    // The timeline is saved with the report and comes back with its unit.
+    reopen(&mut s);
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(sh.pivot_timelines.len(), 1);
+        let tl = &sh.pivot_timelines[0];
+        assert_eq!((tl.name.as_str(), tl.unit), ("ByDate", gridcraft_model::TimeUnit::Quarters));
+    }
+    // Deleting it by id leaves the report alone.
+    s.execute("slicer.delete", json!({"slicer": id})).unwrap();
+    let d = s.doc().unwrap();
+    assert!(d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap().pivot_timelines.is_empty());
+}
