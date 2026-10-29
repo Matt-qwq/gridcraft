@@ -4,6 +4,10 @@
 //! (Excel 2010 onward) and Standard encryption (Excel 2007) are read; RC4, Extensible and
 //! certificate-only encryption are reported as unsupported.
 //!
+//! Agile encryption also carries a data-integrity HMAC over the plaintext package. It is written
+//! on save and **verified on read** once the password is known ([MS-OFFCRYPTO] 2.3.4.14), so a
+//! corrupted or truncated package is an error instead of a silently damaged workbook.
+//!
 //! Clean-room from Microsoft's public [MS-OFFCRYPTO] specification. Every read is
 //! bounds-checked, and the costly inputs (spin count, stated sizes) are capped.
 
@@ -27,11 +31,17 @@ const BLOCK: usize = 16;
 pub(crate) const BLOCK_VERIFIER_INPUT: [u8; 8] = [0xFE, 0xA7, 0xD2, 0x76, 0x3B, 0x4B, 0x9E, 0x79];
 pub(crate) const BLOCK_VERIFIER_HASH: [u8; 8] = [0xD7, 0xAA, 0x0F, 0x6D, 0x30, 0x61, 0x34, 0x4E];
 pub(crate) const BLOCK_KEY: [u8; 8] = [0x14, 0x6E, 0x0B, 0xE7, 0xAB, 0xAC, 0xD0, 0xD6];
-/// The block key of the data-integrity HMAC key and value ([MS-OFFCRYPTO] 2.3.4.14).
-const BLOCK_HMAC: [u8; 8] = [0x5F, 0xB2, 0xAD, 0x01, 0x0C, 0xB9, 0xE1, 0xF6];
+/// The block keys of the data-integrity HMAC's key and value ([MS-OFFCRYPTO] 2.3.4.14). They are
+/// different keys: a value can't be turned into a key or the other way round.
+pub(crate) const BLOCK_HMAC_KEY: [u8; 8] = [0x5F, 0xB2, 0xAD, 0x01, 0x0C, 0xB9, 0xE1, 0xF6];
+pub(crate) const BLOCK_HMAC_VALUE: [u8; 8] = [0xA0, 0x67, 0x7F, 0x02, 0xB2, 0x2C, 0x84, 0x33];
 
 /// The spin count a workbook saved here uses: Excel's default.
 pub(crate) const SAVE_SPIN_COUNT: u32 = 100_000;
+
+/// The package key length the writer uses (AES-256) and the HMAC key length (SHA-512).
+const SAVE_KEY_LEN: usize = 32;
+const SAVE_HMAC_KEY_LEN: usize = 64;
 
 /// The password key encryptor's URI (the other kind is certificate-based).
 pub(crate) const PASSWORD_ENCRYPTOR: &str = "http://schemas.microsoft.com/office/2006/keyEncryptor/password";
@@ -49,6 +59,10 @@ pub enum DecryptError {
     /// The scheme, e.g. "RC4" or "Extensible", to complete "uses {0} encryption".
     #[error("{0} encryption isn't supported")]
     Unsupported(String),
+    /// The scheme's own integrity check says the bytes changed after the file was written. The
+    /// password was right and the structure was readable, so this is corruption, not a typo.
+    #[error("the encrypted workbook was altered after it was saved (its data-integrity check failed)")]
+    Corrupted,
     #[error("the encrypted file is damaged ({0})")]
     Malformed(String),
 }
@@ -153,6 +167,16 @@ impl Hash {
             "SHA512" | "SHA-512" => Hash::Sha512,
             other => return Err(DecryptError::Unsupported(format!("{other} hash"))),
         })
+    }
+
+    /// The digest length in bytes (also the length of an Agile HMAC key and value).
+    pub(crate) fn digest_len(self) -> usize {
+        match self {
+            Hash::Sha1 => 20,
+            Hash::Sha256 => 32,
+            Hash::Sha384 => 48,
+            Hash::Sha512 => 64,
+        }
     }
 
     /// The digest of the concatenated `parts`.
@@ -399,7 +423,8 @@ impl Params {
 }
 
 /// What an Agile descriptor holds: the package's cipher, and the password key encryptor with its
-/// three encrypted values (verifier input, verifier hash, package key).
+/// three encrypted values (verifier input, verifier hash, package key), plus the data-integrity
+/// HMAC's key and value when the writer wrote them.
 struct AgileDescriptor {
     key_data: Params,
     key: Params,
@@ -407,6 +432,9 @@ struct AgileDescriptor {
     verifier_input: Vec<u8>,
     verifier_hash: Vec<u8>,
     key_value: Vec<u8>,
+    /// `dataIntegrity`'s encrypted HMAC key and HMAC value. Excel 2010 onward always writes the
+    /// element; some other writers omit it, and then there is no check to make.
+    integrity: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 /// `xml` is the XML encryption descriptor after the 8-byte version and reserved field.
@@ -425,6 +453,15 @@ fn agile_descriptor(xml: &[u8]) -> Result<AgileDescriptor, DecryptError> {
         return Err(malformed(format!("a spin count of {spin}, more than the {MAX_SPIN_COUNT} allowed")));
     }
     let field = |name: &str| base64(encryptor.attr(name).ok_or_else(|| malformed(format!("no {name}")))?);
+    // The integrity values are optional in the schema, but an element that is there must hold
+    // both: half a check is damage, not an older file.
+    let integrity = match root.child("dataIntegrity") {
+        Some(d) => {
+            let value = |name: &str| base64(d.attr(name).ok_or_else(|| malformed(format!("no {name}")))?);
+            Some((value("encryptedHmacKey")?, value("encryptedHmacValue")?))
+        }
+        None => None,
+    };
     Ok(AgileDescriptor {
         key_data,
         key,
@@ -432,11 +469,12 @@ fn agile_descriptor(xml: &[u8]) -> Result<AgileDescriptor, DecryptError> {
         verifier_input: field("encryptedVerifierHashInput")?,
         verifier_hash: field("encryptedVerifierHashValue")?,
         key_value: field("encryptedKeyValue")?,
+        integrity,
     })
 }
 
 fn agile(xml: &[u8], package: &[u8], password: &str) -> Result<Vec<u8>, DecryptError> {
-    let AgileDescriptor { key_data, key, spin, verifier_input, verifier_hash, key_value } = agile_descriptor(xml)?;
+    let AgileDescriptor { key_data, key, spin, verifier_input, verifier_hash, key_value, integrity } = agile_descriptor(xml)?;
     let h = iterated_hash(key.hash, password, &key.salt, spin);
     let iv = key.iv(None);
     let field = |data: &[u8], block_key: &[u8]| -> Result<Vec<u8>, DecryptError> {
@@ -466,6 +504,32 @@ fn agile(xml: &[u8], package: &[u8], password: &str) -> Result<Vec<u8>, DecryptE
         aes.decrypt_cbc(&key_data.iv(Some(&index.to_le_bytes())), block)?;
     }
     out.truncate(size);
+    if out.len() < size {
+        // A segment chain shorter than the size the stream states is a truncated file, whatever
+        // its first bytes decrypt to: never hand back a short package as the whole workbook.
+        return Err(malformed("the encrypted package is shorter than its stated size"));
+    }
+    // The data-integrity HMAC ([MS-OFFCRYPTO] 2.3.4.14) binds the package key to the plaintext.
+    // Its key and value are encrypted with the *package key itself* (not a password-derived key),
+    // each under its own block key's IV (from the keyData salt); the HMAC uses the keyData hash.
+    // A byte flipped in the ciphertext (or in the encrypted key fields, or in the HMAC value
+    // itself) fails here.
+    if let Some((encrypted_key, encrypted_value)) = integrity {
+        let integrity_field = |data: &[u8], block_key: &[u8]| -> Result<Vec<u8>, DecryptError> {
+            let mut data = data.to_vec();
+            aes.decrypt_cbc(&key_data.iv(Some(block_key)), &mut data)?;
+            Ok(data)
+        };
+        let key_bytes = integrity_field(&encrypted_key, &BLOCK_HMAC_KEY)?;
+        let key_bytes = key_bytes.get(..key_data.hash.digest_len()).unwrap_or(&key_bytes);
+        let expected = integrity_field(&encrypted_value, &BLOCK_HMAC_VALUE)?;
+        let actual = hmac(key_data.hash, key_bytes, &out);
+        // The value is a whole digest, zero-padded to an AES block: compare the digest itself.
+        let expected = expected.get(..actual.len()).ok_or_else(|| malformed("a short data-integrity value"))?;
+        if !constant_time_eq(&actual, expected) {
+            return Err(DecryptError::Corrupted);
+        }
+    }
     Ok(out)
 }
 
@@ -478,10 +542,10 @@ const MAX_PACKAGE: usize = 1 << 30;
 /// encryption ([MS-OFFCRYPTO] 2.3.4) with AES-256-CBC, SHA-512 and a data-integrity HMAC, in a
 /// compound file holding `EncryptionInfo` and `EncryptedPackage`.
 ///
-/// Salts, the verifier, the package key and the HMAC key are random (see [`random_bytes`]), so
-/// two saves of the same workbook share no bytes. Only Agile is written: Standard encryption
-/// (the AES-128/SHA-1 or RC4 form Excel 2007 wrote) is not, and neither is Extensible or
-/// certificate encryption.
+/// Salts, the verifier, the package key and the HMAC key are random: they come from the operating
+/// system's CSPRNG (see [`random_bytes`]), so two saves of the same workbook share no bytes and no
+/// two files share a key. Only Agile is written: Standard encryption (the AES-128/SHA-1 or RC4
+/// form Excel 2007 wrote) is not, and neither is Extensible or certificate encryption.
 pub fn encrypt_workbook(package: &[u8], password: &str) -> Result<Vec<u8>, IoError> {
     encrypt_workbook_with_spin(package, password, SAVE_SPIN_COUNT)
 }
@@ -496,17 +560,18 @@ pub(crate) fn encrypt_workbook_with_spin(package: &[u8], password: &str, spin: u
         return Err(IoError::TooLarge("a workbook larger than 1 GiB can't be password-protected".into()));
     }
     let hash = Hash::Sha512;
-    let key_len = 32;
-    // Everything random: two salts, the verifier, the package key and the HMAC key.
-    let key_data_salt = random_bytes(16);
-    let key_salt = random_bytes(16);
-    let verifier = random_bytes(16);
-    let secret = random_bytes(key_len);
-    let hmac_key = random_bytes(64);
+    let key_len = SAVE_KEY_LEN;
+    // Everything random: two salts, the verifier, the package key and the HMAC key. The sizes are
+    // constants, so no declared size from a file or a command ever picks an allocation.
+    let key_data_salt: [u8; 16] = random_bytes()?;
+    let key_salt: [u8; 16] = random_bytes()?;
+    let verifier: [u8; 16] = random_bytes()?;
+    let secret: [u8; SAVE_KEY_LEN] = random_bytes()?;
+    let hmac_key: [u8; SAVE_HMAC_KEY_LEN] = random_bytes()?;
     let h = iterated_hash(hash, password, &key_salt, spin);
     // The verifier and key fields use the salt as the IV; a package segment uses the salt and
     // its segment number (the same derivation the reader undoes).
-    let mut iv = key_salt.clone();
+    let mut iv = key_salt.to_vec();
     iv.resize(BLOCK, 0x36);
     let field = |data: &[u8], block_key: &[u8]| -> Result<Vec<u8>, IoError> {
         let key = derive(hash, &h, block_key, key_len);
@@ -516,10 +581,19 @@ pub(crate) fn encrypt_workbook_with_spin(package: &[u8], password: &str, spin: u
         Ok(v)
     };
     let encrypted_verifier = field(&verifier, &BLOCK_VERIFIER_INPUT)?;
-    let encrypted_verifier_hash = field(&hash.digest(&[&verifier]), &BLOCK_VERIFIER_HASH)?;
+    let encrypted_verifier_hash = field(&hash.digest(&[&verifier[..]]), &BLOCK_VERIFIER_HASH)?;
     let encrypted_key = field(&secret, &BLOCK_KEY)?;
-    let encrypted_hmac_key = field(&hmac_key, &BLOCK_HMAC)?;
-    let encrypted_hmac = field(&hmac_sha512(&hmac_key, package), &BLOCK_HMAC)?;
+    // The data-integrity fields are different: they are encrypted with the package key itself,
+    // each under its own block key's IV, derived from the keyData salt ([MS-OFFCRYPTO] 2.3.4.14).
+    let key_data = Params { hash, salt: key_data_salt.to_vec(), key_len };
+    let integrity_field = |data: &[u8], block_key: &[u8]| -> Result<Vec<u8>, IoError> {
+        let aes = Aes::new(&secret).map_err(|e| failed(e.to_string()))?;
+        let mut v = pad_to_blocks(data);
+        aes.encrypt_cbc(&key_data.iv(Some(block_key)), &mut v).map_err(|e| failed(e.to_string()))?;
+        Ok(v)
+    };
+    let encrypted_hmac_key = integrity_field(&hmac_key, &BLOCK_HMAC_KEY)?;
+    let encrypted_hmac = integrity_field(&hmac_sha512(&hmac_key, package), &BLOCK_HMAC_VALUE)?;
 
     let params = |salt: &[u8]| {
         format!(
@@ -566,43 +640,54 @@ fn pad_to_blocks(data: &[u8]) -> Vec<u8> {
     v
 }
 
-/// HMAC-SHA-512 ([RFC 2104], [RFC 4231]'s test vectors), for Agile's data integrity.
-pub(crate) fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
-    /// SHA-512 works on 128-byte blocks; its HMAC pads the key to that, not to SHA-256's 64.
-    const BLOCK: usize = 128;
-    let mut k = if key.len() > BLOCK { Hash::Sha512.digest(&[key]) } else { key.to_vec() };
-    k.resize(BLOCK, 0);
-    let mut inner: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
-    inner.extend_from_slice(data);
-    let inner = Hash::Sha512.digest(&[&inner]);
-    let mut outer: Vec<u8> = k.iter().map(|b| b ^ 0x5C).collect();
-    outer.extend_from_slice(&inner);
-    Hash::Sha512.digest(&[&outer])
+/// HMAC ([RFC 2104], [RFC 4231]'s test vectors) with one of the scheme's hashes: Agile's
+/// data-integrity check. HMAC pads the key to the hash's own block size (64 bytes for SHA-1 and
+/// SHA-256, 128 for SHA-384 and SHA-512), and the message is fed in parts so a 1 GiB package is
+/// never copied just to prepend a pad.
+pub(crate) fn hmac(hash: Hash, key: &[u8], data: &[u8]) -> Vec<u8> {
+    let block = match hash {
+        Hash::Sha1 | Hash::Sha256 => 64,
+        Hash::Sha384 | Hash::Sha512 => 128,
+    };
+    let mut k = if key.len() > block { hash.digest(&[key]) } else { key.to_vec() };
+    k.resize(block, 0);
+    let inner: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let inner = hash.digest(&[&inner, data]);
+    let outer: Vec<u8> = k.iter().map(|b| b ^ 0x5C).collect();
+    hash.digest(&[&outer, &inner])
 }
 
-/// Fresh random bytes for the salts, keys and verifier.
+/// HMAC-SHA-512, the hash Agile files written here use for their data integrity.
+pub(crate) fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac(Hash::Sha512, key, data)
+}
+
+/// Whether two digests are equal, without stopping at the first byte that differs (a comparison
+/// that returns early can tell an attacker which prefix was right).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// Fresh random bytes for the salts, verifier, package key and HMAC key.
 ///
-/// std seeds every `RandomState` from the operating system's random source (`getrandom` on
-/// Unix, `BCryptGenRandom` on Windows), so eight fresh ones collect 512 bits of OS entropy — no
-/// new dependency and no `unsafe` — and SHA-512 stretches that seed to the bytes wanted. On
-/// wasm the host's seed is as strong as the browser makes it; if it is not, the salts repeat,
-/// which weakens the file (the key still comes from the password) but never breaks it.
-fn random_bytes(n: usize) -> Vec<u8> {
-    use std::hash::{BuildHasher as _, Hasher as _};
-    let mut seed = b"GridCraft agile encryption".to_vec();
-    for i in 0..8u8 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u8(i);
-        seed.extend_from_slice(&h.finish().to_le_bytes());
-    }
-    let mut out = Vec::with_capacity(n.div_ceil(64).saturating_mul(64));
-    let mut counter = 0u32;
-    while out.len() < n {
-        out.extend_from_slice(&Hash::Sha512.digest(&[&seed, &counter.to_le_bytes()]));
-        counter = counter.wrapping_add(1);
-    }
-    out.truncate(n);
-    out
+/// These come from the operating system's CSPRNG through `getrandom` (`getrandom(2)` / `getentropy`
+/// on Unix, `BCryptGenRandom` on Windows, the kernel's source on the BSDs). Nothing is derived
+/// from a seed that could repeat: a spreadsheet's key material must not be predictable.
+#[cfg(not(target_arch = "wasm32"))]
+fn random_bytes<const N: usize>() -> Result<[u8; N], IoError> {
+    let mut out = [0u8; N];
+    getrandom::fill(&mut out).map_err(|_| {
+        IoError::NoEntropy("saving an encrypted workbook needs a secure random source, and the operating system's random number generator failed")
+    })?;
+    Ok(out)
+}
+
+/// The web build has no secure random source this crate can reach: `getrandom`'s `wasm_js`
+/// backend would pull in `wasm-bindgen`/`js-sys` glue, and this repository is Rust only. Refusing
+/// the save is the honest answer — a file whose salts repeat is worse than no file.
+#[cfg(target_arch = "wasm32")]
+fn random_bytes<const N: usize>() -> Result<[u8; N], IoError> {
+    Err(IoError::NoEntropy("saving an encrypted workbook needs a secure random source this build does not have"))
 }
 
 /// Standard base64 with padding, as Agile's XML stores every binary value.

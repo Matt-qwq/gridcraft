@@ -436,7 +436,12 @@ pub(crate) fn write_compound(streams: &[(&str, &[u8])]) -> Result<Vec<u8>, Strin
     // then each stream too large for the mini stream.
     let entries = streams.len().checked_add(1).ok_or_else(|| bad_write("too many streams"))?;
     let dir_len = entries.checked_mul(128).ok_or_else(|| bad_write("too large"))?.div_ceil(SECTOR) * SECTOR;
-    let mut blobs: Vec<Vec<u8>> = vec![vec![0u8; dir_len], mini_fat.iter().flat_map(|v| v.to_le_bytes()).collect(), container.clone()];
+    // The mini FAT is a stream in regular sectors like any other, so its last sector is padded.
+    // Pad with FREESECT, not zero: a zero entry names mini sector 0, and a reader that followed
+    // it past the mini stream's own length would loop into the live part of the chain.
+    let mut mini_fat_blob: Vec<u8> = mini_fat.iter().flat_map(|v| v.to_le_bytes()).collect();
+    mini_fat_blob.resize(mini_fat_blob.len().div_ceil(SECTOR) * SECTOR, 0xFF);
+    let mut blobs: Vec<Vec<u8>> = vec![vec![0u8; dir_len], mini_fat_blob, container.clone()];
     // In the caller's order, so a stream's own entry finds its data.
     let mut large_at: Vec<Option<usize>> = vec![None; streams.len()];
     for (i, (_, data)) in streams.iter().enumerate() {
@@ -711,6 +716,52 @@ pub(crate) mod tests {
         assert!(u32::from_le_bytes([file[72], file[73], file[74], file[75]]) > 0, "no DIFAT sectors");
         assert_eq!(Compound::open(&file).unwrap().root_stream("EncryptedPackage").unwrap().unwrap(), big);
         assert!(is_encrypted(&write_compound(&[("EncryptionInfo", b"info"), ("EncryptedPackage", b"pk")]).unwrap()));
+    }
+
+    /// The writer's layout at every size class, read by a third-party CFB reader: `cfb` (MIT,
+    /// mdsteele/rust-cfb) is an independent implementation that shares no code with this crate.
+    /// It parses the header, FAT, DIFAT, mini stream and directory tree itself, checks that each
+    /// directory name sorts correctly for its parent, and reports each stream's declared size.
+    ///
+    /// `permissive` mode is the fair oracle, not `strict`: strict additionally demands that the
+    /// mini FAT hold no more entries than the mini stream has 64-byte sectors, but a mini FAT is
+    /// stored in whole 512-byte sectors (128 entries), so its last sector is padding whenever the
+    /// mini stream is smaller — the usual case.
+    #[test]
+    fn an_independent_reader_accepts_every_layout_the_writer_makes() {
+        use std::io::Read as _;
+        let data = |n: usize| -> Vec<u8> { (0..n).map(|i| (i % 251) as u8).collect() };
+        // (the size the directory states, the bytes the reader hands back)
+        let read = |file: &[u8], name: &str| -> (u64, Vec<u8>) {
+            let mut cf = cfb::CompoundFile::open(std::io::Cursor::new(file)).expect("the independent reader rejects the container");
+            assert_eq!(cf.version(), cfb::Version::V3);
+            let stated = cf.entry(name).expect("no such stream").len();
+            let mut got = vec![];
+            cf.open_stream(name).expect("can't open the stream").read_to_end(&mut got).unwrap();
+            (stated, got)
+        };
+        // Every size class: nothing (no mini sector at all), the mini stream either side of a
+        // mini sector, the 4096-byte cutoff either side, and a stream worth many sectors.
+        for len in [0usize, 1, 63, 64, 65, 1000, 4095, 4096, 4097, 100_000] {
+            let small = data(len);
+            let big = data(5000);
+            let file = write_compound(&[("EncryptionInfo", &small), ("EncryptedPackage", &big)]).unwrap();
+            assert_eq!(read(&file, "EncryptionInfo"), (len as u64, small), "a {len}-byte stream");
+            assert_eq!(read(&file, "EncryptedPackage"), (5000, big));
+        }
+        // No mini stream at all: both streams in regular sectors, the root's mini stream empty.
+        let a = data(4096);
+        let b = data(4096);
+        let file = write_compound(&[("EncryptionInfo", &a), ("EncryptedPackage", &b)]).unwrap();
+        assert_eq!(read(&file, "EncryptionInfo"), (4096, a));
+        assert_eq!(read(&file, "EncryptedPackage"), (4096, b));
+        // Past the 109 FAT sectors the header names, the FAT's directory lives in DIFAT sectors:
+        // the outside reader follows that chain and returns the whole 7.2 MB stream.
+        let big = data(7_200_000);
+        let file = write_compound(&[("EncryptionInfo", b"info"), ("EncryptedPackage", &big)]).unwrap();
+        assert!(u32::from_le_bytes([file[44], file[45], file[46], file[47]]) > 109, "no DIFAT sectors needed");
+        assert!(u32::from_le_bytes([file[72], file[73], file[74], file[75]]) > 0, "the header names no DIFAT sector");
+        assert_eq!(read(&file, "EncryptedPackage"), (7_200_000, big));
     }
 
     #[test]

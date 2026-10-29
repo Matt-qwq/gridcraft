@@ -68,9 +68,13 @@ fn every_cut_of_a_saved_encrypted_workbook_is_an_error_not_a_panic() {
     let lying = 100u64.to_le_bytes().to_vec();
     let short = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &lying)]).unwrap();
     assert!(decrypt(&short, "pw").is_err());
-    // An existing but empty package is a clean empty result, not a panic.
+    // An existing but empty package: with the file's own integrity data it cannot be the package
+    // the file was saved with, so it is corruption; a writer that wrote no integrity data leaves
+    // nothing to check, and an empty package stays a clean empty result.
     let empty = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &0u64.to_le_bytes())]).unwrap();
-    assert_eq!(decrypt(&empty, "pw").unwrap(), Vec::<u8>::new());
+    assert_eq!(decrypt(&empty, "pw"), Err(DecryptError::Corrupted));
+    let unchecked = crate::testing::encrypt_workbook(b"", "pw");
+    assert_eq!(decrypt(&unchecked, "pw").unwrap(), Vec::<u8>::new());
 }
 
 #[test]

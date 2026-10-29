@@ -75,6 +75,10 @@ pub enum IoError {
     Format(String),
     #[error("the file is too large: {0}")]
     TooLarge(String),
+    /// Creating encryption key material needs a secure random source, and this build or this
+    /// machine has none. Writing the file with predictable salts would be worse than refusing.
+    #[error("{0}")]
+    NoEntropy(&'static str),
 }
 
 /// What a lenient read skipped or repaired.

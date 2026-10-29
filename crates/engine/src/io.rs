@@ -127,6 +127,9 @@ fn decrypt_message(name: &str, e: gridcraft_xlsx::DecryptError) -> String {
         gridcraft_xlsx::DecryptError::Unsupported(scheme) => {
             format!("'{name}' uses {scheme} encryption, which GridCraft can't open yet. Remove the password in Excel and try again.")
         }
+        gridcraft_xlsx::DecryptError::Corrupted => format!(
+            "We can't open '{name}': the password is right, but the encrypted data has changed since the file was saved (its integrity check failed). Copy the file again from where it came from."
+        ),
         gridcraft_xlsx::DecryptError::Malformed(detail) => format!("We can't open '{name}': the encrypted file is damaged ({detail})."),
     }
 }
@@ -1222,6 +1225,22 @@ mod tests {
             let msg = open_bytes_with_password("secret.xlsx", &file, password).unwrap_err().to_string();
             assert!(msg.contains("damaged") && !msg.contains(PASSWORD_REQUIRED), "got: {msg}");
         }
+    }
+
+    #[test]
+    fn a_corrupted_encrypted_package_is_corruption_not_a_wrong_password() {
+        let mut wb = Workbook::new();
+        wb.sheet_mut(0).unwrap().set_value(CellRef::new(0, 0), gridcraft_core::Value::Number(42.0));
+        let package = save_bytes(&wb, "book.xlsx").unwrap();
+        let file = gridcraft_xlsx::encrypt_workbook(&package, "right-pw").unwrap();
+        let broken = gridcraft_xlsx::testing::corrupt_encrypted_package(&file).unwrap();
+        assert_eq!(gridcraft_xlsx::decrypt(&broken, "right-pw"), Err(gridcraft_xlsx::DecryptError::Corrupted));
+        // The right password, a damaged payload: the message must say the data changed, not blame
+        // the password, and it must never quote the password it was given.
+        let msg = open_bytes_with_password("book.xlsx", &broken, Some("right-pw")).unwrap_err().to_string();
+        assert!(msg.contains("integrity check"), "got: {msg}");
+        assert!(!msg.contains(WRONG_PASSWORD), "got: {msg}");
+        assert!(!msg.contains("right-pw"), "the password is never quoted: {msg}");
     }
 
     #[test]

@@ -43,6 +43,10 @@ sha2 = { version = "0.11", default-features = false }
 # Decrypting password-protected workbooks ([MS-OFFCRYPTO]): AES and SHA-1, pure Rust (wasm-safe).
 aes = { version = "0.9", default-features = false }
 sha1 = { version = "0.11", default-features = false }
+# The operating system's CSPRNG: encryption salts and keys never come from anything weaker.
+# Pure Rust, no unsafe in this crate's use of it; native targets only (the web build has no
+# secure source it can reach — see `crypto::random_bytes`).
+getrandom = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # ui

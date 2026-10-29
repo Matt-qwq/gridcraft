@@ -26,3 +26,14 @@ crc32fast = { workspace = true }
 aes = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+
+# Encryption keys and salts need the OS CSPRNG. The web build has no secure random source we can
+# reach (getrandom's `wasm_js` backend would add a JavaScript dependency this repo doesn't take),
+# so a password-protected save is refused there instead of made with weak entropy.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = { workspace = true }
+
+[dev-dependencies]
+# An independent Compound File Binary reader, used only to prove the encrypted container is valid
+# to software that isn't ours (a test oracle; it ships nowhere).
+cfb = "0.15"
