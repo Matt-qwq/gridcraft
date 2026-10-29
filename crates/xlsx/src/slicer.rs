@@ -22,6 +22,9 @@
 //! - a modelled slicer/timeline whose PivotTable is gone is not written (its cache goes with it),
 //!   matching the kept path's rule for a cache that names a deleted or renamed PivotTable.
 //!
+//! The model is built from the parts the pass-through kept, so reading with the pass-through off
+//! has no slicer content to model (nothing is written back either, as for every other kept part).
+//!
 //! Not modelled (kept raw, and said so here so the next reader does not guess): OLAP slicer caches,
 //! item properties (`<p>`), custom lists, slicer `extLst`s, a timeline's date-range selection, the
 //! drawing shape that places a slicer on the sheet, and the slicer sort order (a file's slicer part
@@ -123,9 +126,10 @@ pub fn read(wb: &mut Workbook, cx: &mut Ctx<'_>, wb_xml: &El, wb_rels: &[crate::
     let slicers = read_slicers(wb, cx, &items);
     let timelines = read_timelines(wb, cx);
     let mut cache_parts: HashSet<String> = HashSet::new();
+    let mut slicer_parts: HashSet<String> = HashSet::new();
     let mut timeline_parts: HashSet<String> = HashSet::new();
     if let Some(list) = slicers {
-        for (si, mut widget, cache_part) in list {
+        for (si, mut widget, cache_part, slicer_part) in list {
             // A widget's id is unique in the workbook, like every other on-sheet object.
             widget.id = cx.next_object_id();
             if let Some(sheet) = wb.sheet_mut(si)
@@ -134,6 +138,7 @@ pub fn read(wb: &mut Workbook, cx: &mut Ctx<'_>, wb_xml: &El, wb_rels: &[crate::
                 sheet.pivot_slicers.push(widget);
             }
             cache_parts.insert(normalize(&cache_part));
+            slicer_parts.insert(normalize(&slicer_part));
         }
     }
     if let Some(list) = timelines {
@@ -151,20 +156,21 @@ pub fn read(wb: &mut Workbook, cx: &mut Ctx<'_>, wb_xml: &El, wb_rels: &[crate::
     if cache_parts.is_empty() && timeline_parts.is_empty() {
         return;
     }
-    strip(wb, &cache_parts, &timeline_parts);
+    strip(wb, &cache_parts, &slicer_parts, &timeline_parts);
 }
 
 /// Removes the kept relationships that reached a modelled cache or timeline part. Each preserved
 /// `<ext>` fragment names its part by relationship id, and a fragment whose ids no longer resolve is
 /// dropped whole by the writer (`passthrough::remap`), so this is what keeps the kept path from
 /// writing a second `<x14:slicerCaches>` list or a second cache part.
-fn strip(wb: &mut Workbook, caches: &HashSet<String>, timelines: &HashSet<String>) {
+fn strip(wb: &mut Workbook, caches: &HashSet<String>, slicers: &HashSet<String>, timelines: &HashSet<String>) {
     let drop_rel = |r: &gridcraft_model::PreservedRel| {
         let kind = r.rel_type.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
         let target = normalize(&r.target);
         match kind.as_str() {
             "slicercache" | "timelinecache" => caches.contains(&target),
-            "timeline" | "slicer" => timelines.contains(&target),
+            "slicer" => slicers.contains(&target),
+            "timeline" => timelines.contains(&target),
             _ => false,
         }
     };
@@ -292,7 +298,7 @@ fn read_slicers(
     wb: &mut Workbook,
     cx: &mut Ctx<'_>,
     items: &HashMap<u32, HashMap<String, Vec<SlicerValue>>>,
-) -> Option<Vec<(usize, PivotSlicer, String)>> {
+) -> Option<Vec<(usize, PivotSlicer, String, String)>> {
     let caches = kept_parts(wb, CT_SLICER_CACHE);
     if caches.is_empty() {
         return Some(vec![]);
@@ -383,7 +389,7 @@ fn read_slicers(
                 };
                 let Some(first) = pivot_tables.first() else { break };
                 let Some(si) = pivot_sheet(wb, first) else { continue };
-                out.push((si, widget, part.name.clone()));
+                out.push((si, widget, part.name.clone(), sp.name.clone()));
             }
         }
         if slicer_els == 0 {
@@ -411,7 +417,7 @@ fn read_slicers(
     }
     // Attach the cache's item list to each widget: a widget's items are the cache's values, in the
     // cache's order, with that cache's selection.
-    for (_, widget, cache_part) in &mut out {
+    for (_, widget, cache_part, _) in &mut out {
         let Some(cache) = parsed.iter().find(|c| same_part(&c.part, cache_part)) else { continue };
         widget.cache = cache.name.clone();
         widget.field = cache.field.clone();

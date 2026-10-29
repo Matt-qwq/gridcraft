@@ -1,6 +1,6 @@
 # File-format parity
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (unmodelled XLSX content is kept through a save: slicers and slicer caches, timelines and their caches, query tables attached to tables, and the `extLst` children of the workbook, worksheets, tables, PivotTables and pivot caches that GridCraft does not model — with their parts, relationships and content types, byte-identical, dropped with the sheet, table or PivotTable that owned them instead of dangling; a strict package validator now runs on every package the test suite saves) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-31 · **Last updated:** 2026-10-31 · **Change:** minor (PivotTable slicers and timelines are modelled, editable and written from the model — a slicer's cache, name, caption, style, column count, item list and selection survive open → save, and the slicer's selection filters its PivotTable; content GridCraft cannot model stays byte-identical) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Every format Excel opens or saves, with GridCraft's read and write support, fidelity and tests.
 Part of [target-app-parity.md](target-app-parity.md). **File formats: ~50% ready, 80–120 h**
@@ -80,8 +80,8 @@ relationship graph walked from an owner, refused when it reaches content GridCra
 | Form controls, ActiveX controls, OLE objects, sheet backgrounds | same, with their VML shapes | worksheet | not shown or editable; notes keep the shape blocks they use |
 | Pictures in headers and footers (`&G`) | same | worksheet (`<legacyDrawingHF>`) | not shown; #1257 |
 | Chart sheets | same (sheet, drawing, chart, style, colour) | workbook | #727; left out when a sheet they plot was deleted or renamed, or a worksheet took their name |
-| Slicers and slicer caches | same | workbook and PivotTable | not editable (gap #8); dropped when the PivotTable they name is deleted or renamed |
-| Timelines and timeline caches | same | worksheet and workbook | same rule as slicers; `tabId`/`pivotCacheId` are not renumbered |
+| Slicers and slicer caches | modelled for a plain tabular cache; anything else same (byte-identical) | workbook and PivotTable | a modelled slicer's name, caption, style, column count, item list and selected tiles are read and written (`crates/xlsx/src/slicer.rs`, `slicer_tests.rs`); a modelled one is written from the model and never also kept, and goes when its PivotTable is deleted or renamed; an OLAP cache, item properties, unknown attributes or a damaged part stay on the pass-through path (not editable) |
+| Timelines and timeline caches | modelled for a plain cache with no selected date range; anything else same | worksheet and workbook | name, caption, style and time unit (`level`) are modelled and written; a selected date range is not modelled yet, so such a timeline stays on the pass-through path; the on-sheet drawing shape is not written (the model keeps its anchor) |
 | Unmodelled `extLst` children | the `<ext>` element, with its relationship ids rewritten | workbook, worksheet, table, PivotTable, pivot cache definition | the extensions GridCraft writes itself (calc features, data bars, sparklines, x14 validations, the PivotTable's own x14 extensions) are written from the model, never kept from the source |
 | **Dropped: the data model** (Power Pivot `xl/model/…`, `powerPivotData`) | — | — | the parts and the connection they hang off cannot be verified without modelling OLAP sources |
 | **Dropped: chart `extLst` children and chart details** | — | — | the chart model and its writer belong to gap #4; a chart part has no stable identity (name or id) to hang a fragment on |
@@ -100,6 +100,12 @@ Rules that keep a save safe:
   PivotTable the workbook no longer has is dropped with its slicers. Relationships are only written
   for parts that are written, so a dropped part never leaves an `r:id` behind: a fragment whose ids
   can't all be resolved is dropped whole.
+- **Modelled owners are written once.** A slicer or timeline the model understands is written from
+  the model and removed from the kept content on read (its workbook/PivotTable/sheet extension and
+  the relationships only it used), so no part or `<ext>` is written twice; a kind is modelled
+  all-or-nothing, so one cache GridCraft cannot fully understand leaves every slicer (or timeline)
+  of that workbook on the kept path. The source extension is dropped only when the model rewrites
+  it, which is what keeps an open → save from duplicating a slicer cache reference.
 - **Bounded.** 256 MiB kept per workbook, 64 MiB per part, 4,096 parts, 4 MiB per XML fragment,
   8 MiB of `extLst` children per owner, 256 elements of nesting; a part over its limit is
   dropped with a warning instead of failing the read.
@@ -161,6 +167,7 @@ refresh. Counted under features (Get & Transform, ~10% ready), not here.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-31 | minor | PivotTable slicers and timelines: modelled (cache field, PivotTables filtered, item values with their selected flags, name, caption, style, column count, timeline unit, anchor), read from the model's selectable parts and written once from it; `insert.slicer`/`insert.timeline`/`slicer.setSelection`/`slicer.setStyle`/`slicer.move`/`slicer.delete` drive them, and a selection filters the PivotTable through its own filter and refresh path, undoably and across save/reopen. Content GridCraft cannot model (OLAP caches, item properties, unknown attributes, a timeline's date range) remains byte-identical on the pass-through path. The placement drawing shape is not written (the model keeps the anchor); the file format was not verified in Excel |
 | 2026-10-30 | minor | Pass-through of unmodelled XLSX content: slicers and slicer caches, timelines and their caches, query tables attached to tables, and the `extLst` children of the workbook, worksheets, tables, PivotTables and pivot caches GridCraft doesn't model are kept byte-for-byte with their relationships and content types, and dropped with the sheet, table or PivotTable that owned them (never a relationship to a part that isn't written). The data model and chart extensions are still dropped. A strict package validator (`testing::check_package`) runs on every package the test suite saves: targets exist, every part has a content type, no orphan parts, no stale overrides (`owner_extensions.rs`) |
 | 2026-10-21 | minor | HTML (Save as Web Page) writes pictures (`data:` URI `<img>`) and charts (inline SVG from the chart crate's drawing primitives, text included) at their anchors; the table uses the sheet's column widths and row heights when the sheet has either, and output for sheets without pictures or charts is unchanged |
 | 2026-10-20 | trivial | XLSX shared strings: Japanese phonetic runs (ふりがな, `<rPh sb="…" eb="…">` with `<phoneticPr>`) are read into the workbook and written back next to the string with the same text, so an open + save no longer deletes them; bad offsets and readings are dropped with a warning, a `<phoneticPr>` without runs is kept on its own, and when duplicate `<si>` items share a text but not a reading only the first reading is written (reported on open) (`phonetic_tests.rs`) |
