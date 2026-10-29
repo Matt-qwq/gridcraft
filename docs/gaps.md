@@ -277,13 +277,20 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus once Excel is
   available. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls` reads everything but CF12; Standard/RC4 encryption cannot be written (FF)
+### 7. Legacy `.xls` reads everything but CF12; RC4 encryption cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
   `file.save` — the silent loss of a file's protection is fixed. `password: ""` removes protection;
   a password on a format that cannot carry one is refused, never dropped. Standard (RC4/AES-128) and
   certificate encryption are not written.
+- **Landed 10-30 (Standard encryption write):** `file.save`/`saveAs`/`saveBytes` take `encryption`
+  (`agile` by default, `standard` on request; an unknown name is an error listing both), and a
+  workbook opened with a Standard file **re-saves as Standard**, so a save never silently changes the
+  form. Standard is [MS-OFFCRYPTO] 2.3.2 — a 224-byte binary header (AES-128, SHA-1, `PROV_RSA_AES`)
+  and AES-128-**ECB** over the zero-padded package, with **no integrity field** — not Agile's
+  segmented CBC, which is what the earlier sketch assumed and would have produced files our own
+  reader refuses.
 - **Landed 10-30 (encryption hardening):** keys and salts come from the **operating system's CSPRNG**
   (`getrandom`, native targets only) instead of stretched SipHash seeds; the Agile `dataIntegrity`
   HMAC-SHA-512 is **verified on read** after the password check (both fields decrypted with the
@@ -330,8 +337,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   RC4-encrypted files are still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 9–19 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, Standard/RC4
-  encryption write 2–3, an Excel run over a `.xls` 2–7). [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 7–16 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, RC4 write 1,
+  an Excel run over a `.xls` 1–6). [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: no slicer UI, calculated items, PivotCharts; unverified in Excel (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
