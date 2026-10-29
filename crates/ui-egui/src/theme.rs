@@ -567,9 +567,41 @@ fn fallback_faces(han: HanOrder) -> Vec<(&'static str, Vec<(String, u32)>)> {
         ("sys-thai", thai()),
         ("sys-lao", lao()),
         ("sys-hebrew", hebrew()),
+        ("sys-devanagari", devanagari()),
         ("sys-symbols", symbols()),
         ("sys-symbols-2", symbols_more()),
     ]
+}
+
+/// Devanagari faces, so a Hindi workbook draws its cells instead of boxes. Windows ships Nirmala
+/// UI (and Mangal with the Indic support files); macOS has Kohinoor Devanagari and Devanagari Sangam
+/// MN; Linux distributions ship Noto Sans Devanagari, Lohit or FreeSerif. Nothing is bundled.
+#[cfg(not(target_arch = "wasm32"))]
+fn devanagari() -> Vec<(String, u32)> {
+    let mac_sys = "/System/Library/Fonts";
+    let mac_sup = "/System/Library/Fonts/Supplemental";
+    let win = std::env::var("WINDIR").map(|w| format!("{w}\\Fonts")).unwrap_or_else(|_| "C:\\Windows\\Fonts".into());
+    let lin = [
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+        "/usr/share/fonts/truetype",
+        "/usr/share/fonts",
+        "/usr/share/fonts/chromeos/noto", // ChromeOS's Linux container (#1762)
+    ];
+    let mut v: Vec<(String, u32)> = Vec::new();
+    v.push((format!("{win}\\Nirmala.ttc"), 0)); // Nirmala UI
+    v.push((format!("{win}\\NirmalaB.ttc"), 0));
+    v.push((format!("{win}\\mangal.ttf"), 0)); // Mangal
+    v.push((format!("{mac_sys}/Kohinoor.ttc"), 0)); // Kohinoor Devanagari
+    v.push((format!("{mac_sup}/Devanagari Sangam MN.ttc"), 0));
+    v.push((format!("{mac_sup}/DevanagariMT.ttc"), 0));
+    for d in lin {
+        v.push((format!("{d}/NotoSansDevanagari-Regular.ttf"), 0));
+        v.push((format!("{d}/lohit-devanagari/Lohit-Devanagari.ttf"), 0));
+    }
+    v.push(("/usr/share/fonts/google-noto-vf/NotoSansDevanagari[wght].ttf".into(), 0));
+    v.push(("/usr/share/fonts/freefont/FreeSerif.ttf".into(), 0));
+    v
 }
 
 /// Linux directories that hold CJK fonts across distributions: Debian/Ubuntu (`opentype/noto`,
@@ -946,11 +978,31 @@ mod tests {
         let keys = |han| fallback_faces(han).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
         assert_eq!(
             keys(HanOrder::Japanese),
-            ["sys-cjk-han-ja", "sys-cjk-han-zh", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-symbols", "sys-symbols-2"]
+            [
+                "sys-cjk-han-ja",
+                "sys-cjk-han-zh",
+                "sys-cjk-hangul",
+                "sys-thai",
+                "sys-lao",
+                "sys-hebrew",
+                "sys-devanagari",
+                "sys-symbols",
+                "sys-symbols-2"
+            ]
         );
         assert_eq!(
             keys(HanOrder::Chinese),
-            ["sys-cjk-han-zh", "sys-cjk-han-ja", "sys-cjk-hangul", "sys-thai", "sys-lao", "sys-hebrew", "sys-symbols", "sys-symbols-2"]
+            [
+                "sys-cjk-han-zh",
+                "sys-cjk-han-ja",
+                "sys-cjk-hangul",
+                "sys-thai",
+                "sys-lao",
+                "sys-hebrew",
+                "sys-devanagari",
+                "sys-symbols",
+                "sys-symbols-2"
+            ]
         );
         assert_eq!(HanOrder::of(Language::Ja), HanOrder::Japanese);
         for l in [Language::En, Language::Zh, Language::Ko, Language::Ru, Language::PtBr, Language::De, Language::Cs, Language::Fr, Language::Tr] {
