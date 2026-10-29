@@ -128,6 +128,9 @@ pub struct GridState {
     /// The PivotTable Fields pane's `pivot.fields` answer, cached per (doc uid, revision, pivot):
     /// it scans the whole source list, far too slow to repeat every frame (#2113).
     pub pivot_fields: Option<((u64, u64, String), serde_json::Value)>,
+    /// The grid's line geometry, cached per (doc uid, revision, sheet): a sheet with a custom
+    /// height on every row would otherwise rebuild its prefix sums on every frame.
+    pub line_geo: Option<LineGeo>,
     pub header_menu: Option<(Pos2, bool)>,
     /// Page Layout view pagination, cached per (doc uid, revision, sheet, rows, columns).
     pub paper: Option<crate::paper_view::PaperCache>,
@@ -145,6 +148,52 @@ pub struct GridState {
     pub wheel_zoom: Option<WheelZoom>,
     /// A one-finger touch drag in progress: it pans the sheet instead of selecting.
     pub touch_pan: bool,
+}
+
+/// The grid's line geometry: prefix sums over custom row heights and column widths, and the
+/// outline axes built from the same maps. It changes only with the document (an edit, undo/redo, a
+/// sheet switch), so [`GridState::line_geo_for`] keeps it for as long as the document revision and
+/// sheet stay the same — a sheet with a custom height on every row would otherwise rebuild it once
+/// or twice every frame.
+#[derive(Clone)]
+pub struct LineGeo {
+    /// (document uid, document revision, sheet index).
+    key: (u64, u64, usize),
+    ri: Arc<LineIndex>,
+    ci: Arc<LineIndex>,
+    row_outline: Arc<crate::outline::Axis>,
+    col_outline: Arc<crate::outline::Axis>,
+}
+
+impl LineGeo {
+    /// The line geometry of `sh`, built from its row and column maps.
+    fn of(sh: &Sheet) -> LineGeo {
+        LineGeo {
+            key: (0, 0, 0),
+            ri: Arc::new(LineIndex::new(&sh.rows, sh.default_row_height, MAX_ROWS)),
+            ci: Arc::new(LineIndex::new(&sh.cols, sh.default_col_width, MAX_COLS)),
+            row_outline: Arc::new(crate::outline::Axis::new(&sh.rows)),
+            col_outline: Arc::new(crate::outline::Axis::new(&sh.cols)),
+        }
+    }
+    /// The four `Arc`s, in [`Geo::new_with_lines`] order.
+    fn into_arcs(self) -> (Arc<LineIndex>, Arc<LineIndex>, Arc<crate::outline::Axis>, Arc<crate::outline::Axis>) {
+        (self.ri, self.ci, self.row_outline, self.col_outline)
+    }
+}
+
+impl GridState {
+    /// The line geometry for `key` — (document uid, revision, sheet) — rebuilt from `sh` when the
+    /// document changed and reused (cloned `Arc`s) otherwise. The returned value owns its `Arc`s,
+    /// so the borrow of `sh` ends with this call.
+    pub fn line_geo_for(&mut self, key: (u64, u64, usize), sh: &Sheet) -> LineGeo {
+        if let Some(cached) = self.line_geo.as_ref().filter(|g| g.key == key) {
+            return cached.clone();
+        }
+        let g = LineGeo { key, ..LineGeo::of(sh) };
+        self.line_geo = Some(g.clone());
+        g
+    }
 }
 
 /// Ctrl+wheel zoom for one (doc uid, sheet). A fine-grained wheel sends parts of a notch, so the
@@ -189,28 +238,40 @@ pub struct Geo {
     /// vertical centre line on screen: painted shapes by `mirror_painted`, widgets by
     /// `mirror_rect`/`mirror_pos`, and pointer input back by `mirror_pos` (an involution).
     pub rtl: bool,
-    /// Prefix sums over custom row heights / column widths, built once per frame.
-    ri: std::sync::Arc<LineIndex>,
-    ci: std::sync::Arc<LineIndex>,
+    /// Prefix sums over custom row heights / column widths, cached per document revision.
+    ri: Arc<LineIndex>,
+    ci: Arc<LineIndex>,
     /// Page Layout view: cells sit on pages (`scroll` is then in page-layout units).
     pub paper: Option<Arc<gridcraft_engine::paper::PageGrid>>,
 }
 
 impl Geo {
+    /// The uncached constructor: builds the line geometry and wraps it. Per-frame callers go
+    /// through `GridState::line_geo_for` and [`Geo::new_with_lines`] instead.
     pub fn new(sh: &Sheet, rect: Rect, scroll: egui::Vec2) -> Geo {
+        let (ri, ci, row_outline, col_outline) = LineGeo::of(sh).into_arcs();
+        Geo::new_with_lines(sh, rect, scroll, ri, ci, row_outline, col_outline)
+    }
+    /// The geometry from line geometry already built (the per-revision cache holds it across
+    /// frames): prefix sums over custom row heights and column widths and the outline axes.
+    pub fn new_with_lines(
+        sh: &Sheet,
+        rect: Rect,
+        scroll: egui::Vec2,
+        ri: Arc<LineIndex>,
+        ci: Arc<LineIndex>,
+        row_outline: Arc<crate::outline::Axis>,
+        col_outline: Arc<crate::outline::Axis>,
+    ) -> Geo {
         let zoom = (sh.zoom as f32 / 100.0).clamp(0.1, 4.0);
         let z = zoom * DISPLAY_SCALE;
         let header_h = if sh.show_headings { (COL_HEADER_H * zoom.max(0.75)).round() } else { 0.0 };
-        let ri = std::sync::Arc::new(LineIndex::new(&sh.rows, sh.default_row_height, MAX_ROWS));
-        let ci = std::sync::Arc::new(LineIndex::new(&sh.cols, sh.default_col_width, MAX_COLS));
         let last_row = ri.at((scroll.y + rect.height() / z) as f64 + 200.0) + 1;
         let digits = (last_row as f32).log10().floor() as i32 + 1;
         let header_w = if sh.show_headings { ((digits.max(2) as f32 * 7.0 + 14.0) * zoom.max(0.75)).round() } else { 0.0 };
         let (fr, fc) = sh.freeze.unwrap_or((0, 0));
         let frozen_w = (ci.start(fc) as f32) * z;
         let frozen_h = (ri.start(fr) as f32) * z;
-        let row_outline = Arc::new(crate::outline::Axis::new(&sh.rows));
-        let col_outline = Arc::new(crate::outline::Axis::new(&sh.cols));
         let mut band_w = crate::outline::band(row_outline.levels, zoom);
         let mut band_h = crate::outline::band(col_outline.levels, zoom);
         // Without headings the level buttons still need a corner to sit in.
@@ -253,7 +314,22 @@ impl Geo {
     /// Page Layout view geometry: `rect` excludes the rulers; cells are drawn at the print scale
     /// on pages laid out by `grid`; frozen panes don't apply (as in Excel).
     pub fn paged(sh: &Sheet, rect: Rect, scroll: egui::Vec2, grid: Arc<gridcraft_engine::paper::PageGrid>) -> Geo {
-        let mut g = Geo::new(sh, rect, scroll);
+        let (ri, ci, row_outline, col_outline) = LineGeo::of(sh).into_arcs();
+        Geo::paged_with_lines(sh, rect, scroll, grid, ri, ci, row_outline, col_outline)
+    }
+    /// [`Geo::paged`] from line geometry already built (the per-revision cache).
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_with_lines(
+        sh: &Sheet,
+        rect: Rect,
+        scroll: egui::Vec2,
+        grid: Arc<gridcraft_engine::paper::PageGrid>,
+        ri: Arc<LineIndex>,
+        ci: Arc<LineIndex>,
+        row_outline: Arc<crate::outline::Axis>,
+        col_outline: Arc<crate::outline::Axis>,
+    ) -> Geo {
+        let mut g = Geo::new_with_lines(sh, rect, scroll, ri, ci, row_outline, col_outline);
         let zoom = (sh.zoom as f32 / 100.0).clamp(0.1, 4.0);
         g.z = zoom * DISPLAY_SCALE * grid.scale.clamp(0.1, 4.0);
         (g.fr, g.fc, g.frozen_w, g.frozen_h) = (0, 0, 0.0, 0.0);
@@ -543,6 +619,8 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     let Some(sh) = wb.sheet(si) else { return };
     let sel = d.selection.clone();
     let place = (d.uid, si);
+    // The line geometry changes only with the document: the revision is part of its cache key.
+    let line_key = (d.uid, d.revision, si);
     let mut view = app.view();
     // Page Layout view: pages on a desk, rulers above and left of the headings.
     let paper = sh.view == gridcraft_engine::model::SheetViewMode::PageLayout;
@@ -554,14 +632,18 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         Rect::from_min_max(pos2((rect.left() + ruler).min(rect.right()), (rect.top() + ruler).min(rect.bottom())), rect.max)
     };
     let make_geo = |app: &mut SheetApp, scroll: egui::Vec2| -> Geo {
+        let lines = app.grid.line_geo_for(line_key, sh);
         if paper {
-            let probe = Geo::new(sh, grid_rect, scroll);
+            let (ri, ci, row_outline, col_outline) = lines.clone().into_arcs();
+            let probe = Geo::new_with_lines(sh, grid_rect, scroll, ri, ci, row_outline, col_outline);
             if let Some(g) = crate::paper_view::grid_for(app, &wb, si, sh, probe.cells.size(), scroll) {
                 let g = crate::paper_view::with_dragged_margin(app, &wb, si, g);
-                return Geo::paged(sh, grid_rect, scroll, g);
+                let (ri, ci, row_outline, col_outline) = lines.into_arcs();
+                return Geo::paged_with_lines(sh, grid_rect, scroll, g, ri, ci, row_outline, col_outline);
             }
         }
-        Geo::new(sh, rect, scroll)
+        let (ri, ci, row_outline, col_outline) = lines.into_arcs();
+        Geo::new_with_lines(sh, rect, scroll, ri, ci, row_outline, col_outline)
     };
     // Scrolling.
     let (scroll_delta, zoom_delta, modifiers, now) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers, i.time));
@@ -4217,5 +4299,40 @@ mod outline_band_tests {
         let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 600.0));
         assert!(outline_bands(Rect::from_min_max(pos2(900.0, 0.0), pos2(950.0, 20.0)), 2.0, clip).is_empty());
         assert!(outline_bands(Rect::from_min_max(pos2(f32::NAN, 0.0), pos2(1.0, 1.0)), 2.0, clip).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod line_geo_tests {
+    use super::*;
+
+    #[test]
+    fn line_geometry_is_reused_until_the_revision_changes() {
+        let mut sh = Sheet::new("S");
+        let mut grid = GridState::default();
+        let key = (7, 1, 0);
+        let first = grid.line_geo_for(key, &sh);
+        let second = grid.line_geo_for(key, &sh);
+        assert!(Arc::ptr_eq(&first.ri, &second.ri), "the same revision reuses the row prefix sums");
+        assert!(Arc::ptr_eq(&first.ci, &second.ci), "the same revision reuses the column prefix sums");
+        assert!(Arc::ptr_eq(&first.row_outline, &second.row_outline));
+        assert!(Arc::ptr_eq(&first.col_outline, &second.col_outline));
+        // Scrolling, selecting and zooming leave the revision alone: the cached lines survive them.
+        let scrolled = grid.line_geo_for(key, &sh);
+        assert!(Arc::ptr_eq(&first.ri, &scrolled.ri));
+
+        // A row height is an edit: the revision moves, so the geometry is rebuilt from the new map.
+        let before = first.ri.start(2);
+        sh.rows.entry(1).or_default().size = Some(60.0);
+        let after = grid.line_geo_for((7, 2, 0), &sh);
+        assert!(!Arc::ptr_eq(&first.ri, &after.ri), "a new revision rebuilds the row prefix sums");
+        assert!(after.ri.start(2) > before, "the added height shifts the rows below it");
+        assert_eq!(after.ri.start(2), before + 40.0);
+
+        // The rebuilt geometry is cached in turn, and another sheet is a different key.
+        let again = grid.line_geo_for((7, 2, 0), &sh);
+        assert!(Arc::ptr_eq(&after.ri, &again.ri));
+        let other_sheet = grid.line_geo_for((7, 2, 1), &sh);
+        assert!(!Arc::ptr_eq(&after.ri, &other_sheet.ri), "the key tells sheets apart");
     }
 }
