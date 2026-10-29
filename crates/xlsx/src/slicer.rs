@@ -1228,13 +1228,16 @@ impl SlicerWriter {
         let mut written_timelines: HashSet<String> = HashSet::new();
         // Slicer caches: a widget whose PivotTable lost its cache is not written.
         for cache in &self.caches {
-            let Some(cache_id) = cache.pivots.iter().find_map(|p| pivots.cache_id(wb, p)) else { continue };
-            let Some(values) = pivots.field_items(cache_id, &cache.field) else { continue };
             let widgets: Vec<&OutSlicer> = self.slicers.iter().filter(|s| s.widget.cache.eq_ignore_ascii_case(&cache.name)).collect();
             if widgets.is_empty() {
                 continue;
             }
             written_caches.insert(cache.name.to_lowercase());
+            // The cache and its item list when the PivotTable's cache exists and itemizes the field;
+            // otherwise a cache with only its PivotTable list, which the format allows and which
+            // shows every tile (a view must never name a cache the package does not have).
+            let cache_id = cache.pivots.iter().find_map(|p| pivots.cache_id(wb, p));
+            let values = cache_id.and_then(|id| pivots.field_items(id, &cache.field));
             let selected: HashMap<String, bool> = cache.items.iter().map(|i| (i.value.key(), i.selected)).collect();
             let mut part_xml = format!(
                 "{XML_DECL}<slicerCacheDefinition xmlns=\"{NS_X14}\" name=\"{}\" sourceName=\"{}\"><pivotTables>",
@@ -1244,24 +1247,28 @@ impl SlicerWriter {
             for p in &cache.pivots {
                 let _ = write!(part_xml, "<pivotTable tabId=\"{}\" name=\"{}\"/>", self.tab_id(wb, p), esc_attr(p));
             }
-            part_xml.push_str("</pivotTables><data>");
-            if values.is_empty() {
-                let _ = write!(part_xml, "<tabular pivotCacheId=\"{cache_id}\"/>");
-            } else {
-                let _ = write!(part_xml, "<tabular pivotCacheId=\"{cache_id}\"><items count=\"{}\">", values.len());
-                for (x, v) in values.iter().enumerate() {
-                    // A value added to the source since the slicer was made is selected, as Excel
-                    // selects a new item; only a tile the model marks off is written off.
-                    let on = selected.get(&SlicerValue::from_value(v).key()).copied().unwrap_or(true);
-                    if on {
-                        let _ = write!(part_xml, "<i x=\"{x}\" s=\"1\"/>");
-                    } else {
-                        let _ = write!(part_xml, "<i x=\"{x}\"/>");
+            part_xml.push_str("</pivotTables>");
+            if let (Some(cache_id), Some(values)) = (cache_id, values) {
+                part_xml.push_str("<data>");
+                if values.is_empty() {
+                    let _ = write!(part_xml, "<tabular pivotCacheId=\"{cache_id}\"/>");
+                } else {
+                    let _ = write!(part_xml, "<tabular pivotCacheId=\"{cache_id}\"><items count=\"{}\">", values.len());
+                    for (x, v) in values.iter().enumerate() {
+                        // A value added to the source since the slicer was made is selected, as Excel
+                        // selects a new item; only a tile the model marks off is written off.
+                        let on = selected.get(&SlicerValue::from_value(v).key()).copied().unwrap_or(true);
+                        if on {
+                            let _ = write!(part_xml, "<i x=\"{x}\" s=\"1\"/>");
+                        } else {
+                            let _ = write!(part_xml, "<i x=\"{x}\"/>");
+                        }
                     }
+                    part_xml.push_str("</items></tabular>");
                 }
-                part_xml.push_str("</items></tabular>");
+                part_xml.push_str("</data>");
             }
-            part_xml.push_str("</data></slicerCacheDefinition>");
+            part_xml.push_str("</slicerCacheDefinition>");
             out.part(&cache.part, Some(CT_SLICER_CACHE), part_xml.into_bytes());
             let rid = wb_rels.add_uri(REL_SLICER_CACHE, &from_workbook(&cache.part));
             let _ = write!(slicer_ext, "<x14:slicerCache r:id=\"{rid}\"/>");
@@ -1303,7 +1310,13 @@ impl SlicerWriter {
         }
         for tl in &self.timelines {
             let pivot_names = tl.widget.pivot_tables.clone();
-            let Some(pivot_cache_id) = pivot_names.iter().find_map(|p| pivots.cache_id(wb, p)) else { continue };
+            // The cache id the pivot cache was written with; a timeline read from a file keeps the
+            // id it came with as the fallback.
+            let Some(pivot_cache_id) =
+                pivot_names.iter().find_map(|p| pivots.cache_id(wb, p)).or(Some(tl.widget.pivot_cache_id).filter(|id| *id > 0))
+            else {
+                continue;
+            };
             let mut cache_xml = format!(
                 "{XML_DECL}<timelineCacheDefinition xmlns=\"{NS_X15}\" name=\"{}\" sourceName=\"{}\"><pivotTables>",
                 esc_attr(&tl.widget.cache),
