@@ -1,6 +1,6 @@
 # Localization parity
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (PDF export embeds subset TrueType fonts, so non-Latin text exports) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (three Japanese and two Vietnamese rows that earlier edits left behind are one row each, and the shipped-language line is one list measured from the catalogs; the label counts in the table are due a re-measure) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Per-language status against Excel, which ships its UI in dozens of languages (Windows language
 packs cover 100+), with localized function names, argument separators, number and date formats,
@@ -80,18 +80,14 @@ separators, number/date formats, machine translation with agent review, and scri
 | French | fr | 0 (0%) | no | Latin: yes | no | none | 6–10 h |
 | Portuguese | pt-BR | 943 (~43%) | dialogs and tooltips (dialogs take effect with #669) | Latin: yes | no | menus, File view, dialogs | 2–4 h |
 | Indonesian | id | 0 (0%) | no | Latin: yes | no | none | 5–8 h |
-| Japanese | ja | 268 (~12%) | no | CJK system-font fallback; IME unverified; PDF embeds a subset (M14); no furigana display, but phonetic runs (ふりがな) survive an XLSX open + save | no | menus only | 8–12 h |
 | Japanese | ja | 943 (~43%) | dialogs and messages | CJK system-font fallback; IME unverified; PDF embeds a subset (M14); no furigana display | no | menus, File view, dialogs, messages | 3–5 h |
-| Japanese | ja | 268 (~12%) | no | CJK system-font fallback; the theme's East Asian typeface (`<a:ea>`) survives open + save (rendering does not use it yet); IME unverified; no furigana display | no | menus only | 8–12 h |
 | German | de | 266 (~12%) | no | Latin: yes | no | menus only | 4–8 h |
 | Italian | it | 971 (~44%) | dialogs, tooltips, pivot pane | Latin: yes | no | menus, File view, dialogs, pivot pane | 3–5 h |
 | Korean | ko | 266 (~12%) | no | Hangul via the CJK fallback; IME unverified; PDF embeds a subset (M14) | no | menus only | 6–10 h |
-| Vietnamese | vi | 0 (0%) | no | Latin with stacked diacritics: unverified | no | none | 6–10 h |
 | Turkish | tr | 382 (~17%) | no | Latin: yes | yes | menus only | 4–8 h |
-
-Other shipped languages: Russian (ru), German (de), Czech (cs), French (fr) and Turkish (tr), menus only.
 | Vietnamese | vi | 398 (~18%) | no | Latin with stacked diacritics: unverified | no | menus, File view | 5–9 h |
-Other shipped languages: Russian (ru) and German (de), 266 labels each (~12%), menus only; Dutch (nl), 518 labels (~24%): ribbon, context menus, File view, dialog titles and the Options page.
+
+Other shipped languages, measured from the catalogs on 10-30 (entries, against a ~1,000-entry reference set): Romanian 991, Italian and Greek 965, Ukrainian and Polish 964, Japanese 963, Portuguese 959 — menus, File view, dialogs and messages; Czech 532, Dutch 513, Spanish 456, German 439, French 427, Serbian and Russian 426, Korean 425, Chinese 421, Vietnamese 400, Turkish 400 — menus and part of the dialogs.
 
 **Total:** catalog work 10–20 h + languages 92–144 h ≈ **100–165 h**. Parallelizes almost fully
 once the catalog covers dialogs and commands.

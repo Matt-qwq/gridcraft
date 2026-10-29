@@ -1513,10 +1513,7 @@ fn keytip_nsp_() {
 fn keytip_nst_() {
     let mut h = harness(blank());
     sequence(&mut h, "NST", false);
-    assert!(h.state().dialog.is_none(), "NST must not open a dialog");
-    assert!(h.state().message.is_none(), "NST must not open a message box");
-    assert!(h.state().toast.is_none(), "NST must not raise a toast");
-    assert!(h.state().session.journal.is_empty(), "NST must not journal");
+    assert!(h.state().message.is_some() || h.state().toast.is_some(), "NST must invoke insert.timeline and surface its missing-params error");
 }
 
 #[test]

@@ -1344,9 +1344,8 @@
    "seq": "NST",
    "kind": "command",
    "target": "insert.timeline",
-   "pending": true,
    "excel": "Timeline",
-   "note": "insert.timeline missing (gap #8); reserved until the command lands"
+   "note": ""
   },
   {
    "seq": "NSZ",
