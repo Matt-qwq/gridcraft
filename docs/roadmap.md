@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (XLSX pass-through landed: gate #3 met, sliced off wave 1; beta total ~150–229) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (key tips across the whole ribbon, keyboard context menus, shortcut audit: gate #9 met, beta total ~135–210) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -28,7 +28,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
 | **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 25–35 | Longest gate; start early in parallel with 1. |
 | **2b** | All-script text: CJK fallback confirmation, Arabic/Devanagari/Thai shaping, bidi, non-Latin PDF | #5 | 12–20 | Parallel with 2. |
-| **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 12–20 | Parallel with 2; UI-heavy but small. |
+| **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
 | **3** | `.xls` import and password-protected workbooks | #7 | 28–42 | Independent and long; start in parallel with 1–2 once the base is stable. |
 | **3b** | PivotTables: slicers, PivotCharts, Excel verification | #8 | 20–30 | After #1's Excel loop exists; needs #7's Excel-side practice less than it seems. |
 | **4** | **Beta exit**: stability soak, all gates green, full `cargo xtask ci`, docs, release, corpus re-run | all | 8–12 | After 0–3b. |
@@ -74,9 +74,9 @@ and edge features. Each gate links its gap.
 | Calculation correctness bugs closed; iterative calculation | #6 | **open** | 10–15 |
 | `.xls` import, password-protected workbooks | #7 | **open** | 28–42 |
 | PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
-| Keyboard: key tips, shortcut audit, context menus | #9 | **open** | 12–20 |
+| Keyboard: key tips, shortcut audit, context menus | #9 | **met 10-29** (417 sequences, keyboard context menus, six shortcuts; the Menu key itself is blocked upstream) | 0–6 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #4–#10 (pass-through #3 met) | **~130–199 + 20–30 base = ~150–229** |
+| **Total** | | gates #1, #4–#8, #10 (pass-through #3 and keyboard #9 met) | **~118–183 + 20–30 base = ~138–213** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).

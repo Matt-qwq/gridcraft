@@ -212,11 +212,24 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 20–30 h for beta (25–40 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
-- Next/previous sheet navigation now skips Hidden and VeryHidden worksheets without activating a
-  hidden sheet at the workbook boundary. Other keyboard gaps below remain.
-- **Evidence:** #33, #49 (key tips: initial Home-tab support landed in #43 on 10-10, the rest of the ribbon not yet), #110, #28 (selection),
-  59 command shortcuts vs Excel's 200+.
-- **Estimate:** 12–20 h. [ui-parity.md](ui-parity.md)
+- **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
+  and button (contextual tabs switch with their context), served by one JSON source of truth
+  (`crates/ui-egui/src/keytips/keytips.json`) and a generated table kept in step by
+  `cargo xtask keytips --check`. `Alt` shows the badges, a typed sequence activates, `Esc` cancels
+  at any depth. Tests enforce sequence length ≤ 4, per-scope uniqueness, no shadowing (two-way
+  prefix), tab reachability, that every badge resolves to a catalog command, and one end-to-end
+  test per sequence (419). `Shift+F10` opens the context menu at the selection for cells and for
+  row/column headers, navigable with arrows/Home/End/Enter/Space/Esc; the grid keeps focus and the
+  selection, and Space cannot start an edit behind the menu. Six Excel shortcuts were added on
+  commands that already existed (`Alt+;`, `Ctrl+Shift+O`, `Ctrl+F2`, `Ctrl+Shift+F12`, `Alt+F5`,
+  `Ctrl+Alt+F5`). The full Excel → command-id → status audit is in [ui-parity.md](ui-parity.md).
+- **Still missing:** the Menu key itself (egui-winit 0.36 drops `KeyCode::ContextMenu` before the app
+  and egui has no `Key` variant for it), context menus for charts/pictures/shapes from the keyboard,
+  QAT/title bar/Backstage badges, the View tab's two combo boxes, and per-item badges in menus whose
+  items share one command id. Remaining Excel shortcuts map to features we do not have yet (Quick
+  Analysis, extend mode, pane cycling, sheet groups, Paste Name, Repeat, outline symbols, formula-bar
+  expand, window keys).
+- **Estimate:** 0–6 h of the 12–20 left (the missing extras above). [ui-parity.md](ui-parity.md)
 
 ### 10. Crashes and freezes reported from the field (S)
 - **Evidence:** #120 (Intel UHD crash on Windows), #117 (error on close, macOS), #166 (freeze opening
