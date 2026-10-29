@@ -36,6 +36,11 @@ use serde::{Deserialize, Serialize};
 use crate::cell::{Cell, Formula};
 use crate::style::StyleId;
 
+/// How many column runs a packed walk follows before it builds cells through `iter_range`
+/// instead. Two or three runs is an ordinary insert-and-delete history; past this, repeating the
+/// per-row walk once per run would cost more than one `Cell` per cell.
+const MAX_PACKED_COLUMN_SEGMENTS: usize = 8;
+
 /// Rows per band: one undo snapshot shares bands this size, so an edit copies at most 64 rows.
 const BAND: u32 = 64;
 
@@ -2661,29 +2666,16 @@ impl CellStore {
     /// Reading a range through `iter_range` builds a `Cell` an iteration — a `Value`, a style, and
     /// two `Arc` bumps — which costs ~77 ns a cell against ~2 ns for the numbers themselves. Summing
     /// a million-cell column spent all of its 154 ms there.
+    ///
+    /// Columns are walked from the column map's runs, so a column-mapped sheet stays on this path:
+    /// `segments_in` hands out clipped, physical-contiguous, logically ordered runs — one when the
+    /// map is identity — and a run's logical column is `logical + (physical - first)`.
     pub fn visit_packed(&self, r: RangeRef, f: &mut dyn FnMut(CellRef, Option<Packed<'_>>) -> bool) -> bool {
-        if !self.col_map.is_identity() {
-            // A column map cannot be walked with the packed column words directly without a
-            // second physical→logical sweep; build the values once instead. Structural edits are
-            // rare and this path stays on the side of correctness.
-            for (at, cell) in self.iter_range(r) {
-                let packed = if cell.formula.is_some() {
-                    None
-                } else {
-                    match &cell.value {
-                        gridcraft_core::Value::Number(n) => Some(Packed::Number(*n)),
-                        gridcraft_core::Value::Text(t) => Some(Packed::Text(t.as_ref())),
-                        gridcraft_core::Value::Bool(b) => Some(Packed::Bool(*b)),
-                        gridcraft_core::Value::Error(e) => Some(Packed::Error(*e)),
-                        gridcraft_core::Value::Array(_) => None,
-                        gridcraft_core::Value::Empty => continue,
-                    }
-                };
-                if !f(at, packed) {
-                    return false;
-                }
-            }
-            return true;
+        let col_runs = self.col_map.segments_in(r.start.col, r.end.col);
+        // A sheet with many column edits would repeat the row walk once per column run; past a
+        // handful of runs build each cell once instead, so the work stays bounded by the range.
+        if col_runs.len() > MAX_PACKED_COLUMN_SEGMENTS {
+            return self.visit_packed_by_iter(r, f);
         }
         let (r0, r1) = (r.start.row, r.end.row);
         let mut current_key = None;
@@ -2702,57 +2694,105 @@ impl CellStore {
                 }
                 let Some(band) = current_band.as_ref() else { continue };
                 let Some(row) = band.row(physical % BAND) else { continue };
-                // Start at the first stored column of the range and stop past its last, so a
-                // narrow read of a wide row costs the cells it asks for, not the row's width.
-                let lo = r.start.col.max(row.first);
-                let hi = r.end.col.min(row.first.saturating_add(row.columns()).saturating_sub(1));
-                if lo > hi {
-                    continue;
-                }
-                let start_slot = (lo - row.first) as usize;
-                // A cell that carries a formula stores the value the file cached, which is not
-                // its value now: the evaluator owns it, so hand it over as `None`.
-                let formulas = row.extras.as_ref().map(|e| e.formulas.as_slice()).filter(|f| !f.is_empty());
-                let mut i = row.rank_before(band, lo);
-                let mut kinds = RunCursor::new(row.kind_runs(band), u16::from(EMPTY));
-                'words: for (word, bits) in row.bits(band).iter().enumerate().skip(start_slot / 64) {
-                    let mut w = *bits;
-                    if word == start_slot / 64 {
-                        w &= !((1u64 << (start_slot % 64)) - 1);
+                for columns in &col_runs {
+                    let last = columns.physical.saturating_add(columns.len).saturating_sub(1);
+                    if columns.physical > last {
+                        continue;
                     }
-                    while w != 0 {
-                        let bit = w.trailing_zeros();
-                        w &= w - 1;
-                        let index = i;
-                        i += 1;
-                        let col = row.first + word as u32 * 64 + bit;
-                        if col > hi {
-                            // Past this row's last wanted column; later rows may still be inside.
-                            break 'words;
-                        }
-                        let has_formula = formulas.is_some_and(|f| f.binary_search_by_key(&col, |(c, _)| *c).is_ok());
-                        let payload = row.payload_at(band, index);
-                        let packed = if has_formula {
-                            None
-                        } else {
-                            match kinds.at(index) as u8 {
-                                // An empty slot is not a stored value (no value, a style at most),
-                                // and `iter_range` does not hand one out either.
-                                EMPTY => continue,
-                                NUMBER => Some(Packed::Number(band.number(payload))),
-                                NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(band, index)))),
-                                TEXT => band.texts.get(payload as usize).map(|t| Packed::Text(t)),
-                                TEXT_WIDE => band.texts.get(row.wide_at(band, index) as usize).map(|t| Packed::Text(t)),
-                                BOOL => Some(Packed::Bool(payload != 0)),
-                                ERROR => Some(Packed::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value))),
-                                _ => None,
-                            }
-                        };
-                        if !f(CellRef::new(at_row, col), packed) {
-                            return false;
-                        }
+                    if !self.visit_packed_row(band, row, at_row, columns.logical, columns.physical, last, f) {
+                        return false;
                     }
                 }
+            }
+        }
+        true
+    }
+
+    /// Walks the cells of one stored row that fall in the physical column run `[first, last]`,
+    /// handing each out at its logical column. Returns false when `f` stopped the walk.
+    #[allow(clippy::too_many_arguments)]
+    fn visit_packed_row(
+        &self,
+        band: &Band,
+        row: &BandRow,
+        at_row: u32,
+        logical: u32,
+        first: u32,
+        last: u32,
+        f: &mut dyn FnMut(CellRef, Option<Packed<'_>>) -> bool,
+    ) -> bool {
+        // Start at the first stored column of the range and stop past its last, so a narrow read
+        // of a wide row costs the cells it asks for, not the row's width.
+        let lo = first.max(row.first);
+        let hi = last.min(row.first.saturating_add(row.columns()).saturating_sub(1));
+        if lo > hi {
+            return true;
+        }
+        let start_slot = (lo - row.first) as usize;
+        // A cell that carries a formula stores the value the file cached, which is not its value
+        // now: the evaluator owns it, so hand it over as `None`.
+        let formulas = row.extras.as_ref().map(|e| e.formulas.as_slice()).filter(|f| !f.is_empty());
+        let mut i = row.rank_before(band, lo);
+        let mut kinds = RunCursor::new(row.kind_runs(band), u16::from(EMPTY));
+        'words: for (word, bits) in row.bits(band).iter().enumerate().skip(start_slot / 64) {
+            let mut w = *bits;
+            if word == start_slot / 64 {
+                w &= !((1u64 << (start_slot % 64)) - 1);
+            }
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                w &= w - 1;
+                let index = i;
+                i += 1;
+                let col = row.first + word as u32 * 64 + bit;
+                if col > hi {
+                    // Past this run's last wanted column; the next column run may still be inside.
+                    break 'words;
+                }
+                let has_formula = formulas.is_some_and(|f| f.binary_search_by_key(&col, |(c, _)| *c).is_ok());
+                let payload = row.payload_at(band, index);
+                let packed = if has_formula {
+                    None
+                } else {
+                    match kinds.at(index) as u8 {
+                        // An empty slot is not a stored value (no value, a style at most),
+                        // and `iter_range` does not hand one out either.
+                        EMPTY => continue,
+                        NUMBER => Some(Packed::Number(band.number(payload))),
+                        NUMBER_WIDE => Some(Packed::Number(f64::from_bits(row.wide_at(band, index)))),
+                        TEXT => band.texts.get(payload as usize).map(|t| Packed::Text(t)),
+                        TEXT_WIDE => band.texts.get(row.wide_at(band, index) as usize).map(|t| Packed::Text(t)),
+                        BOOL => Some(Packed::Bool(payload != 0)),
+                        ERROR => Some(Packed::Error(*ERRORS.get(payload as usize).unwrap_or(&CellError::Value))),
+                        _ => None,
+                    }
+                };
+                if !f(CellRef::new(at_row, logical.saturating_add(col - first)), packed) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The packed walk built from `iter_range` cells, for a column map with more runs than
+    /// [`MAX_PACKED_COLUMN_SEGMENTS`]: one `Cell` per cell, but no repeated row walk.
+    fn visit_packed_by_iter(&self, r: RangeRef, f: &mut dyn FnMut(CellRef, Option<Packed<'_>>) -> bool) -> bool {
+        for (at, cell) in self.iter_range(r) {
+            let packed = if cell.formula.is_some() {
+                None
+            } else {
+                match &cell.value {
+                    gridcraft_core::Value::Number(n) => Some(Packed::Number(*n)),
+                    gridcraft_core::Value::Text(t) => Some(Packed::Text(t.as_ref())),
+                    gridcraft_core::Value::Bool(b) => Some(Packed::Bool(*b)),
+                    gridcraft_core::Value::Error(e) => Some(Packed::Error(*e)),
+                    gridcraft_core::Value::Array(_) => None,
+                    gridcraft_core::Value::Empty => continue,
+                }
+            };
+            if !f(at, packed) {
+                return false;
             }
         }
         true
@@ -3456,6 +3496,104 @@ mod packed_tests {
             assert!(done);
             assert_eq!(got, want, "range {}", range.a1());
         }
+    }
+
+    /// The same equality on a mapped sheet: a column-mapped store walks the column map's runs, so
+    /// the cells come out at their logical columns and the whole range stays row-major.
+    #[test]
+    fn packed_walk_matches_iter_range_on_a_column_mapped_sheet() {
+        for (rows, cols) in [(0u32, 2u32), (3, 0), (3, 2)] {
+            let mut s = store();
+            if rows > 0 {
+                s.shift_rows(3, i64::from(rows));
+            }
+            if cols > 0 {
+                s.shift_cols(1, i64::from(cols));
+            }
+            let mut ranges = vec![
+                // A single cell, then a range that crosses the column map's segment boundary.
+                (0u32, 0u32, 0u32, 0u32),
+                (0, 0, 0, 2 + cols),
+                // A whole row, and a range that starts and ends inside one segment.
+                (0, 0, 0, u32::MAX),
+                (0, 3 + cols, 64 + cols, 64 + cols),
+                // A range that spans both axes' segment boundaries, and one past the last row.
+                (0, 400, 0, 200 + cols),
+                (rows, rows + 200, 0, 100 + cols),
+                (0, 400, 71 + cols, 200 + cols),
+            ];
+            // The inserted columns themselves hold nothing.
+            if cols > 0 {
+                ranges.push((0, 0, 1, cols));
+            }
+            for (r0, r1, c0, c1) in ranges {
+                let range = RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1));
+                let want: Vec<(CellRef, f64)> = s.iter_range(range).filter_map(|(at, cell)| cell.value.as_f64().map(|n| (at, n))).collect();
+                let mut got: Vec<(CellRef, f64)> = Vec::new();
+                let done = s.visit_packed(range, &mut |at, packed| {
+                    match packed {
+                        Some(Packed::Number(n)) => got.push((at, n)),
+                        other => panic!("{} came out as {other:?}", at.a1()),
+                    }
+                    true
+                });
+                assert!(done);
+                assert_eq!(got, want, "range {} with {rows} rows and {cols} cols inserted", range.a1());
+                assert!(got.windows(2).all(|w| (w[0].0.row, w[0].0.col) < (w[1].0.row, w[1].0.col)), "range {} is not row-major", range.a1());
+            }
+        }
+    }
+
+    /// The value-less slot a `BandBatch` row can hold must stay invisible on a column-mapped
+    /// sheet too: it is neither a number nor a formula the evaluator owns.
+    #[test]
+    fn packed_walk_on_a_column_map_skips_an_empty_slot() {
+        let mut batch = BandBatch::new();
+        let mut cells = vec![(3u32, plain(1)), (4, Cell { value: Value::Empty, formula: None, style: StyleId(0) }), (5, plain(3))];
+        batch.set_row(9, &mut cells);
+        let mut s = CellStore::new();
+        s.insert_batch(batch);
+        s.shift_cols(1, 2);
+        let range = RangeRef::new(CellRef::new(9, 0), CellRef::new(9, 10));
+        let want: Vec<(CellRef, f64)> = s.iter_range(range).filter_map(|(at, c)| c.value.as_f64().map(|n| (at, n))).collect();
+        let mut got = Vec::new();
+        let mut needs_host = false;
+        s.visit_packed(range, &mut |at, packed| {
+            match packed {
+                Some(Packed::Number(n)) => got.push((at, n)),
+                None => needs_host = true,
+                other => panic!("{} came out as {other:?}", at.a1()),
+            }
+            true
+        });
+        assert_eq!(got, want);
+        assert!(!needs_host, "a value-less slot must not look like a formula");
+    }
+
+    /// Past the column-run cap the walk builds cells through `iter_range` instead of repeating
+    /// the row walk once per run; the answer must not change.
+    #[test]
+    fn packed_walk_falls_back_past_the_segment_cap() {
+        let mut s = CellStore::new();
+        for col in 0..40u32 {
+            s.set(CellRef::new(2, col), plain(col + 1));
+        }
+        for at in [1u32, 5, 9, 13, 17, 21, 25, 29, 33] {
+            s.shift_cols(at, 1);
+        }
+        assert!(s.col_map.segments_in(0, u32::MAX).len() > MAX_PACKED_COLUMN_SEGMENTS, "the fallback is the path under test");
+        let range = RangeRef::new(CellRef::new(2, 0), CellRef::new(2, u32::MAX));
+        let want: Vec<(CellRef, f64)> = s.iter_range(range).filter_map(|(at, cell)| cell.value.as_f64().map(|n| (at, n))).collect();
+        let mut got: Vec<(CellRef, f64)> = Vec::new();
+        let done = s.visit_packed(range, &mut |at, packed| {
+            match packed {
+                Some(Packed::Number(n)) => got.push((at, n)),
+                other => panic!("{} came out as {other:?}", at.a1()),
+            }
+            true
+        });
+        assert!(done);
+        assert_eq!(got, want);
     }
 }
 
