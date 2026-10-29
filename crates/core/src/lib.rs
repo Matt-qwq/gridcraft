@@ -1,5 +1,6 @@
 //! GridCraft core types: cell addresses, values and Excel's coercion rules, error values,
-//! date serials and typed-input parsing. No dependencies on the rest of the workspace.
+//! date serials, typed-input parsing, and the text engine (bidi + shaping) shared by the grid and
+//! the PDF writer. No dependencies on the rest of the workspace.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -8,6 +9,7 @@ pub mod color;
 pub mod date;
 pub mod fonts;
 pub mod parse;
+pub mod text;
 pub mod value;
 
 pub use addr::{
