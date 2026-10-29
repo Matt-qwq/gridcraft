@@ -288,10 +288,13 @@ struct Pending {
 impl PivotWriter {
     /// Writes the caches of a sheet's PivotTables and adds the sheet's relationships to its
     /// PivotTable parts. Pivots whose source can't be resolved are not written.
-    pub fn add_sheet(&mut self, wb: &Workbook, si: usize, out: &mut Out, rels: &mut Rels) {
+    pub fn add_sheet(&mut self, wb: &Workbook, si: usize, out: &mut Out, rels: &mut Rels, slicers: &crate::slicer::SlicerWriter) {
         let Some(sheet) = wb.sheet(si) else { return };
         for (idx, pt) in sheet.pivots.iter().enumerate() {
-            let Some(cache) = build_cache(wb, pt, si) else { continue };
+            // Fields a modelled slicer shows are itemized in the cache so its `<i x>` can point at
+            // them; the slicer's field is checked before the sheet loop (`SlicerWriter::new`).
+            let fields = slicers.fields_for_pivot(&pt.name);
+            let Some(cache) = build_cache(wb, pt, si, &fields) else { continue };
             let n = self.caches.len() as u32 + 1;
             let cache_part = format!("xl/pivotCache/pivotCacheDefinition{n}.xml");
             let mut cr = Rels::default();
@@ -357,8 +360,25 @@ impl PivotWriter {
         v
     }
 
-    /// Writes the PivotTable parts. `fmt_id` maps a number format code to its styles id.
-    pub fn finish(self, wb: &Workbook, out: &mut Out, fmt_id: &dyn Fn(&str) -> Option<u32>) {
+    /// The `cacheId` of the cache written for the PivotTable `pivot` (case-insensitive name), or
+    /// `None` when that PivotTable's cache is not written (its source can't be resolved).
+    pub fn cache_id(&self, wb: &Workbook, pivot: &str) -> Option<u32> {
+        self.pending.iter().find(|p| wb.sheet(p.sheet).and_then(|s| s.pivots.get(p.idx)).is_some_and(|pt| same(&pt.name, pivot))).map(|p| p.cache_id)
+    }
+
+    /// The shared items written for the cache `cache_id`'s field (in the order `<i x>` indexes
+    /// them). `None` when the field is gone or was not itemized.
+    pub fn field_items(&self, cache_id: u32, field: &str) -> Option<Vec<Value>> {
+        let p = self.pending.iter().find(|p| p.cache_id == cache_id)?;
+        let f = p.cache.fields.iter().find(|f| f.col.is_some() && same(&f.name, field) && f.itemized)?;
+        Some(f.items.clone())
+    }
+
+    /// Writes the PivotTable parts. `fmt_id` maps a number format code to its styles id; `slicers`
+    /// names the modelled slicer caches that filter each PivotTable, written as its extension and
+    /// its own relationship (the same contract as the kept path: the source extension was dropped
+    /// on read when the cache was modelled, so exactly one is written).
+    pub fn finish(self, wb: &Workbook, out: &mut Out, fmt_id: &dyn Fn(&str) -> Option<u32>, slicers: &[crate::slicer::CacheLink]) {
         for p in self.pending {
             let Some(pt) = wb.sheet(p.sheet).and_then(|s| s.pivots.get(p.idx)) else { continue };
             let mut tr = Rels::default();
@@ -367,7 +387,8 @@ impl PivotWriter {
             // cache reference among them), and the parts they name.
             let key = crate::passthrough::pivot_key(&pt.name);
             let ext = crate::passthrough::owner_extras(wb.sheet(p.sheet).and_then(|s| s.preserved.as_deref()), key.as_deref(), &mut tr, out);
-            let xml = table_xml(pt, p.idx, p.cache_id, &p.cache, fmt_id, &ext);
+            let model_ext = crate::slicer::pivot_ext(&pt.name, slicers, &mut tr);
+            let xml = table_xml(pt, p.idx, p.cache_id, &p.cache, fmt_id, &format!("{model_ext}{ext}"));
             out.part(&p.part, Some(CT_PIVOT_TABLE), xml.into_bytes());
             out.part(&p.rels_part, None, tr.xml().into_bytes());
         }
@@ -433,13 +454,11 @@ fn header_text(v: &Value) -> String {
     }
 }
 
-fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Option<Cache> {
-    let (si, r, source_xml) = resolve_source(wb, &pt.source, pivot_sheet, 0)?;
-    if r.count() > MAX_SOURCE_CELLS {
-        return None;
-    }
-    let sh = wb.sheet(si)?;
-    let mut fields: Vec<CField> = Vec::new();
+/// The cache field names a source range gets: its header row, with empty headers numbered
+/// (`ColumnN`) and repeats suffixed (`Region2`), exactly as `build_cache` writes them. Also used
+/// to check a slicer's field before the pivot cache is built.
+fn header_names(sh: &gridcraft_model::Sheet, r: RangeRef) -> Vec<String> {
+    let mut names = Vec::new();
     // Lower-case names taken, and the next suffix for each header (linear for repeated headers).
     let mut taken = std::collections::HashSet::new();
     let mut next_suffix: HashMap<String, usize> = HashMap::new();
@@ -456,6 +475,30 @@ fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Option<Cac
         }
         next_suffix.insert(h.to_lowercase(), i);
         taken.insert(n.to_lowercase());
+        names.push(n);
+    }
+    names
+}
+
+/// The field names a PivotTable's source would get in a written cache, and the source sheet, when
+/// the cache can be written at all (`build_cache` fails on the same conditions). Lets a slicer be
+/// checked before the sheet loop, where the pivot cache does not exist yet.
+pub fn source_fields(wb: &Workbook, pt: &PivotTable, default_sheet: usize) -> Option<(usize, Vec<String>)> {
+    let (si, r, _) = resolve_source(wb, &pt.source, default_sheet, 0)?;
+    if r.count() > MAX_SOURCE_CELLS {
+        return None;
+    }
+    Some((si, header_names(wb.sheet(si)?, r)))
+}
+
+fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize, slicer_fields: &[String]) -> Option<Cache> {
+    let (si, r, source_xml) = resolve_source(wb, &pt.source, pivot_sheet, 0)?;
+    if r.count() > MAX_SOURCE_CELLS {
+        return None;
+    }
+    let sh = wb.sheet(si)?;
+    let mut fields: Vec<CField> = Vec::new();
+    for (k, n) in header_names(sh, r).into_iter().enumerate() {
         fields.push(CField {
             name: n,
             col: Some(k as u32),
@@ -584,6 +627,16 @@ fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Option<Cac
         if !on_axis
             && let Some(i) = find(&fields, &f.source_col)
             && let Some(cf) = fields.get_mut(i)
+        {
+            cf.itemized = true;
+        }
+    }
+    // A field a modelled slicer shows needs its values itemized too, even when it is in no area:
+    // the slicer cache's `<i x>` indexes this cache's shared items.
+    for name in slicer_fields {
+        if let Some(i) = find(&fields, name)
+            && let Some(cf) = fields.get_mut(i)
+            && cf.group.is_none()
         {
             cf.itemized = true;
         }

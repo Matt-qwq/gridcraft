@@ -23,7 +23,7 @@ pub use line::{LineAxis, LineMap};
 pub use password::PasswordHash;
 pub use preserved::{Preserved, PreservedPart, PreservedRel, PreservedSheet, PreservedXml};
 pub use sheet::{DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, LineIndex, Sheet, SheetViewMode, Visibility, points_to_chars};
-pub use slicer::{PivotSlicer, PivotTimeline, SlicerItem, SlicerSort, SlicerValue, TimeUnit};
+pub use slicer::{DEFAULT_SLICER_STYLE, PivotSlicer, PivotTimeline, SLICER_STYLES, SlicerItem, SlicerSort, SlicerValue, TimeUnit};
 pub use store::{BandBatch, CellStore, Compacted, Packed, PageCacheStats, SpillOptions};
 pub use style::{
     Alignment, BorderLine, BorderStyle, Borders, Color, Fill, Font, HAlign, NumFmt, PatternType, Style, StyleId, StyleTable, Theme, Underline,

@@ -468,6 +468,10 @@ fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadRepor
         }
     }
     wb.preserved = kept.workbook(&mut cx, &wb_part, &wb_xml, &file_to_model);
+    // Slicers and timelines the pass-through kept: model the plain ones and take them out of the
+    // kept content (anything it cannot model stays byte-identical). Needs the preserved parts, so
+    // it runs after them.
+    crate::slicer::read(&mut wb, &mut cx, &wb_xml, &wb_rels);
     // Calls of LAMBDA names are spelled like the names (the parser upper-cases them).
     wb.apply_name_call_case();
     wb.styles = cx.styles;

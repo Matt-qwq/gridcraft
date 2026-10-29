@@ -19,6 +19,10 @@ const SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns=
 const SLICER: &str = r#"<?xml version="1.0"?><slicers xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><slicer name="Region" cache="Slicer_Region" caption="Region"/></slicers>"#;
 const TIMELINE: &str = r#"<?xml version="1.0"?><timelines xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><timeline name="Date" cache="Timeline_Date" caption="Date"/></timelines>"#;
 const TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Date" sourceName="Date"><pivotTables><pivotTable tabId="0" name="PivotTable1"/></pivotTables><state scrollPosition="0"/></timelineCacheDefinition>"#;
+/// A slicer cache whose data lives in an `<olap>` block: not modelled, so kept as it came.
+const OLAP_SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="Slicer_Region" sourceName="Region"><pivotTables><pivotTable tabId="0" name="PivotTable1"/></pivotTables><data><olap><pivotCacheId>1</pivotCacheId></olap></data><slicers><slicer r:id="rId1"/></slicers></slicerCacheDefinition>"#;
+/// A timeline cache with a selected date range: not modelled, so kept as it came.
+const SELECTED_TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Date" sourceName="Date"><pivotTables><pivotTable tabId="0" name="PivotTable1"/></pivotTables><state scrollPosition="0" selectionStartDate="2024-01-01T00:00:00" selectionEndDate="2024-03-31T00:00:00"/></timelineCacheDefinition>"#;
 const QUERY_TABLE: &str = r#"<?xml version="1.0"?><queryTable xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="SalesQuery" connectionId="1" autoFormatId="16" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="0"/>"#;
 const PIVOT_CACHE: &str = r#"<?xml version="1.0"?><pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" saveData="0" refreshOnLoad="1" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3"><cacheSource type="worksheet"><worksheetSource ref="A1:B5" sheet="Data"/></cacheSource><cacheFields count="2"><cacheField name="Region" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="1"><s v="North"/><s v="South"/></sharedItems></cacheField><cacheField name="Amount" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0"/></cacheField></cacheFields><extLst><ext uri="{33333333-4444-5555-6666-777777777777}"><x99:cacheThing xmlns:x99="urn:example:cache">keep the cache extension</x99:cacheThing></ext></extLst></pivotCacheDefinition>"#;
 const PIVOT_TABLE: &str = r#"<?xml version="1.0"?><pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="PivotTable1" cacheId="1" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3"><location ref="E3:F6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="2"><pivotField axis="axisRow" showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><rowItems count="1"><i><x/></i></rowItems><colItems count="1"><i/></colItems><dataFields count="1"><dataField name="Sum of Amount" fld="1" baseField="0" baseItem="0"/></dataFields><extLst><ext uri="{A8765BA9-456A-4dab-B4F3-ACF838C121DE}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:slicerCacheData><x14:slicerCache r:id="rId2"/></x14:slicerCacheData></ext><ext uri="{962EF5D1-5CA2-4c93-8EF4-DBF5C05439D2}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:pivotTableDefinition hideValuesRow="1"/></ext><ext uri="{22222222-3333-4444-5555-666666666666}"><x99:pivotThing xmlns:x99="urn:example:pivot">keep the pivot extension</x99:pivotThing></ext></extLst></pivotTableDefinition>"#;
@@ -29,6 +33,12 @@ const TABLE_WITH_EXT: &str = r#"<?xml version="1.0"?><table xmlns="http://schema
 /// table, and unknown `extLst` children on the workbook, the worksheet, the chart, the table and
 /// the pivot cache definition.
 fn extension_package() -> Vec<u8> {
+    extension_package_with(SLICER_CACHE, TIMELINE_CACHE)
+}
+
+/// [`extension_package`] with other slicer and timeline cache parts: a variant GridCraft cannot
+/// model must keep them byte for byte.
+fn extension_package_with(slicer_cache: &str, timeline_cache: &str) -> Vec<u8> {
     let workbook = format!(
         r#"<?xml version="1.0"?><workbook xmlns="{NS_MAIN}" xmlns:r="{NS_R}" xmlns:x14="{NS_X14}" xmlns:x15="{NS_X15}"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId2"/></pivotCaches><extLst><ext uri="{EXT_SLICER_CACHES}" xmlns:x14="{NS_X14}"><x14:slicerCaches><x14:slicerCache r:id="rId3"/></x14:slicerCaches></ext><ext uri="{EXT_TIMELINES}" xmlns:x15="{NS_X15}"><x15:timelineCacheRefs><x15:timelineCacheRef r:id="rId4"/></x15:timelineCacheRefs></ext><ext uri="{{11111111-2222-3333-4444-555555555555}}"><x99:workbookThing xmlns:x99="urn:example:workbook">keep the workbook extension</x99:workbookThing></ext></extLst></workbook>"#
     );
@@ -80,11 +90,11 @@ fn extension_package() -> Vec<u8> {
             .as_bytes(),
         ),
         ("xl/pivotCache/pivotCacheDefinition1.xml", PIVOT_CACHE.as_bytes()),
-        ("xl/slicerCaches/slicerCache1.xml", SLICER_CACHE.as_bytes()),
+        ("xl/slicerCaches/slicerCache1.xml", slicer_cache.as_bytes()),
         ("xl/slicerCaches/_rels/slicerCache1.xml.rels", rels(&[("rId1", REL_SLICER, "../slicers/slicer1.xml")]).as_bytes()),
         ("xl/slicers/slicer1.xml", SLICER.as_bytes()),
         ("xl/timelines/timeline1.xml", TIMELINE.as_bytes()),
-        ("xl/timelineCaches/timelineCache1.xml", TIMELINE_CACHE.as_bytes()),
+        ("xl/timelineCaches/timelineCache1.xml", timeline_cache.as_bytes()),
         ("xl/drawings/drawing1.xml", drawing.as_bytes()),
         ("xl/drawings/_rels/drawing1.xml.rels", rels(&[("rId1", "chart", "../charts/chart1.xml")]).as_bytes()),
         ("xl/charts/chart1.xml", chart.as_bytes()),
@@ -112,93 +122,137 @@ fn kept_parts(u: &Unpacked) -> Vec<String> {
     v
 }
 
+/// The one part whose name starts with `prefix`.
+fn only_part(u: &Unpacked, prefix: &str, suffix: &str) -> String {
+    let hits: Vec<&String> = u.parts.keys().filter(|n| n.starts_with(prefix) && n.ends_with(suffix)).collect();
+    assert_eq!(hits.len(), 1, "expected one {prefix}*{suffix} part, found {hits:?}");
+    u.text(hits[0])
+}
+
 #[test]
 fn slicers_timelines_and_owner_extensions_survive_a_round_trip() {
     let (wb, rep) = read_xlsx(&extension_package()).unwrap();
-    assert_eq!(wb.sheet(0).unwrap().pivots.len(), 1, "the PivotTable is modelled");
-    assert_eq!(wb.sheet(0).unwrap().tables.len(), 1, "the table is modelled");
+    let sheet = wb.sheet(0).unwrap();
+    assert_eq!(sheet.pivots.len(), 1, "the PivotTable is modelled");
+    assert_eq!(sheet.tables.len(), 1, "the table is modelled");
     assert!(!rep.warnings.iter().any(|w| w.contains("dropped")), "{:?}", rep.warnings);
+
+    // The plain slicer and timeline are modelled: the tiles are the pivot cache's shared items, all
+    // selected because the file lists no item selection, and the timeline takes its unit.
+    assert_eq!(sheet.pivot_slicers.len(), 1, "{:?}", rep.warnings);
+    let sl = &sheet.pivot_slicers[0];
+    assert_eq!((sl.name.as_str(), sl.caption.as_str(), sl.field.as_str()), ("Region", "Region", "Region"));
+    assert_eq!(sl.items.iter().map(|i| i.label()).collect::<Vec<_>>(), ["North", "South"]);
+    assert!(sl.all_selected());
+    assert_eq!(sl.pivot_tables, ["PivotTable1"]);
+    assert_eq!(sheet.pivot_timelines.len(), 1, "{:?}", rep.warnings);
+    assert_eq!(sheet.pivot_timelines[0].unit, gridcraft_model::TimeUnit::Months);
+    assert_eq!(sheet.pivot_timelines[0].field, "Date");
 
     let out = write_xlsx(&wb).unwrap();
     let u = Unpacked::new(&out);
     u.assert_valid();
 
-    // The slicer cache and its slicer, the timeline and its cache, and the table's query table:
-    // part bytes unchanged, each still where a reader looks for it.
-    for data in [SLICER_CACHE.as_bytes(), SLICER.as_bytes(), TIMELINE.as_bytes(), TIMELINE_CACHE.as_bytes(), QUERY_TABLE.as_bytes()] {
-        assert_eq!(u.find(data).len(), 1, "kept part missing or duplicated: {}", String::from_utf8_lossy(data));
-    }
-    for name in [
-        "xl/slicerCaches/slicerCache1.xml",
-        "xl/slicers/slicer1.xml",
-        "xl/timelines/timeline1.xml",
-        "xl/timelineCaches/timelineCache1.xml",
-        "xl/queryTables/queryTable2.xml",
+    // Written from the model, once: the source bytes are not kept as well, and there is no second
+    // part of either kind.
+    for (data, what) in [
+        (SLICER_CACHE.as_bytes(), "slicer cache"),
+        (SLICER.as_bytes(), "slicer"),
+        (TIMELINE_CACHE.as_bytes(), "timeline cache"),
+        (TIMELINE.as_bytes(), "timeline"),
     ] {
-        assert!(u.parts.contains_key(name), "{name} lost its name: {:?}", u.parts.keys());
+        assert_eq!(u.find(data).len(), 0, "the modelled {what} is written from the model");
     }
+    let cache = only_part(&u, "xl/slicerCaches/", ".xml");
+    assert!(cache.contains("name=\"Slicer_Region\"") && cache.contains("sourceName=\"Region\""), "{cache}");
+    assert!(cache.contains("<pivotTable tabId=\"0\" name=\"PivotTable1\"/>"), "{cache}");
+    assert!(cache.contains("<i x=\"0\" s=\"1\"/><i x=\"1\" s=\"1\"/>"), "{cache}");
+    let slicer = only_part(&u, "xl/slicers/", ".xml");
+    assert!(slicer.contains("name=\"Region\"") && slicer.contains("caption=\"Region\""), "{slicer}");
+    assert!(slicer.contains("columnCount=\"1\""), "{slicer}");
+    let timeline = only_part(&u, "xl/timelines/", ".xml");
+    assert!(timeline.contains("name=\"Date\"") && timeline.contains("level=\"2\""), "{timeline}");
+    only_part(&u, "xl/timelineCaches/", ".xml");
+
+    // The extensions that name them are written once from the model, and the unknown ones are kept.
     let wbx = u.text("xl/workbook.xml");
-    let (_, cache) = target_of_kind(&u, "xl/workbook.xml", "slicerCache");
-    assert_eq!(u.parts.get(&cache).unwrap(), SLICER_CACHE.as_bytes());
-    let (_, timeline_cache) = target_of_kind(&u, "xl/workbook.xml", "timelineCache");
-    assert_eq!(u.parts.get(&timeline_cache).unwrap(), TIMELINE_CACHE.as_bytes());
-    // The workbook extensions that name them, plus the one we don't model.
     assert!(wbx.contains(EXT_SLICER_CACHES) && wbx.contains("slicerCaches"), "{wbx}");
     assert!(wbx.contains(EXT_TIMELINES) && wbx.contains("timelineCacheRefs"), "{wbx}");
     assert!(wbx.contains("keep the workbook extension"), "{wbx}");
-    let slicer_id = attr_of(&wbx[wbx.find("<x14:slicerCache ").unwrap()..], "x14:slicerCache", "r:id");
-    assert_eq!(u.target("xl/workbook.xml", &slicer_id).1, cache);
+    let (_, cache_part) = target_of_kind(&u, "xl/workbook.xml", "slicerCache");
+    assert_eq!(cache_part, "xl/slicerCaches/slicerCache1.xml", "the cache keeps the part it names");
+    let (_, timeline_cache) = target_of_kind(&u, "xl/workbook.xml", "timelineCache");
+    let tcx = u.parts.get(&timeline_cache).map(|d| String::from_utf8_lossy(d).into_owned()).unwrap_or_default();
+    assert!(tcx.contains("name=\"Timeline_Date\"") && tcx.contains("sourceName=\"Date\""), "{tcx}");
+    assert!(tcx.contains("<state scrollPosition=\"0\"/>"), "{tcx}");
 
     // The worksheet's timeline and its own unknown extension.
-    let sheet = sheet_part(&u, "Data");
-    let sx = u.text(&sheet);
+    let sheet_part_name = sheet_part(&u, "Data");
+    let sx = u.text(&sheet_part_name);
     assert!(sx.contains("timelines") && sx.contains("keep the sheet extension"), "{sx}");
     let timeline_id = attr_of(&sx[sx.find("<x15:timeline ").unwrap()..], "x15:timeline", "r:id");
-    let (ty, timeline) = u.target(&sheet, &timeline_id);
+    let (ty, timeline_part) = u.target(&sheet_part_name, &timeline_id);
     assert!(ty.ends_with("/timeline"), "{ty}");
-    assert_eq!(u.parts.get(&timeline).unwrap(), TIMELINE.as_bytes());
+    assert!(timeline_part.starts_with("xl/timelines/"), "{timeline_part}");
 
-    // The PivotTable keeps the extension that names its slicer cache and its own unknown one; the
-    // extension GridCraft models is never kept from the source too (it is written from the model,
-    // and only when the model asks for it — so at most one, never two).
-    let (_, pivot) = target_of_kind(&u, &sheet, "pivotTable");
+    // The PivotTable keeps the extension that names its modelled slicer cache (written from the
+    // model) and its own unknown one; the modelled extension is written at most once.
+    let (_, pivot) = target_of_kind(&u, &sheet_part_name, "pivotTable");
     let px = u.text(&pivot);
-    assert!(px.contains(EXT_PIVOT_SLICER_CACHE) && px.contains("slicerCacheData"), "{px}");
+    assert_eq!(px.matches(EXT_PIVOT_SLICER_CACHE).count(), 1, "{px}");
+    assert!(px.contains("slicerCacheData"), "{px}");
     assert!(px.matches(EXT_PIVOT_MODELLED).count() <= 1, "the modelled extension is written twice: {px}");
     assert!(px.contains("keep the pivot extension"), "{px}");
     let slicer_id = attr_of(&px[px.find("<x14:slicerCache ").unwrap()..], "x14:slicerCache", "r:id");
-    assert_eq!(u.target(&pivot, &slicer_id).1, cache);
+    assert_eq!(u.target(&pivot, &slicer_id).1, cache_part);
     // The pivot cache definition keeps its own extension.
     let (_, pivot_cache) = target_of_kind(&u, &pivot, "pivotCacheDefinition");
     assert!(u.text(&pivot_cache).contains("keep the cache extension"));
 
     // The table keeps its extension and the query table hanging off it.
-    let (_, table) = target_of_kind(&u, &sheet, "table");
+    let (_, table) = target_of_kind(&u, &sheet_part_name, "table");
     assert!(u.text(&table).contains("keep the table extension"));
     let (_, query_table) = target_of_kind(&u, &table, "queryTable");
     assert_eq!(u.parts.get(&query_table).unwrap(), QUERY_TABLE.as_bytes());
 
     // Unknown chart extensions survive as well now that gap #4 landed: the chart part is kept
-    // byte-identically while the chart is untouched. Editing the chart rewrites the part from the
-    // model, which is where the unmodelled content still goes (documented in chart.rs).
-    let (_, drawing) = target_of_kind(&u, &sheet, "drawing");
+    // byte-identically while the chart is untouched.
+    let (_, drawing) = target_of_kind(&u, &sheet_part_name, "drawing");
     let (_, chart) = target_of_kind(&u, &drawing, "chart");
     assert!(u.text(&chart).contains("unknownChartThing"));
 
-    // Reading the output keeps the same content again: the pass-through is stable.
+    // Reading the output models the same widgets and keeps the same unknown content: the save is
+    // stable, and no part is duplicated on the second pass.
     let (wb2, rep2) = read_xlsx(&out).unwrap();
     assert!(!rep2.warnings.iter().any(|w| w.contains("dropped")), "{:?}", rep2.warnings);
+    let sheet2 = wb2.sheet(0).unwrap();
+    assert_eq!(sheet2.pivot_slicers, sheet.pivot_slicers);
+    assert_eq!(sheet2.pivot_timelines, sheet.pivot_timelines);
     let u2 = Unpacked::new(&write_xlsx(&wb2).unwrap());
     u2.assert_valid();
-    for data in [SLICER_CACHE.as_bytes(), SLICER.as_bytes(), TIMELINE.as_bytes(), TIMELINE_CACHE.as_bytes(), QUERY_TABLE.as_bytes()] {
-        assert_eq!(u2.find(data).len(), 1, "kept part lost on the second save: {}", String::from_utf8_lossy(data));
-    }
+    assert_eq!(u2.find(SLICER_CACHE.as_bytes()).len(), 0);
+    assert_eq!(u2.find(SLICER.as_bytes()).len(), 0);
+    assert_eq!(only_part(&u2, "xl/slicerCaches/", ".xml"), cache);
+    assert_eq!(only_part(&u2, "xl/slicers/", ".xml"), slicer);
     assert!(u2.text("xl/workbook.xml").contains("keep the workbook extension"));
     assert!(u2.text(&sheet_part(&u2, "Data")).contains("keep the sheet extension"));
-    // The kept chart part is stable across a second save too.
     let (_, drawing2) = target_of_kind(&u2, &sheet_part(&u2, "Data"), "drawing");
     let (_, chart2) = target_of_kind(&u2, &drawing2, "chart");
     assert!(u2.text(&chart2).contains("unknownChartThing"));
+
+    // Slicer content GridCraft cannot model keeps today's behaviour: an OLAP cache and a timeline
+    // with a selected date range leave every slicer part byte-identical, and nothing is modelled.
+    let (wb, rep) = read_xlsx(&extension_package_with(OLAP_SLICER_CACHE, SELECTED_TIMELINE_CACHE)).unwrap();
+    assert!(wb.sheet(0).unwrap().pivot_slicers.is_empty(), "{:?}", rep.warnings);
+    assert!(wb.sheet(0).unwrap().pivot_timelines.is_empty(), "{:?}", rep.warnings);
+    assert!(rep.warnings.iter().any(|w| w.contains("kept as they came")), "the file says so: {:?}", rep.warnings);
+    let u = Unpacked::new(&write_xlsx(&wb).unwrap());
+    u.assert_valid();
+    for data in [OLAP_SLICER_CACHE.as_bytes(), SLICER.as_bytes(), SELECTED_TIMELINE_CACHE.as_bytes(), TIMELINE.as_bytes()] {
+        assert_eq!(u.find(data).len(), 1, "kept part missing or duplicated: {}", String::from_utf8_lossy(data));
+    }
+    assert!(u.text("xl/workbook.xml").contains("slicerCaches") && u.text("xl/workbook.xml").contains("timelineCacheRefs"));
+    assert!(u.text(&sheet_part(&u, "Data")).contains("timelines"));
 }
 
 #[test]
@@ -269,9 +323,13 @@ fn editing_a_cell_keeps_the_slicers_and_pivot_extensions() {
     wb.sheet_mut(0).unwrap().set_value(gridcraft_core::CellRef::new(9, 0), gridcraft_core::Value::Number(7.0));
     let u = Unpacked::new(&write_xlsx(&wb).unwrap());
     u.assert_valid();
-    for data in [SLICER_CACHE.as_bytes(), SLICER.as_bytes(), TIMELINE.as_bytes(), TIMELINE_CACHE.as_bytes(), QUERY_TABLE.as_bytes()] {
-        assert_eq!(u.find(data).len(), 1, "an edit dropped a kept part: {}", String::from_utf8_lossy(data));
-    }
+    // The slicer and timeline are modelled now, so an edit writes them from the model (still once)
+    // and keeps the parts GridCraft does not model as they were.
+    only_part(&u, "xl/slicerCaches/", ".xml");
+    only_part(&u, "xl/slicers/", ".xml");
+    only_part(&u, "xl/timelineCaches/", ".xml");
+    only_part(&u, "xl/timelines/", ".xml");
+    assert_eq!(u.find(QUERY_TABLE.as_bytes()).len(), 1, "an edit dropped a kept part");
     let sheet = sheet_part(&u, "Data");
     let (_, pivot) = target_of_kind(&u, &sheet, "pivotTable");
     assert!(u.text(&pivot).contains("slicerCacheData"));
