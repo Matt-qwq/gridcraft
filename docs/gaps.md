@@ -94,6 +94,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Insert inheritance, delete, undo and a mapped-sheet XLSX round trip are covered (model 62,
   engine 419, xlsx 265 tests). The UI also caches the derived `LineIndex`/outline axes per
   `(document, revision, sheet)`, so a 1M-custom-height sheet no longer rebuilds them every frame.
+- **Landed (10-29): mapped value writes and packed folds.** `set_values` streams through the row
+  map's logical runs and keeps a run-merged parallel plan; 1M values after a row insert write in
+  **35 ms** (was 131–135), after a column insert 33 ms (was 116–142). `visit_packed` follows the
+  column map's runs, so a dense block is **2.5–3.3 ns/cell** (was 30.6), and the owned/formula gate
+  resolves a band once (1M paged rows 0.84 ms, was 9.5). `diff` keeps its documented physical
+  contract; `diff_logical` is the O(cells) map-independent diagnostic for tests/fuzz.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
   file is a temporary beside the system temp directory (not the document), the cache budget is a
@@ -102,7 +108,6 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   page-aware compaction landed 10-29 (O(1) identity early-out, gap-scoped page candidates,
   snapshot-safe replacement, `document.compact` and a save hook); a page-file rewrite and
   byte budget remain;
-  `set_values` on a mapped sheet is value-at-a-time and `diff` is still physical;
   whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
   a ten-row used range in 0.0 ms). The 159 cells that still differ from the cached values of the
   1.28 GB report are Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the
@@ -112,8 +117,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Impact:** finance and data users routinely have big workbooks.
 - **Status (10-29): the large-workbook beta gate is met.** Recalc, edit latency, 1M-row operations,
   bounded data commands and memory all pass their targets; M19 cold paging and the M20 row/column
-  maps landed. Remaining work is base hardening, not capacity: M20 compaction wiring/mapped value
-  writes and M19 spill placement/byte budget/flat-memory save are wave 0 in
+  maps landed. Remaining work is base hardening, not capacity: M19 spill placement/byte
+  budget/flat-memory save (and the deferred M20 page-file rewrite) are wave 0 in
   [`roadmap.md`](roadmap.md#execution-queue). The M21 Parquet read half is post-beta. The old
   estimate is superseded by those waves.
 

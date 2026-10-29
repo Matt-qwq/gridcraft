@@ -127,7 +127,7 @@ The detailed queue with dependencies and the parallel plan is in
 
 | Wave | Work | Hours | Notes |
 |---|---|---|---|
-| **0** | Close the base: M20 mapped writes/logical diff/physical-column packed walk; M19 spill path, byte-budget LRU, flat-memory save/scan | **20–30** | Compaction landed 10-29 (page-aware pass, `document.compact`, save hook). Last large-workbook debt. |
+| **0** | Close the base: M19 spill path, byte-budget LRU, flat-memory save/scan; M20 page-file rewrite deferred to M19 | **15–25** | M20 complete 10-29 (maps, line metadata, UI geometry cache, page-aware compaction, mapped value writes). Last large-workbook debt. |
 | **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
 | **1** | **XLSX corpus + Excel acceptance** (#1/#3) | 21–35 | **Owner: half a day in Excel.** The only external gate; start early. |
 | **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M20 mapped value writes complete: `set_values` streams through the row map's runs and keeps a run-merged parallel plan (1M values **35 ms after a row insert**, 33 ms after a column insert, was 131–135 / 116–142); `visit_packed` follows column-map runs (**2.5–3.3 ns/cell** on a dense block, was 30.6); `has_owned_cells`/`formula_cells` resolve a band once (1M paged rows **0.84 ms**, was 9.5); `diff` keeps its physical contract and the new `diff_logical` serves tests/fuzz. Model 87, engine 422 |
 | 2026-10-29 | M20 page-aware compaction: `compact()` is O(1) when both maps are identity, finds pages through map gaps (never a full sweep), decodes candidates without priming the cache, rewrites only pages that held an orphan into new `Arc<Page>`s (snapshots keep old offsets), and returns maps to identity only when complete. `document.compact` (noundo) and the `file.save` hook call it; model 71, engine 422, fuzz green. Page-file rewrite/byte budget stay in M19 |
 | 2026-10-29 | M20 line metadata benchmark: 1M custom row heights now clone in **0.13 ms** (undo snapshots), insert/delete in **0.013/0.007 ms**, and 10k inherited lines in 0.1 ms (`_gridcraft-bench/linebench`); `LineIndex` build 6.6 ms, now cached per revision |
 | 2026-10-29 | M20 UI line geometry is cached per (document, revision, sheet): `Geo` takes the row/column `LineIndex` and outline axes from `GridState`, so a sheet with a custom height on every row no longer rebuilds 1M-entry prefix sums once or twice a frame; scrolling, selection and zoom reuse it, edits and sheet switches rebuild it. Targeted grid test only; the UI suite is unchanged |
@@ -247,6 +248,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 mapped value writes complete: streaming mapped `set_values` + run-merged parallel plan, column-run `visit_packed`, band-cached owned/formula gates, `diff_logical`; 1M write-back 131→35 ms (row insert), dense packed walk 30.6→2.5–3.3 ns/cell; 87 model / 422 engine tests |
 | 2026-10-29 | minor | M20 page-aware compaction with an O(1) identity early-out, gap-scoped page candidates, snapshot-safe page replacement, `document.compact` and a `file.save` hook; 71 model / 422 engine tests; page-file rewrite and byte budget remain M19 |
 | 2026-10-29 | minor | M20 UI line geometry cached per (uid, revision, sheet); 1M-custom-height sheets stop rebuilding `LineIndex`/outline axes every frame; targeted `grid::` tests only |
 | 2026-10-29 | minor | M20 line metadata maps through physical ids (chunked `LineMap`, logical JSON/XLSX, O(1) clone; 62 model / 419 engine / 265 xlsx tests); wave 0 narrows to compaction wiring, mapped value writes and M19, beta ~150–240 h |
