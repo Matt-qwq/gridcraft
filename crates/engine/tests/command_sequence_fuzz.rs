@@ -397,7 +397,9 @@ fn content_diff(a: &Workbook, b: &Workbook) -> Option<String> {
         if Arc::ptr_eq(x, y) {
             continue;
         }
-        for c in x.cells.diff(&y.cells) {
+        // Logical, not stored, positions: the fuzz compares two workbooks that may have been
+        // remapped by different structural edits, and `diff` is a physical comparison.
+        for c in x.cells.diff_logical(&y.cells) {
             let content = |s: &Sheet| {
                 s.cell(c).filter(has_content).map(|c| match &c.formula {
                     Some(f) => format!("={}", f.text),
@@ -630,7 +632,7 @@ fn workbook_diff(a: &Workbook, b: &Workbook) -> Option<String> {
     }
     for (x, y) in a.sheets.iter().zip(&b.sheets) {
         if x != y {
-            if let Some(c) = x.cells.diff(&y.cells).first() {
+            if let Some(c) = x.cells.diff_logical(&y.cells).first() {
                 return Some(format!("{}!{c}: {:?} vs {:?}", x.name, x.cell(*c), y.cell(*c)));
             }
             let field = [

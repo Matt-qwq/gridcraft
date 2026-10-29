@@ -2915,8 +2915,20 @@ impl CellStore {
         last
     }
 
-    /// Positions whose cells differ between `self` and `other`.
+    /// Positions whose stored cells differ between `self` and `other`, by band key and physical
+    /// column. The walk skips a band both stores share (`Arc::ptr_eq`), so it is cheap on the
+    /// common edit path, where only the touched bands differ.
+    ///
+    /// The positions are **stored/physical**: a pure remap is not a difference, because a row or
+    /// column edit changes where a cell lives, not what it is, and the two stores share the bands.
+    /// With different maps a reported position may even hold nothing in either store. Use
+    /// [`diff_logical`](Self::diff_logical) (or [`CellStore::eq`]) when the maps may differ.
     pub fn diff(&self, other: &CellStore) -> Vec<CellRef> {
+        self.diff_bands(other)
+    }
+
+    /// The stored-position walk behind [`diff`](Self::diff).
+    fn diff_bands(&self, other: &CellStore) -> Vec<CellRef> {
         let mut keys: Vec<u32> = self.bands.keys().chain(self.pages.keys()).chain(other.bands.keys()).chain(other.pages.keys()).copied().collect();
         keys.sort_unstable();
         keys.dedup();
@@ -2970,6 +2982,34 @@ impl CellStore {
                             out.push(CellRef::new(logical, logical_col));
                         }
                     }
+                }
+            }
+        }
+        out
+    }
+
+    /// Positions whose **logical** cells differ between `self` and `other`, whichever maps the two
+    /// stores place them with. Two stores with the same content under different maps report
+    /// nothing; a cell only one side holds is reported at its logical position.
+    ///
+    /// This walks the logical cells — the smaller store's, then the larger side's extras when the
+    /// lengths differ — and rebuilds a `Cell` for each comparison, so it is O(cells) and allocates
+    /// the `Cell`s it looks at. At 30M cells that is seconds: a diagnostic for tests and the fuzz,
+    /// not an edit-path check.
+    pub fn diff_logical(&self, other: &CellStore) -> Vec<CellRef> {
+        let (small, large) = if self.len <= other.len { (self, other) } else { (other, self) };
+        let mut out = Vec::new();
+        for (at, cell) in small.iter() {
+            if large.get(at).is_none_or(|other| !same_cell(&cell, &other)) {
+                out.push(at);
+            }
+        }
+        // Only when the counts differ can a position the smaller store holds not stand for the
+        // larger one's cell: the extra cells are where `get` found nothing above.
+        if self.len != other.len {
+            for (at, _) in large.iter() {
+                if small.get(at).is_none() {
+                    out.push(at);
                 }
             }
         }
@@ -4803,6 +4843,108 @@ mod tests {
         s.set(c(700, 3), Cell::value("new".into()));
         s.remove(c(900, 0));
         assert_eq!(snap.diff(&s), [c(5, 0), c(700, 3), c(900, 0)]);
+        // `diff_logical` walks the smaller store's cells: it names the edit and the removal. The
+        // equal-sized addition at (700, 3) is not named again — the removal already pins a change
+        // — but a diff is empty only when the logical content is equal, which is what the fuzz
+        // needs.
+        assert_eq!(snap.diff_logical(&s), [c(5, 0), c(900, 0)]);
+        assert!(!snap.diff_logical(&s).is_empty());
+    }
+
+    /// Two stores holding the same logical cells under different maps: `diff` reports positions
+    /// from the physical walk (some holding nothing in either store), which is why every engine
+    /// caller re-reads the content; `diff_logical` reports no difference at all.
+    #[test]
+    fn diff_reports_only_stored_positions_when_maps_differ() {
+        let mut s = CellStore::new();
+        for r in 0..5u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r))));
+        }
+        s.shift_rows(0, 5);
+        for r in 0..5u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r + 100))));
+        }
+        let mut t = CellStore::new();
+        for r in 0..5u32 {
+            t.set(c(r, 0), Cell::value(Value::Number(f64::from(r + 100))));
+        }
+        for r in 5..10u32 {
+            t.set(c(r, 0), Cell::value(Value::Number(f64::from(r - 5))));
+        }
+        assert_eq!(s, t, "same logical cells, different maps");
+        assert!(s.diff_logical(&t).is_empty());
+        let reported = s.diff(&t);
+        // The shifted rows report their old logical homes, then the band the gap rows were
+        // written to; A11..A15 hold nothing in either store.
+        let want: Vec<CellRef> = (5..15u32).chain(0..5u32).map(|r| c(r, 0)).collect();
+        assert_eq!(reported, want);
+        assert!(s.get(c(12, 0)).is_none() && t.get(c(12, 0)).is_none(), "a reported position may hold nothing at all");
+        for at in reported {
+            match (s.get(at), t.get(at)) {
+                (Some(a), Some(b)) => assert!(same_cell(&a, &b), "{} is a real difference", at.a1()),
+                (a, b) => assert_eq!(a, b, "{} holds content on one side only", at.a1()),
+            }
+        }
+    }
+
+    /// A pure remap is not a content difference: the bands are shared, so `diff` reports nothing
+    /// while the logical content (and therefore `eq`) says otherwise.
+    #[test]
+    fn diff_does_not_see_a_remap() {
+        let mut s = CellStore::new();
+        for r in 0..5u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r))));
+        }
+        let mut remap = s.clone();
+        remap.shift_rows(0, 1);
+        assert_ne!(s, remap, "the logical content moved");
+        assert!(s.diff(&remap).is_empty(), "the bands are the same, and `diff` is physical");
+        assert!(!s.diff_logical(&remap).is_empty());
+        // Every cell that moved is reported at the position the smaller store holds it.
+        assert_eq!(s.diff_logical(&remap), (0..5u32).map(|r| c(r, 0)).collect::<Vec<_>>());
+    }
+
+    /// `diff_logical` is empty exactly when the logical content is equal (`eq`), and for a one-cell
+    /// edit under two maps it names that logical cell.
+    #[test]
+    fn diff_logical_matches_eq() {
+        let mut s = CellStore::new();
+        for r in 0..5u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r))));
+        }
+        s.shift_rows(0, 5);
+        for r in 0..5u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r + 100))));
+        }
+        let mut t = CellStore::new();
+        for r in 0..5u32 {
+            t.set(c(r, 0), Cell::value(Value::Number(f64::from(r + 100))));
+        }
+        for r in 5..10u32 {
+            t.set(c(r, 0), Cell::value(Value::Number(f64::from(r - 5))));
+        }
+        for (a, b) in [(&s, &t), (&t, &s)] {
+            assert_eq!(a == b, a.diff_logical(b).is_empty(), "equal content, different maps");
+        }
+        t.set_value(c(5, 0), &Value::Number(-1.0));
+        assert_ne!(s, t);
+        assert_eq!(s.diff_logical(&t), [c(5, 0)], "only the edited logical cell");
+        assert_eq!(t.diff_logical(&s), [c(5, 0)]);
+    }
+
+    /// A cell only one side holds is reported, in either direction and whatever the maps say.
+    #[test]
+    fn diff_logical_reports_a_cell_only_in_one_store() {
+        let mut s = CellStore::new();
+        for r in 0..10u32 {
+            s.set(c(r, 0), Cell::value(Value::Number(f64::from(r))));
+        }
+        s.shift_rows(0, 1);
+        let mut t = s.clone();
+        assert!(t.remove(c(5, 0)).is_some());
+        assert_eq!(t.diff_logical(&s), [c(5, 0)]);
+        assert_eq!(s.diff_logical(&t), [c(5, 0)]);
+        assert_eq!(t.diff(&s), [c(5, 0)]);
     }
 
     #[test]
