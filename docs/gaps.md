@@ -309,9 +309,18 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   selection survives save/reopen. Catalog 279 → 280 (94.9 %). Everything GridCraft cannot model (an
   OLAP cache, item properties, an unknown attribute or relationship, a timeline's date range) stays
   byte-identical on the pass-through path, all-or-nothing per kind.
-- **Missing:** the slicer/timeline **UI** (the model and commands exist, the widgets are not drawn);
-  the slicer's **placement shape** is not written, so Excel lists a written slicer without placing it
-  on the sheet; a filter on a field outside Rows/Columns is drawn as an extra page-filter row
+- **Landed 10-30 (placement):** a written slicer or timeline is placed and wired the way [MS-XLSX]
+  defines — an anchored `xdr:graphicFrame` naming the view in its sheet's drawing part (read back as
+  the anchor), one slicers/timelines part per sheet related from the worksheet and listed in its
+  `x14:slicerList`/`x15:timelineRefs`, the caches in the workbook's `slicerCaches`/`timelineCacheRefs`
+  — and **table slicers are written** with `x15:tableSlicerCache`, taking the selection from the
+  column's AutoFilter where Excel keeps it. Verifying against the schema also corrected a forbidden
+  cache→slicer relationship, a non-existent cache child, the workbook extension URIs, the timeline
+  content/relationship types and `pivotTable/@tabId` (a `sheetId`, not a sheet index). The writer
+  omits the optional `mc:AlternateContent` fallback shape because the specification does not define
+  its content, and it refuses a timeline whose field holds no dates (no bounds to write).
+- **Missing:** the slicer/timeline **UI** (the model, commands and file format exist, the widgets are
+  not drawn); a filter on a field outside Rows/Columns is drawn as an extra page-filter row
   (`PivotFilter` has no flag to distinguish it); timeline date ranges are kept but not editable;
   calculated items, PivotCharts, value/label filters, number grouping, GETPIVOTDATA and data-model
   pivots; a table slicer is still not written to XLSX; `pivot.filter` does not sync a slicer's tiles.
@@ -320,7 +329,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
   never been opened in Excel — gate #1.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 14–22 h for beta (25–40 h full).
+- **Estimate:** 12–19 h for beta (25–40 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group

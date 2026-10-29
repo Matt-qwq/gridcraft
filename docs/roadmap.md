@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (encryption hardened — OS CSPRNG, verified integrity HMAC, web refuses a password save — and a 595-example documented formula oracle suite with gate #6 met; gates #4 2–6 h and #8 14–22 h; beta total ~94–162) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (slicers and timelines are placed and table slicers written; encryption hardened with OS CSPRNG and a verified integrity HMAC; a 595-example documented formula oracle suite with gate #6 met; gates #4 2–6 h and #8 12–19 h; beta total ~90–156) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -30,7 +30,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi | #5 | 3–7 | **Shaping engine landed 10-30** (`core::text`: unicode-bidi levels + rustybuzz, visual-order runs, logical clusters, 26 tests). What remains is wiring it into the grid and the PDF writer — two tasks in flight. |
 | **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
 | **3** | `.xls` import and password-protected workbooks | #7 | 10–21 | **Encryption (write + verified integrity + CSPRNG) and `.xls` styles/comments landed 10-29/30**; DV/CF records, BIFF5 and Standard/RC4 writing remain. |
-| **3b** | PivotTables: slicer UI, PivotCharts, calculated items, Excel verification | #8 | 14–22 | **Slicers and timelines landed 10-30** (model, XLSX, six commands, a selection filters the pivot); the widgets are not drawn yet. Excel verification waits for #1. |
+| **3b** | PivotTables: slicer UI, PivotCharts, calculated items, Excel verification | #8 | 12–19 | **Slicers and timelines landed 10-30** (model, XLSX, six commands, a selection filters the pivot); the widgets are not drawn yet. Excel verification waits for #1. |
 | **4** | **Beta exit**: stability soak, all gates green, full `cargo xtask ci`, docs, release, corpus re-run | all | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read half and linked tables (20–30 h) · M17 zone maps (8–12 h) · localization, twelve languages (100–165 h) · Get & Transform/data model (60–100 h) · full chart depth, collaboration, mobile, AI · M22 only if a measured trigger fires | M17/M21/M22 | — | Not beta blockers. Keep the 100M/paging base stable; no native format before a trigger. |
 
@@ -76,7 +76,7 @@ and edge features. Each gate links its gap.
 | PivotTables: slicers, calculated items, PivotCharts, verified in Excel | #8 | **partial 10-30**: slicers and timelines are modelled, written from the model and command-driven (`insert.slicer`, `insert.timeline`, `slicer.setSelection/setStyle/move/delete`) and a selection filters the pivot through its own refresh path, undoably and across save/reopen; no widget UI, no placement shape, no PivotCharts or calculated items yet | 14–22 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **met 10-29** (417 sequences, keyboard context menus, six shortcuts; the Menu key itself is blocked upstream) | 0–6 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #4, #8, #10 open or partial (pass-through #3, keyboard #9, calc #6 met; charts #4, text #5, `.xls`/encryption #7, PivotTables #8 partly) | **~72–129 + 20–30 base = ~94–162** |
+| **Total** | | gates #1, #4, #8, #10 open or partial (pass-through #3, keyboard #9, calc #6 met; charts #4, text #5, `.xls`/encryption #7, PivotTables #8 partly) | **~70–126 + 20–30 base = ~90–156** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
@@ -818,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | Slicers and timelines placed and wired per [MS-XLSX] and table slicers written (#8 → 12–19 h); a written widget is now listed, anchored and bound instead of merely stored |
 | 2026-10-30 | major | Encryption hardened (OS CSPRNG, integrity HMAC verified on read, `Corrupted` distinguished, web refuses a password save) and the formula engine gained a 595-example documented oracle suite over 275 functions; gate #6 met with the oracle caveat, #7 down to 10–21 h, beta ~94–162 h |
 | 2026-10-30 | major | Chart Format pane and object resize: the pane drives `chart.setAxis`/`setDataLabels`/`setErrorBars`/`formatPoint` with per-field Auto and shows the reason where a control cannot apply; charts, pictures, shapes and slicers resize from eight handles with Shift, a 20 pt minimum, Esc and one undo step per drag, and the size round-trips through XLSX. Gate #4 → 2–6 h, beta ~102–172 h |
 | 2026-10-30 | minor | PivotTable slicers and timelines modelled (cache field, filtered pivots, item values and selected tiles, caption, style, column count, timeline unit, anchor), written once from the model and driven by six commands; a selection writes the field's `PivotFilter` and refreshes in one undo step, so it really filters and survives save/reopen. Unmodellable widget content stays byte-identical. Catalog 280/295, gate #8 → 14–22 h, beta ~104–176 h |
