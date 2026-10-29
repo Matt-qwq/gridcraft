@@ -1,6 +1,6 @@
 # Localization parity
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (three Japanese and two Vietnamese rows that earlier edits left behind are one row each, and the shipped-language line is one list measured from the catalogs; the label counts in the table are due a re-measure) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (PDF text is shaped and laid out right-to-left with cluster-exact `ToUnicode`; the PDF rows and limits say what now extracts and what a mixed-direction line still cannot) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Per-language status against Excel, which ships its UI in dozens of languages (Windows language
 packs cover 100+), with localized function names, argument separators, number and date formats,
@@ -59,10 +59,14 @@ right-to-left sheets and full complex-script support. Part of
   255 characters, counted as characters rather than UTF-8 bytes, so a 255-letter Arabic name is
   accepted as in Excel. Sheet names already counted characters (31).
 - **PDF export** (M14) embeds a subset of a real TrueType font for text the 14 standard PDF fonts
-  cannot encode: Cyrillic, Greek, Hebrew, CJK, Hangul, and the glyphs of Arabic, Devanagari and
-  Thai (unshaped). The face is found through `gridcraft_core::fonts` (`CRAFT_FONTS_DIR`, then the
+  cannot encode, and shapes it with `gridcraft_core::text` (the shared L0 engine):
+  Arabic joins, Devanagari is reordered, Thai marks are positioned and bidirectional text is laid
+  out in visual order, with `TJ` adjustments and `Ts` rises on a single text matrix. `ToUnicode`
+  maps each drawn glyph to its whole source cluster, so a ligature or conjunct extracts as all of
+  its characters. The face is found through `gridcraft_core::fonts` (`CRAFT_FONTS_DIR`, then the
   platform's font directories) or an explicit `fontPath`, and the matrix below says which script
-  works and what still goes wrong. Shaping and bidi are still missing, as on the grid.
+  works and what still goes wrong. WinAnsi-only text keeps its old bytes; the grid/editor text and
+  mirrored printing for right-to-left sheets are still unshaped.
 
 ## Languages
 
@@ -75,8 +79,8 @@ separators, number/date formats, machine translation with agent review, and scri
 | English | en | ~2,200 / ~2,200 (100%, source) | yes | Latin: yes | yes | full | — |
 | Simplified Chinese (Mandarin) | zh-Hans | 266 (~12%) | no | CJK system-font fallback (#38); IME unverified; PDF embeds a subset (M14) | no | menus only | 8–13 h |
 | Spanish | es | 0 (0%) | no | Latin: yes | no | none | 6–10 h |
-| Hindi | hi | 0 (0%) | no | Devanagari: **no shaping** (PDF embeds the glyphs in stored order) | no | none | 12–18 h |
-| Arabic | ar | 0 (0%) | no | **no shaping, no RTL UI**; Sheet Right-to-Left mirrors the grid (#146); PDF embeds the glyphs in stored order | no | none | 25–35 h |
+| Hindi | hi | 0 (0%) | no | Devanagari: **PDF shapes and reorders (M14)**; grid/editor text is still unshaped | no | none | 12–18 h |
+| Arabic | ar | 0 (0%) | no | **PDF shapes and lays out RTL (M14); no RTL UI**; Sheet Right-to-Left mirrors the grid (#146) | no | none | 25–35 h |
 | French | fr | 0 (0%) | no | Latin: yes | no | none | 6–10 h |
 | Portuguese | pt-BR | 943 (~43%) | dialogs and tooltips (dialogs take effect with #669) | Latin: yes | no | menus, File view, dialogs | 2–4 h |
 | Indonesian | id | 0 (0%) | no | Latin: yes | no | none | 5–8 h |
@@ -117,14 +121,23 @@ independent parser, `skrifa`, draws every glyph):
 | Latin Extended-A/B | `Łódź ő` | yes | Segoe UI (subset) | — |
 | Greek | `Ωμέγα` | yes | Segoe UI | — |
 | Cyrillic | `Привет` | yes | Segoe UI | — |
-| Hebrew | `שלום` | yes, glyphs in the stored order | Segoe UI | no bidi: a Hebrew run inside Latin text prints in storage order, and RTL sheets still print left to right |
-| Arabic | `مرحبا` | glyphs print, **not shaped** | Segoe UI | isolated forms only (no joining), no bidi |
-| Devanagari | `हिन्दी` | glyphs print, **not shaped** | Nirmala UI | matras print in storage order (no reordering), no conjuncts |
-| Thai | `สวัสดี` | glyphs print, **not shaped** | Leelawadee UI | no mark positioning above and below the base |
+| Hebrew | `שלום עולם 2024` | yes, shaped (bidi only); pdftotext returns the logical word | Segoe UI | a line that mixes Hebrew with Latin comes back in the extractor's run order (see below) |
+| Arabic | `مرحبا بالعالم — لا 2024` | yes, joined and laid out right-to-left; pdftotext returns the logical line wrapped in U+202B/U+202A/U+202C | Segoe UI | a mixed Latin/Arabic line comes back in the extractor's run order |
+| Devanagari | `नमस्ते दुनिया 2024` | yes, reordered with conjuncts and the i-matra in front; pdftotext returns the logical line | Nirmala UI | — |
+| Thai | `สวัสดีชาวโลก 2024` | yes, marks positioned above/below the base; pdftotext returns the logical line | Leelawadee UI | — |
 | CJK (Han) | `签字清单` | yes | Microsoft YaHei (`msyh.ttc`, face 0) | — |
 | Kana | `こんにちは` | yes | Microsoft YaHei | — |
 | Hangul | `안녕하세요` | yes | Malgun Gothic | — |
 | Emoji / astral | `😀` | yes when a face with a monochrome glyph covers it; `ToUnicode` writes the surrogate pair | face dependent | a full-colour emoji font prints its outline form |
+
+Measured with Xpdf's `pdftotext` 4.00 (UTF-8) on the 2026-10-30 dev machine. Before shaping,
+Arabic came back reversed (`ابحرم`, the stored order read as visual) and Devanagari and Thai came
+back with the marks detached; after shaping the samples above extract as the logical line. The
+bidi controls around an RTL run are added by the extractor. A single-direction line extracts
+exactly; a line that mixes an RTL script with Latin/digits is reordered by the extractor's own
+bidi pass (Xpdf 4 re-applies the Unicode Bidi Algorithm to the visual string it read, which is not
+invertible for mixed runs), so `Hello مرحبا 2024` extracts as `Hello 2024 ‫مرحبا‬` even though the
+page is laid out as written. That is a reader limitation, not a loss of glyphs or characters.
 
 Decisions and limits, also stated in the code:
 
@@ -138,17 +151,33 @@ Decisions and limits, also stated in the code:
   face on the dev machine covers both).
 - **Only TrueType outlines.** CFF/OTF faces are skipped (they would need a `CIDFontType0` and
   `FontFile3`); a `.ttc` collection is used from face 0.
-- **An ASCII/WinAnsi-only document is byte-for-byte what it was**, and setting `fontPath` on one
-  changes nothing: the font program is written only when a page actually drew with it.
+- **WinAnsi-only text keeps its bytes.** A string with no character outside WinAnsiEncoding and
+  no right-to-left base direction (`plain_ltr`) is written exactly as before, so a WinAnsi-only
+  document stays byte-identical and setting `fontPath` on one changes nothing. Text that needs
+  the embedded face is shaped; when the face cannot be shaped (the engine rejects it, the string
+  is over its 4 MiB limit, or the writer's glyph cap is reached) the export falls back to the
+  stored-order runs with a `log::warn`.
+- **One glyph's extraction can need two CIDs.** `ToUnicode` maps the glyph that carries a cluster
+  to the whole cluster's logical text (a ligature or conjunct is never reduced to one character),
+  and the component glyphs of a multi-glyph cluster get no entry and width 0 so an extractor neither
+  repeats the text nor sees a word gap. A glyph that extracts differently in two places gets two
+  CIDs, and a `CIDToGIDMap` stream points them at one subset glyph; when every CID is its own
+  glyph the map stays `/Identity`.
+- **Placement does not move the text matrix.** One `Tm` starts a text item; the shaper's advances
+  and mark offsets are `TJ` numbers (`Ts` for a vertical mark offset) on the `/W` widths and the
+  `ToUnicode` CMap, so a viewer and an extractor both follow the shaped positions.
+- **Measurement is still unshaped.** `text_width_with` sums per-character `hmtx` advances, so a
+  centred, right-aligned or wrapped cell whose text shapes differently from its stored form is
+  measured as if unshaped; the drawing itself is shaped. (Follow-up: measure through the engine.)
 - **Hostile fonts are data, not code.** Every table offset is range-checked, `loca` must be
   non-decreasing and inside `glyf`, the glyph count is capped, composite glyphs are followed
   iteratively (a self-referencing composite terminates), and a malformed font makes the export
   fall back instead of failing. The parser is fuzzed by the truncation tests.
 - **wasm** has no filesystem: font discovery returns an error, no face is embedded, and the
   document keeps the standard fonts and the CID fallback.
-- Out of scope (the grid/editor shaping task owns it): shaping, bidi, per-run fallback, and
-  mirrored printing for right-to-left sheets. **Needs a human:** native-speaker review of every
-language (none so far) and of localized function names.
+- Out of scope for the PDF writer: per-run font fallback, mirrored printing for right-to-left
+  sheets, and shaping grid/editor text (the UI task owns that). **Needs a human:** native-speaker
+review of every language (none so far) and of localized function names.
 
 ## Infrastructure (do first)
 
@@ -158,14 +187,15 @@ language (none so far) and of localized function names.
 2. Locale-aware formulas: localized function-name tables and separators at the formula-bar
    boundary only (files keep en-US invariant names), locale number and date formats, list
    separators in CSV.
-3. Text shaping and fallback: a shaping engine for grid, editor and PDF text (Arabic, Devanagari,
-   Thai), system font fallback for CJK, bidirectional runs, right-to-left sheet tabs and printing.
-   Embedded subset fonts in PDF landed in M14 (see below); shaping and bidi did not.
+3. Text shaping and fallback: the shared `gridcraft_core::text` engine shapes PDF text now (Arabic,
+   Devanagari, Thai, bidi); the grid/editor text, system font fallback for CJK, right-to-left sheet
+   tabs and mirrored printing still need it.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | major | PDF text is shaped with `gridcraft_core::text`: Arabic joins, Devanagari reorders, Thai marks are positioned and bidi runs are laid out in visual order (`TJ`/`Ts` on one text matrix); `ToUnicode` follows the glyph's whole cluster and a `CIDToGIDMap` keeps a glyph that extracts differently in two places apart, so `pdftotext` returns the logical line for a single-direction string (Arabic/Hebrew wrapped in bidi controls; Devanagari/Thai verbatim). WinAnsi-only text is byte-identical; mixed-direction lines are reordered by the extractor's own bidi pass |
 | 2026-10-30 | major | PDF export embeds subset TrueType fonts (`crates/pdf/src/truetype.rs`, `gridcraft_core::fonts`): Cyrillic, Greek, Hebrew, CJK, Korean and the glyphs of Arabic, Devanagari and Thai now reach the PDF (unshaped, left to right) with `ToUnicode` so the text stays copyable; `file.exportPdf`/`file.print` take `fontPath`; a WinAnsi-only document's bytes are unchanged |
 | 2026-10-21 | minor | Romanian interface (`ro`, Română): 970 labels covering every key of the other catalogs (`crates/ui-egui/src/i18n/ro.rs`), `ro-*` system locales, the View-tab switcher and `app.language.set`; context keys show no prefix (File › Options test). English formulas and formats; AI-assisted draft pending native-speaker review |
 | 2026-10-20 | minor | Japanese: furigana (`rPh` phonetic runs and `<phoneticPr>` in `xl/sharedStrings.xml`) is no longer deleted by an open + save; it is kept on the workbook and written back (a `<phoneticPr>` without runs is kept too, while duplicate texts with different readings keep only the first, reported on open). Display of the readings is still missing (`crates/xlsx/src/tests/phonetic_tests.rs`) |
