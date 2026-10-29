@@ -211,11 +211,11 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Line metadata, 1M custom heights | `Sheet::clone` **0.13 ms**, insert/delete **0.013/0.007 ms**, 10k inherited lines 0.1 ms; `LineIndex` build 6.6 ms (cached per revision) | immediate | measured 2026-10-29, `_gridcraft-bench/linebench` |
 | Mapped value write-back | 1M values: identity 36–42 ms; after a row insert **35 ms** (was 131–135), after a column insert **33 ms** (was 116–142) | immediate | measured 2026-10-29, `_gridcraft-bench` release probe |
 | Packed walk / owned gate | Dense block **2.5–3.3 ns/cell** on identity or a mapped column (was 30.6); owned/formula gate over 1M paged rows **0.84 ms** (was 9.5) | fine | measured 2026-10-29, `_gridcraft-bench` release probe |
-| Save a large workbook | 31.7M cells: **3.92 s, 1,655.8 MiB peak**; 100M-cell export: **26.37 s, 6,049.8 MiB peak** (live 19.3 MiB before save) | should stay flat | measured 2026-10-29, `session_breakdown` release with counting allocator; writer's retained sheet XMLs dominate, per-sheet release open |
+| Save a large workbook | 31.7M cells: **3.48 s, 1,283.9 MiB peak**; 100M-cell export: **28.42 s, 1,814.3 MiB peak** | should stay flat | measured 2026-10-29, `session_breakdown` release with counting allocator; per-sheet deflate, bytes identical |
 | Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
-Work: M19 polish (writer per-sheet release S4b after a measured save peak, the deferred page-file
-rewrite), then M17 zone maps and the M21 Parquet read half after beta. The
+Work: the deferred page-file rewrite and post-beta streaming save, then M17 zone maps and the M21
+Parquet read half after beta. The
 old streaming/threading/whole-column items are landed; keep the measured workbooks and
 `cargo xtask bench` as the regression net.
 

@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M19 writer per-sheet release (S4b) after measuring the save peak; M20 page-file rewrite deferred | M19 follow-up | **5–10** | S4a ownership landed 10-29. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: page-file rewrite (deferred); save streaming (S4c) is post-beta | M19 follow-up | **0–8** | S1–S4b landed 10-29; wave 0's base is closed. Start wave 1 (XLSX corpus/Excel) next. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -104,7 +104,7 @@ to check our files (gate #1/#8), and Windows machines with the reported GPU driv
 | M16 | Get & Transform, data model | not started |
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | landed (10-24/27): whole-column folds and recalc kernels; remaining work in gaps |
-| M19 | Cold paging: bands leave memory when unused | **landed (10-28/29)**: compressed pages, byte-budget cache, uncached save scan, spill beside the document; writer peak and page-file rewrite remain |
+| M19 | Cold paging: bands leave memory when unused | **landed (10-28/29)**: compressed pages, byte-budget cache, uncached save scan, spill beside the document, per-sheet save; page-file rewrite deferred |
 | M20 | Append-style structural edits (segments, no whole-sheet shifts) | **complete (10-29)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20, chunked line metadata, cached UI geometry, page-aware `compact` with `document.compact`/save caller, mapped value writes (35/33 ms per 1M), packed column walk and `diff_logical`; only M19's page-file rewrite/byte budget remain |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading/linked tables are post-beta (not a beta gate) |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
@@ -563,14 +563,25 @@ fails the save instead of writing an empty part. `Out` still retains the sheet X
 release (S4b) is the remaining peak, to be done after a measured save peak. Xlsx **271**, engine
 **423** tests.
 
-**Measured save peak (10-29, `session_breakdown`, release, counting allocator).** The writer, not
-the store, dominates: the 31.7M-cell `real_117m` saves in **3.92 s with a 1,655.8 MiB peak** (live
-141.5 MiB before the save), and the 100M-cell export saves in **26.37 s with a 6,049.8 MiB peak**
-(live 19.3 MiB before the save). S4a removed the redundant part copies; the remaining peak is
-`Out.parts` holding every sheet's XML plus the compressed archive (S4b).
+**Per-sheet save (10-29).** Worksheet XML is handed to a background compression worker as each
+sheet is written (`Out::part_precompressed`), so only the worker's current XML and the compressed
+parts are alive; `write_zip` assembles mixed raw/pre-deflated parts in the same order, with the
+zip64 decision taken from uncompressed sizes. On wasm the packer and the parallel deflate are
+compiled out (inline deflate, sequential archive), and an end-to-end Node run produced the same
+21,491 bytes as the native build. Output is byte-identical: the 100M package hash
+`c7aff2d0…` and the 31.7M hash `11174305…` match the base.
 
-**Scope (remaining).** Per-sheet release (S4b) is the real save peak, and a page-file rewrite
-(bytes appended by compaction) is deferred. Bands outside the working set
+Measured (`session_breakdown`, release, counting allocator):
+
+| file | save | save peak | before |
+|---|---:|---:|---:|
+| `real_117m.xlsx` (31.7M cells) | **3.48 s** | **1,283.9 MiB** | 3.92 s / 1,655.8 MiB |
+| `hundred_m.xlsx` (100M cells) | **28.42 s** | **1,814.3 MiB** | 26.37 s / 6,049.8 MiB |
+
+**Scope (remaining).** A page-file rewrite (bytes appended by compaction) is deferred; streaming
+the archive (S4c) and a zip64 streaming writer are post-beta. Bands outside the working set do
+leave memory, decompressed when the viewport, calculation or a command touches them, which is the
+phase's core. Bands outside the working set
 do leave memory, decompressed when the viewport, calculation or a command touches them, which is
 the phase's core.
 
@@ -807,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M19 per-sheet save: worksheet XML deflates on a background worker as it is written, `write_zip` mixes raw/pre-deflated parts in order, wasm uses inline/sequential paths; 100M save **28.42 s / 1,814.3 MiB** (was 26.37 s / 6,049.8), 31.7M **3.48 s / 1,283.9 MiB**, byte-identical output; 273 xlsx / 423 engine tests |
 | 2026-10-29 | minor | Measured save peak after S4a: 31.7M cells saves in **3.92 s / 1,655.8 MiB peak**, 100M cells in **26.37 s / 6,049.8 MiB peak** (`session_breakdown`, release, counting allocator). The remaining peak is every sheet's XML in `Out.parts` plus the archive; S4b (per-sheet release) is next |
 | 2026-10-29 | minor | M19 writer ownership: `ZipOut::add` takes `Vec` parts, each moves into its deflate worker and is dropped there, zip64 is decided from a whole-archive bound before compression; output unchanged (37,153 bytes / `sha256 ae15eeb1…` pinned); 271 xlsx / 423 engine tests. Per-sheet release remains, after a measured save peak |
 | 2026-10-29 | minor | M19 spill beside the document: document folder then temp, `GRIDCRAFT_SPILL=temp|off`, UNC skip, sanitized name, Unix 0600 + unlink-after-open, Windows delete-on-close, write-failure latch and one warning when paging is unavailable; 104 model / 268 xlsx / 423 engine tests |

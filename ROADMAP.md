@@ -127,7 +127,7 @@ The detailed queue with dependencies and the parallel plan is in
 
 | Wave | Work | Hours | Notes |
 |---|---|---|---|
-| **0** | Close the base: M19 writer per-sheet release (S4b) after measuring the save peak; M20 page-file rewrite deferred | **5–10** | S4a ownership landed 10-29. Last large-workbook debt. |
+| **0** | Close the base: page-file rewrite (deferred); save streaming (S4c) is post-beta | **0–8** | S1–S4b landed 10-29; wave 0 base closed. Start wave 1 (XLSX corpus/Excel). |
 | **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
 | **1** | **XLSX corpus + Excel acceptance** (#1/#3) | 21–35 | **Owner: half a day in Excel.** The only external gate; start early. |
 | **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M19 per-sheet save: worksheet XML is deflated by a background worker as it is written, `write_zip` mixes raw and pre-deflated parts in the same order, and wasm uses inline/sequential paths (Node and native produce identical bytes). **100M save 28.42 s / 1,814.3 MiB peak** (was 26.37 s / 6,049.8), **31.7M 3.48 s / 1,283.9 MiB**; output byte-identical. 273 xlsx / 423 engine tests |
 | 2026-10-29 | M19 save peak measured after S4a: **3.92 s / 1,655.8 MiB** for 31.7M cells (`real_117m`) and **26.37 s / 6,049.8 MiB** for the 100M-cell export (`session_breakdown`, release, counting allocator). The writer's retained sheet XMLs dominate; S4b (per-sheet release) is the remaining wave-0 item |
 | 2026-10-29 | M19 writer ownership: `ZipOut::add` takes each part by value, `write_zip` drops a part as soon as its deflate worker finishes, and the zip64 decision is taken from a whole-archive bound before compression; output is byte-identical (37,153 bytes / `sha256 ae15eeb1…` pinned). 271 xlsx / 423 engine tests; per-sheet release remains, after a measured save peak |
 | 2026-10-29 | M19 spill beside the document: a paging open tries the document folder then temp, `GRIDCRAFT_SPILL=temp|off`, skips UNC; Unix creates it 0600 and unlinks the name at once, Windows uses delete-on-close; a write failure latches spilling off (pages already written stay readable) and an unavailable spill warns but still opens live. 104 model / 268 xlsx / 423 engine tests |
@@ -253,6 +254,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M19 per-sheet save (background deflate as each sheet is written, mixed raw/packed archive, wasm inline); 100M peak 6.05→1.81 GiB at 28.42 s, 31.7M 1.66→1.28 GiB at 3.48 s, bytes identical; wave 0 base closed |
 | 2026-10-29 | minor | M19 writer ownership + measured save peak (31.7M: 3.92 s / 1.66 GiB; 100M: 26.37 s / 6.05 GiB, release counting allocator); retained sheet XMLs dominate; per-sheet release remains |
 | 2026-10-29 | minor | M19 spill beside the document (folder-then-temp, `GRIDCRAFT_SPILL`, UNC skip, Unix 0600+unlink, Windows delete-on-close, failure latch, warning); 104 model / 268 xlsx / 423 engine tests; writer peak remains |
 | 2026-10-29 | minor | M19 uncached save scan (`iter_scan`/`visit_scan`, writer wired, one band at a time, cache stats unchanged, byte-identical output); 97 model / 266 xlsx / 422 engine tests; spill placement and the writer peak remain |

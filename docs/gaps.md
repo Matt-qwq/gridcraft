@@ -94,10 +94,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Insert inheritance, delete, undo and a mapped-sheet XLSX round trip are covered (model 62,
   engine 419, xlsx 265 tests). The UI also caches the derived `LineIndex`/outline axes per
   `(document, revision, sheet)`, so a 1M-custom-height sheet no longer rebuilds them every frame.
-- **Measured 10-29: save peak.** After S4a the 31.7M-cell `real_117m` saves in 3.92 s with a
-  **1,655.8 MiB peak**; the 100M-cell export saves in 26.37 s with a **6,049.8 MiB peak** (live
-  19.3 MiB before the save). `Out.parts` retaining every sheet's XML is the remaining cause; S4b
-  (per-sheet release) is the wave-0 fix.
+- **Landed 10-29: per-sheet save.** Worksheet XML deflates on a background worker as each sheet
+  is written; the archive mixes raw/pre-deflated parts in order, and wasm uses inline/sequential
+  paths. The 100M-cell save now peaks at **1,814.3 MiB in 28.42 s** (was 6,049.8 MiB / 26.37 s),
+  and `real_117m` at 1,283.9 MiB in 3.48 s; output hashes are unchanged. Only the deferred
+  page-file rewrite and post-beta streaming save remain.
 - **Landed (10-29): writer ownership.** `ZipOut::add` takes each part `Vec` instead of copying it,
   `write_zip` moves each part into its deflate worker and drops it there, and the zip64 decision is
   taken before compression from a whole-archive bound. Output is byte-identical (37,153 bytes pinned
@@ -119,9 +120,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   resolves a band once (1M paged rows 0.84 ms, was 9.5). `diff` keeps its documented physical
   contract; `diff_logical` is the O(cells) map-independent diagnostic for tests/fuzz.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
-  clear/copy/paste still clone the stored cells (they scale with the data, not the file); the XLSX
-  writer retains every sheet's XML until layout (the real save peak, S4b); the per-band value
-  dictionaries still cost full price when values do not repeat;
+  clear/copy/paste still clone the stored cells (they scale with the data, not the file); the
+  per-band value dictionaries still cost full price when values do not repeat;
   page-aware compaction and the 64 MiB byte-budget page cache landed 10-29 (identity early-out,
   gap-scoped candidates, snapshot-safe page replacement, `document.compact` and a save hook,
   `PageCacheStats`); a page-file rewrite remains;
