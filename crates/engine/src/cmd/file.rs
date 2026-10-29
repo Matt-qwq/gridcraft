@@ -9,9 +9,9 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(noundo "file.new", "New Workbook", ["File"], Some("Cmd+N"), "{sample?: \"budget\"|\"sales\"|\"grades\"}", always, new_workbook),
         cmd!(noundo "file.open", "Open…", ["File"], Some("Cmd+O"), "{path} | {name, base64}, plus {password} for a password-protected workbook and {csvAsText?: bool} to keep every csv/tsv/txt field as text, with no number or date conversion (xlsx, xlsm, xls import, xlsb and ods data import, csv, tsv, txt, json)", always, open),
-        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?, password?} (xlsx by default; .csv/.tsv/.json/.html/.pdf by extension; without `password` the workbook keeps the one it was opened with, and `\"\"` removes it)", has_doc, save),
-        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path, password?} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet; a password encrypts an .xlsx)", has_doc, save_as),
-        cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html, password?} → {base64}", has_doc, save_bytes),
+        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?, password?, encryption?} (xlsx by default; .csv/.tsv/.json/.html/.pdf by extension; without `password` the workbook keeps the one it was opened with, and `\"\"` removes it; `encryption` picks `agile` — the default — or `standard` for the AES-128/SHA-1 form Excel 2007 wrote, and without it a workbook opened from a Standard file stays Standard)", has_doc, save),
+        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path, password?, encryption?} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet; a password encrypts an .xlsx, with `encryption`: `agile` — the default — or `standard`)", has_doc, save_as),
+        cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html, password?, encryption?: agile|standard} → {base64} (without `encryption` the document's scheme is used)", has_doc, save_bytes),
         cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
         cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
@@ -105,8 +105,10 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.close_document(0);
     }
     let mut doc = DocState::new(wb, path, title);
-    // An encrypted workbook is saved back with the password it was opened with.
+    // An encrypted workbook is saved back with the password it was opened with, and with the
+    // scheme it was written in: a Standard file stays Standard instead of silently changing form.
     doc.password = if encrypted { password.map(str::to_string) } else { None };
+    doc.encryption = if encrypted { gridcraft_xlsx::encryption_scheme(&bytes).unwrap_or_default() } else { Default::default() };
     if crate::io::FileKind::from_path(&name).is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Xlsx {
         doc.content_kind = Some(crate::io::FileKind::Xlsx);
     }
@@ -123,6 +125,22 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
     let out = json!({"index": i, "title": d.display_title(), "sheets": d.wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(), "warnings": warnings});
     Ok(out)
+}
+
+/// The scheme a password-protected save writes: the `encryption` param (`"agile"` — the default —
+/// or `"standard"`), else the one the document's file was written with. An unknown name is an
+/// error that lists the two accepted values.
+fn scheme_param(cmd: &str, p: &Json, d: &DocState) -> Result<gridcraft_xlsx::EncryptionScheme> {
+    use gridcraft_xlsx::EncryptionScheme;
+    match str_param(p, "encryption") {
+        Some(name) => EncryptionScheme::from_name(name).ok_or_else(|| {
+            bad(
+                cmd,
+                format!("unknown encryption scheme `{name}`: use `{}` (the default) or `{}`", EncryptionScheme::NAMES[0], EncryptionScheme::NAMES[1]),
+            )
+        }),
+        None => Ok(d.encryption),
+    }
 }
 
 fn save(s: &mut Session, p: &Json) -> Result<Json> {
@@ -143,14 +161,15 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
     // and without one the document is saved with the password it was opened with.
     let asked = str_param(p, "password").map(|pw| if pw.is_empty() { None } else { Some(pw.to_string()) });
     let password = asked.clone().unwrap_or_else(|| d.password.clone());
+    let scheme = scheme_param("file.save", p, d)?;
     // The document's own file keeps the format its content had when opened; any other path
     // goes by its extension. Relative paths to linked workbooks are rewritten for the new folder.
     let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
     let rebased = crate::io::source_dir(&path).and_then(|f| gridcraft_xlsx::rebase_links(&d.wb, &f));
     let wb = rebased.as_ref().unwrap_or(&d.wb);
     let bytes = match kind {
-        Some(kind) => crate::io::save_bytes_as_with_password(wb, &path, kind, password.as_deref())?,
-        None => crate::io::save_bytes_with_password(wb, &path, password.as_deref())?,
+        Some(kind) => crate::io::save_bytes_as_with(wb, &path, kind, password.as_deref(), scheme)?,
+        None => crate::io::save_bytes_with(wb, &path, password.as_deref(), scheme)?,
     };
     crate::io::write_file(&path, &bytes)?;
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
@@ -169,6 +188,9 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         d.saved = d.wb.clone();
         d.path = Some(path.clone());
         d.password = password;
+        // The document remembers the scheme it was just written with, so the next ordinary Save
+        // does not change the file's form behind the caller's back.
+        d.encryption = scheme;
     }
     Ok(json!({"path": path, "bytes": bytes.len()}))
 }
@@ -178,6 +200,8 @@ fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
         s.ui_requests.push(crate::UiRequest::Dialog("saveAs".into(), json!({})));
         return ok();
     }
+    // Checked here as well, so a bad `encryption` names `file.saveAs` and not `file.save`.
+    scheme_param("file.saveAs", p, s.doc()?)?;
     save(s, p)
 }
 
@@ -193,7 +217,8 @@ fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
         Some(asked) => asked,
         None => d.password.clone(),
     };
-    let bytes = crate::io::save_bytes_with_password(&d.wb, &name, password.as_deref())?;
+    let scheme = scheme_param("file.saveBytes", p, d)?;
+    let bytes = crate::io::save_bytes_with(&d.wb, &name, password.as_deref(), scheme)?;
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
 }
 
