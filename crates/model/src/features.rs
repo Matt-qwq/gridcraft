@@ -645,6 +645,23 @@ impl std::fmt::Debug for ChartPart {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub struct KeptChart {
+    pub id: u32,
+    pub anchor: Anchor,
+    /// The chart part, written back byte for byte: its kind is not modelled (3-D, surface, pie of
+    /// pie, a Pareto line, a filled map) and rebuilding it would silently lose the chart.
+    pub xml: std::sync::Arc<str>,
+    /// A `chartEx` part (Office 2016 and later), drawn through a `mc:AlternateContent` frame.
+    pub chartex: bool,
+}
+
+impl std::fmt::Debug for KeptChart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeptChart").field("id", &self.id).field("bytes", &self.xml.len()).finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LegendPos {
     None,
@@ -806,6 +823,9 @@ pub struct Chart {
     /// Value axis scaling and labels (the primary axis of a combo chart).
     #[serde(default)]
     pub y_axis: AxisOptions,
+    /// The secondary (right) value axis of a combo chart, for the series plotted against it.
+    #[serde(default)]
+    pub y2_axis: AxisOptions,
     /// What data labels show; `data_labels` turns them on and off.
     #[serde(default)]
     pub labels: LabelOptions,
@@ -823,8 +843,15 @@ impl Chart {
         self.part = Some(Box::new(ChartPart { xml, as_read: Box::new(as_read) }));
     }
 
+    /// The chart part as read and the model it was read as, so an edit can patch the fields it
+    /// changes into the kept part instead of regenerating it.
+    pub fn kept_part(&self) -> Option<(&str, &Chart)> {
+        let part = self.part.as_deref()?;
+        Some((part.xml.as_ref(), &part.as_read))
+    }
+
     /// The chart part to write back unchanged: only while nothing in the model changed since it was
-    /// read. An edit writes the model out (and with it every option GridCraft models).
+    /// read. When only modelled fields changed, [`Self::kept_part`] lets the writer patch them in.
     pub fn unchanged_part(&self) -> Option<&str> {
         let part = self.part.as_deref()?;
         let mut now = self.clone();

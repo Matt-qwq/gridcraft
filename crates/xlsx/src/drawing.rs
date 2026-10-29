@@ -168,10 +168,23 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                         // A chart part with relationships of its own (external data, user shapes) can't
                         // be written back on its own: those parts are not kept, and its `r:id`s
                         // would dangle.
-                        let linked = !cx.pkg.rels(&target)?.is_empty();
+                        let rels = cx.pkg.rels(&target)?;
+                        let linked = !rels.is_empty();
+                        // A kept part is written back on its own, so it may only carry relationships
+                        // GridCraft writes again: a chartex part's style and colour parts are.
+                        let kept_ok = rels.is_empty()
+                            || (chartex && rels.iter().all(|r| !r.external && matches!(r.kind.as_str(), "chartStyle" | "chartColorStyle")));
                         let part = cx.optional_xml_text(&target)?;
                         if let Some((cx_xml, text)) = part {
-                            match if chartex { crate::chartex::read_chartex(&cx_xml) } else { crate::chart::read_chart(&cx_xml) } {
+                            let modelled = if chartex { crate::chartex::is_modelled(&cx_xml) } else { crate::chart::is_modelled(&cx_xml) };
+                            let read = if !modelled {
+                                None
+                            } else if chartex {
+                                crate::chartex::read_chartex(&cx_xml)
+                            } else {
+                                crate::chart::read_chart(&cx_xml)
+                            };
+                            match read {
                                 Some(mut ch) => {
                                     ch.id = cx.next_object_id();
                                     ch.anchor = anchor;
@@ -181,6 +194,14 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                                         ch.keep_part(text.into());
                                     }
                                     sheet.charts.push(ch);
+                                }
+                                // A kind GridCraft cannot model (3-D, surface, pie of pie, Pareto, a
+                                // filled map) is kept whole with its frame: rebuilding it from the
+                                // model would silently lose the chart.
+                                None if kept_ok => {
+                                    let id = cx.next_object_id();
+                                    cx.warn(format!("chart {target} is a kind GridCraft does not model: kept as it was, not drawn"));
+                                    sheet.kept_charts.push(gridcraft_model::KeptChart { id, anchor, xml: text.into(), chartex });
                                 }
                                 None => cx.warn(format!("chart {target} has no supported plot and was skipped")),
                             }
@@ -321,6 +342,8 @@ pub fn srgb(c: &Color, theme: &Theme) -> Option<String> {
 pub enum Obj<'a> {
     Image(&'a Image, String),
     Chart(&'a gridcraft_model::Chart, String),
+    /// A chart of a kind GridCraft does not model: its frame only (the part is written as it was).
+    RawChart(&'a gridcraft_model::KeptChart, String),
     Shape(&'a Shape),
 }
 
@@ -343,6 +366,29 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                     id - 1,
                     esc_attr(&img.alt),
                     xfrm(&img.anchor, "a:xfrm")
+                );
+            }
+            Obj::RawChart(ch, rid) if ch.chartex => {
+                let (open, close) = anchor_open(sheet, &ch.anchor);
+                close_tag = close;
+                s.push_str(&open);
+                let _ = write!(
+                    s,
+                    "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice xmlns:cx1=\"http://schemas.microsoft.com/office/drawing/2015/9/8/chartex\" Requires=\"cx1\"><xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"Chart {}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>{}<a:graphic><a:graphicData uri=\"http://schemas.microsoft.com/office/drawing/2014/chartex\"><cx:chart xmlns:cx=\"http://schemas.microsoft.com/office/drawing/2014/chartex\" r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro=\"\" textlink=\"\"><xdr:nvSpPr><xdr:cNvPr id=\"0\" name=\"\"/><xdr:cNvSpPr><a:spLocks noTextEdit=\"1\"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr>{}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr><xdr:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>This chart type can't be shown by this application.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent>",
+                    id - 1,
+                    xfrm(&ch.anchor, "xdr:xfrm"),
+                    xfrm(&ch.anchor, "a:xfrm")
+                );
+            }
+            Obj::RawChart(ch, rid) => {
+                let (open, close) = anchor_open(sheet, &ch.anchor);
+                close_tag = close;
+                s.push_str(&open);
+                let _ = write!(
+                    s,
+                    "<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"Chart {}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>{}<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>",
+                    id - 1,
+                    xfrm(&ch.anchor, "xdr:xfrm")
                 );
             }
             Obj::Chart(ch, rid) if ch.kind.is_chartex() => {
