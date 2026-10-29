@@ -277,13 +277,44 @@ impl PivotSlicer {
     }
 }
 
+/// A timeline's selected date range: the first and last day it shows, as serial days in the
+/// workbook's date system. The file keeps it as the timeline cache's `<state><selection>`
+/// `startDate`/`endDate`; a range is inclusive at both ends.
+///
+/// Serial numbers, not dates, because that is how the sheet stores a date and how the source rows
+/// are compared. A range is only written when it is finite and ordered ([`Self::is_valid`]); a
+/// hostile one is treated as no selection rather than written as a number a reader would choke on.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TimelineRange {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl TimelineRange {
+    pub fn new(start: f64, end: f64) -> TimelineRange {
+        TimelineRange { start, end }
+    }
+
+    /// Whether this is a range a date axis can show: two finite serials with the start not after
+    /// the end. A NaN compares false everywhere, so a hostile range is never valid.
+    pub fn is_valid(&self) -> bool {
+        self.start.is_finite() && self.end.is_finite() && self.start <= self.end
+    }
+
+    /// Whether `serial` is inside the range (both ends included). False for NaN and for a range
+    /// that is not valid.
+    pub fn contains(&self, serial: f64) -> bool {
+        self.is_valid() && serial.is_finite() && serial >= self.start && serial <= self.end
+    }
+}
+
 /// A timeline: the same widget for a date field, with the time unit it groups by.
 ///
-/// A timeline's selection is a date *range* (`selectionStartDate`/`selectionEndDate` on its cache's
-/// `state`), which is not modelled yet: a file with a range is kept as it is instead of being
-/// read into a model that would lose it on save. `items` therefore stays empty; the tiles are the
+/// A timeline's selection is a date *range* ([`TimelineRange`], the cache's
+/// `<state><selection>`), `None` when every date is shown. `items` stays empty; the tiles are the
 /// periods of `field` grouped by `unit`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PivotTimeline {
     pub id: u32,
     pub name: String,
@@ -294,6 +325,8 @@ pub struct PivotTimeline {
     pub pivot_tables: Vec<String>,
     pub style: String,
     pub unit: TimeUnit,
+    /// The dates the timeline shows; `None` = all dates.
+    pub range: Option<TimelineRange>,
     pub anchor: Anchor,
 }
 
@@ -310,6 +343,7 @@ impl Default for PivotTimeline {
             // Empty = Excel's default look: the file carries no style and the UI picks its own.
             style: String::new(),
             unit: TimeUnit::Months,
+            range: None,
             anchor: Anchor { cell: gridcraft_core::CellRef::default(), dx: 4.0, dy: 4.0, width: 240.0, height: 96.0, mode: AnchorMode::MoveOnly },
         }
     }
@@ -368,11 +402,24 @@ mod tests {
         };
         let json = serde_json::to_string(&sl).unwrap();
         assert_eq!(serde_json::from_str::<PivotSlicer>(&json).unwrap(), sl);
-        let tl = PivotTimeline { unit: TimeUnit::Quarters, ..PivotTimeline::default() };
+        let tl = PivotTimeline { unit: TimeUnit::Quarters, range: Some(TimelineRange::new(45_658.0, 45_720.0)), ..PivotTimeline::default() };
         assert_eq!(serde_json::from_str::<PivotTimeline>(&serde_json::to_string(&tl).unwrap()).unwrap(), tl);
         assert_eq!(TimeUnit::from_level(TimeUnit::Days.level()), Some(TimeUnit::Days));
         assert_eq!(TimeUnit::from_level(9), None);
         assert_eq!(SlicerSort::parse("Z-A"), Some(SlicerSort::Descending));
         assert_eq!(SlicerSort::parse("sideways"), None);
+    }
+
+    #[test]
+    fn a_hostile_date_range_is_never_valid_and_contains_nothing() {
+        let r = TimelineRange::new(45_658.0, 45_720.0);
+        assert!(r.is_valid() && r.contains(45_658.0) && r.contains(45_720.0) && !r.contains(45_657.0));
+        // A single day is a range (the two handles meet).
+        assert!(TimelineRange::new(45_658.0, 45_658.0).contains(45_658.0));
+        // Reversed, NaN, infinite: nothing is shown, and the writer will drop the selection.
+        for bad in [TimelineRange::new(45_720.0, 45_658.0), TimelineRange::new(f64::NAN, 1.0), TimelineRange::new(0.0, f64::INFINITY)] {
+            assert!(!bad.is_valid(), "{bad:?}");
+            assert!(!bad.contains(45_658.0), "{bad:?}");
+        }
     }
 }

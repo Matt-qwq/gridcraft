@@ -25,7 +25,8 @@ const TIMELINE: &str = r#"<?xml version="1.0"?><timelines xmlns="http://schemas.
 const TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Amount" sourceName="Amount"><pivotTables><pivotTable tabId="1" name="PivotTable1"/></pivotTables><state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="unknown"><bounds startDate="1900-01-10T00:00:00" endDate="1900-02-09T00:00:00"/></state></timelineCacheDefinition>"#;
 /// A slicer cache whose data lives in an `<olap>` block: not modelled, so kept as it came.
 const OLAP_SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="Slicer_Region" sourceName="Region"><pivotTables><pivotTable tabId="1" name="PivotTable1"/></pivotTables><data><olap><pivotCacheId>1</pivotCacheId></olap></data></slicerCacheDefinition>"#;
-/// A timeline cache with a selected date range: not modelled, so kept as it came.
+/// A timeline cache that says `filterType="unknown"` yet carries a selection: the two contradict
+/// each other, so GridCraft does not guess which one wins and keeps it as it came.
 const SELECTED_TIMELINE_CACHE: &str = r#"<?xml version="1.0"?><timelineCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" name="Timeline_Amount" sourceName="Amount"><pivotTables><pivotTable tabId="1" name="PivotTable1"/></pivotTables><state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="unknown"><selection startDate="1900-01-10T00:00:00" endDate="1900-02-09T00:00:00"/><bounds startDate="1900-01-10T00:00:00" endDate="1900-02-09T00:00:00"/></state></timelineCacheDefinition>"#;
 const QUERY_TABLE: &str = r#"<?xml version="1.0"?><queryTable xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="SalesQuery" connectionId="1" autoFormatId="16" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="0"/>"#;
 const PIVOT_CACHE: &str = r#"<?xml version="1.0"?><pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" saveData="0" refreshOnLoad="1" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3"><cacheSource type="worksheet"><worksheetSource ref="A1:B5" sheet="Data"/></cacheSource><cacheFields count="2"><cacheField name="Region" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="1"><s v="North"/><s v="South"/></sharedItems></cacheField><cacheField name="Amount" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0"/></cacheField></cacheFields><extLst><ext uri="{33333333-4444-5555-6666-777777777777}"><x99:cacheThing xmlns:x99="urn:example:cache">keep the cache extension</x99:cacheThing></ext></extLst></pivotCacheDefinition>"#;
@@ -253,7 +254,8 @@ fn slicers_timelines_and_owner_extensions_survive_a_round_trip() {
     assert!(u2.text(&chart2).contains("unknownChartThing"));
 
     // Slicer content GridCraft cannot model keeps today's behaviour: an OLAP cache and a timeline
-    // with a selected date range leave every slicer part byte-identical, and nothing is modelled.
+    // whose state contradicts itself (no filter type, but a selection) leave every slicer part
+    // byte-identical, and nothing is modelled.
     let (wb, rep) = read_xlsx(&extension_package_with(OLAP_SLICER_CACHE, SELECTED_TIMELINE_CACHE)).unwrap();
     assert!(wb.sheet(0).unwrap().pivot_slicers.is_empty(), "{:?}", rep.warnings);
     assert!(wb.sheet(0).unwrap().pivot_timelines.is_empty(), "{:?}", rep.warnings);

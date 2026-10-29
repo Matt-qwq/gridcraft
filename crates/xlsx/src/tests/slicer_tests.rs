@@ -480,3 +480,117 @@ fn a_hostile_anchor_is_clamped_not_trusted() {
     assert!(a.dx.is_finite() && a.dy.is_finite() && a.width.is_finite() && a.height.is_finite());
     assert!(a.dx >= 0.0 && a.dy >= 0.0 && a.width >= 0.0 && a.height >= 0.0);
 }
+
+/// The one timeline cache part of a written workbook.
+fn timeline_cache(parts: &HashMap<String, Vec<u8>>) -> String {
+    text(parts, "xl/timelineCaches/")
+}
+
+/// [`workbook`] saved, with its timeline cache's `<state>` replaced by `state`: the surrounding
+/// part (name, source field, PivotTable list) is kept, so only the state is under test.
+fn package_with_timeline_state(state: &str) -> (Vec<u8>, String) {
+    let out = write_xlsx(&workbook()).unwrap();
+    let mut parts = unpack(&out);
+    let part = parts.keys().find(|n| n.starts_with("xl/timelineCaches/")).cloned().unwrap();
+    let cache = text(&parts, "xl/timelineCaches/");
+    let start = cache.find("<state").unwrap();
+    let end = cache.find("</state>").unwrap() + "</state>".len();
+    let patched = format!("{}{}{}", &cache[..start], state, &cache[end..]);
+    parts.insert(part, patched.clone().into_bytes());
+    (super::make_zip(&parts.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect::<Vec<_>>()), patched)
+}
+
+#[test]
+fn a_timeline_date_range_round_trips_through_the_model() {
+    let mut wb = workbook();
+    // 2025-01-01 .. 2025-02-12.
+    wb.sheet_mut(1).unwrap().pivot_timelines[0].range = Some(TimelineRange::new(45_658.0, 45_700.0));
+    let out = write_xlsx(&wb).unwrap();
+    check_package(&out).unwrap();
+    let parts = unpack(&out);
+    let cache = timeline_cache(&parts);
+    assert!(cache.contains("filterType=\"dateBetween\""), "{cache}");
+    assert!(
+        cache.contains("<selection startDate=\"2025-01-01T00:00:00\" endDate=\"2025-02-12T00:00:00\"/><bounds startDate="),
+        "the selection is written before the bounds: {cache}"
+    );
+
+    // The exact dates come back, and no part was kept raw.
+    let (back, rep) = read_xlsx(&out).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains("kept as they came")), "{:?}", rep.warnings);
+    let tl = &back.sheet(1).unwrap().pivot_timelines[0];
+    assert_eq!(tl.range, Some(TimelineRange::new(45_658.0, 45_700.0)), "the range's dates survive the read");
+    assert_eq!(tl.unit, TimeUnit::Quarters, "the range does not disturb the unit");
+
+    // A save from the model writes the same state, and a further round trip is stable.
+    let out2 = write_xlsx(&back).unwrap();
+    check_package(&out2).unwrap();
+    assert_eq!(timeline_cache(&unpack(&out2)), cache);
+    let (back2, rep2) = read_xlsx(&out2).unwrap();
+    assert!(!rep2.warnings.iter().any(|w| w.contains("kept as they came")), "{:?}", rep2.warnings);
+    assert_eq!(back2.sheet(1).unwrap().pivot_timelines[0].range, tl.range);
+    assert_eq!(timeline_cache(&unpack(&write_xlsx(&back2).unwrap())), cache);
+}
+
+#[test]
+fn a_timeline_without_a_range_writes_no_selection_and_unknown() {
+    let out = write_xlsx(&workbook()).unwrap();
+    check_package(&out).unwrap();
+    let cache = timeline_cache(&unpack(&out));
+    assert!(cache.contains("filterType=\"unknown\""), "{cache}");
+    assert!(!cache.contains("<selection"), "no range means no selection: {cache}");
+    let (back, rep) = read_xlsx(&out).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains("kept as they came")), "{:?}", rep.warnings);
+    assert_eq!(back.sheet(1).unwrap().pivot_timelines[0].range, None);
+}
+
+#[test]
+fn a_timeline_state_a_save_could_not_spell_back_keeps_its_bytes() {
+    // A reversed range, a date the calendar cannot hold, a fraction of a second GridCraft's dates
+    // do not carry, a filter type that contradicts the children, a state attribute or child the
+    // model does not carry, and a refresh version: none of these can be written back as they came,
+    // so the whole timeline set stays on the kept path, byte for byte.
+    let variants = [
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-02-12T00:00:00" endDate="2025-01-01T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="10000-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00.500" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="unknown" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="3" lastRefreshVersion="3" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1" foo="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><foo/></state>"#,
+    ];
+    for state in variants {
+        let (bytes, patched) = package_with_timeline_state(state);
+        let (back, rep) = read_xlsx(&bytes).unwrap();
+        assert!(rep.warnings.iter().any(|w| w.contains("kept as they came")), "{state}: {:?}", rep.warnings);
+        assert!(back.sheet(1).unwrap().pivot_timelines.is_empty(), "{state}: the timeline must not be modelled");
+        let out = write_xlsx(&back).unwrap();
+        check_package(&out).unwrap();
+        let parts = unpack(&out);
+        assert_eq!(timeline_cache(&parts), patched, "{state}: the kept cache is written byte for byte");
+        assert_eq!(text(&parts, "xl/timelines/"), text(&unpack(&bytes), "xl/timelines/"), "{state}: the kept view part too");
+    }
+}
+
+#[test]
+fn a_hostile_model_range_is_written_as_no_selection() {
+    // The command refuses these, but a model can arrive from JSON or a repaired workbook: the file
+    // must not state a range no reader could use.
+    for range in [
+        TimelineRange::new(45_700.0, 45_658.0),
+        TimelineRange::new(f64::NAN, 45_700.0),
+        TimelineRange::new(45_658.0, f64::INFINITY),
+        TimelineRange::new(0.0, 45_700.0),
+        TimelineRange::new(45_658.0, 1e18),
+    ] {
+        let mut wb = workbook();
+        wb.sheet_mut(1).unwrap().pivot_timelines[0].range = Some(range);
+        let out = write_xlsx(&wb).unwrap();
+        check_package(&out).unwrap();
+        let cache = timeline_cache(&unpack(&out));
+        assert!(cache.contains("filterType=\"unknown\"") && !cache.contains("<selection"), "{range:?}: {cache}");
+        let (back, rep) = read_xlsx(&out).unwrap();
+        assert!(!rep.warnings.iter().any(|w| w.contains("kept as they came")), "{range:?}: {:?}", rep.warnings);
+        assert_eq!(back.sheet(1).unwrap().pivot_timelines[0].range, None, "{range:?}: no range is stated");
+    }
+}
