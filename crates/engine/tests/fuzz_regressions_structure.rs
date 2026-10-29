@@ -1,11 +1,16 @@
 //! Regressions from the 400-seed command-sequence soak: two `[structure]` failures (a legacy array
-//! whose range no longer starts at its formula cell after `data.removeDuplicates`).
+//! whose range no longer starts at its formula cell after `data.removeDuplicates`) and one `[undo]`
+//! failure (workbook-level state changed by a command that recorded no history step).
 //!
-//! The invariants are the fuzz harness's own, and so is the comparison ([`fuzz_common`]).
+//! The invariants are the fuzz harness's own, and so is the comparison ([`fuzz_common`]): undoing
+//! every step must give back the starting workbook, view state and the Watch Window list aside.
 
 use gridcraft_core::CellRef;
 use gridcraft_engine::Session;
+use gridcraft_engine::model::Workbook;
 use serde_json::json;
+
+mod fuzz_common;
 
 /// The array ranges on a sheet, as `(anchor, covered range)` for every legacy array formula.
 fn arrays(s: &Session) -> Vec<(String, String)> {
@@ -120,4 +125,59 @@ fn remove_duplicates_refuses_to_cut_an_array_apart() {
     assert_eq!(array_problem(&s), None);
     assert_eq!(arrays(&s), [("Sheet1!F11".to_string(), "F11:F13".to_string())]);
     assert_eq!((value(&s, "F11"), value(&s, "F12"), value(&s, "F13")), ("1".to_string(), "2".to_string(), "3".to_string()));
+}
+
+/// The fuzz harness's `[undo]` check: undo every step, then redo every step, and the workbook must
+/// come back — including the workbook-level state (defined names, styles, settings) a cell-level
+/// comparison misses.
+fn undo_and_redo_all(s: &mut Session, base: &Workbook) {
+    let end = s.doc().expect("document").wb.clone();
+    let mut n = 0;
+    while !s.doc().expect("document").undo.is_empty() {
+        s.execute("edit.undo", json!({})).expect("undo");
+        n += 1;
+        assert!(n <= 100, "undo never empties its history");
+    }
+    let undone = s.doc().expect("document").wb.clone();
+    if let Some(diff) = fuzz_common::workbook_diff(base, &undone) {
+        panic!("undoing all {n} steps doesn't give back the starting workbook: {diff}");
+    }
+    for _ in 0..n {
+        s.execute("edit.redo", json!({})).expect("redo");
+    }
+    assert!(s.doc().expect("document").redo.is_empty(), "redo stack not empty after redoing every step");
+    let redone = s.doc().expect("document").wb.clone();
+    if let Some(diff) = fuzz_common::workbook_diff(&end, &redone) {
+        panic!("redoing all {n} steps doesn't give back the final workbook: {diff}");
+    }
+}
+
+#[test]
+fn undoing_a_recorded_script_gives_back_the_starting_workbook() {
+    // `automate.recordActions {stop}` saves the recorded steps as a script in the workbook (a
+    // hidden defined name), but recorded no history step: undoing everything left the script
+    // behind, and a later step's snapshot carried it back in.
+    let mut s = Session::new();
+    s.execute("file.new", json!({"sample": "sales"})).expect("sample");
+    let base = s.doc().expect("document").wb.clone();
+    s.execute("automate.recordActions", json!({})).expect("record");
+    s.execute("automate.recordActions", json!({"stop": true, "name": "Recorded"})).expect("save script");
+    // The script exists before the first undoable step, so undoing everything has to take it away.
+    assert!(s.doc().expect("document").wb.names.iter().any(|n| n.name == "_sc_scripts"));
+    s.execute("cell.set", json!({"cell": "A1", "input": "1"})).expect("edit");
+    s.execute("home.deleteColumns", json!({"cols": "F:F"})).expect("delete columns");
+    undo_and_redo_all(&mut s, &base);
+}
+
+#[test]
+fn undoing_a_saved_custom_view_gives_back_the_starting_workbook() {
+    // Saving a custom view writes it into the workbook's hidden names, and the command was marked
+    // not undoable: undoing everything could never remove it.
+    let mut s = Session::new();
+    s.execute("file.new", json!({"sample": "budget"})).expect("sample");
+    let base = s.doc().expect("document").wb.clone();
+    s.execute("view.customViews", json!({"save": "Frozen"})).expect("save view");
+    assert!(s.doc().expect("document").wb.names.iter().any(|n| n.name == "_sc_custom_views"));
+    s.execute("home.deleteColumns", json!({"cols": "F:F"})).expect("delete columns");
+    undo_and_redo_all(&mut s, &base);
 }
