@@ -359,6 +359,12 @@ fn read_slicers(
             why = Some(format!("{}: it names a PivotTable this workbook does not have", part.name));
             break;
         }
+        // A relationship we do not model (a slicer part pointing at something besides a slicer)
+        // would be dropped with the kept content: leave the whole file's slicers on that path.
+        if part.rels.iter().any(|r| !r.external && !r.rel_type.rsplit('/').next().is_some_and(|k| k.eq_ignore_ascii_case("slicer"))) {
+            why = Some(format!("{}: it has relationships GridCraft does not model", part.name));
+            break;
+        }
         let selected = match read_selection(tab, values.len()) {
             Ok(s) => s,
             Err(e) => {
@@ -373,6 +379,10 @@ fn read_slicers(
                 why = Some(format!("{}: {} is missing", part.name, target));
                 break 'cache;
             };
+            if !sp.rels.is_empty() {
+                why = Some(format!("{}: it has relationships GridCraft does not model", sp.name));
+                break 'cache;
+            }
             let Ok(sroot) = xml::parse(&sp.data) else {
                 why = Some(format!("{}: not XML", sp.name));
                 break 'cache;
@@ -552,6 +562,10 @@ fn read_timelines(wb: &mut Workbook, cx: &mut Ctx<'_>) -> Option<Vec<(usize, Piv
                 why = Some(format!("{target}: the timeline part is missing"));
                 continue;
             };
+            if !part.rels.is_empty() {
+                why = Some(format!("{}: it has relationships GridCraft does not model", part.name));
+                continue;
+            }
             let Ok(root) = xml::parse(&part.data) else {
                 why = Some(format!("{}: not XML", part.name));
                 continue;
@@ -572,6 +586,10 @@ fn read_timelines(wb: &mut Workbook, cx: &mut Ctx<'_>) -> Option<Vec<(usize, Piv
                     why = Some(format!("{cache_name}: the timeline cache is missing"));
                     continue;
                 };
+                if !cache.rels.is_empty() {
+                    why = Some(format!("{}: it has relationships GridCraft does not model", cache.name));
+                    continue;
+                }
                 let Ok(croot) = xml::parse(&cache.data) else {
                     why = Some(format!("{}: not XML", cache.name));
                     continue;
