@@ -161,6 +161,11 @@ pub struct GridState {
     pub ruler_drag: Option<crate::paper_view::RulerDrag>,
     /// Insert › Header & Footer: start editing the first page's header once Page Layout view is up.
     pub hf_start: bool,
+    /// Pivot slicer tile scroll offsets, by (document uid, slicer id): the first tile row shown.
+    /// The widget elides tiles that do not fit; the wheel over a slicer moves this instead of the sheet.
+    pub slicer_scroll: std::collections::HashMap<(u64, u32), usize>,
+    /// The tile of the selected pivot slicer that Tab last focused, if any.
+    pub slicer_focus: Option<(u32, usize)>,
     /// The grid geometry of the last frame (hit-testing for agents and tests).
     pub geo: Option<Geo>,
     /// The horizontal scrollbar's track in the sheet tab bar (hit-testing for tests).
@@ -698,17 +703,29 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
             }
             app.grid.wheel_zoom = Some(zooming);
         } else if scroll_delta != egui::Vec2::ZERO {
-            let z = if paper { make_geo(app, view.scroll).z } else { sh.zoom as f32 / 100.0 * DISPLAY_SCALE };
-            let mut d = scroll_delta;
-            // A horizontal swipe moves the content the way the fingers go, which is towards
-            // higher columns on a mirrored sheet.
-            if sh.right_to_left {
-                d.x = -d.x;
+            // A pivot slicer under the pointer takes the wheel for its own tile list (the tiles
+            // beyond the frame are elided), so the sheet does not scroll underneath it.
+            let used = app
+                .grid
+                .geo
+                .clone()
+                .zip(ui.input(|i| i.pointer.hover_pos()))
+                .is_some_and(|(geo, p)| crate::slicer_view::wheel(app, sh, &geo, geo.mirror_pos(p), scroll_delta));
+            if used {
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            } else {
+                let z = if paper { make_geo(app, view.scroll).z } else { sh.zoom as f32 / 100.0 * DISPLAY_SCALE };
+                let mut d = scroll_delta;
+                // A horizontal swipe moves the content the way the fingers go, which is towards
+                // higher columns on a mirrored sheet.
+                if sh.right_to_left {
+                    d.x = -d.x;
+                }
+                if modifiers.shift && d.x == 0.0 {
+                    d = vec2(d.y, 0.0);
+                }
+                view.scroll -= d / z;
             }
-            if modifiers.shift && d.x == 0.0 {
-                d = vec2(d.y, 0.0);
-            }
-            view.scroll -= d / z;
         }
     }
     // A one-finger touch drag pans the sheet, the content following the finger; it doesn't select.
@@ -2015,7 +2032,8 @@ fn object_name(kind: &str) -> &'static str {
     match kind {
         "chart" => "Chart",
         "image" => "Picture",
-        "slicer" => "Slicer",
+        "slicer" | "pivotSlicer" => "Slicer",
+        "timeline" => "Timeline",
         _ => "Shape",
     }
 }
@@ -2085,7 +2103,8 @@ fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: 
     let border_panes = geo.range_panes(sel.current());
     let on_handle = handle.contains(p) && handle_panes.iter().any(|r| r.contains(p));
     let on_cur_border = on_border(cur_rect, p) && border_panes.iter().any(|r| r.contains(p));
-    let selected_object = crate::chartview::hit(app, geo, sh, p).filter(|&(_, id, _)| app.selected_chart == Some(id));
+    // A timeline shows no resize handles (it has no move command), so it must not show their cursors either.
+    let selected_object = crate::chartview::hit(app, geo, sh, p).filter(|&(kind, id, _)| kind != "timeline" && app.selected_chart == Some(id));
     let handle = selected_object.and_then(|(_, _, rect)| crate::chartview::handle_at(rect, p));
     if app.grid.drag == Drag::None
         && let Some(h) = handle
@@ -2189,7 +2208,26 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             return;
         }
     }
-    // A plain click on a slicer value tile toggles it (Ctrl/Cmd for multi-select); the clear
+    // A plain click on a pivot slicer's value tile toggles it (Ctrl/Cmd for multi-select); the
+    // clear button selects every tile again. One click is one command, so one undo step.
+    if primary_clicked
+        && !resp.drag_started()
+        && let Some(p) = pos
+        && let Some((id, act)) = crate::slicer_view::click(app, geo, sh, wb, p)
+    {
+        app.selected_chart = Some(id);
+        match act {
+            crate::slicer_view::SlicerAction::Toggle { index, label } => {
+                app.grid.slicer_focus = Some((id, index));
+                let _ = app.run("slicer.toggle", json!({"slicer": id, "value": label, "multi": mods.command || mods.ctrl}));
+            }
+            crate::slicer_view::SlicerAction::Clear => {
+                let _ = app.run("slicer.clear", json!({"slicer": id}));
+            }
+        }
+        return;
+    }
+    // A plain click on a table slicer value tile toggles it (Ctrl/Cmd for multi-select); the clear
     // button resets it. Runs before the generic object select/drag so tiles stay clickable.
     if primary_clicked
         && !resp.drag_started()
@@ -2230,9 +2268,12 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             }
             if primary_drag {
                 // A handle belongs to the object that was selected before this press: the first
-                // press on an object selects it, the next one moves or resizes it.
+                // press on an object selects it, the next one moves or resizes it. A timeline has
+                // no move or resize command (`slicer.move` handles slicers only), so it selects
+                // but never starts a drag.
                 if app.grid.drag == Drag::None
                     && let Some(a) = object_anchor(sh, kind, id)
+                    && kind != "timeline"
                 {
                     app.grid.drag = Drag::Object(ObjectDrag::new(kind, id, p, crate::chartview::frame_of(sh, &a), handle));
                 }
@@ -2591,9 +2632,20 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 let delta = (p - d.start) / geo.z;
                 let f = crate::chartview::drag_frame(d.orig, d.edges(), delta, shift);
                 let (cell, dx, dy, w, h) = crate::chartview::anchor_of(sh, f);
-                let params = json!({"kind": d.kind, "id": d.id, "at": cell.a1(), "dx": dx, "dy": dy, "width": w, "height": h});
+                let (command, params) = object_move_call(d.kind, d.id, cell, dx, dy, w, h);
                 let before = app.session.active().map(|x| x.revision).unwrap_or(0);
-                let _ = app.session.run("object.move", params);
+                // A pivot slicer moves through `slicer.move`, which stores only whole-cell anchors:
+                // skip a frame whose target its command cannot represent rather than recording an
+                // undo entry that changes nothing.
+                let unchanged = object_anchor(sh, d.kind, d.id).is_some_and(|a| {
+                    a.cell == cell
+                        && (a.width - w).abs() < 0.01
+                        && (a.height - h).abs() < 0.01
+                        && (d.kind == "pivotSlicer" || ((a.dx - dx).abs() < 0.01 && (a.dy - dy).abs() < 0.01))
+                });
+                if !unchanged {
+                    let _ = app.session.run(command, params);
+                }
                 let changed = app.session.active().map(|x| x.revision).unwrap_or(0) != before;
                 let mut d = d;
                 if changed {
@@ -2963,6 +3015,8 @@ fn object_anchor(sh: &Sheet, kind: &str, id: u32) -> Option<gridcraft_engine::mo
         "chart" => sh.charts.iter().find(|c| c.id == id).map(|c| c.anchor),
         "image" => sh.images.iter().find(|c| c.id == id).map(|c| c.anchor),
         "slicer" => sh.slicers.iter().find(|c| c.id == id).map(|c| c.anchor),
+        "pivotSlicer" => sh.pivot_slicers.iter().find(|c| c.id == id).map(|c| c.anchor),
+        "timeline" => sh.pivot_timelines.iter().find(|c| c.id == id).map(|c| c.anchor),
         _ => sh.shapes.iter().find(|c| c.id == id).map(|c| c.anchor),
     }
 }
@@ -2975,10 +3029,25 @@ fn object_kind(sh: &Sheet, id: u32) -> Option<&'static str> {
         Some("image")
     } else if sh.slicers.iter().any(|o| o.id == id) {
         Some("slicer")
+    } else if sh.pivot_slicers.iter().any(|o| o.id == id) {
+        Some("pivotSlicer")
+    } else if sh.pivot_timelines.iter().any(|o| o.id == id) {
+        Some("timeline")
     } else if sh.shapes.iter().any(|o| o.id == id) {
         Some("shape")
     } else {
         None
+    }
+}
+
+/// The command that writes a dragged or nudged object's new place. A PivotTable slicer moves
+/// through `slicer.move`; that command has no `dx`/`dy`, so only the anchor cell and the size are
+/// written and a drag lands on a cell boundary. `timeline` never gets here: it has no move path.
+fn object_move_call(kind: &str, id: u32, cell: CellRef, dx: f32, dy: f32, w: f32, h: f32) -> (&'static str, serde_json::Value) {
+    if kind == "pivotSlicer" {
+        ("slicer.move", json!({"slicer": id, "at": cell.a1(), "width": w, "height": h}))
+    } else {
+        ("object.move", json!({"kind": kind, "id": id, "at": cell.a1(), "dx": dx, "dy": dy, "width": w, "height": h}))
     }
 }
 
@@ -2988,6 +3057,11 @@ fn object_kind(sh: &Sheet, id: u32) -> Option<&'static str> {
 fn nudge_selected_object(app: &mut SheetApp, sh: &Sheet, key: egui::Key, shift: bool, fine: bool) -> bool {
     let Some(id) = app.selected_chart else { return false };
     let Some(kind) = object_kind(sh, id) else { return false };
+    // A timeline has no move command (`slicer.move` handles slicers only), so arrows keep their
+    // cell meaning for it instead of pretending to move it.
+    if kind == "timeline" {
+        return false;
+    }
     let Some(anchor) = object_anchor(sh, kind, id) else { return false };
     let (dx, dy) = match key {
         egui::Key::ArrowLeft => (-1.0, 0.0),
@@ -3014,23 +3088,26 @@ fn nudge_selected_object(app: &mut SheetApp, sh: &Sheet, key: egui::Key, shift: 
     };
     let f = crate::chartview::drag_frame(crate::chartview::frame_of(sh, &anchor), edges, delta, false);
     let (cell, adx, ady, w, h) = crate::chartview::anchor_of(sh, f);
-    let _ = app.session.run("object.move", json!({"kind": kind, "id": id, "at": cell.a1(), "dx": adx, "dy": ady, "width": w, "height": h}));
+    // `slicer.move` stores the anchor cell and the size but has no dx/dy, so a nudge that stays
+    // inside a cell has nothing to write: keep the key and add no empty undo step.
+    if kind == "pivotSlicer" && anchor.cell == cell && (anchor.width - w).abs() < 0.01 && (anchor.height - h).abs() < 0.01 {
+        return true;
+    }
+    let (command, params) = object_move_call(kind, id, cell, adx, ady, w, h);
+    let _ = app.session.run(command, params);
     app.toast = Some((object_toast(kind, &f, !shift), crate::now_ms()));
     true
 }
 
 fn delete_selected_object(app: &mut SheetApp, sh: &Sheet) -> bool {
     let Some(id) = app.selected_chart else { return false };
-    let kind = if sh.charts.iter().any(|object| object.id == id) {
-        "chart"
-    } else if sh.images.iter().any(|object| object.id == id) {
-        "image"
-    } else if sh.shapes.iter().any(|object| object.id == id) {
-        "shape"
+    let Some(kind) = object_kind(sh, id) else { return false };
+    if matches!(kind, "pivotSlicer" | "timeline") {
+        // A PivotTable widget has its own delete command, which also clears the report's filter.
+        app.run_or_alert("slicer.delete", json!({"slicer": id}));
     } else {
-        return false;
-    };
-    app.run_or_alert("object.delete", json!({"kind": kind, "id": id}));
+        app.run_or_alert("object.delete", json!({"kind": kind, "id": id}));
+    }
     app.selected_chart = None;
     true
 }
@@ -3142,6 +3219,12 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                 }
                 let cmd = m.command;
                 let shift = m.shift;
+                // Tab moves between the value tiles of a selected pivot slicer (Shift+Tab back),
+                // keeping grid focus where it is; every other selection keeps Tab for cells.
+                // Arrows are not used for tiles: a selected object takes them for nudging.
+                if key == Key::Tab && crate::slicer_view::tab(app, sh, if shift { -1 } else { 1 }) {
+                    continue;
+                }
                 // A selected object takes the arrows: move it, or resize it with Shift (Ctrl or
                 // Cmd for one-point steps), as Excel does. Escape below drops the selection.
                 if matches!(key, Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight)
@@ -3180,6 +3263,8 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
                         let _ = app.session.run("selection.set", json!({"cell": CellRef::new(a.row, 0).a1()}));
                         app.grid.ensure_visible = true;
                     }
+                    // A focused tile of the selected slicer toggles through `slicer.toggle`.
+                    Key::Enter if crate::slicer_view::toggle_focused(app, sh) => {}
                     // Excel: Enter while a copied range is marked pastes it and ends copy mode.
                     Key::Enter if !m.alt && !m.ctrl && !shift && !cmd && app.session.clipboard.is_some() => {
                         app.run_or_alert("edit.paste", json!({}));
@@ -3626,18 +3711,24 @@ fn fill_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
     }
 }
 
-/// The right-click menu of a chart, picture, shape or slicer.
+/// The right-click menu of a chart, picture, shape, slicer or timeline.
 fn object_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
     let Some((at, kind, id)) = app.grid.object_menu else { return };
     let mut close = false;
+    let lang = crate::i18n::current(ui.ctx());
+    let widget = matches!(kind, "pivotSlicer" | "timeline");
     let resp = egui::Area::new(egui::Id::new("object_context")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(200.0);
-            let mut items = vec![("Delete", "object.delete")];
+            // A PivotTable widget deletes through `slicer.delete` (it also clears the report's
+            // filter); a table slicer and the drawing objects use `object.delete`.
+            let mut items: Vec<(&str, &str)> = vec![("Delete", if widget { "slicer.delete" } else { "object.delete" })];
             if kind == "chart" {
                 items.extend([("-", ""), ("Select Data…", "ui:selectData"), ("Format Chart Area…", "ui:formatChart")]);
             }
-            let lang = crate::i18n::current(ui.ctx());
+            if kind == "pivotSlicer" {
+                items.extend([("-", ""), ("Select All", "slicer.selectAll"), ("Clear Filter", "slicer.clear")]);
+            }
             for (label, action) in items {
                 if label == "-" {
                     ui.separator();
@@ -3648,12 +3739,35 @@ fn object_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
                     match action {
                         "ui:selectData" => app.open_dialog("selectData", json!({"chart": id})),
                         "ui:formatChart" => app.grid.pane = Some("formatChart".into()),
+                        "slicer.selectAll" => {
+                            app.run_or_alert("slicer.selectAll", json!({"slicer": id}));
+                        }
+                        "slicer.clear" => {
+                            app.run_or_alert("slicer.clear", json!({"slicer": id}));
+                        }
+                        "slicer.delete" => {
+                            app.run_or_alert("slicer.delete", json!({"slicer": id}));
+                            app.selected_chart = None;
+                        }
                         _ => {
                             app.run_or_alert("object.delete", json!({"kind": kind, "id": id}));
                             app.selected_chart = None;
                         }
                     }
                 }
+            }
+            // Slicer styles are a submenu: the file's style names are the only choices (an
+            // unknown name is refused by the command, not written into the file).
+            if kind == "pivotSlicer" {
+                ui.separator();
+                ui.menu_button(lang.tr("Slicer Styles"), |ui| {
+                    for style in gridcraft_engine::model::SLICER_STYLES {
+                        if ui.button(*style).clicked() {
+                            app.run_or_alert("slicer.setStyle", json!({"slicer": id, "style": style}));
+                            close = true;
+                        }
+                    }
+                });
             }
         });
     });

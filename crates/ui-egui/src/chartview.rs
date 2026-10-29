@@ -573,6 +573,8 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
         }
     }
     paint_slicers(app, p, geo, wb, si, sh);
+    // PivotTable slicers and timelines sit above the table slicers (their own drawings are last).
+    painted.extend(crate::slicer_view::paint(app, p, geo, wb, sh));
     painted
 }
 
@@ -681,8 +683,16 @@ pub fn slicer_click(geo: &Geo, sh: &Sheet, wb: &Workbook, si: usize, p: Pos2) ->
     None
 }
 
+/// The accent border of a selected object that has no resize handles. A timeline is selected like
+/// any object, but `slicer.move` has no timeline path, so drawing handles would advertise a drag
+/// that does not exist.
+pub(crate) fn selection_outline(p: &Painter, r: Rect) {
+    let t = theme::Tokens::get(p.ctx());
+    p.rect_stroke(r, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Outside);
+}
+
 /// The frame and eight drag handles of the selected object, in theme colours.
-fn selection_frame(p: &Painter, r: Rect) {
+pub(crate) fn selection_frame(p: &Painter, r: Rect) {
     let t = theme::Tokens::get(p.ctx());
     p.rect_stroke(r, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Outside);
     for c in handle_centres(r) {
@@ -696,6 +706,19 @@ fn selection_frame(p: &Painter, r: Rect) {
 pub fn hit(app: &SheetApp, geo: &Geo, sh: &Sheet, p: Pos2) -> Option<(&'static str, u32, Rect)> {
     if app.session.active().is_some_and(|d| objects_hidden(&d.wb)) {
         return None;
+    }
+    // Pivot slicers and timelines are painted last, so they are hit first.
+    for tl in sh.pivot_timelines.iter().rev() {
+        let r = crate::slicer_view::widget_rect(geo, sh, &tl.anchor);
+        if r.contains(p) && geo.cells.contains(p) {
+            return Some(("timeline", tl.id, r));
+        }
+    }
+    for sl in sh.pivot_slicers.iter().rev() {
+        let r = crate::slicer_view::widget_rect(geo, sh, &sl.anchor);
+        if r.contains(p) && geo.cells.contains(p) {
+            return Some(("pivotSlicer", sl.id, r));
+        }
     }
     for sl in sh.slicers.iter().rev() {
         let r = anchor_rect(geo, sh, &sl.anchor);
