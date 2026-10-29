@@ -17,6 +17,63 @@ fn the_test_compound_writer_reads_back() {
 }
 
 #[test]
+fn a_workbook_saved_with_a_password_reopens_with_the_same_cells() {
+    use gridcraft_core::{CellRef, Value};
+
+    let mut wb = gridcraft_model::Workbook::new();
+    let sh = wb.sheet_mut(0).unwrap();
+    sh.set_value(CellRef::parse("A1").unwrap(), Value::from("Quarterly"));
+    sh.set_value(CellRef::parse("A2").unwrap(), Value::Number(1200.5));
+    sh.set_value(CellRef::parse("B2").unwrap(), Value::Bool(true));
+    sh.set_value(CellRef::parse("C2").unwrap(), Value::from("=Été!"));
+    for row in 0..200u32 {
+        sh.set_value(CellRef::new(row + 5, 0), Value::Number(f64::from(row) * 1.5));
+    }
+    let xlsx = crate::write_xlsx(&wb).unwrap();
+    let file = crate::encrypt_workbook(&xlsx, "Pa55word").unwrap();
+    assert_eq!(crate::sniff(&file), crate::Format::Encrypted);
+    assert_eq!(crate::check_encryption(&file), Ok(()));
+    assert_eq!(decrypt(&file, "Pa55word").unwrap(), xlsx, "the package must come back byte for byte");
+    assert_eq!(decrypt(&file, "pa55word"), Err(DecryptError::WrongPassword));
+    assert_eq!(decrypt(&file, ""), Err(DecryptError::WrongPassword));
+    // And the same package reads back as the same workbook.
+    let (back, _) = crate::read_xlsx(&decrypt(&file, "Pa55word").unwrap()).unwrap();
+    assert_eq!(back.sheets.len(), wb.sheets.len());
+    for (a, b) in wb.sheets.iter().zip(&back.sheets) {
+        assert_eq!(a.cells.iter().count(), b.cells.iter().count());
+        for (at, cell) in b.cells.iter() {
+            assert_eq!(cell.value, a.value(at), "{at:?}");
+        }
+    }
+}
+
+#[test]
+fn every_cut_of_a_saved_encrypted_workbook_is_an_error_not_a_panic() {
+    let mut wb = gridcraft_model::Workbook::new();
+    wb.sheet_mut(0).unwrap().set_value(gridcraft_core::CellRef::parse("A1").unwrap(), gridcraft_core::Value::from("hi"));
+    let file = crate::encrypt_workbook(&crate::write_xlsx(&wb).unwrap(), "pw").unwrap();
+    for cut in (0..file.len()).step_by(97) {
+        if let Ok(plain) = decrypt(&file[..cut], "pw") {
+            // A cut inside the last sector's slack still reads whole; it must then be the package.
+            assert!(plain.starts_with(b"PK"), "{cut} of {}", file.len());
+        }
+    }
+    // A file cut inside the EncryptedPackage stream is damage, never a short package.
+    let (info, _) = crate::crypto::streams(&file).unwrap();
+    for size in [0usize, 4, 7] {
+        let short = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &vec![0u8; size])]).unwrap();
+        assert!(decrypt(&short, "pw").is_err(), "a {size}-byte package stream");
+    }
+    // A stream that states more bytes than it holds is refused before any allocation.
+    let lying = 100u64.to_le_bytes().to_vec();
+    let short = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &lying)]).unwrap();
+    assert!(decrypt(&short, "pw").is_err());
+    // An existing but empty package is a clean empty result, not a panic.
+    let empty = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &0u64.to_le_bytes())]).unwrap();
+    assert_eq!(decrypt(&empty, "pw").unwrap(), Vec::<u8>::new());
+}
+
+#[test]
 fn encrypted_files_decrypt_to_the_package() {
     let package: Vec<u8> = (0..3_000_000u32).map(|i| (i * 31 % 251) as u8).collect();
     let agile = encrypt_workbook(&package, "Pass1234");

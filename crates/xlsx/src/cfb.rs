@@ -327,6 +327,244 @@ impl<'a> Compound<'a> {
     }
 }
 
+// ---- writing -------------------------------------------------------------------------------
+
+/// The compound-file sector and mini-sector sizes. Version 3 files (the only kind Excel writes)
+/// use 512-byte sectors; the mini stream exists for streams under the 4096-byte cutoff.
+const SECTOR: usize = 512;
+const MINI: usize = 64;
+const MINI_CUTOFF: usize = 4096;
+/// Markers in the FAT for a free sector, the end of a chain, a FAT sector and a DIFAT sector.
+const FREE: u32 = 0xFFFF_FFFF;
+const FAT_SECTOR: u32 = 0xFFFF_FFFD;
+const DIFAT_SECTOR: u32 = 0xFFFF_FFFC;
+/// Streams one compound file written here holds (an encrypted workbook has two).
+const MAX_STREAMS: usize = 64;
+/// The output is refused above this (the reader's own stream cap, plus one sector of slack).
+const MAX_BYTES: usize = (1 << 30) + (1 << 20);
+
+fn bad_write(m: &str) -> String {
+    format!("can't write the compound file: {m}")
+}
+
+fn put16(b: &mut [u8], at: usize, v: u16) -> Result<(), String> {
+    let s = b.get_mut(at..at.checked_add(2).ok_or_else(|| bad_write("offset overflow"))?).ok_or_else(|| bad_write("offset past the end"))?;
+    s.copy_from_slice(&v.to_le_bytes());
+    Ok(())
+}
+
+fn put32(b: &mut [u8], at: usize, v: u32) -> Result<(), String> {
+    let s = b.get_mut(at..at.checked_add(4).ok_or_else(|| bad_write("offset overflow"))?).ok_or_else(|| bad_write("offset past the end"))?;
+    s.copy_from_slice(&v.to_le_bytes());
+    Ok(())
+}
+
+/// A directory entry ([MS-CFB] 2.6.1): 128 bytes, name in UTF-16, no nested storage.
+struct Entry<'a> {
+    name: &'a str,
+    kind: u8,
+    left: u32,
+    right: u32,
+    child: u32,
+    start: u32,
+    size: u64,
+}
+
+fn write_entry(out: &mut [u8], at: usize, e: &Entry<'_>) -> Result<(), String> {
+    let units: Vec<u16> = e.name.encode_utf16().collect();
+    if units.is_empty() || units.len() > 31 {
+        return Err(bad_write("a stream name must be 1 to 31 characters"));
+    }
+    if units.iter().any(|u| *u == 0 || *u == u16::from(b'/') || *u == u16::from(b'\\')) {
+        return Err(bad_write("a stream name holds a control character or a path separator"));
+    }
+    let name_len = (units.len() as u16).checked_add(1).ok_or_else(|| bad_write("name too long"))?;
+    for (i, u) in units.iter().enumerate() {
+        let at = at.checked_add(i.checked_mul(2).ok_or_else(|| bad_write("offset overflow"))?).ok_or_else(|| bad_write("offset overflow"))?;
+        put16(out, at, *u)?;
+    }
+    put16(out, at.checked_add(64).ok_or_else(|| bad_write("offset overflow"))?, name_len.checked_mul(2).ok_or_else(|| bad_write("name too long"))?)?;
+    *out.get_mut(at + 66).ok_or_else(|| bad_write("offset past the end"))? = e.kind;
+    // Every node black: the tree is a sorted right chain, so lookups still follow the name order.
+    *out.get_mut(at + 67).ok_or_else(|| bad_write("offset past the end"))? = 1;
+    put32(out, at + 68, e.left)?;
+    put32(out, at + 72, e.right)?;
+    put32(out, at + 76, e.child)?;
+    put32(out, at + 116, e.start)?;
+    // Version 3: the size is 32 bits; the high 32 bits are zero.
+    put32(out, at + 120, u32::try_from(e.size).map_err(|_| bad_write("a stream is larger than 4 GiB"))?)?;
+    put32(out, at + 124, 0)
+}
+
+/// The order the CFB directory tree sorts names in: by length, then case-insensitively.
+fn name_key(name: &str) -> (usize, String) {
+    (name.encode_utf16().count(), name.to_uppercase())
+}
+
+/// Writes a compound file (version 3, 512-byte sectors) holding `streams` directly under the
+/// root storage, laid out the way Excel lays a workbook out: streams under 4096 bytes in the mini
+/// stream, larger ones in regular sectors, DIFAT sectors past the 109 FAT sectors the header
+/// names. Clean-room from [MS-CFB] 2.2-2.6.
+pub(crate) fn write_compound(streams: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
+    if streams.len() > MAX_STREAMS {
+        return Err(bad_write("too many streams"));
+    }
+    let total_bytes = streams.iter().try_fold(0usize, |n, (_, d)| n.checked_add(d.len())).ok_or_else(|| bad_write("too large"))?;
+    if total_bytes > MAX_BYTES {
+        return Err(bad_write("more than 1 GiB of streams"));
+    }
+    // Streams kept in the mini stream, chained in 64-byte mini sectors.
+    let mut mini_fat: Vec<u32> = vec![];
+    let mut container: Vec<u8> = vec![];
+    let mut mini_start: Vec<u32> = vec![END_OF_CHAIN; streams.len()];
+    for (i, (_, data)) in streams.iter().enumerate() {
+        if data.is_empty() || data.len() >= MINI_CUTOFF {
+            continue;
+        }
+        let n = data.len().div_ceil(MINI);
+        let first = mini_fat.len();
+        for k in 0..n {
+            let next = if k + 1 == n { END_OF_CHAIN } else { u32::try_from(first + k + 1).map_err(|_| bad_write("too many mini sectors"))? };
+            mini_fat.push(next);
+        }
+        mini_start[i] = u32::try_from(first).map_err(|_| bad_write("too many mini sectors"))?;
+        container.extend_from_slice(data);
+        container.resize((first + n) * MINI, 0);
+    }
+
+    // Blobs written into whole sectors, in order: the directory, the mini FAT, the mini stream,
+    // then each stream too large for the mini stream.
+    let entries = streams.len().checked_add(1).ok_or_else(|| bad_write("too many streams"))?;
+    let dir_len = entries.checked_mul(128).ok_or_else(|| bad_write("too large"))?.div_ceil(SECTOR) * SECTOR;
+    let mut blobs: Vec<Vec<u8>> = vec![vec![0u8; dir_len], mini_fat.iter().flat_map(|v| v.to_le_bytes()).collect(), container.clone()];
+    // In the caller's order, so a stream's own entry finds its data.
+    let mut large_at: Vec<Option<usize>> = vec![None; streams.len()];
+    for (i, (_, data)) in streams.iter().enumerate() {
+        if data.is_empty() || data.len() < MINI_CUTOFF {
+            continue;
+        }
+        let mut body = data.to_vec();
+        body.resize(body.len().div_ceil(SECTOR) * SECTOR, 0);
+        large_at[i] = Some(blobs.len());
+        blobs.push(body);
+    }
+    let counts: Vec<usize> = blobs.iter().map(|b| b.len().div_ceil(SECTOR)).collect();
+    let body: usize = counts.iter().try_fold(0usize, |n, c| n.checked_add(*c)).ok_or_else(|| bad_write("too large"))?;
+
+    // The FAT's own sectors are described by the FAT, so its count is a fixed point; past 109
+    // FAT sectors the header's DIFAT overflows into DIFAT sectors, which need their own sectors.
+    let mut fat_sectors = 1usize;
+    let (difat_sectors, total) = loop {
+        let difat = fat_sectors.saturating_sub(109).div_ceil(127);
+        let total = fat_sectors.checked_add(difat).and_then(|n| n.checked_add(body)).ok_or_else(|| bad_write("too large"))?;
+        let need = total.div_ceil(128);
+        if need <= fat_sectors {
+            break (difat, total);
+        }
+        fat_sectors = need;
+    };
+    let len = total
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(SECTOR))
+        .filter(|n| *n <= MAX_BYTES)
+        .ok_or_else(|| bad_write("more than 1 GiB of streams"))?;
+
+    let mut fat = vec![FREE; fat_sectors.checked_mul(128).ok_or_else(|| bad_write("too large"))?];
+    for v in fat.iter_mut().take(fat_sectors) {
+        *v = FAT_SECTOR;
+    }
+    for v in fat.iter_mut().skip(fat_sectors).take(difat_sectors) {
+        *v = DIFAT_SECTOR;
+    }
+    let mut starts: Vec<u32> = Vec::with_capacity(counts.len());
+    let mut next = fat_sectors + difat_sectors;
+    for &n in &counts {
+        if n == 0 {
+            starts.push(END_OF_CHAIN);
+            continue;
+        }
+        starts.push(u32::try_from(next).map_err(|_| bad_write("too many sectors"))?);
+        for k in 0..n {
+            let slot = fat.get_mut(next + k).ok_or_else(|| bad_write("too many sectors"))?;
+            *slot = if k + 1 == n { END_OF_CHAIN } else { u32::try_from(next + k + 1).map_err(|_| bad_write("too many sectors"))? };
+        }
+        next += n;
+    }
+
+    let mut out = vec![0u8; len];
+    out.get_mut(..SIGNATURE.len()).ok_or_else(|| bad_write("truncated"))?.copy_from_slice(&SIGNATURE);
+    put16(&mut out, 24, 0x3E)?; // minor version
+    put16(&mut out, 26, 3)?; // major version: 512-byte sectors
+    put16(&mut out, 28, 0xFFFE)?; // little-endian byte order
+    put16(&mut out, 30, 9)?; // sector shift: 2^9 = 512
+    put16(&mut out, 32, 6)?; // mini sector shift: 2^6 = 64
+    put32(&mut out, 44, u32::try_from(fat_sectors).map_err(|_| bad_write("too many FAT sectors"))?)?;
+    put32(&mut out, 48, starts.first().copied().unwrap_or(END_OF_CHAIN))?; // the directory
+    put32(&mut out, 56, MINI_CUTOFF as u32)?;
+    put32(&mut out, 60, starts.get(1).copied().unwrap_or(END_OF_CHAIN))?; // the mini FAT
+    put32(&mut out, 64, u32::try_from(counts.get(1).copied().unwrap_or(0)).map_err(|_| bad_write("too large"))?)?;
+    let first_difat = if difat_sectors > 0 { fat_sectors } else { END_OF_CHAIN as usize };
+    put32(&mut out, 68, u32::try_from(first_difat).map_err(|_| bad_write("too many sectors"))?)?;
+    put32(&mut out, 72, u32::try_from(difat_sectors).map_err(|_| bad_write("too many sectors"))?)?;
+    for i in 0..109 {
+        let v = if i < fat_sectors { i as u32 } else { FREE };
+        put32(&mut out, 76 + i * 4, v)?;
+    }
+    for (i, v) in fat.iter().enumerate() {
+        let at = i.checked_mul(4).and_then(|n| n.checked_add(SECTOR)).ok_or_else(|| bad_write("offset overflow"))?;
+        put32(&mut out, at, *v)?;
+    }
+    // DIFAT sectors: 127 FAT sector ids each, then the next DIFAT sector.
+    for k in 0..difat_sectors {
+        let sector = fat_sectors + k;
+        let at = sector.checked_add(1).and_then(|n| n.checked_mul(SECTOR)).ok_or_else(|| bad_write("offset overflow"))?;
+        for j in 0..127 {
+            let id = 109 + k * 127 + j;
+            put32(&mut out, at + j * 4, if id < fat_sectors { id as u32 } else { FREE })?;
+        }
+        let next = if k + 1 == difat_sectors { END_OF_CHAIN } else { u32::try_from(sector + 1).map_err(|_| bad_write("too many sectors"))? };
+        put32(&mut out, at + 127 * 4, next)?;
+    }
+    for (blob, start) in blobs.iter().zip(&starts) {
+        if blob.is_empty() {
+            continue;
+        }
+        let at = (*start as usize).checked_add(1).and_then(|n| n.checked_mul(SECTOR)).ok_or_else(|| bad_write("offset overflow"))?;
+        let to = at.checked_add(blob.len()).ok_or_else(|| bad_write("offset overflow"))?;
+        out.get_mut(at..to).ok_or_else(|| bad_write("offset past the end"))?.copy_from_slice(blob);
+    }
+
+    // The directory: the root first, then the streams in the tree's name order as right siblings.
+    // It was copied into its sectors above, so the entries go at its own sector here.
+    let dir_at = (*starts.first().ok_or_else(|| bad_write("missing directory"))? as usize)
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(SECTOR))
+        .ok_or_else(|| bad_write("offset overflow"))?;
+    let mut order: Vec<usize> = (0..streams.len()).collect();
+    order.sort_by(|a, b| name_key(streams[*a].0).cmp(&name_key(streams[*b].0)));
+    let root = Entry {
+        name: "Root Entry",
+        kind: 5,
+        left: NO_STREAM,
+        right: NO_STREAM,
+        child: if streams.is_empty() { NO_STREAM } else { 1 },
+        start: starts.get(2).copied().unwrap_or(END_OF_CHAIN),
+        size: container.len() as u64,
+    };
+    write_entry(&mut out, dir_at, &root)?;
+    for (position, index) in order.iter().enumerate() {
+        let (name, data) = streams.get(*index).copied().ok_or_else(|| bad_write("missing stream"))?;
+        let right = if position + 1 < order.len() { u32::try_from(position + 2).map_err(|_| bad_write("too many streams"))? } else { NO_STREAM };
+        let start = match large_at[*index] {
+            Some(b) => starts.get(b).copied().unwrap_or(END_OF_CHAIN),
+            None => mini_start.get(*index).copied().unwrap_or(END_OF_CHAIN),
+        };
+        let e = Entry { name, kind: 2, left: NO_STREAM, right, child: NO_STREAM, start, size: data.len() as u64 };
+        write_entry(&mut out, dir_at + (position + 1) * 128, &e)?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -451,5 +689,58 @@ pub(crate) mod tests {
         file[1024 + 2 * 128 + 120..1024 + 2 * 128 + 124].copy_from_slice(&1064u32.to_le_bytes());
         let cf = Compound::open(&file).unwrap();
         assert!(cf.root_stream("Workbook").is_err());
+    }
+
+    /// The writer's layout, at every size class: an empty stream, a mini-stream one, the cutoff
+    /// either side, a large one, and one big enough to need DIFAT sectors (over 109 FAT sectors).
+    #[test]
+    fn written_compound_files_read_back() {
+        let data = |n: usize| -> Vec<u8> { (0..n).map(|i| (i % 251) as u8).collect() };
+        let big = data(11_000_000);
+        for len in [0usize, 1, 63, 64, 65, 1000, 4095, 4096, 4097, 10_000] {
+            let small = data(len);
+            let file = write_compound(&[("EncryptionInfo", &small), ("EncryptedPackage", &big)]).unwrap();
+            let cf = Compound::open(&file).unwrap();
+            assert_eq!(cf.root_stream("EncryptionInfo").unwrap().unwrap(), small, "a {len}-byte stream");
+            assert_eq!(cf.root_stream("EncryptedPackage").unwrap().unwrap(), big);
+        }
+        // The 11 MB package must need DIFAT sectors: the header only names 109 FAT sectors.
+        let file = write_compound(&[("EncryptionInfo", b"info"), ("EncryptedPackage", &big)]).unwrap();
+        let fat_sectors = u32::from_le_bytes([file[44], file[45], file[46], file[47]]);
+        assert!(fat_sectors > 109, "{fat_sectors} FAT sectors");
+        assert!(u32::from_le_bytes([file[72], file[73], file[74], file[75]]) > 0, "no DIFAT sectors");
+        assert_eq!(Compound::open(&file).unwrap().root_stream("EncryptedPackage").unwrap().unwrap(), big);
+        assert!(is_encrypted(&write_compound(&[("EncryptionInfo", b"info"), ("EncryptedPackage", b"pk")]).unwrap()));
+    }
+
+    #[test]
+    fn the_writer_refuses_what_it_cannot_lay_out() {
+        assert!(write_compound(&[("", b"x")]).is_err());
+        assert!(write_compound(&[("a/b", b"x")]).is_err());
+        let long = "n".repeat(32);
+        assert!(write_compound(&[(&long, b"x")]).is_err());
+        let names: Vec<String> = (0..MAX_STREAMS + 1).map(|i| format!("s{i}")).collect();
+        let many: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        assert!(write_compound(&many).is_err());
+        // A stream name that is too long is the only hostile input this writer takes: every
+        // other size it is given it computes itself.
+        let ok = write_compound(&[("Workbook", &[0u8; 600])]).unwrap();
+        assert_eq!(ok.len() % SECTOR, 0);
+    }
+
+    /// The output is a fixed layout: the same streams always make the same bytes, so a writer
+    /// change that moves a sector is a deliberate one.
+    #[test]
+    fn the_written_layout_is_stable() {
+        let file = write_compound(&[("EncryptionInfo", &[1, 2, 3, 4]), ("EncryptedPackage", &[5; 5000])]).unwrap();
+        assert_eq!(file.len(), 512 * (1 + 3 + 10 + 1));
+        // Header: version 3, 512-byte sectors, the directory in sector 1 (sector 0 is the FAT),
+        // the mini FAT in sector 2 and the mini stream in sector 3.
+        assert_eq!((u16::from_le_bytes([file[26], file[27]]), u16::from_le_bytes([file[30], file[31]])), (3, 9));
+        assert_eq!(u32::from_le_bytes([file[48], file[49], file[50], file[51]]), 1);
+        assert_eq!(u32::from_le_bytes([file[60], file[61], file[62], file[63]]), 2);
+        assert_eq!(u32::from_le_bytes([file[1024 + 116], file[1024 + 117], file[1024 + 118], file[1024 + 119]]), 3);
+        let names = directory_names(&file).unwrap();
+        assert_eq!(names, ["Root Entry", "EncryptionInfo", "EncryptedPackage"]);
     }
 }

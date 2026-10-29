@@ -47,7 +47,7 @@ pub const PASSWORD_REQUIRED: &str = "is password-protected. Enter its password t
 /// The error for a wrong password contains this.
 pub const WRONG_PASSWORD: &str = "The password is incorrect.";
 /// The first open warning of a workbook decrypted with its password.
-pub const DECRYPTED_NOTICE: &str = "This workbook was password-protected. GridCraft saves it without the password.";
+pub const DECRYPTED_NOTICE: &str = "This workbook was password-protected. GridCraft saves it back with the same password.";
 
 /// Parses a file's bytes into a workbook. `name` picks the format by extension when the bytes
 /// don't say. An encrypted workbook needs [`open_bytes_with_password`].
@@ -375,17 +375,40 @@ fn rename_first_sheet(wb: &mut Workbook, path: &str) {
 
 /// Encodes a workbook in the format chosen by `path`'s extension.
 pub fn save_bytes(wb: &Workbook, path: &str) -> Result<Vec<u8>> {
+    save_bytes_with_password(wb, path, None)
+}
+
+/// [`save_bytes`] with an optional password: an `.xlsx` is wrapped in Agile encryption, so the
+/// protection the file had is not silently dropped. A format that can't hold a password refuses
+/// one instead of writing the file unprotected.
+pub fn save_bytes_with_password(wb: &Workbook, path: &str, password: Option<&str>) -> Result<Vec<u8>> {
     // An unknown or missing extension is refused rather than written as an XLSX under that name:
     // a typo like `.cvs` would otherwise produce a file no other app recognises.
     let Some(kind) = FileKind::from_path(path) else {
         let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
         return Err(EngineError::Other(format!("{name}: unknown file format. Save as .xlsx, .csv, .tsv, .json or .html.")));
     };
-    save_bytes_as(wb, path, kind)
+    save_bytes_as_with_password(wb, path, kind, password)
 }
 
 /// Encodes a workbook as `kind`, whatever `path`'s extension says.
 pub fn save_bytes_as(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8>> {
+    save_bytes_as_with_password(wb, path, kind, None)
+}
+
+/// [`save_bytes_as`] with an optional password, which only an `.xlsx` package can hold.
+pub fn save_bytes_as_with_password(wb: &Workbook, path: &str, kind: FileKind, password: Option<&str>) -> Result<Vec<u8>> {
+    let bytes = encode(wb, path, kind)?;
+    let Some(password) = password.filter(|p| !p.is_empty()) else { return Ok(bytes) };
+    if kind != FileKind::Xlsx {
+        return Err(EngineError::Other(
+            "Only .xlsx workbooks can be password-protected. Save as .xlsx to keep the password, or save without one.".into(),
+        ));
+    }
+    gridcraft_xlsx::encrypt_workbook(&bytes, password).map_err(|e| EngineError::Other(format!("We can't password-protect this workbook: {e}")))
+}
+
+fn encode(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8>> {
     let sheet = wb.active_sheet;
     match kind {
         // The extension picks the package kind; only the macro-enabled kinds (.xlsm, .xltm) carry
