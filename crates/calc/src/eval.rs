@@ -234,13 +234,10 @@ impl<'h> Evaluator<'h> {
             return self.host.cell_value(a.sheet, a.range.start);
         }
         // A reference keeps its size, so the array has its shape and its blanks count
-        // (`=A1:A10`, `SUMPRODUCT(--(A1:A10=""))`).
-        let cells = u64::from(a.range.height()) * u64::from(a.range.width());
-        // `A:A`, `1:1` and `A2:A1048576` run to the edge of the sheet: they stand for "the rest of
-        // the column", not for a block of a chosen size.
-        let to_edge = a.range.end.row == MAX_ROWS - 1 || a.range.end.col == MAX_COLS - 1;
-        let full_size = cells <= FULL_SIZE_CELLS || (!to_edge && cells <= FULL_SIZE_BOUNDED_CELLS);
-        let range = if full_size { a.range } else { self.trim(a) };
+        // (`=A1:A10`, `SUMPRODUCT(--(A1:A10=""))`). `A:A`, `1:1` and `A2:A1048576` run to the
+        // edge of the sheet: they stand for "the rest of the column", not for a block of a chosen
+        // size, so they are read through the used range instead (see `trimmed`).
+        let range = if trimmed(a.range) { self.trim(a) } else { a.range };
         let (h, w) = (range.height() as usize, range.width() as usize);
         if (h as u64) * (w as u64) > MAX_CELLS {
             return Value::Error(CellError::Num);
@@ -1948,11 +1945,23 @@ pub fn resized_sum_range(sum: RangeRef, height: u32, width: u32) -> RangeRef {
     RangeRef::new(sum.start, CellRef::new(row, col))
 }
 
+/// Whether a reference is read through the sheet's used range instead of in full: a block bigger
+/// than [`FULL_SIZE_CELLS`], or one bigger than [`FULL_SIZE_BOUNDED_CELLS`] that runs to the edge of
+/// the sheet (`A:A`, `1:1`). Its values then end where the sheet's content does, so its result can
+/// change when the used range moves even though no cell the formula names changed.
+pub fn trimmed(range: RangeRef) -> bool {
+    let cells = u64::from(range.height()) * u64::from(range.width());
+    let to_edge = range.end.row == MAX_ROWS - 1 || range.end.col == MAX_COLS - 1;
+    !(cells <= FULL_SIZE_CELLS || (!to_edge && cells <= FULL_SIZE_BOUNDED_CELLS))
+}
+
 /// Collects the static references of an expression with their sheets resolved; `dynamic` is
-/// set when the formula uses INDIRECT/OFFSET/names/tables whose targets can change.
-pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
+/// set when the formula uses INDIRECT/OFFSET/names/tables whose targets can change, and `trim`
+/// when one of its references is read through the used range (see [`trimmed`]).
+pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool, bool) {
     let mut out = Vec::new();
     let mut dynamic = false;
+    let mut trim = false;
     let push = |out: &mut Vec<Area>, r: &Reference, range: RangeRef| match &r.sheet {
         SheetSel::Current => out.push(Area { sheet, range }),
         SheetSel::Named(n) => {
@@ -1969,13 +1978,19 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
         }
     };
     e.walk(&mut |x| match x {
-        Expr::Ref(r) => push(&mut out, r, r.range()),
+        Expr::Ref(r) => {
+            let range = r.range();
+            trim |= trimmed(range);
+            push(&mut out, r, range);
+        }
         // The cells SUMIF/AVERAGEIF really read from the sum range (see `resized_sum_range`); when
         // the criteria range's size isn't known statically, recalculate the formula every time.
         Expr::Call(n, args) if resizes_sum_range(n, args.len()) => match (args.first(), args.get(2)) {
             (Some(Expr::Ref(c)), Some(Expr::Ref(s))) => {
                 let (crit, sum) = (c.range(), s.range());
-                push(&mut out, s, resized_sum_range(sum, crit.height(), crit.width()));
+                let resized = resized_sum_range(sum, crit.height(), crit.width());
+                trim |= trimmed(resized);
+                push(&mut out, s, resized);
             }
             (_, Some(Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) | Expr::Array(_) | Expr::Missing)) => {}
             _ => dynamic = true,
@@ -2003,7 +2018,7 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
         }
         _ => {}
     });
-    (out, dynamic)
+    (out, dynamic, trim)
 }
 
 fn is_special(n: &str) -> bool {

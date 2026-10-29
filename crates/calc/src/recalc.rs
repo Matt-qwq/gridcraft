@@ -60,6 +60,9 @@ struct Node {
     /// The formula may return an array and therefore spill: it cannot be evaluated on a thread of
     /// its own while other formulas are being laid out (the spill layout is a pass of its own).
     may_spill: bool,
+    /// A reference is read through the sheet's used range (see [`crate::eval::trimmed`]), so the
+    /// value changes when the used range moves even if no cell the formula names changed.
+    trim: bool,
 }
 
 /// Ranges wider than this many columns go to the per-sheet wide index instead of per-column ones.
@@ -214,6 +217,9 @@ pub struct Graph {
     /// A pass checks these against its dirty set: a dirty one means the pass cannot be split.
     may_spill: HashSet<Key>,
     legacy: HashSet<Key>,
+    /// Formulas with a reference read through the used range. An edit that moves the used range
+    /// (or a spill that does) has to evaluate them again: they read cells it didn't name.
+    trim: HashSet<Key>,
     /// Range indexes changed since the last [`Graph::settle`].
     unsettled_cols: HashSet<(usize, u32)>,
     unsettled_wide: HashSet<usize>,
@@ -274,6 +280,9 @@ impl Graph {
         if node.legacy.is_some() {
             self.legacy.insert(k);
         }
+        if node.trim {
+            self.trim.insert(k);
+        }
         self.nodes.insert(k, node);
     }
 
@@ -303,6 +312,7 @@ impl Graph {
         self.dynamic.remove(&k);
         self.may_spill.remove(&k);
         self.legacy.remove(&k);
+        self.trim.remove(&k);
     }
 
     /// Tidies the range indexes changed by `insert`/`remove` (queries stay correct without it,
@@ -1558,8 +1568,9 @@ impl Calc {
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, f, _) in sheet.cells.formulas() {
                 if let Some(e) = f.expr_arc() {
-                    let (areas, dynamic) = precedents(wb, si, &e);
-                    self.graph.insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill: may_return_array(&e) });
+                    let (areas, dynamic, trim) = precedents(wb, si, &e);
+                    self.graph
+                        .insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill: may_return_array(&e), trim });
                 }
             }
         }
@@ -1627,8 +1638,22 @@ impl Calc {
         self.run(wb, stale, true, &HashSet::default());
     }
 
+    /// Whether any formula on `sheet` reads a reference through the used range, so an edit that
+    /// moves the used range has to evaluate it again.
+    pub fn trims_used_range(&self, sheet: usize) -> bool {
+        self.graph.trim.iter().any(|k| k.0 == sheet)
+    }
+
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        self.cells_changed_with_used(wb, changed, &[]);
+    }
+
+    /// [`cells_changed`](Self::cells_changed) for an edit that moved the used range of the sheets
+    /// in `used_changed`: their formulas that read a reference through the used range (a whole
+    /// column or row, `SUM(A:A)`, `=23:26`) are evaluated again, because the cells they read
+    /// changed without any of them being named as a precedent.
+    pub fn cells_changed_with_used(&mut self, wb: &mut Workbook, changed: &[Key], used_changed: &[usize]) {
         self.parallel_fallback = false;
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
         for &k in changed {
@@ -1636,9 +1661,9 @@ impl Calc {
             let parsed = formula.as_ref().and_then(|f| f.expr_arc().map(|e| (e, f.array)));
             match parsed {
                 Some((e, legacy)) => {
-                    let (areas, dynamic) = precedents(wb, k.0, &e);
+                    let (areas, dynamic, trim) = precedents(wb, k.0, &e);
                     let may_spill = may_return_array(&e);
-                    self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy, may_spill });
+                    self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy, may_spill, trim });
                 }
                 None => {
                     self.graph.remove(k);
@@ -1670,6 +1695,9 @@ impl Calc {
             return;
         }
         let mut seeds: Vec<Key> = changed.to_vec();
+        for &si in used_changed {
+            seeds.extend(self.graph.trim.iter().filter(|k| k.0 == si).copied());
+        }
         let mut emptied: Vec<Key> = Vec::new();
         // Per-sheet bounds of the edit, so a bulk change scans for blocked arrays once instead of
         // once per cell: redoing a whole row of Remove Duplicates used to walk a 64×64 block for

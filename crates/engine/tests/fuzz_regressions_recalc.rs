@@ -100,3 +100,20 @@ fn seed_378_insert_columns_keeps_a_concatenation_with_an_empty_cell_empty() {
     assert_eq!(value(&s, "E8"), Value::Number(70150.0));
     assert_eq!(value(&s, "A23"), Value::Text("-70150".into()));
 }
+/// Seed 320. The incremental pass was the wrong side: `=23:26` is read through the sheet's used
+/// range, and the last edit moved that range's right edge, so the array no longer fits.
+#[test]
+fn seed_320_offset_into_a_whole_row_reference_spills_like_a_full_recalc_says() {
+    let mut s = session("grades");
+    run(
+        &mut s,
+        "range.setValues",
+        json!({"range": "K5", "values": [[null, false], ["=IF(B14>2,\"big\",B14)", "=A23:A26"], [true, "=SUM(H11:L17)"], [153, false]]}),
+    );
+    run(&mut s, "edit.replace", json!({"all": true, "what": "A", "with": ""}));
+    run(&mut s, "cell.set", json!({"cell": "XFB6", "input": "=OFFSET(F22,1,1)"}));
+
+    assert_recalc_agrees(&s);
+    assert_eq!(formula(&s, "L6").as_deref(), Some("23:26"));
+    assert_eq!(value(&s, "L6"), Value::Error(CellError::Spill));
+}

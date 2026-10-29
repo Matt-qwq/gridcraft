@@ -205,7 +205,8 @@ impl Trial {
                 keys.push((*si, *c));
             }
         }
-        self.calc.cells_changed(&mut wb, &keys);
+        let used = super::used_range_changes(&self.calc, &self.base, &wb, &keys);
+        self.calc.cells_changed_with_used(&mut wb, &keys, &used);
         reads.iter().map(|(si, c)| wb.sheet(*si).map(|s| s.value(*c)).unwrap_or_default()).collect()
     }
 }
