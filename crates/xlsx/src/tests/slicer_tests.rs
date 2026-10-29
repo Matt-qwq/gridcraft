@@ -329,6 +329,90 @@ fn a_table_slicer_round_trips_through_its_table_slicer_cache() {
 }
 
 #[test]
+fn views_on_one_sheet_share_its_parts_and_are_each_placed() {
+    // One slicers part and one timelines part per sheet, as the format requires, holding every view
+    // on that sheet; each view still gets its own anchored frame.
+    let mut wb = workbook();
+    {
+        let report = wb.sheet_mut(1).unwrap();
+        report.pivot_timelines.push(PivotTimeline {
+            id: 3,
+            name: "Date by day".into(),
+            cache: "Timeline_Day".into(),
+            caption: "By day".into(),
+            field: "Date".into(),
+            pivot_tables: vec!["Report Pivot".into()],
+            unit: TimeUnit::Days,
+            anchor: Anchor { cell: at("H10"), dx: 4.0, dy: 4.0, width: 240.0, height: 96.0, mode: AnchorMode::MoveOnly },
+            ..PivotTimeline::default()
+        });
+        // A table on the same sheet, with a table slicer on it beside the pivot slicer.
+        report.tables.push(Table {
+            id: 1,
+            name: "Sales".into(),
+            range: rr("J1:K4"),
+            header_row: true,
+            totals_row: false,
+            columns: vec![
+                TableColumn { name: "Region".into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None },
+                TableColumn { name: "Amount".into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None },
+            ],
+            style: "TableStyleMedium2".into(),
+            banded_rows: true,
+            banded_cols: false,
+            first_col: false,
+            last_col: false,
+            filter_button: true,
+            filter: vec![],
+            table_type: None,
+            connection_id: None,
+        });
+        for (r, (region, amount)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)].iter().enumerate() {
+            report.cells.set(CellRef::new(r as u32 + 1, 9), Cell::value(Value::text(*region)));
+            report.cells.set(CellRef::new(r as u32 + 1, 10), Cell::value(Value::number(*amount)));
+        }
+        report.slicers.push(Slicer {
+            id: 4,
+            table: "Sales".into(),
+            column: "Region".into(),
+            caption: "Sales region".into(),
+            anchor: Anchor { cell: at("N2"), dx: 4.0, dy: 4.0, width: 168.0, height: 160.0, mode: AnchorMode::MoveOnly },
+            selected: None,
+            columns: 1,
+        });
+    }
+    let out = write_xlsx(&wb).unwrap();
+    check_package(&out).unwrap();
+    let parts = unpack(&out);
+    let slicer = text(&parts, "xl/slicers/");
+    assert_eq!(slicer.matches("<slicer ").count(), 2, "one part holds both views: {slicer}");
+    assert!(slicer.contains("name=\"Region\"") && slicer.contains("name=\"Sales_Region\""), "{slicer}");
+    let timeline = text(&parts, "xl/timelines/");
+    assert_eq!(timeline.matches("<timeline ").count(), 2, "{timeline}");
+    let sheet = String::from_utf8_lossy(&parts["xl/worksheets/sheet2.xml"]).into_owned();
+    assert_eq!(sheet.matches("<x14:slicer ").count(), 1, "one slicers part means one reference: {sheet}");
+    assert_eq!(sheet.matches("<x15:timelineRef ").count(), 1, "{sheet}");
+    let drawing = text(&parts, "xl/drawings/");
+    assert_eq!(drawing.matches("uri=\"http://schemas.microsoft.com/office/drawing/2010/slicer\"").count(), 2, "{drawing}");
+    assert_eq!(drawing.matches("uri=\"http://schemas.microsoft.com/office/drawing/2012/timeslicer\"").count(), 2, "{drawing}");
+
+    // All four views come back with their anchors.
+    let (back, rep) = read_xlsx(&out).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains("kept as they came") || w.contains("not placed")), "{:?}", rep.warnings);
+    let report = back.sheet(1).unwrap();
+    assert_eq!((report.pivot_slicers.len(), report.slicers.len(), report.pivot_timelines.len()), (1, 1, 2));
+    assert_eq!(report.slicers[0].anchor.cell, at("N2"));
+    assert_eq!(report.pivot_timelines[1].anchor.cell, at("H10"));
+    assert_eq!(report.pivot_timelines[1].unit, TimeUnit::Days);
+    let out2 = write_xlsx(&back).unwrap();
+    check_package(&out2).unwrap();
+    let parts2 = unpack(&out2);
+    assert_eq!(text(&parts2, "xl/slicers/"), slicer);
+    assert_eq!(text(&parts2, "xl/timelines/"), timeline);
+    assert_eq!(text(&parts2, "xl/drawings/"), drawing);
+}
+
+#[test]
 fn a_slicer_cache_the_model_does_not_understand_keeps_its_bytes() {
     // A cache with an attribute the model does not carry must stay exactly as it came: the whole
     // slicer set is kept, not half-rewritten.
