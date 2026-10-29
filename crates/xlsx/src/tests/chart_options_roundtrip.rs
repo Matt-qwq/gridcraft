@@ -8,7 +8,7 @@ use std::sync::Arc;
 use gridcraft_core::CellRef;
 use gridcraft_model::{
     Anchor, AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions,
-    LabelPosition, LegendPos, PointFormat, Series, Sheet, Workbook,
+    LabelPosition, LegendPos, PointFormat, PointLabel, Series, Sheet, Workbook,
 };
 
 use crate::{read_xlsx, write_xlsx};
@@ -615,4 +615,449 @@ fn adding_and_removing_trendlines_and_point_formats_patches_the_repeated_element
         }
         assert!(back.contains(needle), "the edit dropped `{needle}`:\n{back}");
     }
+}
+
+// ---------------------------------------------------------------- chartex parts
+
+/// A modelled chartex part (a histogram) carrying options GridCraft has no field for: a title fill,
+/// a per-point label format, binning, display units, formatted gridlines and tick labels, and an
+/// extension block. Everything here has to survive a patched edit byte for byte.
+const CHARTEX_HISTOGRAM: &str = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:f>_xlchart.v1.0</cx:f></cx:numDim></cx:data></cx:chartData><cx:chart><cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:txData><cx:v>Bins</cx:v></cx:txData></cx:tx><cx:spPr><a:solidFill><a:schemeClr val="accent2"/></a:solidFill></cx:spPr></cx:title><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="clusteredColumn" uniqueId="{00000000-0000-0000-0000-000000000001}"><cx:tx><cx:txData><cx:f>_xlchart.v1.1</cx:f><cx:v>Sales</cx:v></cx:txData></cx:tx><cx:spPr><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></cx:spPr><cx:dataLabels pos="outEnd"><cx:visibility seriesName="0" categoryName="0" value="1"/><cx:dataLabel idx="2"><cx:visibility value="0"/><cx:spPr><a:ln w="9525"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:ln></cx:spPr></cx:dataLabel></cx:dataLabels><cx:dataId val="0"/><cx:layoutPr><cx:binning intervalClosed="r"/></cx:layoutPr></cx:series></cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0"/><cx:tickLabels/></cx:axis><cx:axis id="1"><cx:valScaling min="0" max="50" majorUnit="10"/><cx:units><cx:builtInUnit val="thousands"/></cx:units><cx:majorGridlines><cx:spPr><a:ln w="6350"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln></cx:spPr></cx:majorGridlines><cx:tickLabels><cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr></cx:tickLabels></cx:axis></cx:plotArea><cx:legend pos="b" align="ctr" overlay="0"/></cx:chart><cx:spPr><a:solidFill><a:schemeClr val="bg1"/></a:solidFill></cx:spPr><cx:extLst><cx:ext uri="{AAAAAAAA-0000-0000-0000-000000000001}"><cx15:unknownThing xmlns:cx15="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" val="1"/></cx:ext></cx:extLst></cx:chartSpace>"##;
+
+/// A modelled chartex part for `kind`, with the axes that kind has.
+fn chartex_part(kind: ChartKind) -> String {
+    let (layout, axes) = match kind {
+        ChartKind::Histogram => (
+            "clusteredColumn",
+            r#"<cx:axis id="0"><cx:catScaling gapWidth="0"/><cx:tickLabels/></cx:axis><cx:axis id="1"><cx:valScaling/><cx:tickLabels/></cx:axis>"#,
+        ),
+        ChartKind::Waterfall => (
+            "waterfall",
+            r#"<cx:axis id="0"><cx:catScaling gapWidth="0.5"/><cx:tickLabels/></cx:axis><cx:axis id="1"><cx:valScaling/><cx:tickLabels/></cx:axis>"#,
+        ),
+        ChartKind::BoxWhisker => (
+            "boxWhisker",
+            r#"<cx:axis id="0"><cx:catScaling gapWidth="1"/><cx:tickLabels/></cx:axis><cx:axis id="1"><cx:valScaling/><cx:tickLabels/></cx:axis>"#,
+        ),
+        ChartKind::Funnel => ("funnel", r#"<cx:axis id="0"><cx:catScaling gapWidth="0.06"/><cx:tickLabels/></cx:axis>"#),
+        ChartKind::Treemap => ("treemap", ""),
+        _ => ("sunburst", ""),
+    };
+    let dims = if kind == ChartKind::Histogram {
+        r#"<cx:numDim type="val"><cx:f>_xlchart.v1.0</cx:f></cx:numDim>"#
+    } else {
+        r#"<cx:strDim type="cat"><cx:f>_xlchart.v1.0</cx:f></cx:strDim><cx:numDim type="val"><cx:f>_xlchart.v1.2</cx:f></cx:numDim>"#
+    };
+    let layout_pr = match kind {
+        ChartKind::Histogram => r#"<cx:layoutPr><cx:binning intervalClosed="r"/></cx:layoutPr>"#,
+        ChartKind::BoxWhisker => {
+            r#"<cx:layoutPr><cx:visibility meanLine="0" meanMarker="1" nonoutliers="0" outliers="1"/><cx:statistics quartileMethod="exclusive"/></cx:layoutPr>"#
+        }
+        ChartKind::Treemap => r#"<cx:layoutPr><cx:parentLabelLayout val="overlapping"/></cx:layoutPr>"#,
+        _ => "",
+    };
+    format!(
+        r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0">{dims}</cx:data></cx:chartData><cx:chart><cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:txData><cx:v>Old</cx:v></cx:txData></cx:tx></cx:title><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="{layout}" uniqueId="{{00000000-0000-0000-0000-000000000001}}"><cx:tx><cx:txData><cx:f>_xlchart.v1.1</cx:f><cx:v>Sales</cx:v></cx:txData></cx:tx><cx:dataId val="0"/>{layout_pr}</cx:series></cx:plotAreaRegion>{axes}</cx:plotArea></cx:chart></cx:chartSpace>"##
+    )
+}
+
+/// A package with one sheet of data and one chartex part framed through `mc:AlternateContent`.
+fn chartex_package(part: &str) -> Vec<u8> {
+    let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>10</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>15</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" Requires="cx1"><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chart xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex" r:id="rId1"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="0" name=""/><xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr/><xdr:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US"/><a:t>x</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
+    let drels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx1.xml"/></Relationships>"#;
+    let srels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+    let sheet = r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Sales</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>One</t></is></c><c r="B2"><v>1</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>Two</t></is></c><c r="B3"><v>4</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>Three</t></is></c><c r="B4"><v>9</v></c></row><row r="5"><c r="A5" t="inlineStr"><is><t>Four</t></is></c><c r="B5"><v>16</v></c></row></sheetData><drawing r:id="rId1"/>"#;
+    let names = r#"<definedNames><definedName name="_xlchart.v1.0" hidden="1">Data!$B$2:$B$5</definedName><definedName name="_xlchart.v1.1" hidden="1">Data!$B$1</definedName><definedName name="_xlchart.v1.2" hidden="1">Data!$A$2:$A$5</definedName></definedNames>"#;
+    super::minimal(
+        sheet,
+        &[
+            ("xl/worksheets/_rels/sheet1.xml.rels", srels),
+            ("xl/drawings/drawing1.xml", drawing),
+            ("xl/drawings/_rels/drawing1.xml.rels", drels),
+            ("xl/charts/chartEx1.xml", part),
+            (
+                "xl/charts/_rels/chartEx1.xml.rels",
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#,
+            ),
+        ],
+        "",
+        names,
+    )
+}
+
+fn chartex_part_of(bytes: &[u8]) -> String {
+    chart_part(bytes, "xl/charts/chartEx1.xml")
+}
+
+#[test]
+fn a_chartex_chart_read_from_a_file_keeps_its_options_through_an_edit() {
+    let bytes = chartex_package(CHARTEX_HISTOGRAM);
+    let (mut wb, _rep) = read_xlsx(&bytes).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        assert_eq!(sheet.charts.len(), 1, "a modelled chartex chart is read, not kept whole");
+        let c = &mut sheet.charts[0];
+        assert_eq!(c.kind, ChartKind::Histogram);
+        assert_eq!(c.series[0].values, "Data!$B$2:$B$5", "the hidden name resolved to its reference");
+        assert_eq!(c.y_axis.min, Some(0.0));
+        assert_eq!(c.y_axis.max, Some(50.0));
+        assert_eq!(c.y_axis.major_unit, Some(10.0));
+        assert!(c.data_labels);
+        assert_eq!(c.series[0].labels.as_ref().map(|l| l.position), Some(LabelPosition::OutsideEnd));
+        // The edit: one value-axis option.
+        c.y_axis.min = Some(8.0);
+    }
+    let back = write_xlsx(&wb).unwrap();
+    let part = chartex_part_of(&back);
+    // The element that carries the edit changed; every other byte is the file's.
+    assert_eq!(part.replace("min=\"8\"", "min=\"0\""), CHARTEX_HISTOGRAM, "the patch touched more than the edited attribute:\n{part}");
+    for needle in [
+        "<cx:units><cx:builtInUnit val=\"thousands\"/></cx:units>",
+        "<cx:binning intervalClosed=\"r\"/>",
+        "<cx:dataLabel idx=\"2\">",
+        "<a:srgbClr val=\"FF0000\"/>",
+        "<a:schemeClr val=\"accent2\"/>",
+        "<a:srgbClr val=\"D9D9D9\"/>",
+        "<a:noFill/>",
+        "unknownThing",
+    ] {
+        assert!(part.contains(needle), "the edit dropped `{needle}`:\n{part}");
+    }
+    // The hidden names the part refers to are defined again, and the chart reads back the same.
+    let book = chart_part(&back, "xl/workbook.xml");
+    assert!(book.contains(r#"_xlchart.v1.0" hidden="1">Data!$B$2:$B$5"#), "{book}");
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    let c = &again.sheets[0].charts[0];
+    assert_eq!(c.kind, ChartKind::Histogram);
+    assert_eq!((c.y_axis.min, c.y_axis.max, c.y_axis.major_unit), (Some(8.0), Some(50.0), Some(10.0)));
+    assert_eq!(c.series[0].values, "Data!$B$2:$B$5");
+    assert_eq!(c.series[0].name.as_deref(), Some("Data!$B$1"));
+    assert!(c.data_labels);
+    // A second save is stable.
+    assert_eq!(chartex_part_of(&write_xlsx(&again).unwrap()), part);
+    // Saving the edited workbook again changes nothing either.
+    assert_eq!(chartex_part_of(&write_xlsx(&wb).unwrap()), part);
+}
+
+#[test]
+fn every_chartex_kind_patches_only_the_edited_element() {
+    for kind in [ChartKind::Histogram, ChartKind::Waterfall, ChartKind::BoxWhisker, ChartKind::Funnel, ChartKind::Treemap, ChartKind::Sunburst] {
+        let original = chartex_part(kind);
+        let (mut wb, _rep) = read_xlsx(&chartex_package(&original)).unwrap();
+        {
+            let sheet = Arc::make_mut(&mut wb.sheets[0]);
+            let c = &mut sheet.charts[0];
+            assert_eq!(c.kind, kind, "{kind:?} did not read back");
+            // The title is the one option every kind stores.
+            c.title = Some("Edited".into());
+        }
+        let part = chartex_part_of(&write_xlsx(&wb).unwrap());
+        assert_eq!(part.replace("<cx:v>Edited</cx:v>", "<cx:v>Old</cx:v>"), original, "{kind:?}: the patch touched more than the title:\n{part}");
+        let (again, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+        assert_eq!(again.sheets[0].charts[0].title.as_deref(), Some("Edited"), "{kind:?}");
+    }
+}
+
+#[test]
+fn a_chartex_series_label_position_and_visibilities_patch_only_the_label_element() {
+    let original = chartex_part(ChartKind::Waterfall);
+    let (mut wb, _rep) = read_xlsx(&chartex_package(&original)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        let c = &mut sheet.charts[0];
+        c.data_labels = true;
+        c.series[0].labels = Some(LabelOptions { show_value: true, show_category: true, position: LabelPosition::Center, ..LabelOptions::default() });
+    }
+    let part = chartex_part_of(&write_xlsx(&wb).unwrap());
+    assert!(part.contains(r#"<cx:dataLabels pos="ctr"><cx:visibility seriesName="0" categoryName="1" value="1"/></cx:dataLabels>"#), "{part}");
+    // Everything else is the original's.
+    let then = r##"<cx:series layoutId="waterfall" uniqueId="{00000000-0000-0000-0000-000000000001}"><cx:tx><cx:txData><cx:f>_xlchart.v1.1</cx:f><cx:v>Sales</cx:v></cx:txData></cx:tx><cx:dataLabels pos="ctr"><cx:visibility seriesName="0" categoryName="1" value="1"/></cx:dataLabels><cx:dataId val="0"/>"##;
+    let before = r##"<cx:series layoutId="waterfall" uniqueId="{00000000-0000-0000-0000-000000000001}"><cx:tx><cx:txData><cx:f>_xlchart.v1.1</cx:f><cx:v>Sales</cx:v></cx:txData></cx:tx><cx:dataId val="0"/>"##;
+    assert_eq!(part.replace(then, before), original, "{part}");
+    // The labels come back from the saved file.
+    let (again, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    let l = again.sheets[0].charts[0].series[0].labels.clone().expect("series labels");
+    assert!(l.show_value && l.show_category && l.position == LabelPosition::Center);
+}
+
+#[test]
+fn a_chartex_box_whisker_quartile_edit_patches_the_statistics_element() {
+    let original = chartex_part(ChartKind::BoxWhisker);
+    let (mut wb, _rep) = read_xlsx(&chartex_package(&original)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        assert_eq!(sheet.charts[0].series[0].quartiles, gridcraft_model::QuartileMethod::Exclusive);
+        sheet.charts[0].series[0].quartiles = gridcraft_model::QuartileMethod::Inclusive;
+    }
+    let part = chartex_part_of(&write_xlsx(&wb).unwrap());
+    assert_eq!(
+        part.replace("quartileMethod=\"inclusive\"", "quartileMethod=\"exclusive\""),
+        original,
+        "the quartile edit touched more than the attribute:\n{part}"
+    );
+    let (again, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert_eq!(again.sheets[0].charts[0].series[0].quartiles, gridcraft_model::QuartileMethod::Inclusive);
+}
+
+// ---------------------------------------------------------------- per-point labels
+
+#[test]
+fn a_point_label_text_and_position_round_trip() {
+    let mut c = chart(1, ChartKind::ColumnClustered);
+    c.data_labels = true;
+    c.labels = LabelOptions::values();
+    c.series[0].point_labels = vec![
+        PointLabel { index: 1, text: Some("Data!$C$2".into()), show_value: Some(false), position: LabelPosition::Top, ..PointLabel::default() },
+        PointLabel { index: 2, text: Some("Peak".into()), show_category: Some(true), position: LabelPosition::InsideEnd, ..PointLabel::default() },
+    ];
+    let mut s = Sheet::new("Data");
+    for (i, v) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
+        s.set_value(CellRef::new(i as u32 + 1, 0), gridcraft_core::Value::Number(*v));
+        s.set_value(CellRef::new(i as u32 + 1, 1), gridcraft_core::Value::Number(*v * 2.0));
+        s.set_value(CellRef::new(i as u32 + 1, 2), gridcraft_core::Value::Text("note".into()));
+    }
+    let wanted = c.series[0].point_labels.clone();
+    s.charts.push(c);
+    let wb = Workbook { sheets: vec![Arc::new(s)], ..Workbook::default() };
+    let bytes = write_xlsx(&wb).unwrap();
+    let part = chart_part(&bytes, "xl/charts/chart1.xml");
+    // A reference goes through a strRef with its cache; literal text is one rich-text run.
+    assert!(
+        part.contains(
+            "<c:tx><c:strRef><c:f>Data!$C$2</c:f><c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>note</c:v></c:pt></c:strCache></c:strRef></c:tx>"
+        ),
+        "{part}"
+    );
+    assert!(part.contains("<a:t>Peak</a:t>"), "{part}");
+    assert!(part.contains("<c:dLbl><c:idx val=\"1\"/><c:tx>"), "{part}");
+    assert!(part.contains("<c:dLblPos val=\"t\"/>"), "{part}");
+    assert!(part.contains("<c:showVal val=\"0\"/>"), "{part}");
+    let (back, _rep) = read_xlsx(&bytes).unwrap();
+    assert_eq!(back.sheets[0].charts[0].series[0].point_labels, wanted);
+    // A second save writes the same part.
+    assert_eq!(chart_part(&write_xlsx(&back).unwrap(), "xl/charts/chart1.xml"), part);
+}
+
+/// A chart part with two per-point labels (one rich text, one taken from a cell) beside the series
+/// options and an unmodelled callout layout.
+fn point_labels_part() -> String {
+    r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/><c:ser><c:idx val="0"/><c:order val="0"/><c:dLbls><c:dLbl><c:idx val="1"/><c:layout><c:manualLayout><c:x val="0.3"/><c:y val="0.4"/></c:manualLayout></c:layout><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:rPr lang="en-US" b="1"/><a:t>Peak</a:t></a:r></a:p></c:rich></c:tx><c:dLblPos val="t"/><c:showVal val="0"/></c:dLbl><c:dLbl><c:idx val="2"/><c:tx><c:strRef><c:f>Data!$D$2</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>From a cell</c:v></c:pt></c:strCache></c:strRef></c:tx><c:showCatName val="1"/></c:dLbl><c:dLbl><c:idx val="3"/><c:delete val="1"/></c:dLbl><c:showVal val="1"/></c:dLbls><c:cat><c:strRef><c:f>Data!$A$2:$A$5</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$B$2:$B$5</c:f></c:numRef></c:val><c:extLst><c:ext uri="{44444444-4444-4444-4444-444444444444}"><c15:pointThing xmlns:c15="http://schemas.microsoft.com/office/drawing/2012/chart" val="1"/></c:ext></c:extLst></c:ser><c:dLbls><c:showVal val="1"/></c:dLbls><c:gapWidth val="150"/><c:axId val="1"/><c:axId val="2"/></c:barChart><c:catAx><c:axId val="1"/><c:crossAx val="2"/></c:catAx><c:valAx><c:axId val="2"/><c:crossAx val="1"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"##
+        .to_string()
+}
+
+#[test]
+fn per_point_labels_in_a_file_survive_and_patch() {
+    let original = point_labels_part();
+    let (mut wb, _rep) = read_xlsx(&chart_package(&original)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        let c = &mut sheet.charts[0];
+        let p = &c.series[0].point_labels;
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert_eq!(p[0].index, 1);
+        assert_eq!(p[0].text.as_deref(), Some("Peak"), "rich text concatenated");
+        assert_eq!(p[0].position, LabelPosition::Top);
+        assert_eq!(p[0].show_value, Some(false));
+        assert_eq!(p[1].index, 2);
+        assert_eq!(p[1].text.as_deref(), Some("Data!$D$2"), "a cell reference is kept as one");
+        assert_eq!(p[1].show_category, Some(true));
+        // A deleted label stays in the point formats.
+        assert!(c.series[0].points.iter().any(|x| x.index == 3 && x.no_label));
+    }
+    // An unrelated edit patches the axis and leaves the labels (and their layout) alone.
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].y_axis.min = Some(2.0);
+    }
+    let part = chart_part(&write_xlsx(&wb).unwrap(), "xl/charts/chart1.xml");
+    for needle in ["<a:t>Peak</a:t>", "<c:manualLayout>", "<c:f>Data!$D$2</c:f>", "pointThing", "<c:delete val=\"1\"/>"] {
+        assert!(part.contains(needle), "the edit dropped `{needle}`:\n{part}");
+    }
+    // Changing one point's text rewrites that `dLbl` and keeps the other point's.
+    let (mut again, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut again.sheets[0]);
+        let c = &mut sheet.charts[0];
+        let mut l = c.series[0].point_labels[0].clone();
+        l.text = Some("Renamed".into());
+        c.series[0].set_point_label(l);
+    }
+    let part = chart_part(&write_xlsx(&again).unwrap(), "xl/charts/chart1.xml");
+    assert!(part.contains("<a:t>Renamed</a:t>"), "{part}");
+    assert!(part.contains("<c:f>Data!$D$2</c:f>"), "the other point's label stays: {part}");
+    assert!(part.contains("<c:manualLayout>"), "the callout layout stays: {part}");
+    let (back, _rep) = read_xlsx(&write_xlsx(&again).unwrap()).unwrap();
+    assert_eq!(back.sheets[0].charts[0].series[0].point_labels[0].text.as_deref(), Some("Renamed"));
+}
+
+// ---------------------------------------------------------------- custom error bars from a file
+
+/// A chart part whose series carries custom error bars (a reference on each side) with their own
+/// line formatting.
+fn custom_error_bars_part() -> String {
+    r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/><c:ser><c:idx val="0"/><c:order val="0"/><c:errBars><c:errBarType val="both"/><c:errValType val="cust"/><c:noEndCap val="0"/><c:plus><c:numRef><c:f>Data!$C$2:$C$5</c:f><c:numCache><c:ptCount val="4"/></c:numCache></c:numRef></c:plus><c:minus><c:numRef><c:f>Data!$D$2:$D$5</c:f><c:numCache><c:ptCount val="4"/></c:numCache></c:numRef></c:minus><c:spPr><a:ln w="9525"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:ln></c:spPr></c:errBars><c:cat><c:strRef><c:f>Data!$A$2:$A$5</c:f></c:strRef></c:cat><c:val><c:numRef><c:f>Data!$B$2:$B$5</c:f></c:numRef></c:val></c:ser><c:gapWidth val="150"/><c:axId val="1"/><c:axId val="2"/></c:barChart><c:catAx><c:axId val="1"/><c:crossAx val="2"/></c:catAx><c:valAx><c:axId val="2"/><c:crossAx val="1"/></c:valAx></c:plotArea></c:chart></c:chartSpace>"##
+        .to_string()
+}
+
+#[test]
+fn custom_error_bars_read_from_a_file_survive_an_unrelated_edit() {
+    let original = custom_error_bars_part();
+    let (mut wb, _rep) = read_xlsx(&chart_package(&original)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        let e = sheet.charts[0].series[0].error_bars.clone().expect("error bars");
+        assert_eq!(
+            e.kind,
+            ErrorBarKind::Custom { plus: Some("Data!$C$2:$C$5".into()), minus: Some("Data!$D$2:$D$5".into()) },
+            "the custom references are read"
+        );
+        sheet.charts[0].y_axis.min = Some(1.0);
+    }
+    let part = chart_part(&write_xlsx(&wb).unwrap(), "xl/charts/chart1.xml");
+    assert!(part.contains("<c:f>Data!$C$2:$C$5</c:f>"), "{part}");
+    assert!(part.contains("<c:f>Data!$D$2:$D$5</c:f>"), "{part}");
+    assert!(part.contains("<a:srgbClr val=\"FF0000\"/>"), "the bar's line style stays: {part}");
+    // The references survive a save of a model written from scratch too.
+    let (back, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    let e = back.sheets[0].charts[0].series[0].error_bars.clone().expect("error bars");
+    assert_eq!(e.kind, ErrorBarKind::Custom { plus: Some("Data!$C$2:$C$5".into()), minus: Some("Data!$D$2:$D$5".into()) });
+    // Changing the bars themselves keeps both references.
+    let mut from_scratch = (*back.sheets[0]).clone();
+    from_scratch.charts[0].series[0].error_bars = Some(ErrorBars {
+        direction: ErrorBarDirection::Minus,
+        kind: ErrorBarKind::Custom { plus: Some("Data!$C$2:$C$5".into()), minus: Some("Data!$D$2:$D$5".into()) },
+        no_end_cap: true,
+    });
+    let wb2 = Workbook { sheets: vec![Arc::new(from_scratch)], ..Workbook::default() };
+    let part2 = chart_part(&write_xlsx(&wb2).unwrap(), "xl/charts/chart1.xml");
+    assert!(part2.contains("<c:f>Data!$C$2:$C$5</c:f>") && part2.contains("<c:f>Data!$D$2:$D$5</c:f>"), "{part2}");
+}
+
+#[test]
+fn a_chartex_series_colour_edit_patches_the_series_fill() {
+    let original = chartex_part(ChartKind::Histogram);
+    let (mut wb, _rep) = read_xlsx(&chartex_package(&original)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].series[0].color = Some(Color::Rgb(0xC00000));
+    }
+    let part = chartex_part_of(&write_xlsx(&wb).unwrap());
+    // The series had no fill of its own: the patch adds one where the schema puts it.
+    assert_eq!(
+        part.replace("<cx:spPr><a:solidFill><a:srgbClr val=\"C00000\"/></a:solidFill></cx:spPr>", ""),
+        original,
+        "the colour edit touched more than the series fill:\n{part}"
+    );
+    let (again, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert_eq!(again.sheets[0].charts[0].series[0].color, Some(Color::Rgb(0xC00000)));
+}
+
+#[test]
+fn an_untouched_chartex_part_is_written_back_byte_identical() {
+    let (wb, _rep) = read_xlsx(&chartex_package(CHARTEX_HISTOGRAM)).unwrap();
+    let back = write_xlsx(&wb).unwrap();
+    assert_eq!(chartex_part_of(&back), CHARTEX_HISTOGRAM);
+    // Its hidden names are defined again, at the indices the part uses.
+    let book = chart_part(&back, "xl/workbook.xml");
+    for (name, reference) in [("_xlchart.v1.0", "Data!$B$2:$B$5"), ("_xlchart.v1.1", "Data!$B$1")] {
+        assert!(book.contains(&format!("name=\"{name}\" hidden=\"1\">{reference}</definedName>")), "{name}: {book}");
+    }
+    // And a second save changes nothing.
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    assert_eq!(chartex_part_of(&write_xlsx(&again).unwrap()), CHARTEX_HISTOGRAM);
+}
+
+#[test]
+fn a_chartex_data_change_regenerates_the_part_with_readable_names() {
+    let (mut wb, _rep) = read_xlsx(&chartex_package(CHARTEX_HISTOGRAM)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].series[0].values = "Data!$B$2:$B$3".into();
+    }
+    let back = write_xlsx(&wb).unwrap();
+    let part = chartex_part_of(&back);
+    // The data reference moved, which a patched part cannot express: the part is regenerated, with
+    // its data behind hidden names and no stale reference left.
+    assert!(part.contains("<cx:f>_xlchart.v1.0</cx:f>"), "{part}");
+    assert!(!part.contains("Data!"), "{part}");
+    let book = chart_part(&back, "xl/workbook.xml");
+    assert!(book.contains(">Data!$B$2:$B$3</definedName>"), "{book}");
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    assert_eq!(again.sheets[0].charts[0].series[0].values, "Data!$B$2:$B$3");
+}
+
+/// A package with two chartex parts, the second numbered from 5 (as a workbook whose earlier
+/// chartex parts were deleted would be).
+fn chartex_pair_package(a: &str, b: &str) -> Vec<u8> {
+    let frame = |rid: &str, id: u32| {
+        format!(
+            r#"<xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{id}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>10</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" Requires="cx1"><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{id}" name="Chart {id}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chart xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex" r:id="{rid}"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="0" name=""/><xdr:cNvSpPr><a:spLocks noTextEdit="1"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr/><xdr:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US"/><a:t>x</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent><xdr:clientData/></xdr:twoCellAnchor>"#,
+            id + 10
+        )
+    };
+    let drawing = format!(
+        r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">{}{}</xdr:wsDr>"#,
+        frame("rId1", 1),
+        frame("rId2", 20)
+    );
+    let drels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2014/relationships/chartEx" Target="../charts/chartEx2.xml"/></Relationships>"#;
+    let srels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+    let sheet = r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Sales</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>One</t></is></c><c r="B2"><v>1</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>Two</t></is></c><c r="B3"><v>4</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>Three</t></is></c><c r="B4"><v>9</v></c></row><row r="5"><c r="A5" t="inlineStr"><is><t>Four</t></is></c><c r="B5"><v>16</v></c></row></sheetData><drawing r:id="rId1"/>"#;
+    let names = r#"<definedNames><definedName name="_xlchart.v1.0" hidden="1">Data!$B$2:$B$5</definedName><definedName name="_xlchart.v1.1" hidden="1">Data!$B$1</definedName><definedName name="_xlchart.v1.5" hidden="1">Data!$A$2:$A$5</definedName><definedName name="_xlchart.v1.6" hidden="1">Data!$B$1</definedName><definedName name="_xlchart.v1.7" hidden="1">Data!$B$2:$B$5</definedName></definedNames>"#;
+    super::minimal(
+        sheet,
+        &[
+            ("xl/worksheets/_rels/sheet1.xml.rels", srels),
+            ("xl/drawings/drawing1.xml", &drawing),
+            ("xl/drawings/_rels/drawing1.xml.rels", drels),
+            ("xl/charts/chartEx1.xml", a),
+            ("xl/charts/chartEx2.xml", b),
+        ],
+        "",
+        names,
+    )
+}
+
+#[test]
+fn two_chartex_parts_keep_their_own_names_at_their_own_indices() {
+    // The second part numbers its hidden names 5, 7 and 6: the writer fills the gaps and keeps the
+    // indices, and neither part disturbs the other's data.
+    let second = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:strDim type="cat"><cx:f>_xlchart.v1.5</cx:f></cx:strDim><cx:numDim type="val"><cx:f>_xlchart.v1.7</cx:f></cx:numDim></cx:data></cx:chartData><cx:chart><cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:txData><cx:v>Second</cx:v></cx:txData></cx:tx></cx:title><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="waterfall" uniqueId="{00000000-0000-0000-0000-000000000002}"><cx:tx><cx:txData><cx:f>_xlchart.v1.6</cx:f><cx:v>Sales</cx:v></cx:txData></cx:tx><cx:dataId val="0"/></cx:series></cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0.5"/><cx:tickLabels/></cx:axis><cx:axis id="1"><cx:valScaling/><cx:tickLabels/></cx:axis></cx:plotArea></cx:chart></cx:chartSpace>"##.to_string();
+    let (mut wb, _rep) = read_xlsx(&chartex_pair_package(&chartex_part(ChartKind::Histogram), &second)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        assert_eq!(sheet.charts.len(), 2);
+        assert_eq!(sheet.charts[1].series[0].values, "Data!$B$2:$B$5");
+        assert_eq!(sheet.charts[1].series[0].categories.as_deref(), Some("Data!$A$2:$A$5"));
+        // Edit both: one axis option on each.
+        sheet.charts[0].y_axis.max = Some(40.0);
+        sheet.charts[1].y_axis.min = Some(1.0);
+    }
+    let back = write_xlsx(&wb).unwrap();
+    let a = chartex_part_of(&back);
+    assert!(a.contains("<cx:valScaling max=\"40\"/>"), "{a}");
+    // The first part's names stay 0 and 1.
+    assert!(a.contains("<cx:f>_xlchart.v1.0</cx:f>") && a.contains("<cx:f>_xlchart.v1.1</cx:f>"), "{a}");
+    let b = chart_part(&back, "xl/charts/chartEx2.xml");
+    // The second part keeps the indices it had (5, 7 and 6), all defined again.
+    for name in ["_xlchart.v1.5", "_xlchart.v1.6", "_xlchart.v1.7"] {
+        assert!(b.contains(&format!("<cx:f>{name}</cx:f>")), "{name} lost from the second part:\n{b}");
+    }
+    let book = chart_part(&back, "xl/workbook.xml");
+    for (i, reference) in [(5, "Data!$A$2:$A$5"), (6, "Data!$B$1"), (7, "Data!$B$2:$B$5")] {
+        assert!(
+            book.contains(&format!("name=\"_xlchart.v1.{i}\" hidden=\"1\">{reference}</definedName>")),
+            "name {i} is not defined as {reference}:\n{book}"
+        );
+    }
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    assert_eq!(again.sheets[0].charts[0].y_axis.max, Some(40.0));
+    assert_eq!(again.sheets[0].charts[1].y_axis.min, Some(1.0));
+    assert_eq!(again.sheets[0].charts[1].series[0].values, "Data!$B$2:$B$5");
+    assert_eq!(chart_part(&write_xlsx(&again).unwrap(), "xl/charts/chartEx2.xml"), b);
 }

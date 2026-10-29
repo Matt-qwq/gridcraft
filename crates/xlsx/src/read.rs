@@ -437,6 +437,9 @@ fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadRepor
                     s.categories.iter_mut().for_each(&resolve);
                     s.name.iter_mut().for_each(&resolve);
                 }
+                // A kept chartex part refers to its data through these names: keep them with the
+                // part so the writer can define them again.
+                ch.keep_chart_names(&chart_names);
             }
         }
     }
