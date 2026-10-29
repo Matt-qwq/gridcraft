@@ -963,9 +963,62 @@ impl Band {
 
     /// Puts a payload that does not fit `u16` in the row's side table and returns its index there.
     fn push_wide(&mut self, at: usize, value: u64) -> u16 {
+        // A value write appends (it cannot tell which entry was the cell's own), so a band
+        // rewritten many times — a recalculated row of formulas — walks past the 65,535 an index
+        // can hold; `compact_wide` brings it back to one entry per value the row still uses.
+        if self.rows[at].extras.as_ref().is_some_and(|e| e.wide.len() > usize::from(u16::MAX)) {
+            self.compact_wide(at);
+        }
         let extras = Arc::make_mut(self.rows[at].extras.get_or_insert_with(Default::default));
         extras.wide.push(value);
-        (extras.wide.len() - 1) as u16
+        // Compaction keeps the table at or below the row's cell count, so the index always fits.
+        u16::try_from(extras.wide.len() - 1).unwrap_or(u16::MAX)
+    }
+
+    /// Rebuilds the row's wide table with one entry per distinct value its cells still use, so the
+    /// index a payload stores always fits a `u16`. A row holds at most
+    /// [`gridcraft_core::MAX_COLS`] cells, so the rebuilt table always fits.
+    fn compact_wide(&mut self, at: usize) {
+        let cells = self.rows[at].cells as usize;
+        let len = self.rows[at].extras.as_ref().map_or(0, |e| e.wide.len());
+        if len <= usize::from(u16::MAX) {
+            return;
+        }
+        let mut used: Vec<(usize, u64)> = Vec::new();
+        for i in 0..cells {
+            let kind = self.rows[at].kind_at(self, i);
+            if kind != TEXT_WIDE && kind != NUMBER_WIDE {
+                continue;
+            }
+            let slot = usize::from(self.rows[at].payload_at(self, i));
+            if let Some(v) = self.rows[at].extras.as_ref().and_then(|e| e.wide.get(slot)) {
+                used.push((i, *v));
+            }
+        }
+        let mut wide: Vec<u64> = Vec::with_capacity(used.len());
+        let mut seen: std::collections::HashMap<u64, u16> = std::collections::HashMap::new();
+        let mut slots: Vec<(usize, u16)> = Vec::with_capacity(used.len());
+        for (i, v) in used {
+            let slot = match seen.get(&v) {
+                Some(slot) => *slot,
+                None => {
+                    let Ok(slot) = u16::try_from(wide.len()) else { break };
+                    wide.push(v);
+                    seen.insert(v, slot);
+                    slot
+                }
+            };
+            slots.push((i, slot));
+        }
+        if let Some(extras) = self.rows[at].extras.as_mut() {
+            Arc::make_mut(extras).wide = wide;
+        }
+        let cells_at = self.rows[at].cells_at as usize;
+        for (i, slot) in slots {
+            if let Some(p) = self.payloads.get_mut(cells_at + i) {
+                *p = slot;
+            }
+        }
     }
 
     /// Rebuilds the `Cell` at `col` from the packed row.
