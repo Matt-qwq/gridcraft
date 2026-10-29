@@ -127,7 +127,7 @@ The detailed queue with dependencies and the parallel plan is in
 
 | Wave | Work | Hours | Notes |
 |---|---|---|---|
-| **0** | Close the base: M19 spill path, writer peak (S4a/S4b); M20 page-file rewrite deferred to M19 | **10–18** | M20, the byte-budget cache and the uncached save scan complete 10-29. Last large-workbook debt. |
+| **0** | Close the base: M19 writer peak (S4a/S4b); M20 page-file rewrite deferred to M19 | **8–15** | M20, the byte-budget cache, the uncached save scan and spill-beside-document complete 10-29. Last large-workbook debt. |
 | **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
 | **1** | **XLSX corpus + Excel acceptance** (#1/#3) | 21–35 | **Owner: half a day in Excel.** The only external gate; start early. |
 | **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M19 spill beside the document: a paging open tries the document folder then temp, `GRIDCRAFT_SPILL=temp|off`, skips UNC; Unix creates it 0600 and unlinks the name at once, Windows uses delete-on-close; a write failure latches spilling off (pages already written stay readable) and an unavailable spill warns but still opens live. 104 model / 268 xlsx / 423 engine tests |
 | 2026-10-29 | M19 uncached save scan: `iter_scan`/`visit_scan` hold one band and one packed row at a time and decode pages without touching the cache; `sheet_write` uses it, so a save leaves the viewport's cache exactly unchanged and no longer collects a 16k-wide band into a `Vec`. Model 97, xlsx 266, engine 422; byte-identical output pinned |
 | 2026-10-29 | M19 byte-budget page cache: 64 MiB default (`GRIDCRAFT_PAGE_CACHE_MB` clamped 8–512), budget shared per page file, decode-time heap charging with generation/`Weak` eviction, `PageCacheStats`, and compaction-primed pages charged; 93 model / 422 engine tests. Spill placement, save/scan and the page-file rewrite remain |
 | 2026-10-29 | M20 mapped value writes complete: `set_values` streams through the row map's runs and keeps a run-merged parallel plan (1M values **35 ms after a row insert**, 33 ms after a column insert, was 131–135 / 116–142); `visit_packed` follows column-map runs (**2.5–3.3 ns/cell** on a dense block, was 30.6); `has_owned_cells`/`formula_cells` resolve a band once (1M paged rows **0.84 ms**, was 9.5); `diff` keeps its physical contract and the new `diff_logical` serves tests/fuzz. Model 87, engine 422 |
@@ -250,6 +251,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M19 spill beside the document (folder-then-temp, `GRIDCRAFT_SPILL`, UNC skip, Unix 0600+unlink, Windows delete-on-close, failure latch, warning); 104 model / 268 xlsx / 423 engine tests; writer peak remains |
 | 2026-10-29 | minor | M19 uncached save scan (`iter_scan`/`visit_scan`, writer wired, one band at a time, cache stats unchanged, byte-identical output); 97 model / 266 xlsx / 422 engine tests; spill placement and the writer peak remain |
 | 2026-10-29 | minor | M19 byte-budget page cache (64 MiB default, env-clamped, per-file sharing, generation/`Weak` accounting, `PageCacheStats`, compaction priming charged); 93 model / 422 engine tests; spill placement, save/scan and page-file rewrite remain |
 | 2026-10-29 | minor | M20 mapped value writes complete: streaming mapped `set_values` + run-merged parallel plan, column-run `visit_packed`, band-cached owned/formula gates, `diff_logical`; 1M write-back 131→35 ms (row insert), dense packed walk 30.6→2.5–3.3 ns/cell; 87 model / 422 engine tests |

@@ -94,6 +94,10 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Insert inheritance, delete, undo and a mapped-sheet XLSX round trip are covered (model 62,
   engine 419, xlsx 265 tests). The UI also caches the derived `LineIndex`/outline axes per
   `(document, revision, sheet)`, so a 1M-custom-height sheet no longer rebuilds them every frame.
+- **Landed (10-29): spill beside the document.** A paging read creates the page file in the
+  document's folder (temp fallback), with `GRIDCRAFT_SPILL=temp|off`, a UNC skip, a sanitized name,
+  Unix 0600 + unlink-after-open and Windows delete-on-close. A write failure latches spilling off
+  while existing pages stay readable; no file means the workbook opens live with one warning.
 - **Landed (10-29): byte-budget page cache and uncached save scan.** The decoded-band cache is
   64 MiB by default (`GRIDCRAFT_PAGE_CACHE_MB` clamped 8–512), shared per page file, charged at
   decode with generation/`Weak` eviction and `PageCacheStats`. `iter_scan`/`visit_scan` decode one
@@ -106,10 +110,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   resolves a band once (1M paged rows 0.84 ms, was 9.5). `diff` keeps its documented physical
   contract; `diff_logical` is the O(cells) map-independent diagnostic for tests/fuzz.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
-  clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
-  file is a temporary beside the system temp directory (not the document), and the XLSX writer
-  retains every sheet's XML (the real save peak); the per-band value dictionaries still cost full
-  price when values do not repeat;
+  clear/copy/paste still clone the stored cells (they scale with the data, not the file); the XLSX
+  writer retains every sheet's XML (the real save peak); the per-band value dictionaries still cost
+  full price when values do not repeat;
   page-aware compaction and the 64 MiB byte-budget page cache landed 10-29 (identity early-out,
   gap-scoped candidates, snapshot-safe page replacement, `document.compact` and a save hook,
   `PageCacheStats`); a page-file rewrite remains;

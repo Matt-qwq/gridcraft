@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M19 spill-beside-document, writer peak (S4a/S4b); M20 page-file rewrite deferred to M19 | M19 follow-up | **10–18** | M20, the byte-budget cache and the uncached save scan landed by 10-29. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: M19 writer peak (S4a/S4b); M20 page-file rewrite deferred to M19 | M19 follow-up | **8–15** | M20, the byte-budget cache, the uncached save scan and spill-beside-document landed by 10-29. This is the last large-workbook debt before beta evidence. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -104,7 +104,7 @@ to check our files (gate #1/#8), and Windows machines with the reported GPU driv
 | M16 | Get & Transform, data model | not started |
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | landed (10-24/27): whole-column folds and recalc kernels; remaining work in gaps |
-| M19 | Cold paging: bands leave memory when unused | **landed (10-28/29)**: compressed pages + byte-budget cache; spill-beside-document, flat-memory save/scan and page-file rewrite remain |
+| M19 | Cold paging: bands leave memory when unused | **landed (10-28/29)**: compressed pages, byte-budget cache, uncached save scan, spill beside the document; writer peak and page-file rewrite remain |
 | M20 | Append-style structural edits (segments, no whole-sheet shifts) | **complete (10-29)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20, chunked line metadata, cached UI geometry, page-aware `compact` with `document.compact`/save caller, mapped value writes (35/33 ms per 1M), packed column walk and `diff_logical`; only M19's page-file rewrite/byte budget remain |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading/linked tables are post-beta (not a beta gate) |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
@@ -543,11 +543,20 @@ test pins that a full scan decodes each band once and leaves `PageCacheStats` ex
 XLSX test pins byte-identical output and unchanged stats after save. Model tests **97**, xlsx
 **266** (2 ignored), engine **422**. No save-peak benchmark was run.
 
-**Scope (remaining).** The file is a temporary beside the system temp directory, not beside the
-document; the XLSX writer still retains every sheet's XML (the real save peak, S4a/S4b); a spill
-file left by a crash is not cleaned on the next open; and a page-file rewrite (bytes appended by
-compaction) is deferred. Bands outside the working set do leave memory, decompressed when the
-viewport, calculation or a command touches them, which is the phase's core.
+**Spill beside the document (10-29).** A paging read now tries the document's folder first and
+the system temp directory second, by creating the file (no writability probe); `GRIDCRAFT_SPILL`
+accepts `temp`/`off`, and a Windows UNC folder is skipped. The name is a sanitized stem and a
+nonce; Unix creates it `0600` and unlinks the name immediately (the fd survives, so a crash leaves
+nothing), Windows uses `FILE_DELETE_ON_CLOSE` with a retry. A first write failure latches spilling
+off while pages already written stay readable; if no file can be created the workbook still opens
+live with one info-bar warning. `GRIDCRAFT_PAGE_MB` pins the size threshold for tests. Model tests
+**104**, xlsx **268** (2 ignored), engine **423**. The Unix-only assertions are written but were not
+run on this Windows machine; no peak-memory benchmark was run.
+
+**Scope (remaining).** The XLSX writer still retains every sheet's XML (the real save peak,
+S4a/S4b); and a page-file rewrite (bytes appended by compaction) is deferred. Bands outside the
+working set do leave memory, decompressed when the viewport, calculation or a command touches them,
+which is the phase's core.
 
 **Acceptance.**
 - Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size: **16.7 MiB live,
@@ -782,6 +791,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M19 spill beside the document: document folder then temp, `GRIDCRAFT_SPILL=temp|off`, UNC skip, sanitized name, Unix 0600 + unlink-after-open, Windows delete-on-close, write-failure latch and one warning when paging is unavailable; 104 model / 268 xlsx / 423 engine tests |
 | 2026-10-29 | minor | M19 uncached save scan: `iter_scan`/`visit_scan` decode one band at a time without touching the page cache, and the XLSX writer uses it (cache stats unchanged, decodes = paged band count, byte-identical output); 97 model / 266 xlsx / 422 engine tests |
 | 2026-10-29 | minor | M19 byte-budget page cache: 64 MiB default (`GRIDCRAFT_PAGE_CACHE_MB` clamped 8–512), per-page-file sharing, decode-time heap charging with generation/`Weak` eviction, `PageCacheStats`, compaction-primed pages charged; 93 model / 422 engine tests; spill placement, save/scan and page-file rewrite remain |
 | 2026-10-29 | minor | M20 mapped value writes complete: `set_values` streams through row-map runs with a run-merged parallel plan (1M values: 131→35 ms row insert, 116→33 ms column insert), `visit_packed` follows column runs (30.6→2.5–3.3 ns/cell), the owned/formula gate resolves a band once (9.5→0.84 ms/1M), and `diff_logical` is the map-independent diagnostic; 87 model / 422 engine tests |
