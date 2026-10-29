@@ -322,6 +322,23 @@ fn autofit_measures_shaped_text_and_ascii_stays_bit_identical() {
 }
 
 #[test]
+fn autofit_falls_back_to_the_plain_measure_without_a_face() {
+    // AutoFit's entry point (`Session::text_width`) goes through `cell_text_width`, which looks the
+    // role family up in the app's font set: a family the set does not bind answers with the plain
+    // measure instead of failing or shaping with bytes the renderer does not have.
+    let ctx = ubuntu_context();
+    let engine = ubuntu_engine();
+    let missing = model::Font { name: "GridCraft No Such Family".into(), size: 11.0, ..Default::default() };
+    let text = "مبيعات 2024";
+    assert_eq!(
+        engine.cell_text_width(&ctx, text, &missing, true),
+        crate::theme::cell_text_width(&ctx, text, &missing, true),
+        "the font-less answer is the existing measure"
+    );
+    assert!(engine.cell_text_width(&ctx, text, &missing, true) > 0.0);
+}
+
+#[test]
 fn latin_with_accents_keeps_the_plain_editor_path() {
     let ctx = ubuntu_context();
     let engine = ubuntu_engine();
