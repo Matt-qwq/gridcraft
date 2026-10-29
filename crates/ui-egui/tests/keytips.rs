@@ -381,13 +381,17 @@ fn tab_letters_switch_to_their_ribbon_tabs() {
         key(&mut h, Key::F10); // disarm
         assert_eq!(h.state().keytips.prefix(), None);
     }
-    // A terminal tab unit with no deeper sequences finishes and clears.
+    // A multi-letter unit reaches its tab; the Draw tab has controls of its own now
+    // (J,I,P pen; J,I,E eraser), so the prefix stays for the next letter.
     key(&mut h, Key::F10); // re-arm
     letter(&mut h, Key::J, false);
     assert_eq!(h.state().keytips.prefix(), Some("J"), "J waits for its multi-letter unit");
     letter(&mut h, Key::I, false);
     assert_eq!(h.state().ui.ribbon_tab, "Draw");
-    assert_eq!(h.state().keytips.prefix(), None, "terminal tab units finish cleanly");
+    assert_eq!(h.state().keytips.prefix(), Some("JI"), "Draw keeps its level so its control badges show");
+    letter(&mut h, Key::E, false);
+    assert_eq!(h.state().session.draw_tool, "eraser", "J, I, E arms the eraser");
+    assert_eq!(h.state().keytips.prefix(), None, "the finished control clears the prefix");
 }
 
 #[test]
@@ -441,7 +445,7 @@ fn two_letter_unit_waits_after_first_letter_then_fires() {
     assert_eq!(h.state().ui.ribbon_tab, "Home");
     letter(&mut h, Key::I, false);
     assert_eq!(h.state().ui.ribbon_tab, "Draw");
-    assert_eq!(h.state().keytips.prefix(), None);
+    assert_eq!(h.state().keytips.prefix(), Some("JI"), "the Draw tab keeps the unit armed for its controls");
     assert!(h.state().editor.is_none(), "unit letters must not begin a cell edit");
 }
 
@@ -679,4 +683,37 @@ fn font_dropdown_highlight_follows_the_filtered_rows() {
     key(&mut h, Key::Backspace);
     h.run_steps(3);
     assert!(h.query_all_by_label("Georgia").count() >= 1, "an emptied filter lists every font again");
+}
+
+#[test]
+fn contextual_tabs_open_with_their_context_and_keep_their_controls() {
+    // Table Design: J, T opens it while a table holds the active cell; J, T, H toggles Header Row.
+    let mut h = harness(blank());
+    h.state_mut()
+        .session
+        .execute("range.setValues", serde_json::json!({"range": "A1:B3", "values": [["Fruit", "Sales"], ["Apples", 5], ["Pears", 3]]}))
+        .unwrap();
+    h.state_mut().session.execute("selection.set", serde_json::json!({"range": "A1:B3"})).unwrap();
+    h.state_mut().session.execute("insert.table", serde_json::json!({})).unwrap();
+    h.run_steps(2);
+    key(&mut h, Key::F10);
+    letter(&mut h, Key::J, false);
+    letter(&mut h, Key::T, false);
+    assert_eq!(h.state().ui.ribbon_tab, "Table Design");
+    assert_eq!(h.state().keytips.prefix(), Some("JT"), "the tab keeps its level for its controls");
+    letter(&mut h, Key::H, false);
+    assert!(h.state().session.journal.iter().any(|(id, _)| id == "table.headerRow"), "J, T, H toggles Header Row");
+
+    // Chart Design: J, C opens it while a chart is selected; J, C, S flips its rows and columns.
+    h.state_mut().session.execute("selection.set", serde_json::json!({"range": "A1:B3"})).unwrap();
+    h.state_mut().session.execute("insert.chart", serde_json::json!({"type": "column"})).unwrap();
+    let id = h.state().session.active().unwrap().wb.active().unwrap().charts.first().unwrap().id;
+    h.state_mut().selected_chart = Some(id);
+    h.run_steps(2);
+    key(&mut h, Key::F10);
+    letter(&mut h, Key::J, false);
+    letter(&mut h, Key::C, false);
+    assert_eq!(h.state().ui.ribbon_tab, "Chart Design");
+    letter(&mut h, Key::S, false);
+    assert!(h.state().session.journal.iter().any(|(id, _)| id == "chart.switchRowColumn"), "J, C, S switches row/column");
 }

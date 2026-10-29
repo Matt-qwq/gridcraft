@@ -10,8 +10,32 @@
 use std::fs;
 use std::path::Path;
 
-/// "File" is not a ribbon tab: its sequence opens the Backstage view.
-const TABS: &[&str] = &["File", "Home", "Insert", "Draw", "Page Layout", "Formulas", "Data", "Review", "View", "Automate"];
+/// "File" is not a ribbon tab: its sequence opens the Backstage view. The last three are
+/// contextual (Table Design, Chart Design, Header & Footer): their tabs appear with a table,
+/// a chart or a header/footer edit, and their badges only paint while the tab is shown.
+const TABS: &[&str] = &[
+    "File",
+    "Home",
+    "Insert",
+    "Draw",
+    "Page Layout",
+    "Formulas",
+    "Data",
+    "Review",
+    "View",
+    "Automate",
+    "Table Design",
+    "Chart Design",
+    "Header & Footer",
+];
+
+/// Contextual tab units: their tabs appear with a table, a chart or a header/footer edit, so the
+/// generated per-sequence test checks they stay quiet (and switch nothing) without that context.
+const CONTEXTUAL_TABS: &[&str] = &["Table Design", "Chart Design", "Header & Footer"];
+
+/// The longest sequence any badge may use (see docs/ui-parity.md: shorter than Excel's
+/// five-letter sparkline paths, which is what makes the whole scheme typeable from memory).
+const MAX_SEQUENCE: usize = 4;
 
 /// Commands whose empty-params behaviour depends on the host machine (e.g. the
 /// system dictionary). These are never probed; their tests assert "invoked
@@ -125,8 +149,8 @@ fn parse_and_probe(source: &str) -> Result<(Vec<Entry>, Probe), String> {
     for (i, e) in seqs.iter().enumerate() {
         let at = format!("entry {}", i + 1);
         let seq = e.get("seq").and_then(|v| v.as_str()).ok_or_else(|| format!("{at}: missing `seq`"))?.to_string();
-        if seq.is_empty() || seq.len() > 6 || !seq.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return Err(format!("{at}: seq {seq:?} must be 1-6 ASCII letters/digits (Excel's longest are 5, e.g. sparkline paths)"));
+        if seq.is_empty() || seq.len() > MAX_SEQUENCE || !seq.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(format!("{at}: seq {seq:?} must be 1-{MAX_SEQUENCE} ASCII letters/digits (see MAX_SEQUENCE)"));
         }
         if !seen.insert(seq.clone()) {
             return Err(format!("{at}: duplicate seq {seq:?}"));
@@ -152,17 +176,8 @@ fn parse_and_probe(source: &str) -> Result<(Vec<Entry>, Probe), String> {
             other => return Err(format!("{at}: unknown kind {other:?}")),
         }
         // A terminal Finish entry on a strict prefix makes the longer sequence
-        // unreachable (the prefix fires and clears first), e.g. HC (Copy) kills HCP.
-        if matches!(kind.as_str(), "command" | "dialog" | "control") {
-            for cut in 1..seq.len() {
-                let prefix = &seq[..cut];
-                if entries.iter().any(|e| e.seq == prefix && matches!(e.kind.as_str(), "command" | "dialog" | "control")) {
-                    return Err(format!(
-                        "{at}: seq {seq:?} is unreachable — {prefix:?} already fires first; the deeper item needs a menu (item-letter), not a trie sequence"
-                    ));
-                }
-            }
-        }
+        // unreachable (the prefix fires and clears first); checked for both directions
+        // after the whole table is read, in `validate_trie`.
         entries.push(Entry {
             seq,
             kind,
@@ -172,6 +187,7 @@ fn parse_and_probe(source: &str) -> Result<(Vec<Entry>, Probe), String> {
             note: e.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         });
     }
+    validate_trie(&entries)?;
     // JSON order is authoritative and curated: the first entry for a tab is its canonical
     // badge (legacy aliases come later), and groups stay together. Do not sort.
 
@@ -209,6 +225,26 @@ fn parse_and_probe(source: &str) -> Result<(Vec<Entry>, Probe), String> {
         probe.insert(id, status);
     }
     Ok((entries, probe))
+}
+
+/// A terminal entry on a strict prefix hides every longer sequence below it (the prefix fires and
+/// clears first), so the trie may only stop where nothing continues.
+fn validate_trie(entries: &[Entry]) -> Result<(), String> {
+    for e in entries {
+        if !matches!(e.kind.as_str(), "command" | "dialog" | "control") {
+            continue;
+        }
+        for cut in 1..e.seq.len() {
+            let prefix = &e.seq[..cut];
+            if entries.iter().any(|p| p.seq == prefix && matches!(p.kind.as_str(), "command" | "dialog" | "control")) {
+                return Err(format!(
+                    "seq {:?} is unreachable — {:?} already fires first; the deeper item needs a menu (item-letter), not a trie sequence",
+                    e.seq, prefix
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn render_table(entries: &[Entry]) -> String {
@@ -268,6 +304,13 @@ fn render_tests(entries: &[Entry], probe: &Probe) -> String {
             "tab" if e.target == "File" => format!(
                 "sequence(&mut h, {seq:?}, false);\n    assert!(h.state().backstage.is_some(), \"{seq} must open the File view\");\n    assert_eq!(h.state().keytips.prefix(), Some({seq:?}));",
                 seq = e.seq,
+            ),
+            "tab" if CONTEXTUAL_TABS.contains(&e.target.as_str()) => format!(
+                "sequence(&mut h, {seq:?}, false);
+    assert!(h.state().message.is_none() && h.state().toast.is_none(), \"{seq} must not error without its context\");
+    assert_eq!(h.state().ui.ribbon_tab, \"Home\", \"{seq} needs its context before the {tab} tab can open\");",
+                seq = e.seq,
+                tab = e.target,
             ),
             "tab" => format!(
                 "sequence(&mut h, {seq:?}, false);\n    assert_eq!(h.state().ui.ribbon_tab, {tab:?}, \"{seq} must switch to the {tab} tab\");",

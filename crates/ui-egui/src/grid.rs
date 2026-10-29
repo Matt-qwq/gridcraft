@@ -132,6 +132,8 @@ pub struct GridState {
     /// height on every row would otherwise rebuild its prefix sums on every frame.
     pub line_geo: Option<LineGeo>,
     pub header_menu: Option<(Pos2, bool)>,
+    /// Where the keyboard is in the open context menu (cell or row/column header), if any.
+    pub menu_nav: Option<MenuNav>,
     /// Page Layout view pagination, cached per (doc uid, revision, sheet, rows, columns).
     pub paper: Option<crate::paper_view::PaperCache>,
     /// Header or footer being edited in place (Page Layout view).
@@ -2603,8 +2605,10 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 let range = if rows { RangeRef::rows(idx, idx) } else { RangeRef::cols(idx, idx) };
                 let _ = app.session.run("selection.set", json!({"range": range.a1()}));
             }
+            app.grid.menu_nav = None;
             app.grid.header_menu = Some((geo.mirror_pos(p), rows));
         } else {
+            app.grid.menu_nav = None;
             app.grid.context_menu = Some(geo.mirror_pos(p));
             app.grid.context_menu_frame = ui.ctx().cumulative_frame_nr();
         }
@@ -2940,6 +2944,9 @@ fn keyboard(app: &mut SheetApp, ctx: &egui::Context, resp: &egui::Response, geo:
         || app.message.is_some()
         || app.grid.filter_menu.is_some()
         || app.grid.fill_menu.is_some()
+        // An open context menu owns the keyboard for its own navigation (grid::menu_keys).
+        || app.grid.context_menu.is_some()
+        || app.grid.header_menu.is_some()
         || matches!(app.grid.drag, Drag::Fill { menu: true, .. })
     {
         return;
@@ -3249,84 +3256,168 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
     }
 }
 
+/// Where the keyboard is in an open context menu. `items` records the list it was moved in, so a
+/// menu whose items changed (Insert Copied Cells appeared) starts unhighlighted instead of
+/// activating the wrong row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuNav {
+    pub items: usize,
+    pub selected: usize,
+}
+
+/// The keys an open context menu owns, consumed before the grid's own keyboard pass: arrows,
+/// Home/End, Enter/Space and Escape. Nothing is focused, so the grid keeps the keyboard for
+/// everything else and loses nothing when the menu closes. Returns `(close, activate)` where
+/// `activate` is an index into `items`.
+fn menu_keys(ui: &egui::Ui, items: &[(&str, &str)], nav: &mut Option<MenuNav>) -> (bool, Option<usize>) {
+    let actionable: Vec<usize> = items.iter().enumerate().filter(|(_, (label, _))| *label != "-").map(|(at, _)| at).collect();
+    let Some(first) = actionable.first().copied() else { return (false, None) };
+    let (down, up, home, end, enter, space, escape) = ui.input_mut(|i| {
+        let plain = egui::Modifiers::NONE;
+        (
+            i.consume_key(plain, egui::Key::ArrowDown),
+            i.consume_key(plain, egui::Key::ArrowUp),
+            i.consume_key(plain, egui::Key::Home),
+            i.consume_key(plain, egui::Key::End),
+            i.consume_key(plain, egui::Key::Enter),
+            i.consume_key(plain, egui::Key::Space),
+            i.consume_key(plain, egui::Key::Escape),
+        )
+    });
+    // Space also arrives as text: it must not start editing the cell behind the menu.
+    ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(text) if text.trim().is_empty())));
+    if escape {
+        return (true, None);
+    }
+    let current = nav.filter(|n| n.items == items.len()).map(|n| n.selected).filter(|at| actionable.contains(at));
+    if down || up || home || end {
+        let at = current.and_then(|sel| actionable.iter().position(|item| *item == sel));
+        let next = if home {
+            actionable.first().copied()
+        } else if end {
+            actionable.last().copied()
+        } else if down {
+            let step = at.map_or(0, |i| i.saturating_add(1) % actionable.len());
+            actionable.get(step).copied()
+        } else {
+            let step = at.map_or(actionable.len().saturating_sub(1), |i| (i + actionable.len().saturating_sub(1)) % actionable.len());
+            actionable.get(step).copied()
+        };
+        if let Some(next) = next {
+            *nav = Some(MenuNav { items: items.len(), selected: next });
+        }
+    }
+    if enter || space {
+        // Excel opens the menu unhighlighted and Enter takes the first item.
+        return (false, current.or(Some(first)));
+    }
+    (false, None)
+}
+
+/// One context-menu row: highlighted when the keyboard is on it, frameless otherwise.
+fn menu_row(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> egui::Response {
+    let mut button = egui::Button::new(label).min_size(vec2(width, 20.0));
+    if selected {
+        button = button.fill(Tokens::get(ui.ctx()).hover);
+    } else {
+        button = button.frame_when_inactive(false);
+    }
+    ui.add(button)
+}
+
+/// Run the action a context-menu row names. Shared by mouse clicks and keyboard activation.
+fn run_menu_item(app: &mut SheetApp, ui: &egui::Ui, id: &str) {
+    match id {
+        "ui:pasteSpecial" => app.open_dialog("pasteSpecial", json!({})),
+        "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),
+        "ui:insertCells" => app.open_dialog("insertCells", json!({})),
+        "ui:deleteCells" => app.open_dialog("deleteCells", json!({})),
+        "ui:formatCells" => app.open_dialog("formatCells", json!({})),
+        "ui:newComment" => app.open_dialog("comment", json!({"threaded": true})),
+        "ui:newNote" => app.open_dialog("comment", json!({"threaded": false})),
+        "ui:defineName" => app.open_dialog("defineName", json!({})),
+        "ui:insertLink" => app.open_dialog("insertLink", json!({})),
+        "ui:pickList" => app.open_dialog("pickList", json!({})),
+        "ui:rowHeight" => app.open_dialog("rowHeight", json!({})),
+        "ui:columnWidth" => app.open_dialog("columnWidth", json!({})),
+        "ui:filterValue" => {
+            if let Some(d) = app.session.active() {
+                let a = d.selection.active;
+                let text = d.wb.active().map(|sh| gridcraft_engine::display::cell_text(&d.wb, sh, a)).unwrap_or_default();
+                let has = d.wb.active().is_some_and(|sh| sh.autofilter.is_some());
+                if !has {
+                    let _ = app.run("data.filter", json!({}));
+                }
+                app.run_or_alert("data.filterBy", json!({"column": col_to_letters(a.col), "values": [text]}));
+            }
+        }
+        "edit.copy" | "edit.cut" => app.copy_to_clipboard(ui.ctx(), id),
+        "edit.paste" => app.paste_from_clipboard(),
+        other => app.run_or_alert(other, json!({})),
+    }
+}
+
 fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
     let Some(at) = app.grid.context_menu else { return };
-    let mut close = false;
+    let insert_copied = insert_copied_item(app);
+    let mut items: Vec<(&str, &str)> = vec![
+        ("Cut", "edit.cut"),
+        ("Copy", "edit.copy"),
+        ("Paste", "edit.paste"),
+        ("Paste Special…", "ui:pasteSpecial"),
+        ("-", ""),
+        ("Insert…", "ui:insertCells"),
+        ("Delete…", "ui:deleteCells"),
+        ("Clear Contents", "edit.clearContents"),
+        ("-", ""),
+        ("Filter by Selected Cell's Value", "ui:filterValue"),
+        ("Sort A to Z", "data.sortAscending"),
+        ("Sort Z to A", "data.sortDescending"),
+        ("-", ""),
+        ("New Comment", "ui:newComment"),
+        ("New Note", "ui:newNote"),
+        ("-", ""),
+        ("Format Cells…", "ui:formatCells"),
+        ("Pick From Drop-down List…", "ui:pickList"),
+        ("Define Name…", "ui:defineName"),
+        ("Link…", "ui:insertLink"),
+    ];
+    if let Some(item) = insert_copied {
+        items.insert(6, item);
+    }
+    let (keys_closed, activate) = menu_keys(ui, &items, &mut app.grid.menu_nav);
+    let mut close = keys_closed;
+    let mut run = None;
+    let hover_moved = ui.input(|i| i.pointer.delta().length_sq() > 0.0);
     let resp = egui::Area::new(egui::Id::new("cell_context")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(200.0);
-            let insert_copied = insert_copied_item(app);
-            let mut items: Vec<(&str, &str)> = vec![
-                ("Cut", "edit.cut"),
-                ("Copy", "edit.copy"),
-                ("Paste", "edit.paste"),
-                ("Paste Special…", "ui:pasteSpecial"),
-                ("-", ""),
-                ("Insert…", "ui:insertCells"),
-                ("Delete…", "ui:deleteCells"),
-                ("Clear Contents", "edit.clearContents"),
-                ("-", ""),
-                ("Filter by Selected Cell's Value", "ui:filterValue"),
-                ("Sort A to Z", "data.sortAscending"),
-                ("Sort Z to A", "data.sortDescending"),
-                ("-", ""),
-                ("New Comment", "ui:newComment"),
-                ("New Note", "ui:newNote"),
-                ("-", ""),
-                ("Format Cells…", "ui:formatCells"),
-                ("Pick From Drop-down List…", "ui:pickList"),
-                ("Define Name…", "ui:defineName"),
-                ("Link…", "ui:insertLink"),
-            ];
-            if let Some(item) = insert_copied {
-                items.insert(6, item);
-            }
             let lang = crate::i18n::current(ui.ctx());
-            for (label, id) in items {
-                if label == "-" {
+            for (index, (label, id)) in items.iter().enumerate() {
+                if *label == "-" {
                     ui.separator();
                     continue;
                 }
-                if ui.add(egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(190.0, 20.0))).clicked() {
+                let selected = app.grid.menu_nav.is_some_and(|n| n.items == items.len() && n.selected == index);
+                let row = menu_row(ui, lang.tr(label), selected, 190.0);
+                if hover_moved && row.hovered() {
+                    app.grid.menu_nav = Some(MenuNav { items: items.len(), selected: index });
+                }
+                if row.clicked() || activate == Some(index) {
                     close = true;
-                    match id {
-                        "ui:pasteSpecial" => app.open_dialog("pasteSpecial", json!({})),
-                        "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),
-                        "ui:insertCells" => app.open_dialog("insertCells", json!({})),
-                        "ui:deleteCells" => app.open_dialog("deleteCells", json!({})),
-                        "ui:formatCells" => app.open_dialog("formatCells", json!({})),
-                        "ui:newComment" => app.open_dialog("comment", json!({"threaded": true})),
-                        "ui:newNote" => app.open_dialog("comment", json!({"threaded": false})),
-                        "ui:defineName" => app.open_dialog("defineName", json!({})),
-                        "ui:insertLink" => app.open_dialog("insertLink", json!({})),
-                        "ui:pickList" => app.open_dialog("pickList", json!({})),
-                        "ui:filterValue" => {
-                            if let Some(d) = app.session.active() {
-                                let a = d.selection.active;
-                                let text = d.wb.active().map(|sh| gridcraft_engine::display::cell_text(&d.wb, sh, a)).unwrap_or_default();
-                                let has = d.wb.active().is_some_and(|sh| sh.autofilter.is_some());
-                                if !has {
-                                    let _ = app.run("data.filter", json!({}));
-                                }
-                                app.run_or_alert("data.filterBy", json!({"column": col_to_letters(a.col), "values": [text]}));
-                            }
-                        }
-                        "edit.copy" | "edit.cut" => {
-                            app.copy_to_clipboard(ui.ctx(), id);
-                        }
-                        "edit.paste" => app.paste_from_clipboard(),
-                        other => app.run_or_alert(other, json!({})),
-                    }
+                    run = Some(*id);
                 }
             }
         });
     });
+    if let Some(id) = run {
+        run_menu_item(app, ui, id);
+    }
     // A quick right-click presses and releases in one frame, and the menu's corner snaps to the
     // nearest physical pixel, which can put the pointer just outside it: that press opened the
     // menu, so it doesn't count as a click elsewhere.
     let opened_now = app.grid.context_menu_frame == ui.ctx().cumulative_frame_nr();
     if close
-        || ui.input(|i| i.key_pressed(egui::Key::Escape))
         || (!opened_now
             && ui.input(|i| i.pointer.any_pressed())
             && !resp.response.contains_pointer()
@@ -3334,6 +3425,7 @@ fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
             && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !resp.response.rect.contains(p)))
     {
         app.grid.context_menu = None;
+        app.grid.menu_nav = None;
     }
 }
 
@@ -3668,75 +3760,77 @@ fn list_picker(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
 
 fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
     let Some((at, rows)) = app.grid.header_menu else { return };
-    let mut close = false;
+    let insert_copied = insert_copied_item(app);
+    let mut items: Vec<(&str, &str)> = if rows {
+        vec![
+            ("Cut", "edit.cut"),
+            ("Copy", "edit.copy"),
+            ("Paste", "edit.paste"),
+            ("-", ""),
+            ("Insert", "home.insertRows"),
+            ("Delete", "home.deleteRows"),
+            ("Clear Contents", "edit.clearContents"),
+            ("-", ""),
+            ("Format Cells…", "ui:formatCells"),
+            ("Row Height…", "ui:rowHeight"),
+            ("AutoFit Row Height", "home.autofitRowHeight"),
+            ("Hide", "home.hideRows"),
+            ("Unhide", "home.unhideRows"),
+            ("Group", "data.group"),
+        ]
+    } else {
+        vec![
+            ("Cut", "edit.cut"),
+            ("Copy", "edit.copy"),
+            ("Paste", "edit.paste"),
+            ("-", ""),
+            ("Insert", "home.insertColumns"),
+            ("Delete", "home.deleteColumns"),
+            ("Clear Contents", "edit.clearContents"),
+            ("-", ""),
+            ("Format Cells…", "ui:formatCells"),
+            ("Column Width…", "ui:columnWidth"),
+            ("AutoFit Column Width", "home.autofitColumnWidth"),
+            ("Hide", "home.hideColumns"),
+            ("Unhide", "home.unhideColumns"),
+            ("Sort A to Z", "data.sortAscending"),
+            ("Group", "data.group"),
+        ]
+    };
+    if let Some(item) = insert_copied {
+        items.insert(5, item);
+    }
+    let (keys_closed, activate) = menu_keys(ui, &items, &mut app.grid.menu_nav);
+    let mut close = keys_closed;
+    let mut run = None;
+    let hover_moved = ui.input(|i| i.pointer.delta().length_sq() > 0.0);
     let response = egui::Area::new(egui::Id::new("header_menu")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(190.0);
-            let insert_copied = insert_copied_item(app);
-            let mut items: Vec<(&str, &str)> = if rows {
-                vec![
-                    ("Cut", "edit.cut"),
-                    ("Copy", "edit.copy"),
-                    ("Paste", "edit.paste"),
-                    ("-", ""),
-                    ("Insert", "home.insertRows"),
-                    ("Delete", "home.deleteRows"),
-                    ("Clear Contents", "edit.clearContents"),
-                    ("-", ""),
-                    ("Format Cells…", "ui:formatCells"),
-                    ("Row Height…", "ui:rowHeight"),
-                    ("AutoFit Row Height", "home.autofitRowHeight"),
-                    ("Hide", "home.hideRows"),
-                    ("Unhide", "home.unhideRows"),
-                    ("Group", "data.group"),
-                ]
-            } else {
-                vec![
-                    ("Cut", "edit.cut"),
-                    ("Copy", "edit.copy"),
-                    ("Paste", "edit.paste"),
-                    ("-", ""),
-                    ("Insert", "home.insertColumns"),
-                    ("Delete", "home.deleteColumns"),
-                    ("Clear Contents", "edit.clearContents"),
-                    ("-", ""),
-                    ("Format Cells…", "ui:formatCells"),
-                    ("Column Width…", "ui:columnWidth"),
-                    ("AutoFit Column Width", "home.autofitColumnWidth"),
-                    ("Hide", "home.hideColumns"),
-                    ("Unhide", "home.unhideColumns"),
-                    ("Sort A to Z", "data.sortAscending"),
-                    ("Group", "data.group"),
-                ]
-            };
-            if let Some(item) = insert_copied {
-                items.insert(5, item);
-            }
             let lang = crate::i18n::current(ui.ctx());
-            for (label, id) in items {
-                if label == "-" {
+            for (index, (label, id)) in items.iter().enumerate() {
+                if *label == "-" {
                     ui.separator();
                     continue;
                 }
-                if ui.add(egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(180.0, 20.0))).clicked() {
+                let selected = app.grid.menu_nav.is_some_and(|n| n.items == items.len() && n.selected == index);
+                let row = menu_row(ui, lang.tr(label), selected, 180.0);
+                if hover_moved && row.hovered() {
+                    app.grid.menu_nav = Some(MenuNav { items: items.len(), selected: index });
+                }
+                if row.clicked() || activate == Some(index) {
                     close = true;
-                    match id {
-                        "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),
-                        "ui:rowHeight" => app.open_dialog("rowHeight", json!({})),
-                        "ui:formatCells" => app.open_dialog("formatCells", json!({})),
-                        "ui:columnWidth" => app.open_dialog("columnWidth", json!({})),
-                        "edit.copy" | "edit.cut" => {
-                            app.copy_to_clipboard(ui.ctx(), id);
-                        }
-                        "edit.paste" => app.paste_from_clipboard(),
-                        other => app.run_or_alert(other, json!({})),
-                    }
+                    run = Some(*id);
                 }
             }
         });
     });
+    if let Some(id) = run {
+        run_menu_item(app, ui, id);
+    }
     if close || popup_dismissed(&response.response, was_open) {
         app.grid.header_menu = None;
+        app.grid.menu_nav = None;
     }
 }
 

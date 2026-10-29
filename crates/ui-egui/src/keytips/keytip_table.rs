@@ -166,11 +166,14 @@ mod tests {
             ("Data", "A"),
             ("Review", "R"),
             ("View", "W"),
-            ("Draw", "JI"), // two-letter unit, shown as one badge
+            ("Automate", "U"),
+            ("Draw", "JI"),            // two-letter unit, shown as one badge
+            ("Table Design", "JT"),    // contextual
+            ("Chart Design", "JC"),    // contextual
+            ("Header & Footer", "JH"), // contextual
         ] {
             assert_eq!(tab_sequence(tab), Some(letter), "tab {tab}");
         }
-        assert_eq!(tab_sequence("Automate"), None);
     }
 
     #[test]
@@ -230,5 +233,106 @@ mod tests {
         assert_eq!(anchor_badge("H", &["table.style"]), Some("HT"));
         assert!(anchor_badge("", &["edit.paste"]).is_none(), "empty prefix shows only tab badges");
         assert!(anchor_badge("H", &["view.zoom"]).is_none(), "no sequences under this prefix");
+    }
+
+    /// The action a sequence lands on, as the key `control_badge` expects; `None` for the
+    /// structural levels (tabs and group letters), which paint nothing on a control.
+    fn target_key(entry: &Entry) -> Option<String> {
+        match entry {
+            Entry::Finish(Action::Command(id) | Action::Pending(id) | Action::Control(id)) => Some((*id).to_string()),
+            Entry::Finish(Action::Dialog(name)) => Some(format!("dialog:{name}")),
+            Entry::Finish(Action::Tab(_)) | Entry::Continue | Entry::Tab(_) => None,
+        }
+    }
+
+    #[test]
+    fn every_sequence_is_short_unique_and_resolves_to_exactly_one_action() {
+        for (index, (seq, entry)) in SEQUENCES.iter().enumerate() {
+            assert!(!seq.is_empty() && seq.len() <= 4, "{seq:?} must be 1-4 keys");
+            assert!(seq.bytes().all(|b| b.is_ascii_alphanumeric()), "{seq:?} must be letters or digits");
+            let assigned: Vec<usize> = SEQUENCES.iter().enumerate().filter(|(_, (other, _))| other == seq).map(|(at, _)| at).collect();
+            assert_eq!(assigned, vec![index], "{seq:?} must be assigned exactly once");
+            assert_eq!(lookup(seq), Some(*entry), "{seq:?} must resolve to exactly its own action");
+        }
+    }
+
+    #[test]
+    fn no_finish_hides_a_longer_sequence() {
+        // A terminal action clears the prefix, so any longer sequence under it is unreachable.
+        for (seq, entry) in SEQUENCES {
+            if matches!(entry, Entry::Continue | Entry::Tab(_)) {
+                continue;
+            }
+            for (longer, _) in SEQUENCES {
+                assert!(!longer.starts_with(seq) || longer == seq, "{longer:?} is unreachable behind the finish {seq:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn tab_sequences_are_reachable_from_the_armed_root() {
+        // The root paints every tab badge at once, so no tab sequence may start with another tab
+        // sequence: `A` (Data) must not make a later `AU`-style Automate badge unreachable.
+        for (seq, entry) in SEQUENCES {
+            if !matches!(entry, Entry::Tab(_)) {
+                continue;
+            }
+            for (other, other_entry) in SEQUENCES {
+                if other != seq && matches!(other_entry, Entry::Tab(_)) {
+                    assert!(!seq.starts_with(other), "tab {seq:?} is unreachable: {other:?} switches tabs first");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_targets_paint_the_same_badge_under_the_same_parent() {
+        // Every strict prefix is a painted scope (the armed root shows only tab badges and is
+        // covered by `tab_sequences_are_reachable_from_the_armed_root`). Within a scope a badge
+        // is the common letter run of the target's remaining sequences: two different targets
+        // showing the same letters would be a key-tip collision.
+        let mut parents: Vec<&str> = Vec::new();
+        for (seq, _) in SEQUENCES {
+            for cut in 1..seq.len() {
+                let parent = &seq[..cut];
+                if !parents.contains(&parent) {
+                    parents.push(parent);
+                }
+            }
+        }
+        for parent in parents {
+            let mut keys: Vec<String> = Vec::new();
+            for (seq, entry) in SEQUENCES {
+                if seq.len() > parent.len()
+                    && seq.starts_with(parent)
+                    && let Some(key) = target_key(entry)
+                    && !keys.contains(&key)
+                {
+                    keys.push(key);
+                }
+            }
+            let mut painted: Vec<(String, String)> = Vec::new();
+            for key in keys {
+                if let Some(badge) = control_badge(parent, &key) {
+                    if let Some((other, _)) = painted.iter().find(|(_, b)| *b == badge) {
+                        assert_eq!(other, &key, "{parent:?}: {other:?} and {key:?} would both paint {badge:?}");
+                    } else {
+                        painted.push((key.clone(), badge.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_and_dialog_target_exists() {
+        for (seq, entry) in SEQUENCES {
+            if let Entry::Finish(Action::Command(id)) = entry {
+                assert!(gridcraft_engine::find_command(id).is_some(), "{seq:?} runs the missing command {id:?}");
+            }
+            if let Entry::Finish(Action::Dialog(name)) = entry {
+                assert!(!name.is_empty(), "{seq:?} opens an unnamed dialog");
+            }
+        }
     }
 }

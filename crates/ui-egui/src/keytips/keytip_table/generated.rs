@@ -15,8 +15,30 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("A", Entry::Tab("Data")),
     ("R", Entry::Tab("Review")),
     ("W", Entry::Tab("View")),
-    ("E", Entry::Tab("Home")), // Legacy Edit-menu path (Excel 2003); leads to the same Home menus.
-    ("O", Entry::Tab("Home")), // Legacy Format-menu path (Excel 2003); leads to the same Home menus.
+    ("JH", Entry::Tab("Header & Footer")), // Excel: Header & Footer tab; Contextual: Page Layout view while a header or footer is being edited.
+    ("JHH", Entry::Finish(Action::Control("hf.headerMenu"))), // Excel: Header
+    ("JHF", Entry::Finish(Action::Control("hf.footerMenu"))), // Excel: Footer
+    ("JHP", Entry::Finish(Action::Control("hf.pageNumber"))), // Excel: Page Number
+    ("JHN", Entry::Finish(Action::Control("hf.pageCount"))), // Excel: Number of Pages
+    ("JHD", Entry::Finish(Action::Control("hf.date"))), // Excel: Current Date
+    ("JHT", Entry::Finish(Action::Control("hf.time"))), // Excel: Current Time
+    ("JHK", Entry::Finish(Action::Control("hf.path"))), // Excel: File Path
+    ("JHI", Entry::Finish(Action::Control("hf.fileName"))), // Excel: File Name
+    ("JHS", Entry::Finish(Action::Control("hf.sheetName"))), // Excel: Sheet Name
+    ("JHG", Entry::Finish(Action::Control("hf.goHeader"))), // Excel: Go to Header
+    ("JHO", Entry::Finish(Action::Control("hf.goFooter"))), // Excel: Go to Footer
+    ("JHA", Entry::Finish(Action::Control("hf.differentFirst"))), // Excel: Different First Page
+    ("JHB", Entry::Finish(Action::Control("hf.differentOddEven"))), // Excel: Different Odd & Even Pages
+    ("JC", Entry::Tab("Chart Design")), // Excel: Chart Design tab; Contextual: shown while a chart is selected. JCA/JCC/JAM were already reserved for it.
+    ("JT", Entry::Tab("Table Design")), // Excel: Table Design tab; Contextual: shown while the active cell is in a table. JTS/JTV were already reserved for it.
+    ("U", Entry::Tab("Automate")), // Our letter: it must not begin with another tab letter (a tab sequence such as "AZ" would be unreachable after "A" opens Data).
+    ("UM", Entry::Finish(Action::Dialog("macros"))), // Excel: Macros
+    ("UC", Entry::Finish(Action::Control("commandSearch"))), // Excel: Command Palette
+    ("UA", Entry::Finish(Action::Control("agents"))), // Excel: Agent Control (ours)
+    ("UJ", Entry::Finish(Action::Control("journal"))), // Excel: Action Journal (ours)
+    ("UB", Entry::Finish(Action::Control("about"))), // Excel: About (ours)
+    ("E", Entry::Tab("Home")),     // Legacy Edit-menu path (Excel 2003); leads to the same Home menus.
+    ("O", Entry::Tab("Home")),     // Legacy Format-menu path (Excel 2003); leads to the same Home menus.
     ("HAR", Entry::Finish(Action::Command("home.alignRight"))),
     ("HAT", Entry::Finish(Action::Command("home.alignTop"))),    // Excel: Excel: Top Align
     ("HAM", Entry::Finish(Action::Command("home.alignMiddle"))), // Excel: Excel: Middle Align
@@ -32,6 +54,7 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("H1", Entry::Finish(Action::Command("home.bold"))),            // Excel: Bold
     ("H2", Entry::Finish(Action::Command("home.italic"))),          // Excel: Italic
     ("H3", Entry::Finish(Action::Command("home.underline"))),       // Excel: Excel: Underline; fires immediately (not a menu)
+    ("H4", Entry::Finish(Action::Command("home.strikethrough"))),   // Excel: Strikethrough
     ("H5", Entry::Finish(Action::Command("home.decreaseIndent"))),  // Excel: Decrease Indent
     ("H6", Entry::Finish(Action::Command("home.increaseIndent"))),  // Excel: Increase Indent
     ("H9", Entry::Finish(Action::Command("home.decreaseDecimal"))), // Excel: Decrease Decimals; containment(Decrease Decimal)
@@ -43,7 +66,6 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("HBC", Entry::Finish(Action::Command("home.borders"))),    // Excel: Top and Thick Bottom Border; border-side TBD
     ("HBD", Entry::Finish(Action::Command("home.borders"))),    // Excel: Top and Bottom Border; border-side TBD
     ("HBE", Entry::Finish(Action::Command("home.borders"))),    // Excel: Erase Border; border-side TBD
-    ("HBG", Entry::Finish(Action::Command("home.drawBorder"))), // Excel: Draw Border Grid; containment(Draw Border)
     ("HBH", Entry::Finish(Action::Command("home.borders"))),    // Excel: Thick Bottom Border; border-side TBD
     ("HBI", Entry::Finish(Action::Command("home.borders"))),    // Excel: Line Color; Line Color (submenu TBD)
     ("HBL", Entry::Finish(Action::Command("home.borders"))),    // Excel: Left Border; border-side TBD
@@ -55,7 +77,6 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("HBS", Entry::Finish(Action::Command("home.borders"))),    // Excel: Outside Borders; containment(Borders)
     ("HBT", Entry::Finish(Action::Command("home.borders"))),    // Excel: Thick Outside Borders; border-side TBD
     ("HBU", Entry::Finish(Action::Command("home.borders"))),    // Excel: Top and Double Bottom Border; border-side TBD
-    ("HBW", Entry::Finish(Action::Command("home.drawBorder"))), // Excel: Draw Border
     ("HBY", Entry::Finish(Action::Command("home.borders"))),    // Excel: Line Style; Line Style (submenu TBD)
     ("HC", Entry::Finish(Action::Command("edit.copy"))),        // Excel: Copy; fires immediately in Excel; deeper aliases dropped as unreachable
     ("HDC", Entry::Finish(Action::Command("home.deleteColumns"))), // Excel: Delete Columns; Delete Columns
@@ -181,7 +202,7 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("NSA", Entry::Finish(Action::Control("insert.chart.statistic"))), // Excel: Statistical Chart; Statistical chart (kind TBD)
     ("NSC", Entry::Finish(Action::Pending("insert.screenshot"))), // pending; Excel: Screenshot Menu; Screenshot; reserved until the command lands
     ("NSD", Entry::Finish(Action::Command("insert.chart"))), // Excel: Combo Chart; Combo (kind TBD)
-    ("NSF", Entry::Finish(Action::Command("insert.slicer"))), // Excel: Slicer; insert.slicer missing (gap #8); reserved until the command lands
+    ("NSF", Entry::Finish(Action::Command("insert.slicer"))), // Excel: Slicer
     ("NSH", Entry::Finish(Action::Command("insert.shape"))), // Excel: Shapes
     ("NSP", Entry::Finish(Action::Command("insert.recommendedPivotTables"))), // Excel: Recommended PivotTables
     ("NST", Entry::Finish(Action::Pending("insert.timeline"))), // pending; Excel: Timeline; insert.timeline missing (gap #8); reserved until the command lands
@@ -193,10 +214,9 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("NW", Entry::Finish(Action::Pending("insert.wordArt"))),   // pending; Excel: WordArt; WordArt; reserved until the command lands
     ("NX", Entry::Finish(Action::Command("insert.textBox"))),   // Excel: Text Box
     ("NZK", Entry::Continue),                                   // Excel: Sparklines Menu; group level:
-    ("NZKSL", Entry::Finish(Action::Dialog("sparkline"))),      // Excel: Line Sparkline
-    ("NZKSO", Entry::Finish(Action::Dialog("sparkline"))),      // Excel: Column Sparkline
-    ("NZKSW", Entry::Finish(Action::Dialog("sparkline"))),      // Excel: Win/Loss Sparkline
-    ("NZTX", Entry::Finish(Action::Command("insert.textBox"))), // Excel: Text Box
+    ("NZKL", Entry::Finish(Action::Dialog("sparkline"))),       // Excel: Line Sparkline
+    ("NZKO", Entry::Finish(Action::Dialog("sparkline"))),       // Excel: Column Sparkline
+    ("NZKW", Entry::Finish(Action::Dialog("sparkline"))),       // Excel: Win/Loss Sparkline
     ("NZT", Entry::Finish(Action::Command("insert.textBox"))),  // Excel: Excel: Text Box (modern)
     ("PAE", Entry::Finish(Action::Command("arrange.sendBackward"))), // Excel: Send Backward
     ("PAF", Entry::Finish(Action::Command("arrange.bringForward"))), // Excel: Bring Forward
@@ -221,7 +241,8 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("PTHB", Entry::Finish(Action::Command("pageLayout.theme"))), // Excel: Browse Themes; containment(Themes)
     ("PVG", Entry::Finish(Action::Command("view.gridlines"))),  // Excel: View Gridlines
     ("PVH", Entry::Finish(Action::Command("view.headings"))),   // Excel: View Headings
-    ("MA", Entry::Continue),                                    // Excel: Remove Arrows Menu; group level: containment(Remove Arrows)
+    ("PLR", Entry::Finish(Action::Command("view.rightToLeft"))), // Excel: Sheet Right-to-Left; Page Layout tab, Layout group (our letter; Excel has no published sequence here).
+    ("MA", Entry::Continue),                                     // Excel: Remove Arrows Menu; group level: containment(Remove Arrows)
     ("MAA", Entry::Finish(Action::Command("formulas.removeArrows"))), // Excel: Remove All Arrows; landed in the catalog; live since T7 probe
     ("MAP", Entry::Finish(Action::Pending("formulas.removePrecedentArrows"))), // pending; Excel: Remove Precedent Arrows; Remove Precedent Arrows; reserved until the command lands
     ("MB", Entry::Finish(Action::Command("formulas.calculateNow"))),           // Excel: Calculate Now
@@ -315,6 +336,8 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("AWS", Entry::Finish(Action::Command("data.scenarioManager"))),        // Excel: Scenario Manager
     ("AWT", Entry::Finish(Action::Command("data.dataTable"))),              // Excel: Data Table
     ("AX", Entry::Finish(Action::Pending("data.existingConnections"))), // pending; Excel: Existing Connections; gap #12; reserved until the command lands
+    ("ANS", Entry::Finish(Action::Dialog("solver"))),                   // Excel: Solver
+    ("AND", Entry::Finish(Action::Dialog("analysisToolPak"))),          // Excel: Data Analysis
     ("AY", Entry::Finish(Action::Command("data.reapply"))),             // Excel: Reapply Filter; containment(Reapply)
     ("RA1", Entry::Finish(Action::Dialog("accessibility"))),            // Excel: Check Accessibility
     ("RA2", Entry::Finish(Action::Command("review.showComments"))), // Excel: Show All Comments; Show All Comments; reserved until the command lands
@@ -323,12 +346,19 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("RG", Entry::Finish(Action::Pending("review.showChanges"))),   // pending; Excel: Track Changes; reserved until the command lands
     ("RL", Entry::Finish(Action::Pending("review.translate"))),     // pending; Excel: Translate; feature gap; reserved until the command lands
     ("RN", Entry::Finish(Action::Command("review.nextComment"))),   // Excel: Next Comment
+    ("RH", Entry::Finish(Action::Command("review.showComments"))),  // Excel: Show Comments
     ("RO", Entry::Finish(Action::Command("review.protectWorkbook"))), // Excel: Protect and Share Workbook
+    ("RW", Entry::Finish(Action::Dialog("statistics"))),            // Excel: Workbook Statistics
     ("RPS", Entry::Finish(Action::Dialog("protectSheet"))),         // Excel: Protect Sheet
+    ("RAR", Entry::Finish(Action::Dialog("allowEditRanges"))),      // Excel: Allow Edit Ranges
     ("RPW", Entry::Finish(Action::Command("review.protectWorkbook"))), // Excel: Protect Workbook
     ("RRS", Entry::Finish(Action::Pending("review.smartLookup"))),  // pending; Excel: Smart Lookup; feature gap; reserved until the command lands
     ("RS", Entry::Finish(Action::Dialog("spelling"))),              // Excel: Spelling
     ("RTN", Entry::Finish(Action::Command("review.newNote"))),      // Excel: New Note
+    ("RTC", Entry::Finish(Action::Command("review.convertToComments"))), // Excel: Convert to Comments
+    ("RTA", Entry::Finish(Action::Command("review.showAllNotes"))), // Excel: Show All Notes
+    ("RTS", Entry::Finish(Action::Command("review.showNote"))),     // Excel: Show/Hide Note
+    ("RT", Entry::Continue),                                        // Excel: Notes Menu; group level:
     ("RV", Entry::Finish(Action::Command("review.previousComment"))), // Excel: Previous Comment
     ("WA", Entry::Finish(Action::Command("view.arrangeAll"))),      // Excel: Arrange All
     ("WC", Entry::Finish(Action::Command("view.customViews"))),     // Excel: Custom Views
@@ -336,6 +366,7 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("WFC", Entry::Finish(Action::Command("view.freezeFirstColumn"))), // Excel: Freeze First Column
     ("WFF", Entry::Finish(Action::Command("view.freezePanes"))),    // Excel: Freeze Panes
     ("WFR", Entry::Finish(Action::Command("view.freezeTopRow"))),   // Excel: Freeze Top Row
+    ("WFU", Entry::Finish(Action::Command("view.unfreezePanes"))),  // Excel: Unfreeze Panes
     ("WG", Entry::Finish(Action::Command("view.zoomToSelection"))), // Excel: Zoom To Selection
     ("WH", Entry::Finish(Action::Command("view.hideWindow"))),      // Excel: Hide Window
     ("WI", Entry::Finish(Action::Command("view.pageBreakPreview"))), // Excel: Page Break Preview
@@ -358,10 +389,31 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("WVR", Entry::Finish(Action::Command("view.ruler"))),          // Excel: Ruler
     ("WW", Entry::Finish(Action::Command("view.switchWindows"))),   // Excel: Switch Windows
     ("JAM", Entry::Finish(Action::Command("chart.formatSelection"))), // Excel: Chart format: Format Selection pane; containment(Format Selection)
+    ("JCX", Entry::Finish(Action::Control("chart.delete"))),        // Excel: Delete Chart
+    ("JCE", Entry::Finish(Action::Control("chartFormatPane"))),     // Excel: Format Pane
+    ("JCT", Entry::Finish(Action::Control("chartTitle"))),          // Excel: Chart Title
+    ("JCD", Entry::Finish(Action::Control("selectData"))),          // Excel: Select Data; Opens the dialog with the selected chart.
+    ("JCS", Entry::Finish(Action::Command("chart.switchRowColumn"))), // Excel: Switch Row/Column
     ("JCA", Entry::Finish(Action::Command("chart.addElement"))),    // Excel: Chart: Add Chart Element; containment(Add Chart Element)
+    ("JCG", Entry::Finish(Action::Control("chart.addElementMenu"))), // Excel: Add Chart Element
+    ("JCH", Entry::Finish(Action::Control("chart.changeTypeMenu"))), // Excel: Change Chart Type
     ("JCC", Entry::Finish(Action::Command("chart.changeType"))),    // Excel: Chart: Change Chart Type; containment(Change Chart Type)
     ("JTS", Entry::Finish(Action::Command("table.style"))),         // Excel: Table: table style
+    ("JIS", Entry::Finish(Action::Command("draw.inkToShape"))),     // Excel: Ink to Shape
+    ("JIE", Entry::Finish(Action::Command("draw.eraser"))),         // Excel: Eraser
+    ("JIP", Entry::Finish(Action::Command("draw.pen"))),            // Excel: Pen
+    ("JIL", Entry::Finish(Action::Command("draw.lasso"))),          // Excel: Select Objects / Lasso
     ("JTV", Entry::Finish(Action::Command("table.summarizePivot"))), // Excel: Table: Summarize with PivotTable; containment(Summarize with PivotTable)
+    ("JTC", Entry::Finish(Action::Control("table.bandedColumns"))),  // Excel: Banded Columns
+    ("JTL", Entry::Finish(Action::Control("table.lastColumn"))),     // Excel: Last Column
+    ("JTF", Entry::Finish(Action::Control("table.firstColumn"))),    // Excel: First Column
+    ("JTB", Entry::Finish(Action::Control("table.bandedRows"))),     // Excel: Banded Rows
+    ("JTT", Entry::Finish(Action::Control("table.totalRow"))),       // Excel: Total Row
+    ("JTH", Entry::Finish(Action::Control("table.headerRow"))),      // Excel: Header Row
+    ("JTI", Entry::Finish(Action::Command("table.insertSlicer"))),   // Excel: Insert Slicer
+    ("JTG", Entry::Finish(Action::Command("table.convertToRange"))), // Excel: Convert to Range
+    ("JTD", Entry::Finish(Action::Command("data.removeDuplicates"))), // Excel: Remove Duplicates
+    ("JTR", Entry::Finish(Action::Dialog("tableResize"))),           // Excel: Resize Table
     ("FA", Entry::Finish(Action::Command("file.saveAs"))), // Excel: Save / Save As page; fires immediately in Excel; deeper aliases dropped as unreachable
     ("FC", Entry::Finish(Action::Command("file.close"))),  // Excel: Close workbook
     ("FEA", Entry::Finish(Action::Command("file.exportPdf"))), // Excel: Export: create PDF/XPS; Export: create PDF/XPS

@@ -848,9 +848,11 @@ pub fn ribbon_tab(app: &mut SheetApp, ui: &mut egui::Ui) {
     let (sheet_name, file) =
         app.session.active().map(|d| (d.wb.sheet(e.sheet).map(|s| s.name.clone()).unwrap_or_default(), d.display_title())).unwrap_or_default();
     // Header & Footer presets (shown with sample values, as the result will read).
-    for (label, part) in [("Header", false), ("Footer", true)] {
+    for (label, part, key) in [("Header", false, "hf.headerMenu"), ("Footer", true, "hf.footerMenu")] {
         let r = big_button(ui, if part { Icon::Footer } else { Icon::Header }, label, label, true);
-        egui::Popup::menu(&r).show(|ui| {
+        crate::ribbon::control_keytip(app, ui, &r, key);
+        let forced = crate::ribbon::invoke(app, key);
+        egui::Popup::menu(&r).open_memory(crate::ribbon::popup_command(forced, r.clicked())).show(|ui| {
             let presets: [(String, &str); 7] = [
                 (tr(app, "(none)").to_string(), ""),
                 ("Page 1".into(), "&CPage &P"),
@@ -871,24 +873,30 @@ pub fn ribbon_tab(app: &mut SheetApp, ui: &mut egui::Ui) {
         });
     }
     sep(ui);
-    for (icon, label, tip, field) in [
-        (Icon::PageNumber, "Page\nNumber", "Page Number", "&[Page]"),
-        (Icon::PageCount, "Number\nof Pages", "Number of Pages", "&[Pages]"),
-        (Icon::Calendar, "Current\nDate", "Current Date", "&[Date]"),
-        (Icon::Clock, "Current\nTime", "Current Time", "&[Time]"),
-        (Icon::Folder, "File\nPath", "File Path", "&[Path]&[File]"),
-        (Icon::FileName, "File\nName", "File Name", "&[File]"),
-        (Icon::Sheet, "Sheet\nName", "Sheet Name", "&[Tab]"),
+    for (icon, label, tip, field, key) in [
+        (Icon::PageNumber, "Page\nNumber", "Page Number", "&[Page]", "hf.pageNumber"),
+        (Icon::PageCount, "Number\nof Pages", "Number of Pages", "&[Pages]", "hf.pageCount"),
+        (Icon::Calendar, "Current\nDate", "Current Date", "&[Date]", "hf.date"),
+        (Icon::Clock, "Current\nTime", "Current Time", "&[Time]", "hf.time"),
+        (Icon::Folder, "File\nPath", "File Path", "&[Path]&[File]", "hf.path"),
+        (Icon::FileName, "File\nName", "File Name", "&[File]", "hf.fileName"),
+        (Icon::Sheet, "Sheet\nName", "Sheet Name", "&[Tab]", "hf.sheetName"),
     ] {
-        if big_button(ui, icon, label, tip, false).clicked() {
+        let r = big_button(ui, icon, label, tip, false);
+        crate::ribbon::control_keytip(app, ui, &r, key);
+        if r.clicked() || crate::ribbon::invoke(app, key) {
             insert_field(app, field);
         }
     }
     sep(ui);
-    if big_button(ui, Icon::Header, "Go to\nHeader", "Go to Header", false).clicked() && footer {
+    let gh = big_button(ui, Icon::Header, "Go to\nHeader", "Go to Header", false);
+    crate::ribbon::control_keytip(app, ui, &gh, "hf.goHeader");
+    if (gh.clicked() || crate::ribbon::invoke(app, "hf.goHeader")) && footer {
         go_to(app, false);
     }
-    if big_button(ui, Icon::Footer, "Go to\nFooter", "Go to Footer", false).clicked() && !footer {
+    let gf = big_button(ui, Icon::Footer, "Go to\nFooter", "Go to Footer", false);
+    crate::ribbon::control_keytip(app, ui, &gf, "hf.goFooter");
+    if (gf.clicked() || crate::ribbon::invoke(app, "hf.goFooter")) && !footer {
         go_to(app, true);
     }
     sep(ui);
@@ -899,11 +907,15 @@ pub fn ribbon_tab(app: &mut SheetApp, ui: &mut egui::Ui) {
         .unwrap_or_default();
     ui.vertical(|ui| {
         let (mut f, mut o) = (first, odd_even);
-        if ui.checkbox(&mut f, tr(app, "Different First Page")).changed() {
-            set_option(app, "differentFirst", f);
+        let df = ui.checkbox(&mut f, tr(app, "Different First Page"));
+        crate::ribbon::control_keytip(app, ui, &df, "hf.differentFirst");
+        if df.changed() || crate::ribbon::invoke(app, "hf.differentFirst") {
+            set_option(app, "differentFirst", if df.changed() { f } else { !f });
         }
-        if ui.checkbox(&mut o, tr(app, "Different Odd & Even Pages")).changed() {
-            set_option(app, "differentOddEven", o);
+        let de = ui.checkbox(&mut o, tr(app, "Different Odd & Even Pages"));
+        crate::ribbon::control_keytip(app, ui, &de, "hf.differentOddEven");
+        if de.changed() || crate::ribbon::invoke(app, "hf.differentOddEven") {
+            set_option(app, "differentOddEven", if de.changed() { o } else { !o });
         }
     });
 }

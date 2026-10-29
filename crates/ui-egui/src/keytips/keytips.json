@@ -3,12 +3,14 @@
   "Single source of truth for Excel-style sequential access keys (Alt+H+X+X style).",
   "The generated keytip_table/generated.rs is produced from this file: `cargo xtask keytips`.",
   "Adding or removing a shortcut is a one-line edit here. Rules:",
-  "  - seq: the access-key sequence, letters and digits only (two-letter units like \"JI\" are one entry).",
+  "  - seq: the access-key sequence, 1-4 letters/digits (two-letter units like \"JI\" are one entry).",
   "  - kind: \"tab\" (switches a ribbon tab), \"command\" (runs a command id), \"dialog\" (opens a dialog by name),",
-  "    \"continue\" (an explicit group level with no deeper sequences yet).",
+  "    \"control\" (routes to the ribbon control: opens its dropdown or runs its click handler),",
+  "    \"continue\" (an explicit group level with no action of its own).",
   "  - Intermediate levels need no entries: the matcher waits automatically when deeper sequences exist.",
   "  - pending: true = the command does not exist yet; the sequence stays reserved and silent until it lands.",
-  "  - Keep entries grouped by tab and sorted by sequence within a group; the FIRST entry for a tab is its canonical badge (legacy aliases come after it)."
+  "  - Keep entries grouped by tab and sorted by sequence within a group; the FIRST entry for a tab is its canonical badge (legacy aliases come after it).",
+  "  - The generator rejects duplicates, sequences over 4 keys, a terminal sequence that hides a deeper one, and unknown tab names."
  ],
  "sequences": [
   {
@@ -58,6 +60,141 @@
    "seq": "W",
    "kind": "tab",
    "target": "View"
+  },
+  {
+   "seq": "JH",
+   "kind": "tab",
+   "target": "Header & Footer",
+   "excel": "Header & Footer tab",
+   "note": "Contextual: Page Layout view while a header or footer is being edited."
+  },
+  {
+   "seq": "JHH",
+   "kind": "control",
+   "target": "hf.headerMenu",
+   "excel": "Header"
+  },
+  {
+   "seq": "JHF",
+   "kind": "control",
+   "target": "hf.footerMenu",
+   "excel": "Footer"
+  },
+  {
+   "seq": "JHP",
+   "kind": "control",
+   "target": "hf.pageNumber",
+   "excel": "Page Number"
+  },
+  {
+   "seq": "JHN",
+   "kind": "control",
+   "target": "hf.pageCount",
+   "excel": "Number of Pages"
+  },
+  {
+   "seq": "JHD",
+   "kind": "control",
+   "target": "hf.date",
+   "excel": "Current Date"
+  },
+  {
+   "seq": "JHT",
+   "kind": "control",
+   "target": "hf.time",
+   "excel": "Current Time"
+  },
+  {
+   "seq": "JHK",
+   "kind": "control",
+   "target": "hf.path",
+   "excel": "File Path"
+  },
+  {
+   "seq": "JHI",
+   "kind": "control",
+   "target": "hf.fileName",
+   "excel": "File Name"
+  },
+  {
+   "seq": "JHS",
+   "kind": "control",
+   "target": "hf.sheetName",
+   "excel": "Sheet Name"
+  },
+  {
+   "seq": "JHG",
+   "kind": "control",
+   "target": "hf.goHeader",
+   "excel": "Go to Header"
+  },
+  {
+   "seq": "JHO",
+   "kind": "control",
+   "target": "hf.goFooter",
+   "excel": "Go to Footer"
+  },
+  {
+   "seq": "JHA",
+   "kind": "control",
+   "target": "hf.differentFirst",
+   "excel": "Different First Page"
+  },
+  {
+   "seq": "JHB",
+   "kind": "control",
+   "target": "hf.differentOddEven",
+   "excel": "Different Odd & Even Pages"
+  },
+  {
+   "seq": "JC",
+   "kind": "tab",
+   "target": "Chart Design",
+   "excel": "Chart Design tab",
+   "note": "Contextual: shown while a chart is selected. JCA/JCC/JAM were already reserved for it."
+  },
+  {
+   "seq": "JT",
+   "kind": "tab",
+   "target": "Table Design",
+   "excel": "Table Design tab",
+   "note": "Contextual: shown while the active cell is in a table. JTS/JTV were already reserved for it."
+  },
+  {
+   "seq": "U",
+   "kind": "tab",
+   "target": "Automate",
+   "note": "Our letter: it must not begin with another tab letter (a tab sequence such as \"AZ\" would be unreachable after \"A\" opens Data)."
+  },
+  {
+   "seq": "UM",
+   "kind": "dialog",
+   "target": "macros",
+   "excel": "Macros"
+  },
+  {
+   "seq": "UC",
+   "kind": "control",
+   "target": "commandSearch",
+   "excel": "Command Palette"
+  },
+  {
+   "seq": "UA",
+   "kind": "control",
+   "target": "agents",
+   "excel": "Agent Control (ours)"
+  },
+  {
+   "seq": "UJ",
+   "kind": "control",
+   "target": "journal",
+   "excel": "Action Journal (ours)"
+  },
+  {
+   "seq": "UB",
+   "kind": "control",
+   "target": "about",
+   "excel": "About (ours)"
   },
   {
    "seq": "E",
@@ -159,6 +296,12 @@
    "target": "home.underline"
   },
   {
+   "seq": "H4",
+   "kind": "command",
+   "target": "home.strikethrough",
+   "excel": "Strikethrough"
+  },
+  {
    "seq": "H5",
    "kind": "command",
    "target": "home.decreaseIndent",
@@ -233,13 +376,6 @@
    "target": "home.borders",
    "excel": "Erase Border",
    "note": "border-side TBD"
-  },
-  {
-   "seq": "HBG",
-   "kind": "command",
-   "target": "home.drawBorder",
-   "excel": "Draw Border Grid",
-   "note": "containment(Draw Border)"
   },
   {
    "seq": "HBH",
@@ -317,13 +453,6 @@
    "target": "home.borders",
    "excel": "Top and Double Bottom Border",
    "note": "border-side TBD"
-  },
-  {
-   "seq": "HBW",
-   "kind": "command",
-   "target": "home.drawBorder",
-   "excel": "Draw Border",
-   "note": ""
   },
   {
    "seq": "HBY",
@@ -1195,9 +1324,7 @@
    "seq": "NSF",
    "kind": "command",
    "target": "insert.slicer",
-   "pending": false,
-   "excel": "Slicer",
-   "note": "insert.slicer missing (gap #8); reserved until the command lands"
+   "excel": "Slicer"
   },
   {
    "seq": "NSH",
@@ -1278,31 +1405,24 @@
    "note": "group level:"
   },
   {
-   "seq": "NZKSL",
+   "seq": "NZKL",
    "kind": "dialog",
    "target": "sparkline",
    "excel": "Line Sparkline",
    "note": ""
   },
   {
-   "seq": "NZKSO",
+   "seq": "NZKO",
    "kind": "dialog",
    "target": "sparkline",
    "excel": "Column Sparkline",
    "note": ""
   },
   {
-   "seq": "NZKSW",
+   "seq": "NZKW",
    "kind": "dialog",
    "target": "sparkline",
    "excel": "Win/Loss Sparkline",
-   "note": ""
-  },
-  {
-   "seq": "NZTX",
-   "kind": "command",
-   "target": "insert.textBox",
-   "excel": "Text Box",
    "note": ""
   },
   {
@@ -1467,6 +1587,13 @@
    "target": "view.headings",
    "excel": "View Headings",
    "note": ""
+  },
+  {
+   "seq": "PLR",
+   "kind": "command",
+   "target": "view.rightToLeft",
+   "excel": "Sheet Right-to-Left",
+   "note": "Page Layout tab, Layout group (our letter; Excel has no published sequence here)."
   },
   {
    "seq": "MA",
@@ -2132,6 +2259,18 @@
    "note": "gap #12; reserved until the command lands"
   },
   {
+   "seq": "ANS",
+   "kind": "dialog",
+   "target": "solver",
+   "excel": "Solver"
+  },
+  {
+   "seq": "AND",
+   "kind": "dialog",
+   "target": "analysisToolPak",
+   "excel": "Data Analysis"
+  },
+  {
    "seq": "AY",
    "kind": "command",
    "target": "data.reapply",
@@ -2192,10 +2331,22 @@
    "note": ""
   },
   {
+   "seq": "RH",
+   "kind": "command",
+   "target": "review.showComments",
+   "excel": "Show Comments"
+  },
+  {
    "seq": "RO",
    "kind": "command",
    "target": "review.protectWorkbook",
    "excel": "Protect and Share Workbook"
+  },
+  {
+   "seq": "RW",
+   "kind": "dialog",
+   "target": "statistics",
+   "excel": "Workbook Statistics"
   },
   {
    "seq": "RPS",
@@ -2203,6 +2354,12 @@
    "target": "protectSheet",
    "excel": "Protect Sheet",
    "note": ""
+  },
+  {
+   "seq": "RAR",
+   "kind": "dialog",
+   "target": "allowEditRanges",
+   "excel": "Allow Edit Ranges"
   },
   {
    "seq": "RPW",
@@ -2232,6 +2389,30 @@
    "target": "review.newNote",
    "excel": "New Note",
    "note": ""
+  },
+  {
+   "seq": "RTC",
+   "kind": "command",
+   "target": "review.convertToComments",
+   "excel": "Convert to Comments"
+  },
+  {
+   "seq": "RTA",
+   "kind": "command",
+   "target": "review.showAllNotes",
+   "excel": "Show All Notes"
+  },
+  {
+   "seq": "RTS",
+   "kind": "command",
+   "target": "review.showNote",
+   "excel": "Show/Hide Note"
+  },
+  {
+   "seq": "RT",
+   "kind": "continue",
+   "excel": "Notes Menu",
+   "note": "group level:"
   },
   {
    "seq": "RV",
@@ -2281,6 +2462,12 @@
    "target": "view.freezeTopRow",
    "excel": "Freeze Top Row",
    "note": ""
+  },
+  {
+   "seq": "WFU",
+   "kind": "command",
+   "target": "view.unfreezePanes",
+   "excel": "Unfreeze Panes"
   },
   {
    "seq": "WG",
@@ -2439,11 +2626,54 @@
    "note": "containment(Format Selection)"
   },
   {
+   "seq": "JCX",
+   "kind": "control",
+   "target": "chart.delete",
+   "excel": "Delete Chart"
+  },
+  {
+   "seq": "JCE",
+   "kind": "control",
+   "target": "chartFormatPane",
+   "excel": "Format Pane"
+  },
+  {
+   "seq": "JCT",
+   "kind": "control",
+   "target": "chartTitle",
+   "excel": "Chart Title"
+  },
+  {
+   "seq": "JCD",
+   "kind": "control",
+   "target": "selectData",
+   "excel": "Select Data",
+   "note": "Opens the dialog with the selected chart."
+  },
+  {
+   "seq": "JCS",
+   "kind": "command",
+   "target": "chart.switchRowColumn",
+   "excel": "Switch Row/Column"
+  },
+  {
    "seq": "JCA",
    "kind": "command",
    "target": "chart.addElement",
    "excel": "Chart: Add Chart Element",
    "note": "containment(Add Chart Element)"
+  },
+  {
+   "seq": "JCG",
+   "kind": "control",
+   "target": "chart.addElementMenu",
+   "excel": "Add Chart Element"
+  },
+  {
+   "seq": "JCH",
+   "kind": "control",
+   "target": "chart.changeTypeMenu",
+   "excel": "Change Chart Type"
   },
   {
    "seq": "JCC",
@@ -2460,11 +2690,95 @@
    "note": ""
   },
   {
+   "seq": "JIS",
+   "kind": "command",
+   "target": "draw.inkToShape",
+   "excel": "Ink to Shape"
+  },
+  {
+   "seq": "JIE",
+   "kind": "command",
+   "target": "draw.eraser",
+   "excel": "Eraser"
+  },
+  {
+   "seq": "JIP",
+   "kind": "command",
+   "target": "draw.pen",
+   "excel": "Pen"
+  },
+  {
+   "seq": "JIL",
+   "kind": "command",
+   "target": "draw.lasso",
+   "excel": "Select Objects / Lasso"
+  },
+  {
    "seq": "JTV",
    "kind": "command",
    "target": "table.summarizePivot",
    "excel": "Table: Summarize with PivotTable",
    "note": "containment(Summarize with PivotTable)"
+  },
+  {
+   "seq": "JTC",
+   "kind": "control",
+   "target": "table.bandedColumns",
+   "excel": "Banded Columns"
+  },
+  {
+   "seq": "JTL",
+   "kind": "control",
+   "target": "table.lastColumn",
+   "excel": "Last Column"
+  },
+  {
+   "seq": "JTF",
+   "kind": "control",
+   "target": "table.firstColumn",
+   "excel": "First Column"
+  },
+  {
+   "seq": "JTB",
+   "kind": "control",
+   "target": "table.bandedRows",
+   "excel": "Banded Rows"
+  },
+  {
+   "seq": "JTT",
+   "kind": "control",
+   "target": "table.totalRow",
+   "excel": "Total Row"
+  },
+  {
+   "seq": "JTH",
+   "kind": "control",
+   "target": "table.headerRow",
+   "excel": "Header Row"
+  },
+  {
+   "seq": "JTI",
+   "kind": "command",
+   "target": "table.insertSlicer",
+   "excel": "Insert Slicer"
+  },
+  {
+   "seq": "JTG",
+   "kind": "command",
+   "target": "table.convertToRange",
+   "excel": "Convert to Range"
+  },
+  {
+   "seq": "JTD",
+   "kind": "command",
+   "target": "data.removeDuplicates",
+   "excel": "Remove Duplicates"
+  },
+  {
+   "seq": "JTR",
+   "kind": "dialog",
+   "target": "tableResize",
+   "excel": "Resize Table"
   },
   {
    "seq": "FA",

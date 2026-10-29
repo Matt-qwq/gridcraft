@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-21 · **Change:** minor (Esc and Enter close a data validation alert over the cell editor; Ctrl+Enter fill gives each cell the automatic number format typing gives it; keytip letters typed with Alt held, #1846; Number Stored as Text indicator and Convert to Number) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (key tips across every ribbon tab including the contextual ones; keyboard-navigable context menus; shortcut audit with six new bindings) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Interaction, controls and feel, against Excel. Part of [target-app-parity.md](target-app-parity.md).
 **UI/UX fidelity: ~55% ready, 50–80 h** (estimated). Ribbon command coverage is measured
@@ -20,7 +20,7 @@ Sources: `crates/ui-egui/src` (ribbon, grid, editor, formula bar, dialogs, panes
 | Ribbon collapse, simplified ribbon, customize ribbon/QAT | yes | partial | customization missing (File ▸ Options is the one missing File command) |
 | Ribbon: tabs, groups, split buttons, galleries, contextual tabs | yes | yes (Table Design, Chart Design, Format, PivotTable tabs) | done; missing contextual tabs for pictures, shapes, sparklines, header/footer, slicers |
 | Ribbon collapse, simplified ribbon, customize ribbon/QAT | yes | partial | customization missing |
-| Key tips (Alt / F10 then letters) | yes, every ribbon control | **initial** (#43, 10-10): Alt or F10 shows key tips on Home for alignment, Paste Special and AutoFit plus legacy Alt sequences; other tabs and controls not yet (#33, #49) | 3–5 h |
+| Key tips (Alt / F10 then letters) | yes, every ribbon control | done (#43 → #33/#49): 417 sequences for every tab, group and ribbon button, contextual tabs included, badges drawn in code, Esc backs out one level, per-scope collision and reachability tests; QAT/Backstage and the View combo boxes excluded (see Keyboard) | done |
 | Formula bar with Name Box, expand, function hints | yes | yes | done |
 | Sheet tabs: rename, reorder, colour, hide, scroll | yes | yes | Ctrl-drag (Cmd or Option on macOS) drops a copy (#971); active tab revealed on navigation and resize (#681); manual wheel/trackpad browsing preserved; rename focus bug on macOS (#145) |
 | Formula bar with Name Box, expand, function hints | yes | yes | done; dynamic-array spill children show the source formula muted and read-only, using current spill ownership |
@@ -74,72 +74,218 @@ this logic, with one undo step.
 
 ## Keyboard
 
-| Area | Excel | GridCraft |
+Excel is a keyboard application: every ribbon control has an access-key path and the documented
+shortcut list runs past 200 keys. GridCraft has the same two layers — **key tips** (sequential Alt
+access keys) and **direct shortcuts** — plus the keys the grid, formula bar and cell editor own.
+
+### Key tips (Alt or F10, then letters)
+
+Alt, or F10 on keyboards without an Alt, arms the badges: one per tab, and once a tab is open, one per
+control. A typed sequence switches tabs and runs its command; `Esc` backs out one level at any depth
+(from a control's group to the tab, from the tab to the tab letters, then off); Alt again, a click, a
+wheel or a focus loss cancels. The badges are painted from `theme::Tokens` in `ribbon::keytip` — no
+bitmaps, no vendor artwork. Letters also work with left Alt held (`Alt`, `H`, `O`, `A` autofits the
+column), as in Excel.
+
+The table is `crates/ui-egui/src/keytips/keytips.json` (hand-edited, one line per sequence);
+`cargo xtask keytips` generates `keytip_table/generated.rs` and one end-to-end test per sequence in
+`crates/ui-egui/tests/keytips_generated.rs` (419 tests today). A sequence may:
+
+| Kind | What it does |
+|---|---|
+| `tab` | switches to a ribbon tab and keeps the level so its badge letters can follow |
+| `command` | runs an engine command by id |
+| `dialog` | opens a dialog by name |
+| `control` | routes to the ribbon control that owns the keytip (opens its dropdown, or runs its click handler with the right params), so a dropdown keytip does not fire the bare command |
+| `continue` | a group level with no action of its own (the badge waits for the next key) |
+| pending | a `command` whose command does not exist yet: badge and level reserved, invocation silent, live the moment the command lands |
+
+**Tabs.** Every tab has one, contextual tabs included; a contextual tab's badge is painted only while
+the tab is shown, and typing its sequence without the context does nothing (as in Excel).
+
+| Tab | Sequence | Note |
 |---|---|---|
-| Shortcuts bound to commands | 200+ documented shortcuts per platform | 59 command shortcuts plus grid and editor keys (55 distinct keys handled in `ui-egui`) |
-| Ctrl+arrow, Ctrl+Shift+arrow, Ctrl+Home/End, Page Up/Down, Alt+Page | yes | done |
-| Ctrl+1, Ctrl+; and Ctrl+Shift+; , Ctrl+D/R, Ctrl+E, Ctrl+T, Ctrl+K, Ctrl+Shift+L | yes | most done; audit pending |
-| F2, F4, F5, F9 family, Shift+F3, F11 | yes | most; F11 chart sheet missing (no chart sheets) |
-| Mac-specific (Cmd variants, Fn keys) | yes | Cmd mapping done |
-| Delete selected charts, pictures and shapes | yes | done (#213) |
-| Shortcuts bound to commands | 200+ documented shortcuts per platform | audited below (#110): shortcuts whose feature exists are bound, with the exceptions listed; the rest wait for their features |
-| Ctrl+arrow, Ctrl+Shift+arrow, Ctrl+Home/End, Ctrl+Shift+Home/End, Page Up/Down, Alt+Page | yes | done |
-| Ctrl+1, Ctrl+; and Ctrl+Shift+; , Ctrl+D/R, Ctrl+E, Ctrl+T/L, Ctrl+K, Ctrl+Shift+L, Ctrl+Shift+~!@#$%^&_ | yes | done |
-| F2, F4, F5, F7, F9 family, Shift+F2/F3/F10/F11, F12 | yes | done; F11 chart sheet, F8 extend mode, F3 Paste Name, F4 Repeat missing |
-| Mac-specific (Cmd variants, Control variants, Fn keys) | yes | done where a feature exists (`keymap.rs` picks the Mac variant) |
-| Sequential Alt access keys (Alt, H, N, …) on every ribbon tab | yes | 364-sequence keytip table for all tabs: per-control badges, prefix waiting, dropdowns open for editing (type/arrows/Enter), pending bindings for not-yet-built commands; letters also work with left Alt held (Alt+H, O, A), as in Excel; QAT/Backstage excluded |
-| Requests | — | #110 (more shortcuts and hot keys), #33 (sequential Alt; initial support landed in #43) |
+| Home | `H` (and legacy `E` Edit, `O` Format paths) | |
+| Insert | `N` | |
+| Draw | `J I` | two-letter unit, one badge |
+| Page Layout | `P` | |
+| Formulas | `M` | |
+| Data | `A` | |
+| Review | `R` | |
+| View | `W` | |
+| Automate | `U` | our letter: Excel publishes none, and `A U` would be shadowed by Data ▸ Ungroup |
+| Table Design | `J T` | contextual: active cell in a table |
+| Chart Design | `J C` | contextual: a chart is selected |
+| Header & Footer | `J H` | contextual: Page Layout view, editing a header or footer |
+| File | `F` | opens the Backstage view; its letter path still runs (`F`, `S` saves) |
+
+Groups follow Excel where it has a published sequence and our own mnemonic otherwise: `H`, `F` font
+(`H F B` size, `H F C` colour), `H`, `B` borders, `H`, `L` conditional formatting, `H`, `O` cells,
+`H`, `V` paste, `N`, `Z` (Symbol `N Z S`, Sparklines `N Z K`, then `L`/`O`/`W`), `W`, `V` show/hide
+(`W V G` gridlines), `M`, `U` AutoSum, `A`, `S` sort, and so on. Every ribbon button paints the rest
+of its sequence on the badge; a menu anchor shows one group letter and its items show the last key
+(`H`, `V` opens Paste, `S` still chooses Paste Special).
+
+**What the tests enforce** (`keytip_table.rs` unit tests and the generated suite):
+
+- every sequence is 1–4 ASCII keys (Excel's sparkline paths run to five; ours stop at four so the
+  whole scheme is typeable from memory), assigned once, and resolves to exactly one action;
+- no terminal sequence is a strict prefix of another, so nothing is shadowed (`N Z T` used to hide
+  `N Z T X`; the generator now validates both directions);
+- no two tabs share a prefix at the armed root (`A` must not make a later `A U` Automate badge
+  unreachable — this is why Automate is `U`);
+- within one parent, two different controls never paint the same badge
+  (`no_two_targets_paint_the_same_badge_under_the_same_parent`);
+- every `command` target exists in the live catalog and every `dialog` target opens.
+
+Deliberate exceptions: Quick Access Toolbar/title-bar buttons, Backstage pages, dialog fields and the
+View tab's two combo boxes (Display theme, Interface size) carry no badges — they are not ribbon
+buttons. Menus whose items share one command id (Paste Special variants, chart types, number-format
+symbols) paint the anchor badge only: a trie cannot tell two items of the same command apart.
+
+### Reachability of what the mouse can do
+
+| What | Keyboard | Detail |
+|---|---|---|
+| Cell context menu | `Shift+F10` | opens at the active cell, without moving the selection |
+| Row/column header menus | (mouse to open) + arrows | navigate like the cell menu |
+| Menu navigation | arrows, Home/End, Enter, Space, Esc | the keyboard position is painted; Enter/Space run the highlighted row (Enter without a highlight takes the first), Esc closes. Nothing takes focus, so the grid keeps the keyboard and the selection while the menu is open, and Space never starts an edit behind it |
+| Dedicated Menu key (VK_APPS) | **blocked upstream** | egui-winit 0.36 maps neither `KeyCode::ContextMenu` nor `NamedKey::ContextMenu` and egui has no `Key` variant for it, so the event never reaches the app; fixing it needs a dependency patch. `Shift+F10` is the reachable pair, as on keyboards without the key |
+| Ribbon button | Alt/F10 + sequence | activates with no pointer; dropdowns open for typing/arrows/Enter |
+| Menus keytips | — | while a context/menu is open the grid is quiet; the menu's own keys win, never both |
+
+Tests: `crates/ui-egui/tests/context_menu_keyboard.rs` (open, arrows, wrap, Home/End, Enter, Space,
+Escape, header menus, one-shot execution) and the generated keytip suite (activation with no pointer).
 
 ### Shortcut audit (#110)
 
-Checked against Microsoft's published "Keyboard shortcuts in Excel" (Windows and Mac tables,
-2026-10-11). Alt key-tip sequences are tracked separately (#33). Bindings live in
-`crates/ui-egui/src/grid.rs` (navigation, editing keys), `ribbon::shortcut` (Ctrl/Cmd letters),
-`keymap.rs` (everything added in #110, with a `lookup` table that tests cover) and
-`formula_bar.rs` (keys while editing). "Ctrl" means Cmd on a Mac unless the Mac column says
-otherwise. Number-format and border keys match the physical key (Ctrl+Shift+4, wherever `$` is).
+Checked against Microsoft's published "Keyboard shortcuts in Excel" (Windows and Mac tables).
+Bindings live in `crates/ui-egui/src/grid.rs` (navigation and editing keys), `ribbon::shortcut`
+(Ctrl/Cmd letters), `keymap.rs` (F-keys, Alt/Option and the Mac variants, with a `lookup` table the
+tests cover), `formula_bar.rs` (keys while editing) and `keytips.json` (Alt sequences).
+"Ctrl" means Cmd on a Mac unless the Mac column says otherwise; number-format and border keys match
+the physical key (Ctrl+Shift+4 is `$`'s position, wherever `$` is on the layout). `added` means it
+landed with this audit; `missing` means Excel has the shortcut but we have no command behind it yet;
+`n/a` means the feature does not apply to a single-window spreadsheet.
 
-| Shortcut (Windows) | Mac | Action | Status |
+**Clipboard, selection and editing**
+
+| Excel shortcut | Mac | Our command id (or handler) | Status |
 |---|---|---|---|
-| Ctrl+C / X / V, Ctrl+Z / Y, Ctrl+A, Ctrl+B / I / U | same with Cmd | clipboard, undo/redo, select all, bold/italic/underline | present |
-| Ctrl+S, Ctrl+Shift+S, Ctrl+O, Ctrl+N, Ctrl+W | Cmd | save, save as, open, new, close | present |
-| Ctrl+F, Ctrl+H, Ctrl+G, Ctrl+K, Ctrl+T | Cmd (Ctrl+H) | find, replace, go to, hyperlink, table | present |
-| Ctrl+D, Ctrl+R, Ctrl+E, Ctrl+1, Ctrl+9 / 0, Ctrl+Shift+9 / 0 | Cmd (Ctrl+E on Mac: see below) | fill down/right, Flash Fill, Format Cells, hide/unhide | present |
-| Ctrl+- , Ctrl+Shift+= | Cmd | Delete / Insert cells dialog | present |
-| Ctrl+; , Ctrl+` | Control+; | current date, show formulas | present (Mac Control+; added) |
-| Arrows, Shift / Ctrl / Ctrl+Shift+arrows, Home, Ctrl+Home / End, Page Up / Down, Ctrl+Page Up / Down | Cmd+arrows | navigation and extension | present |
-| Tab, Shift+Tab, Enter, Shift+Enter, Ctrl+Space, Shift+Space, Delete, Esc | same | entry and selection | present |
-| F2, F9, F10 (key tips), F4 / Alt+Enter / Ctrl+Enter / Ctrl+Shift+Enter while editing | same | edit, calculate, references, new line, fill, array | present |
-| Ctrl+Shift+~ ! @ # $ % ^ | Control+Shift | General, Number, Time, Date, Currency, Percent, Scientific | **added** |
-| Ctrl+Shift+& / Ctrl+Shift+_ | Cmd+Option+0 / Cmd+Option+- (and Cmd+Option+arrows for one side) | outline border / remove borders | **added** |
-| Ctrl+2 / 3 / 4 / 5 | — | bold / italic / underline / strikethrough | **added** |
-| Ctrl+6 | Control+6 | hide / show objects (charts, pictures, shapes, slicers), saved as `workbookPr showObjects` | **added** |
-| Ctrl+Shift+: | Cmd+; | current time | **added** |
-| Ctrl+' / Ctrl+Shift+" | Control | formula / value from the cell above | **added** |
-| Ctrl+L | Cmd+L is Align Left, Cmd+E Center, Control+E Flash Fill | create table | **added** |
-| Ctrl+Shift+L | Cmd+Shift+F (present) / Control+Shift+L | filter | **added** |
-| Ctrl+Shift+F, Ctrl+Shift+G | — | Format Cells Font tab, Workbook Statistics | **added** |
-| — | Cmd+Shift+H, Cmd+Shift+R, Cmd+Shift+K / J, Control+L, Control+U | replace, sort, group / ungroup, Define Name, edit cell | **added** |
-| Alt+Shift+Right / Left | Option+Right / Left is next/previous sheet | group / ungroup | **added** |
-| Ctrl+Shift+* (Ctrl+Shift+8), Ctrl+Shift+Space | Cmd+Shift+Space | current region, select all | **added** |
-| Ctrl+Shift+Home / End, Shift+Home | same | extend to A1 / last used cell / row start | **added** |
-| Ctrl+P | Cmd+P | print | **added** |
-| Ctrl+Shift+> / < | Cmd+Shift+> / < | font size | **added** |
-| Ctrl+Alt+V | Cmd+Control+V, Cmd+Option+V | Paste Special | **added** |
-| Ctrl+Alt+= / Ctrl+Alt+- | — | zoom in / out (10% steps) | **added** |
-| Alt+=, Alt+Down, Alt+Page Down / Up | Option+Down, Option+Page Down / Up | AutoSum, drop-down list, one screen right / left | **added** |
-| Alt+Down on a filter header | Option+Down | Open the existing AutoFilter popup; validation dropdowns keep priority | **added** (AutoFilter portion of #441; Ribbon dropdowns and column value picker are separate work) |
-| Alt+F1, Alt+Shift+F1, Shift+F11 | Shift+F11 | embedded chart, new sheet | **added** |
-| Shift+F2, Ctrl+Shift+F2 | Shift+F2, Cmd+Shift+F2 | note, threaded comment | **added** |
-| Shift+F3, Ctrl+F3, Ctrl+Shift+F3 | Shift+F3, Cmd+F3 (Define Name), Cmd+Shift+F3 | Insert Function, Name Manager, Create from Selection | **added** |
-| F5, Shift+F5 (Mac), F7, Shift+F9, Ctrl+Alt+F9, F12, Ctrl+F4 | same | Go To, Find, Spelling, calculate sheet / all, Save As, close | **added** |
-| Shift+F10, Alt+Shift+F10, Ctrl+F1 | Shift+F10, Cmd+Option+R | context menu, Error Checking, ribbon | **added** |
-| F1, F3, F4 (repeat), F6 / Shift+F6, F8 / Shift+F8, F11, End mode | same | help, Paste Name, Repeat, pane cycling, extend/add mode, chart sheet | missing (no such feature yet) |
-| Ctrl+8, Ctrl+Q, Ctrl+Shift+A, Ctrl+A after a function name, Ctrl+Shift+U, Ctrl+Alt+P | same | outline symbols, Quick Analysis, argument names, Function Arguments, formula bar height, tooltips | missing |
-| Ctrl+Shift+A after a function name | Control+Shift+A | argument names: `=SUMIF(` becomes `=SUMIF(range,criteria,sum_range)`, the `(` added when missing; one Undo takes them back | **added** |
-| Ctrl+6, Ctrl+8, Ctrl+Q, Ctrl+A after a function name, Ctrl+Shift+U, Ctrl+Alt+P | same | objects, outline symbols, Quick Analysis, Function Arguments, formula bar height, tooltips | missing |
-| Ctrl+Shift+Page Up / Down, Ctrl+Alt+5, Ctrl+Shift+F1, Ctrl+F5–F10, Alt+F8 / F11 / F12 | same | group sheets, shape cycling, full screen, window keys, macros, VBA, Power Query | missing |
-| — | Cmd+= (calculate), Cmd+T (references while editing; F4 works), Shift+F7, Cmd+Shift+L | Mac-only extras | missing (Cmd+= is egui's zoom key; no thesaurus or Modify Cell Style) |
+| Ctrl+C / X / V | Cmd | `edit.copy` / `edit.cut` / `edit.paste` | have |
+| Ctrl+Z / Y / Shift+Z | Cmd | `edit.undo` / `edit.redo` | have |
+| Ctrl+A | Cmd | `edit.selectAll` | have |
+| Ctrl+Space / Shift+Space | Control+Space / Shift+Space | `selection.column` / `selection.row` | have |
+| Ctrl+Shift+Space | Cmd+Shift+Space | `edit.selectAll` | have |
+| Shift+arrow, Ctrl+arrow, Ctrl+Shift+arrow | same with Cmd | `selection.move` (extend / jump / extend jump) | have |
+| Home / Ctrl+Home / End / Ctrl+End, Shift+Home, Ctrl+Shift+Home/End | Cmd | `selection.set`, extend-to-start/end/row start in `keymap.rs` | have |
+| Page Up/Down, Alt+Page Up/Down | same | `selection.move` one screen; `Shortcut::ScreenLeft/Right` | have |
+| Ctrl+Page Up/Down | Cmd+Page Up/Down | `sheet.previous` / `sheet.next` | have |
+| Tab / Shift+Tab, Enter / Shift+Enter | same | grid traversal (`move_after_enter`) | have |
+| F2, Delete, Backspace | Control+U edits | `begin_edit`, `edit.clearContents` | have |
+| Esc | same | cancels editing / copy / Format Painter | have |
+| Ctrl+Enter | Control+Enter | `range.fill` (editor) | have |
+| Ctrl+Shift+Enter | Control+Shift+Enter | array formula entry (editor) | have |
+| Ctrl+D / Ctrl+R | Cmd | `edit.fillDown` / `edit.fillRight` | have |
+| Ctrl+E | Control+E | `edit.flashFill` | have |
+| Ctrl+; / Ctrl+Shift+; | Control+; / Cmd+; | date / time entry (`Shortcut::Date` / `Time`) | have |
+| Ctrl+' / Ctrl+Shift+" | Control | formula / value from the cell above | have |
+| Ctrl+- / Ctrl+Shift+= | Cmd | `home.deleteRows` / `home.deleteColumns`, `home.insertRows` / `home.insertColumns`, or the Insert/Delete Cells dialogs | have |
+| Ctrl+Shift+`*` (Ctrl+Shift+8) | Cmd+Shift+Space | `selection.currentRegion` | have |
+| Ctrl+[ / Ctrl+] / +Shift | same | `formulas.selectPrecedents` / `selectDependents` | have |
+| Ctrl+Shift+O | same | `edit.goToSpecial` `{kind: "comments"}` (cells with comments/notes) | **added** |
+| Alt+; | Option+; | `edit.goToSpecial` `{kind: "visible"}` (visible cells only) | **added** |
+| Ctrl+Alt+5, Ctrl+/ , Ctrl+\ , Ctrl+Shift+\| | same | object cycling, current array, row / column differences | missing (no command) |
+| Ctrl+Shift+Page Up/Down | same | group / ungroup sheets | missing (one sheet group) |
+
+**File, workbook and print**
+
+| Excel shortcut | Mac | Our command id (or handler) | Status |
+|---|---|---|---|
+| Ctrl+N / O / S / W | Cmd | `file.new` / `file.open` / `file.save` / `file.close` | have |
+| Ctrl+Shift+S, F12 | Cmd / F12 | `file.saveAs` | have |
+| Ctrl+P | Cmd+P | `file.print` (print window via `print_now`) | have |
+| Ctrl+F2 | — | `file.print` | **added** |
+| Ctrl+Shift+F12 | — | `file.print` | **added** |
+| Ctrl+F1 | Cmd+F1 | `view.collapseRibbon` | have |
+| Ctrl+F4 | Cmd+F4 | `file.close` | have |
+| Alt+F8 | Fn+Alt+F8 | macros dialog | have |
+| Ctrl+K | Cmd+K | Insert Link dialog | have |
+| Ctrl+T, Ctrl+L | Cmd+T | `insert.table` | have |
+| Ctrl+Shift+L | Cmd+Shift+F / Control+Shift+L | `data.filter` | have |
+| Ctrl+O after typing a URL | — | open hyperlink | missing |
+| Ctrl+F5 / F9 / F10, Ctrl+Shift+F1 | same | window size / minimize / maximize / full screen | n/a (the OS owns the window) |
+
+**Navigation and tools**
+
+| Excel shortcut | Mac | Our command id (or handler) | Status |
+|---|---|---|---|
+| Ctrl+F / Ctrl+H | Cmd (Control+H) | Find / Replace dialogs | have |
+| Ctrl+G, F5 | same | Go To dialog | have |
+| F3 | Cmd+F3 (Define Name) | paste-name list | missing (`formulas.pasteName` command missing) |
+| Shift+F3, Ctrl+F3, Ctrl+Shift+F3 | Shift+F3, Cmd+F3, Cmd+Shift+F3 | Insert Function, Name Manager, `formulas.createFromSelection` | have |
+| Shift+F4 | same | repeat last Find | missing (no command) |
+| F4 | same | repeat last action | missing (no command; F4 cycles references while editing) |
+| F6 / Shift+F6 | same | next / previous pane | missing (no split-pane cycling command) |
+| F7 | same | `Spelling` dialog | have |
+| F8 / Shift+F8 | same | extend / add to selection mode | missing (no extend mode) |
+| F9 / Shift+F9 / Ctrl+Alt+F9 | same | `formulas.calculateNow` / `calculateSheet` | have |
+| F11 / Shift+F11 | same | F11 is a chart sheet (missing, no chart sheets) / `home.insertSheet` | partial |
+| Alt+F11 | Option+F11 | VBA editor | n/a |
+| Shift+F10, Alt+Shift+F10 | same | context menu (see above) / Error Checking dialog | have |
+| Alt+Down | Option+Down | validation drop-down or the AutoFilter popup | have |
+| Alt+= | Option+= | `formulas.autoSum` | have |
+| Ctrl+\` | Ctrl+\` | `formulas.showFormulas` | have |
+| Ctrl+8 | same | outline symbols on/off | missing (no command) |
+| Ctrl+Q | same | Quick Analysis | missing (feature) |
+| Ctrl+Shift+U | Control+Shift+U | expand / collapse the formula bar | missing (the toggle `view.formulaBar` is a different action) |
+| Ctrl+Shift+L | see file table | `data.filter` | have |
+| Alt+Q | — | search / Tell Me | missing (`ui.search` reserved keytip `Q`) |
+| Ctrl+Tab / Ctrl+Shift+Tab, Ctrl+F6 | same | next / previous workbook window | n/a (one window per workbook) |
+| Ctrl+Shift+F2, Shift+F2 | Cmd+Shift+F2, Shift+F2 | `review.newComment` / `review.newNote` | have |
+
+**Formatting**
+
+| Excel shortcut | Mac | Our command id (or handler) | Status |
+|---|---|---|---|
+| Ctrl+1 | Cmd+1 | Format Cells dialog | have |
+| Ctrl+B / I / U / 5 | Cmd | `home.bold` / `italic` / `underline` / `strikethrough` | have |
+| Ctrl+2 / 3 / 4 | — | `home.bold` / `italic` / `underline` | have |
+| Ctrl+Shift+~ ! @ # $ % ^ | Control+Shift | `home.numberFormat` variants (General, Number, Time, Date, Currency, Percent, Scientific) | have |
+| Ctrl+Shift+& / _ | Cmd+Option+0 / Cmd+Option+- | `home.borders` `outline` / `none` (Option+arrows for one side) | have |
+| Ctrl+9 / 0, Ctrl+Shift+9 / 0 | Cmd | `home.hideRows` / `home.hideColumns`, `home.unhideRows` / `home.unhideColumns` | have |
+| Ctrl+6 | Control+6 | `view.showObjects` | have |
+| Ctrl+Shift+> / < | Cmd+Shift+> / < | `home.increaseFontSize` / `decreaseFontSize` | have |
+| Ctrl+Shift+F | Cmd+Shift+F | Format Cells (Font tab) | have |
+| Ctrl+Shift+G | — | Workbook Statistics | have |
+
+**Data, formulas and calculation**
+
+| Excel shortcut | Mac | Our command id (or handler) | Status |
+|---|---|---|---|
+| Alt+= / Shift+F3 / F4 (editing) | Option+= | `formulas.autoSum`, Insert Function, reference cycling | have |
+| Ctrl+Shift+A after a function name | Control+Shift+A | argument names in the editor | have |
+| Alt+Shift+Right / Left | Option+Right / Left is next/previous sheet | `data.group` / `data.ungroup` | have |
+| Alt+F5 | Option+F5 | `pivot.refresh` (selected PivotTable) | **added** |
+| Ctrl+Alt+F5 | Cmd+Option+F5 | `data.refreshAll` | **added** |
+| Alt+Shift+F1 / Alt+F1 | Shift+F11 / Option+F1 | `home.insertSheet` / `insert.chart` | have |
+| Ctrl+F9 / F9 / Ctrl+Alt+F9 | same | `formulas.calculateNow` / `calculateSheet` | have |
+| Ctrl+Shift+F9 | same | recheck dependents and recalculate | missing |
+
+**Mac extras** (where the Windows key would clash with a system key)
+
+| Excel for Mac | Our command id (or handler) | Status |
+|---|---|---|
+| Cmd+Option+R | `view.collapseRibbon` | have |
+| Cmd+Shift+H / R / K / J, Control+L, Control+U | Replace, Sort, `data.group` / `ungroup`, Define Name, edit the active cell | have |
+| Cmd+Option+arrows, Cmd+Option+0 / - | `home.borders` per side, outside / none | have |
+| Cmd+Shift+F2, Cmd+F3, Cmd+Shift+F3 | New Comment, Name Manager, Create from Selection | have |
+| Cmd+= , Shift+F7, Cmd+Shift+L | calculate, thesaurus, Modify Cell Style | missing (Cmd+= is egui's zoom key; no thesaurus or cell-style dialog) |
+
+Count today: 68 command specs declare a `shortcut` string; the grid, editor and `keymap.rs` add the
+rest of the keys above (about 40 more combinations), and six of them landed with this audit. The
+remaining Excel keys are mostly features we do not have yet (Quick Analysis, extend mode, pane
+cycling, sheet groups), listed as missing rather than silently absent.
 
 On Windows, AltGr arrives as Ctrl+Alt: a Ctrl+Alt key that also types a character is treated as
 text, so AltGr symbols (e.g. `~` on a German layout) and user-defined Ctrl+Alt+letter hotkeys that type
@@ -168,7 +314,7 @@ by rule and will never match Office's, by design.
 
 ## Work (50–80 h)
 
-Key tips 3–5 · remaining shortcuts with their features 2–4 · context menus and Quick Analysis 5–8 · Page Layout view
+Key tips done · remaining shortcuts with their features 2–4 · keyboard context menus done, Quick Analysis 5–8 · Page Layout view
 8–12 · Options dialog and ribbon/QAT customization 6–10 · accessibility 12–18 · selection and
 scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 
@@ -176,6 +322,7 @@ scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | major | Key tips across the whole ribbon: 417 sequences, every standard tab and the contextual Table Design / Chart Design / Header & Footer tabs, per-control badges for what had none (strikethrough, Draw pens/eraser, Slicer, Checkbox, Show/Hide Detail, Data Analysis, Solver, Forecast Sheet, Show Comments, Insert Slicer, chart controls, header/footer fields, Automate), sparkline paths cut to four keys, and tests for length, uniqueness, per-scope badge collisions, tab reachability and catalog targets. Shift+F10's context menus are keyboard-navigable (arrows/Home/End/Enter/Space/Esc, highlight painted, the grid keeps focus and selection and Space does not start an edit); the Menu key is blocked in egui-winit. Shortcut audit: Alt+; visible cells, Ctrl+Shift+O commented cells, Ctrl+F2 / Ctrl+Shift+F12 print, Alt+F5 / Ctrl+Alt+F5 pivot and query refresh added, the full Excel → command table written down |
 | 2026-10-21 | minor | Background error checking, first part (#1994): a constant whose text would be a number if typed (signs, thousands, currency, percent, exponent, parenthesised negative) gets Excel's green corner triangle; the active cell then shows a warning button whose menu names the problem and offers Convert to Number for the selection (`formulas.convertToNumber`). Dates, times and fractions kept as text and formula results are not flagged, as in Excel |
 | 2026-10-21 | minor | Paste Special laid out as Excel's: Paste and Operation options each in two columns inside a frame, Skip blanks and Transpose side by side, Paste Link as a button that pastes references at once; labels translated (the generic form didn't translate them) and the window no longer runs past the screen |
 | 2026-10-21 | minor | Form dialogs (conditional-format quick rules, New Name, Remove Duplicates, Text to Columns and every other `Dialog::form`) fit their content: OK and Cancel sit in a row under the last field instead of a right-to-left layout that took the screen's whole height and left the buttons floating halfway down |
