@@ -3771,9 +3771,13 @@ fn object_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
             }
         });
     });
+    // A click inside an open submenu (Slicer Styles) lands outside this area and must not close
+    // the menu before the submenu's item handles it.
+    let submenu_open = egui::Popup::is_any_open(ui.ctx());
     if close
         || ui.input(|i| i.key_pressed(egui::Key::Escape))
-        || (ui.input(|i| i.pointer.any_pressed())
+        || (!submenu_open
+            && ui.input(|i| i.pointer.any_pressed())
             && !resp.response.contains_pointer()
             && !resp.response.hovered()
             && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !resp.response.rect.contains(p)))

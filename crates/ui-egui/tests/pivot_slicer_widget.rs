@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Shape, vec2};
+use egui_kittest::kittest::Queryable as _;
 use gridcraft_engine::Session;
 use gridcraft_engine::core::{CellRef, MAX_COLS, MAX_ROWS};
 use gridcraft_engine::model::{AnchorMode, SlicerValue};
@@ -374,6 +375,24 @@ fn the_selection_pane_lists_the_slicer_and_timeline() {
     let texts = painted_texts(&h);
     assert!(texts.iter().any(|t| t.contains("Slicer Region")), "{texts:?}");
     assert!(texts.iter().any(|t| t.contains("Timeline Date")), "{texts:?}");
+}
+
+#[test]
+fn the_style_submenu_runs_slicer_set_style() {
+    let (mut h, slicer, _) = fixture();
+    let f = frame(&h, slicer);
+    let pos = f.left_top() + vec2(20.0, 13.0);
+    move_to(&mut h, pos);
+    h.input_mut().events.push(Event::PointerButton { pos, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+    h.input_mut().events.push(Event::PointerButton { pos, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(3);
+    let styles = h.get_by_role_and_label(egui::accesskit::Role::Button, "Slicer Styles").rect().center();
+    click(&mut h, styles);
+    let dark = h.get_by_role_and_label(egui::accesskit::Role::Button, "SlicerStyleDark4").rect().center();
+    click(&mut h, dark);
+    let d = h.state().session.active().unwrap();
+    let sh = d.wb.active().unwrap();
+    assert_eq!(sh.pivot_slicers.iter().find(|s| s.id == slicer).unwrap().style, "SlicerStyleDark4");
 }
 
 #[test]
