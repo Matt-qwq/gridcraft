@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M19 save peak measured after S4a: **3.92 s / 1,655.8 MiB** for 31.7M cells (`real_117m`) and **26.37 s / 6,049.8 MiB** for the 100M-cell export (`session_breakdown`, release, counting allocator). The writer's retained sheet XMLs dominate; S4b (per-sheet release) is the remaining wave-0 item |
 | 2026-10-29 | M19 writer ownership: `ZipOut::add` takes each part by value, `write_zip` drops a part as soon as its deflate worker finishes, and the zip64 decision is taken from a whole-archive bound before compression; output is byte-identical (37,153 bytes / `sha256 ae15eeb1…` pinned). 271 xlsx / 423 engine tests; per-sheet release remains, after a measured save peak |
 | 2026-10-29 | M19 spill beside the document: a paging open tries the document folder then temp, `GRIDCRAFT_SPILL=temp|off`, skips UNC; Unix creates it 0600 and unlinks the name at once, Windows uses delete-on-close; a write failure latches spilling off (pages already written stay readable) and an unavailable spill warns but still opens live. 104 model / 268 xlsx / 423 engine tests |
 | 2026-10-29 | M19 uncached save scan: `iter_scan`/`visit_scan` hold one band and one packed row at a time and decode pages without touching the cache; `sheet_write` uses it, so a save leaves the viewport's cache exactly unchanged and no longer collects a 16k-wide band into a `Vec`. Model 97, xlsx 266, engine 422; byte-identical output pinned |
@@ -252,7 +253,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-29 | minor | M19 writer ownership (owned parts, drop-after-deflate, zip64 bound up front; byte-identical output pinned); 271 xlsx / 423 engine tests; per-sheet release remains |
+| 2026-10-29 | minor | M19 writer ownership + measured save peak (31.7M: 3.92 s / 1.66 GiB; 100M: 26.37 s / 6.05 GiB, release counting allocator); retained sheet XMLs dominate; per-sheet release remains |
 | 2026-10-29 | minor | M19 spill beside the document (folder-then-temp, `GRIDCRAFT_SPILL`, UNC skip, Unix 0600+unlink, Windows delete-on-close, failure latch, warning); 104 model / 268 xlsx / 423 engine tests; writer peak remains |
 | 2026-10-29 | minor | M19 uncached save scan (`iter_scan`/`visit_scan`, writer wired, one band at a time, cache stats unchanged, byte-identical output); 97 model / 266 xlsx / 422 engine tests; spill placement and the writer peak remain |
 | 2026-10-29 | minor | M19 byte-budget page cache (64 MiB default, env-clamped, per-file sharing, generation/`Weak` accounting, `PageCacheStats`, compaction priming charged); 93 model / 422 engine tests; spill placement, save/scan and page-file rewrite remain |

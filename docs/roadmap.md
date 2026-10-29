@@ -563,8 +563,14 @@ fails the save instead of writing an empty part. `Out` still retains the sheet X
 release (S4b) is the remaining peak, to be done after a measured save peak. Xlsx **271**, engine
 **423** tests.
 
-**Scope (remaining).** The XLSX writer still retains every sheet's XML (the real save peak, S4b),
-and a page-file rewrite (bytes appended by compaction) is deferred. Bands outside the working set
+**Measured save peak (10-29, `session_breakdown`, release, counting allocator).** The writer, not
+the store, dominates: the 31.7M-cell `real_117m` saves in **3.92 s with a 1,655.8 MiB peak** (live
+141.5 MiB before the save), and the 100M-cell export saves in **26.37 s with a 6,049.8 MiB peak**
+(live 19.3 MiB before the save). S4a removed the redundant part copies; the remaining peak is
+`Out.parts` holding every sheet's XML plus the compressed archive (S4b).
+
+**Scope (remaining).** Per-sheet release (S4b) is the real save peak, and a page-file rewrite
+(bytes appended by compaction) is deferred. Bands outside the working set
 do leave memory, decompressed when the viewport, calculation or a command touches them, which is
 the phase's core.
 
@@ -801,6 +807,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | Measured save peak after S4a: 31.7M cells saves in **3.92 s / 1,655.8 MiB peak**, 100M cells in **26.37 s / 6,049.8 MiB peak** (`session_breakdown`, release, counting allocator). The remaining peak is every sheet's XML in `Out.parts` plus the archive; S4b (per-sheet release) is next |
 | 2026-10-29 | minor | M19 writer ownership: `ZipOut::add` takes `Vec` parts, each moves into its deflate worker and is dropped there, zip64 is decided from a whole-archive bound before compression; output unchanged (37,153 bytes / `sha256 ae15eeb1…` pinned); 271 xlsx / 423 engine tests. Per-sheet release remains, after a measured save peak |
 | 2026-10-29 | minor | M19 spill beside the document: document folder then temp, `GRIDCRAFT_SPILL=temp|off`, UNC skip, sanitized name, Unix 0600 + unlink-after-open, Windows delete-on-close, write-failure latch and one warning when paging is unavailable; 104 model / 268 xlsx / 423 engine tests |
 | 2026-10-29 | minor | M19 uncached save scan: `iter_scan`/`visit_scan` decode one band at a time without touching the page cache, and the XLSX writer uses it (cache stats unchanged, decodes = paged band count, byte-identical output); 97 model / 266 xlsx / 422 engine tests |

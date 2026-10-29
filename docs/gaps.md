@@ -94,6 +94,10 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Insert inheritance, delete, undo and a mapped-sheet XLSX round trip are covered (model 62,
   engine 419, xlsx 265 tests). The UI also caches the derived `LineIndex`/outline axes per
   `(document, revision, sheet)`, so a 1M-custom-height sheet no longer rebuilds them every frame.
+- **Measured 10-29: save peak.** After S4a the 31.7M-cell `real_117m` saves in 3.92 s with a
+  **1,655.8 MiB peak**; the 100M-cell export saves in 26.37 s with a **6,049.8 MiB peak** (live
+  19.3 MiB before the save). `Out.parts` retaining every sheet's XML is the remaining cause; S4b
+  (per-sheet release) is the wave-0 fix.
 - **Landed (10-29): writer ownership.** `ZipOut::add` takes each part `Vec` instead of copying it,
   `write_zip` moves each part into its deflate worker and drops it there, and the zip64 decision is
   taken before compression from a whole-archive bound. Output is byte-identical (37,153 bytes pinned
