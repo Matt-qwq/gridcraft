@@ -1370,8 +1370,11 @@ impl SheetApp {
             match action {
                 keytips::Action::Tab("File") => self.open_backstage(backstage::Page::Home),
                 keytips::Action::Tab(tab) => {
-                    self.run_or_alert("ui.ribbonTab", json!({"tab": tab}));
-                    self.ui.ribbon_collapsed = false;
+                    // A contextual tab opens only while its context exists (see ribbon::tab_available).
+                    if crate::ribbon::tab_available(self, tab) {
+                        self.run_or_alert("ui.ribbonTab", json!({"tab": tab}));
+                        self.ui.ribbon_collapsed = false;
+                    }
                 }
                 keytips::Action::Command(id @ ("edit.copy" | "edit.cut")) => self.copy_to_clipboard(ctx, id),
                 keytips::Action::Command("edit.paste") => self.paste_from_clipboard(),

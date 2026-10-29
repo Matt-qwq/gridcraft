@@ -306,3 +306,65 @@ fn ctrl_alt_letter_that_typed_text_is_not_select_all() {
     assert_eq!(h.state().session.active().unwrap().selection.current().a1(), "B2");
     assert_eq!(h.state().editor.as_ref().unwrap().text, "\u{e4}");
 }
+
+/// The Excel shortcuts added by the M14 keyboard audit (#110): Alt+; visible cells,
+/// Ctrl+Shift+O cells with notes, Ctrl+F1 ribbon, Ctrl+F2 / Ctrl+Shift+F12 print, Alt+F5 /
+/// Ctrl+Alt+F5 pivot and query refreshes. The lookup table is the contract; the two selection
+/// commands also run end to end.
+#[test]
+fn excel_shortcuts_added_by_the_audit() {
+    let run = |id: &'static str| Some(Shortcut::Run(id, json!({})));
+    // Alt+; selects the visible cells only (Excel's "Select Visible Cells").
+    assert_eq!(
+        lookup(Key::Semicolon, Some(Key::Semicolon), Modifiers::ALT, false),
+        Some(Shortcut::Run("edit.goToSpecial", json!({"kind": "visible"})))
+    );
+    // Ctrl+Shift+O selects the cells that carry a comment or note.
+    assert_eq!(lookup(Key::O, Some(Key::O), CTRL_SHIFT, false), Some(Shortcut::Run("edit.goToSpecial", json!({"kind": "comments"}))));
+    // Ctrl+F1 collapses the ribbon (the Mac variant, Cmd+F1, already did).
+    assert_eq!(lookup(Key::F1, Some(Key::F1), CTRL, false), run("view.collapseRibbon"));
+    // Ctrl+F2 and Ctrl+Shift+F12 open the print window; Ctrl+P stays as it was.
+    assert_eq!(lookup(Key::F2, Some(Key::F2), CTRL, false), Some(Shortcut::Print));
+    assert_eq!(lookup(Key::F12, Some(Key::F12), CTRL_SHIFT, false), Some(Shortcut::Print));
+    assert_eq!(lookup(Key::F2, Some(Key::F2), CTRL, true), None, "Cmd+F2 is not Excel's print on a Mac");
+    // Alt+F5 refreshes the selected PivotTable; Ctrl+Alt+F5 refreshes everything.
+    assert_eq!(lookup(Key::F5, Some(Key::F5), Modifiers::ALT, false), run("pivot.refresh"));
+    let ctrl_alt = Modifiers { alt: true, ..CTRL };
+    assert_eq!(lookup(Key::F5, Some(Key::F5), ctrl_alt, false), run("data.refreshAll"));
+    // The plain keys keep their meanings.
+    assert_eq!(lookup(Key::F2, Some(Key::F2), Modifiers::NONE, false), None);
+    assert_eq!(lookup(Key::F5, Some(Key::F5), Modifiers::NONE, false), Some(Shortcut::Dialog("goTo", json!({}))));
+}
+
+#[test]
+fn alt_semicolon_selects_only_visible_cells() {
+    let mut h = harness(book("A1:A3"));
+    h.state_mut().session.execute("selection.set", json!({"range": "2:2"})).unwrap();
+    h.state_mut().session.execute("home.hideRows", json!({})).unwrap();
+    h.state_mut().session.execute("selection.set", json!({"range": "A1:A3"})).unwrap();
+    key(&mut h, Key::Semicolon, Modifiers::ALT);
+    let sel = h.state().session.active().unwrap().selection.clone();
+    assert!(!sel.contains(CellRef::new(1, 0)), "the hidden row is left out");
+    assert!(sel.contains(CellRef::new(0, 0)) && sel.contains(CellRef::new(2, 0)), "the visible rows stay");
+    assert_ne!(h.state().session.active().unwrap().selection.current().start.row, 1, "the active cell is a visible one");
+}
+
+#[test]
+fn ctrl_shift_o_selects_the_cells_with_notes() {
+    let mut h = harness(book("A1:C3"));
+    h.state_mut().session.execute("review.newNote", json!({"cell": "B2", "text": "look here"})).unwrap();
+    key(&mut h, Key::O, CTRL_SHIFT);
+    let d = h.state().session.active().unwrap();
+    assert_eq!(d.selection.current().a1(), "B2", "the note's cell is selected");
+    assert!(!d.selection.contains(CellRef::new(0, 0)), "cells without notes are not");
+}
+
+#[test]
+fn ctrl_f1_collapses_and_expands_the_ribbon() {
+    let mut h = harness(book("A1"));
+    assert!(!h.state().ui.ribbon_collapsed);
+    key(&mut h, Key::F1, CTRL);
+    assert!(h.state().ui.ribbon_collapsed);
+    key(&mut h, Key::F1, CTRL);
+    assert!(!h.state().ui.ribbon_collapsed);
+}

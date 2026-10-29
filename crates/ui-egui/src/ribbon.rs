@@ -340,6 +340,13 @@ fn contextual_tabs(app: &SheetApp) -> Vec<&'static str> {
     v
 }
 
+/// Whether a key tip may switch to `tab`: the standard tabs always, a contextual tab only while
+/// its context exists (Table Design with a table, Chart Design with a selected chart, Header &
+/// Footer while editing one). Excel ignores the keytip rather than opening an empty tab.
+pub(crate) fn tab_available(app: &SheetApp, tab: &str) -> bool {
+    !matches!(tab, "Table Design" | "Chart Design" | crate::paper_view::TAB) || contextual_tabs(app).contains(&tab)
+}
+
 fn sep(ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let (r, _) = ui.allocate_exact_size(vec2(13.0, 72.0), Sense::hover());
@@ -378,14 +385,14 @@ fn keytip(app: &SheetApp, ui: &Ui, sequence: &str, at: egui::Pos2) {
 }
 
 /// Paint the badge for a control that runs command `id`, when the armed prefix matches.
-fn control_keytip(app: &SheetApp, ui: &Ui, response: &egui::Response, id: &str) {
+pub(crate) fn control_keytip(app: &SheetApp, ui: &Ui, response: &egui::Response, id: &str) {
     if let Some(sequence) = keytip_table::control_badge(app.keytips.prefix().unwrap_or_default(), id) {
         keytip(app, ui, sequence, response.rect.center_bottom());
     }
 }
 
 /// Paint the single badge for a menu anchor whose popup items run `targets`.
-fn anchor_keytip(app: &SheetApp, ui: &Ui, response: &egui::Response, targets: &[&str]) {
+pub(crate) fn anchor_keytip(app: &SheetApp, ui: &Ui, response: &egui::Response, targets: &[&str]) {
     if let Some(sequence) = keytip_table::anchor_badge(app.keytips.prefix().unwrap_or_default(), targets) {
         keytip(app, ui, sequence, response.rect.center_bottom());
     }
@@ -398,7 +405,7 @@ fn checkbox_on(clicked: bool, shown: bool) -> bool {
 }
 
 /// Consume a one-shot keytip request for control `id` (set by `Action::Control`).
-fn invoke(app: &mut SheetApp, id: &str) -> bool {
+pub(crate) fn invoke(app: &mut SheetApp, id: &str) -> bool {
     if app.ui.keytip_invoke == Some(id) {
         app.ui.keytip_invoke = None;
         true
@@ -408,7 +415,7 @@ fn invoke(app: &mut SheetApp, id: &str) -> bool {
 }
 
 /// Force-open command for a popup: either a keytip invoke (open it) or a click (toggle).
-fn popup_command(forced: bool, clicked: bool) -> Option<egui::SetOpenCommand> {
+pub(crate) fn popup_command(forced: bool, clicked: bool) -> Option<egui::SetOpenCommand> {
     if forced { Some(egui::SetOpenCommand::Bool(true)) } else { clicked.then_some(egui::SetOpenCommand::Toggle) }
 }
 
@@ -1648,7 +1655,9 @@ fn insert(app: &mut SheetApp, ui: &mut Ui) {
         });
     });
     sep(ui);
-    if big_button(ui, Icon::Filter, "Slicer", "Insert a slicer to filter a table", false).clicked() {
+    let sl = big_button(ui, Icon::Filter, "Slicer", "Insert a slicer to filter a table", false);
+    control_keytip(app, ui, &sl, "insert.slicer");
+    if sl.clicked() {
         act(app, "insert.slicer", json!({}));
     }
     sep(ui);
@@ -1663,7 +1672,9 @@ fn insert(app: &mut SheetApp, ui: &mut Ui) {
     });
     sep(ui);
     // Cell Controls.
-    if big_button(ui, Icon::Checkbox, "Checkbox", "Insert checkboxes in the selected cells", false).clicked() {
+    let cb = big_button(ui, Icon::Checkbox, "Checkbox", "Insert checkboxes in the selected cells", false);
+    control_keytip(app, ui, &cb, "insert.checkbox");
+    if cb.clicked() {
         act(app, "insert.checkbox", json!({}));
     }
     sep(ui);
@@ -1717,6 +1728,7 @@ fn draw(app: &mut SheetApp, ui: &mut Ui) {
     for (label, color) in [("Pen\nBlue", "#1F5FC9"), ("Pen\nBlack", "#000000"), ("Pen\nRed", "#D13B2F"), ("Highlighter", "#F2E33A")] {
         let on = tool == "pen" && app.session.draw_color.eq_ignore_ascii_case(color);
         let r = big_button(ui, Icon::Pen, label, "Draw with ink", false);
+        control_keytip(app, ui, &r, "draw.pen");
         if on {
             ui.painter().rect_stroke(r.rect, 5.0, Stroke::new(2.0, Tokens::get(ui.ctx()).accent), StrokeKind::Inside);
         }
@@ -1726,6 +1738,7 @@ fn draw(app: &mut SheetApp, ui: &mut Ui) {
         }
     }
     let er = big_button(ui, Icon::Eraser, "Eraser", "Erase ink strokes", false);
+    control_keytip(app, ui, &er, "draw.eraser");
     if tool == "eraser" {
         ui.painter().rect_stroke(er.rect, 5.0, Stroke::new(2.0, Tokens::get(ui.ctx()).accent), StrokeKind::Inside);
     }
@@ -1887,6 +1900,7 @@ fn page_layout(app: &mut SheetApp, ui: &mut Ui) {
     });
     let rtl = app.session.active().and_then(|d| d.wb.active()).is_some_and(|s| s.right_to_left);
     let r = big_button(ui, Icon::SheetRtl, "Sheet\nRight-to-Left", "Sheet Right-to-Left", false);
+    control_keytip(app, ui, &r, "view.rightToLeft");
     if rtl {
         let t = Tokens::get(ui.ctx());
         ui.painter().rect_stroke(r.rect, 5.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
@@ -2131,7 +2145,9 @@ fn data(app: &mut SheetApp, ui: &mut Ui) {
             ],
         );
     });
-    if big_button(ui, Icon::ChartLine, "Forecast\nSheet", "Forecast Sheet", false).clicked() {
+    let fc = big_button(ui, Icon::ChartLine, "Forecast\nSheet", "Forecast Sheet", false);
+    control_keytip(app, ui, &fc, "data.forecastSheet");
+    if fc.clicked() {
         app.open_dialog("forecastSheet", json!({}));
     }
     sep(ui);
@@ -2153,19 +2169,27 @@ fn data(app: &mut SheetApp, ui: &mut Ui) {
         }
     });
     ui.vertical(|ui| {
-        if small_button(ui, Icon::Plus, "Show Detail", "Show Detail", false).clicked() {
+        let sd = small_button(ui, Icon::Plus, "Show Detail", "Show Detail", false);
+        control_keytip(app, ui, &sd, "data.showDetail");
+        if sd.clicked() {
             act(app, "data.showDetail", json!({}));
         }
-        if small_button(ui, Icon::Minus, "Hide Detail", "Hide Detail", false).clicked() {
+        let hd = small_button(ui, Icon::Minus, "Hide Detail", "Hide Detail", false);
+        control_keytip(app, ui, &hd, "data.hideDetail");
+        if hd.clicked() {
             act(app, "data.hideDetail", json!({}));
         }
     });
     sep(ui);
-    if big_button(ui, Icon::ChartBar, "Data\nAnalysis", "Data Analysis", false).clicked() {
+    let da = big_button(ui, Icon::ChartBar, "Data\nAnalysis", "Data Analysis", false);
+    control_keytip(app, ui, &da, "dialog:analysisToolPak");
+    if da.clicked() {
         app.open_dialog("analysisToolPak", json!({}));
     }
     sep(ui);
-    if big_button(ui, Icon::Function, "Solver", "Solver", false).clicked() {
+    let so = big_button(ui, Icon::Function, "Solver", "Solver", false);
+    control_keytip(app, ui, &so, "dialog:solver");
+    if so.clicked() {
         app.open_dialog("solver", json!({}));
     }
 }
@@ -2201,7 +2225,9 @@ fn review(app: &mut SheetApp, ui: &mut Ui) {
         for (icon, label, tip, id) in
             [(Icon::Left, "Previous", "Previous Comment", "review.previousComment"), (Icon::Right, "Next", "Next Comment", "review.nextComment")]
         {
-            if small_button(ui, icon, label, tip, false).clicked() {
+            let r = small_button(ui, icon, label, tip, false);
+            control_keytip(app, ui, &r, id);
+            if r.clicked() {
                 act(app, id, json!({}));
                 app.grid.ensure_visible = true;
             }
@@ -2209,6 +2235,7 @@ fn review(app: &mut SheetApp, ui: &mut Ui) {
     });
     let shown = app.session.comments_pane;
     let r = big_button(ui, Icon::Comment, "Show\nComments", "Comments pane", false);
+    control_keytip(app, ui, &r, "review.showComments");
     if shown {
         ui.painter().rect_stroke(r.rect, 5.0, Stroke::new(2.0, Tokens::get(ui.ctx()).accent), StrokeKind::Inside);
     }
@@ -2219,7 +2246,7 @@ fn review(app: &mut SheetApp, ui: &mut Ui) {
         }
     }
     let notes = big_button(ui, Icon::Note, "Notes", "Notes", true);
-    anchor_keytip(app, ui, &notes, &["review.nextComment"]);
+    anchor_keytip(app, ui, &notes, &["dialog:comment", "review.showNote", "review.showAllNotes", "review.convertToComments"]);
     egui::Popup::menu(&notes).show(|ui| {
         menu_items(
             app,
@@ -2245,7 +2272,9 @@ fn review(app: &mut SheetApp, ui: &mut Ui) {
     if __k.clicked() {
         crate::backstage::protect_workbook(app);
     }
-    if big_button(ui, Icon::Validation, "Allow Edit\nRanges", "Allow Edit Ranges", false).clicked() {
+    let aer = big_button(ui, Icon::Validation, "Allow Edit\nRanges", "Allow Edit Ranges", false);
+    control_keytip(app, ui, &aer, "dialog:allowEditRanges");
+    if aer.clicked() {
         app.open_dialog("allowEditRanges", json!({}));
     }
 }
@@ -2319,9 +2348,10 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
     }
     sep(ui);
     let fp = big_button(ui, Icon::Freeze, "Freeze\nPanes", "Freeze Panes", true);
-    for sequence in
-        keytip_table::group_extension(app.keytips.prefix().unwrap_or_default(), &["view.freezePanes", "view.freezeTopRow", "view.freezeFirstColumn"])
-    {
+    for sequence in keytip_table::group_extension(
+        app.keytips.prefix().unwrap_or_default(),
+        &["view.freezePanes", "view.freezeTopRow", "view.freezeFirstColumn", "view.unfreezePanes"],
+    ) {
         keytip(app, ui, sequence, fp.rect.center_bottom());
     }
     egui::Popup::menu(&fp).show(|ui| {
@@ -2387,7 +2417,9 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
 }
 
 fn automate(app: &mut SheetApp, ui: &mut Ui) {
-    if big_button(ui, Icon::Script, "Macros", "Macros and scripts in this workbook (Alt+F8)", false).clicked() {
+    let mc = big_button(ui, Icon::Script, "Macros", "Macros and scripts in this workbook (Alt+F8)", false);
+    control_keytip(app, ui, &mc, "dialog:macros");
+    if mc.clicked() {
         app.open_dialog("macros", json!({}));
     }
     let __k = big_button(ui, Icon::Script, "Command\nPalette", "Search and run any command", false);
@@ -2446,7 +2478,9 @@ fn table_design(app: &mut SheetApp, ui: &mut Ui) {
         act(app, "table.convertToRange", json!({"table": tname}));
     }
     sep(ui);
-    if big_button(ui, Icon::Filter, "Insert\nSlicer", "Insert Slicer", false).clicked() {
+    let isl = big_button(ui, Icon::Filter, "Insert\nSlicer", "Insert Slicer", false);
+    control_keytip(app, ui, &isl, "table.insertSlicer");
+    if isl.clicked() {
         act(app, "table.insertSlicer", json!({"table": tname}));
     }
     sep(ui);
@@ -2457,8 +2491,10 @@ fn table_design(app: &mut SheetApp, ui: &mut Ui) {
             ("Banded Rows", "table.bandedRows", banded),
         ] {
             let mut on = v;
-            if ui.checkbox(&mut on, label).changed() {
-                act(app, cmd, json!({"table": tname, "on": on}));
+            let resp = ui.checkbox(&mut on, label);
+            control_keytip(app, ui, &resp, cmd);
+            if resp.changed() || invoke(app, cmd) {
+                act(app, cmd, json!({"table": tname, "on": checkbox_on(resp.changed(), on)}));
             }
         }
     });
@@ -2469,8 +2505,10 @@ fn table_design(app: &mut SheetApp, ui: &mut Ui) {
             ("Banded Columns", "table.bandedColumns", banded_c),
         ] {
             let mut on = v;
-            if ui.checkbox(&mut on, label).changed() {
-                act(app, cmd, json!({"table": tname, "on": on}));
+            let resp = ui.checkbox(&mut on, label);
+            control_keytip(app, ui, &resp, cmd);
+            if resp.changed() || invoke(app, cmd) {
+                act(app, cmd, json!({"table": tname, "on": checkbox_on(resp.changed(), on)}));
             }
         }
     });
@@ -2520,10 +2558,8 @@ fn table_style_strip(app: &mut SheetApp, ui: &mut Ui, tname: &str, current: &str
 fn chart_design(app: &mut SheetApp, ui: &mut Ui) {
     let Some(id) = app.selected_chart else { return };
     let ae = big_button(ui, Icon::Chart, "Add Chart\nElement", "Add Chart Element", true);
-    for sequence in keytip_table::group_extension(app.keytips.prefix().unwrap_or_default(), &["chart.set"]) {
-        keytip(app, ui, sequence, ae.rect.center_bottom());
-    }
-    egui::Popup::menu(&ae).show(|ui| {
+    control_keytip(app, ui, &ae, "chart.addElementMenu");
+    egui::Popup::menu(&ae).open_memory(popup_command(invoke(app, "chart.addElementMenu"), ae.clicked())).show(|ui| {
         menu_items(
             app,
             ui,
@@ -2545,17 +2581,14 @@ fn chart_design(app: &mut SheetApp, ui: &mut Ui) {
     if __k.clicked() {
         act(app, "chart.switchRowColumn", json!({"chart": id}));
     }
-    if big_button(ui, Icon::Table, "Select\nData", "Select Data", false).clicked() {
+    let sd = big_button(ui, Icon::Table, "Select\nData", "Select Data", false);
+    control_keytip(app, ui, &sd, "dialog:selectData");
+    if sd.clicked() {
         app.open_dialog("selectData", json!({"chart": id}));
     }
     let ct = big_button(ui, Icon::ChartBar, "Change\nChart Type", "Change Chart Type", true);
-    for sequence in keytip_table::group_extension(
-        app.keytips.prefix().unwrap_or_default(),
-        &["column", "bar", "line", "area", "pie", "doughnut", "scatter", "radar", "waterfall", "funnel", "treemap"],
-    ) {
-        keytip(app, ui, sequence, ct.rect.center_bottom());
-    }
-    egui::Popup::menu(&ct).show(|ui| {
+    control_keytip(app, ui, &ct, "chart.changeTypeMenu");
+    egui::Popup::menu(&ct).open_memory(popup_command(invoke(app, "chart.changeTypeMenu"), ct.clicked())).show(|ui| {
         for (label, k, s) in [
             ("Clustered Column", "column", ""),
             ("Stacked Column", "column", "stacked"),
@@ -2575,12 +2608,14 @@ fn chart_design(app: &mut SheetApp, ui: &mut Ui) {
             }
         }
     });
-    if big_button(ui, Icon::Settings, "Format\nPane", "Format Chart pane", false).clicked() {
+    let fp = big_button(ui, Icon::Settings, "Format\nPane", "Format Chart pane", false);
+    control_keytip(app, ui, &fp, "chartFormatPane");
+    if fp.clicked() || invoke(app, "chartFormatPane") {
         app.grid.pane = Some("formatChart".into());
     }
     let __k = big_button(ui, Icon::TextBox, "Chart\nTitle", "Edit chart title", false);
     control_keytip(app, ui, &__k, "chartTitle");
-    if __k.clicked() {
+    if __k.clicked() || invoke(app, "chartTitle") {
         app.open_dialog("chartTitle", json!({"chart": id}));
     }
     let __k = big_button(ui, Icon::Delete, "Delete\nChart", "Delete chart", false);

@@ -39,6 +39,8 @@ pub enum Shortcut {
     DropDown,
     /// Ctrl+Alt+= / Ctrl+Alt+-: zoom in / out.
     Zoom(i32),
+    /// Ctrl+F2 / Ctrl+Shift+F12: the print window (same flow as Ctrl+P).
+    Print,
 }
 
 fn run(id: &'static str) -> Shortcut {
@@ -81,6 +83,8 @@ pub fn lookup(key: Key, physical: Option<Key>, m: Modifiers, mac: bool) -> Optio
         Num7 if ctrl && s => borders("outside"),
         Minus if ctrl && s => borders("none"),
         Num8 if ctrl && s => run("selection.currentRegion"),
+        Semicolon if alt => Shortcut::Run("edit.goToSpecial", json!({"kind": "visible"})),
+        O if ctrl && s => Shortcut::Run("edit.goToSpecial", json!({"kind": "comments"})),
         Semicolon if ctrl && s => Shortcut::Time,
         Quote if ctrl && s => Shortcut::ValueAbove,
         Quote if ctrl => Shortcut::FormulaAbove,
@@ -130,6 +134,8 @@ pub fn lookup(key: Key, physical: Option<Key>, m: Modifiers, mac: bool) -> Optio
         Equals | Plus if ctrl_alt => Shortcut::Zoom(10),
         Minus if ctrl_alt && !mac => Shortcut::Zoom(-10),
         F9 if ctrl_alt => run("formulas.calculateNow"),
+        F5 if ctrl_alt => run("data.refreshAll"),
+        F5 if alt => run("pivot.refresh"),
         R if ctrl_alt && mac => run("view.collapseRibbon"),
         Num0 if ctrl_alt && mac => borders("outside"),
         Minus if ctrl_alt && mac => borders("none"),
@@ -153,6 +159,7 @@ pub fn lookup(key: Key, physical: Option<Key>, m: Modifiers, mac: bool) -> Optio
         F1 if cmd && !s => run("view.collapseRibbon"),
         F2 if (cmd || ctrl) && s => Shortcut::Dialog("comment", json!({"threaded": true})),
         F2 if plain && s => Shortcut::Dialog("comment", json!({"threaded": false})),
+        F2 if cmd && !s && !mac => Shortcut::Print,
         F3 if cmd && s => run("formulas.createFromSelection"),
         F3 if cmd && mac => Shortcut::Dialog("defineName", json!({})),
         F3 if cmd => Shortcut::Dialog("nameManager", json!({})),
@@ -164,6 +171,7 @@ pub fn lookup(key: Key, physical: Option<Key>, m: Modifiers, mac: bool) -> Optio
         F9 if plain && s => run("formulas.calculateSheet"),
         F10 if plain && s => Shortcut::ContextMenu,
         F11 if plain && s => run("home.insertSheet"),
+        F12 if cmd && s && !mac => Shortcut::Print,
         F12 if plain && !s => run("file.saveAs"),
         _ => return None,
     })
@@ -228,7 +236,17 @@ pub(crate) fn dispatch(app: &mut SheetApp, ctx: &egui::Context, key: Key, physic
             app.grid.reveal_moving_end = m.shift;
         }
         Shortcut::Edit => app.begin_edit(None, false),
-        Shortcut::ContextMenu => app.grid.context_menu = Some(geo.cell_rect(sh, active).center()),
+        // The Menu key would land here too, but egui-winit drops `KeyCode::ContextMenu` before
+        // the app sees it (there is no `egui::Key` variant; see docs/ui-parity.md). Shift+F10 is
+        // the reachable pair.
+        Shortcut::ContextMenu => {
+            app.grid.menu_nav = None;
+            app.grid.context_menu = Some(geo.cell_rect(sh, active).center());
+        }
+        Shortcut::Print => {
+            app.commit_edit(0, 0, false, false);
+            app.print_now(json!({}));
+        }
         Shortcut::DropDown => {
             if sh.validations.iter().any(|d| d.in_cell_dropdown && d.ranges.iter().any(|r| r.contains(active))) {
                 app.grid.list_picker = Some(active);
