@@ -555,6 +555,7 @@ fn insert_timeline(s: &mut Session, p: &Json) -> Result<Json> {
         pivot_tables: vec![pt.name.clone()],
         style,
         unit,
+        range: None,
         anchor: Anchor { cell: at, dx: 4.0, dy: 4.0, width, height, mode: AnchorMode::MoveOnly },
     };
     edit(s, |cx| {

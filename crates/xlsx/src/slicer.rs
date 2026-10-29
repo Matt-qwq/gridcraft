@@ -18,8 +18,8 @@
 //!   PivotTable's `<x14:slicerCacheData>` extension) are removed from the preserved content, so the
 //!   kept path cannot write them a second time;
 //! - content that was **not** modelled (an OLAP cache, item properties, an unknown attribute or
-//!   relationship, a timeline with a selected date range, a sort order other than the default, a
-//!   refresh version this model does not carry, a damaged part) is not touched: every part,
+//!   relationship, a timeline cache whose state, range or refresh version this model does not
+//!   carry, a sort order other than the default, a damaged part) is not touched: every part,
 //!   relationship and extension stays as it is, and a save keeps it byte for byte;
 //! - modelling is all-or-nothing for each kind: one cache GridCraft cannot fully understand leaves
 //!   *every* slicer in that workbook on the kept path, and the same for timelines. That is stricter
@@ -32,10 +32,19 @@
 //! `xdr:graphicFrame` whose `a:graphicData` names the widget and its name ([`crate::drawing`]).
 //! Reading takes the anchor from that frame; writing emits it there.
 //!
+//! A timeline's selected date range is modelled ([`TimelineRange`]): the cache's
+//! `<state><selection startDate endDate>` with `filterType="dateBetween"`, and no selection with
+//! `filterType="unknown"`. The two are written together, so only those two pairs are read: a
+//! state that says one and carries the other is contradictory and stays on the kept path. A date
+//! written in any form other than the `YYYY-MM-DDThh:mm:ss` GridCraft writes (a fraction of a
+//! second, a zone, a short date) also stays kept, because a save could not spell it back exactly;
+//! so does a selection whose level differs from the level shown ([`timeline_widget`]).
+//!
 //! Not modelled (kept raw, and said so here so the next reader does not guess): OLAP slicer caches,
-//! item properties (`<p>`), custom lists, slicer `extLst`s, a timeline's date-range selection, a
-//! timeline cache's refresh versions, the drawing shape's `mc:Fallback`, and the slicer sort order
-//! (a file's slicer part does not carry it; the model keeps it as a UI hint only).
+//! item properties (`<p>`), custom lists, slicer `extLst`s, a timeline cache's refresh versions
+//! (the writer states 0), a timeline state's `singleRangeFilterState` other than the default, the
+//! drawing shape's `mc:Fallback`, and the slicer sort order (a file's slicer part does not carry
+//! it; the model keeps it as a UI hint only).
 //!
 //! Attribute provenance: the parts' names and attributes are [MS-XLSX]'s extension schemas
 //! (sections 2.2.4.8, 2.2.4.11, 2.2.4.12, 2.4.36–2.4.50, 2.6.67–2.6.114), the drawing frames are
@@ -47,9 +56,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use gridcraft_core::CellRef;
-use gridcraft_core::date::datetime_from_serial;
+use gridcraft_core::date::{datetime_from_serial, serial_from_ymd, time_fraction};
 use gridcraft_model::{
-    Anchor, AnchorMode, FilterCriterion, PivotSlicer, PivotTimeline, Slicer, SlicerItem, SlicerSort, SlicerValue, Table, TimeUnit, Workbook,
+    Anchor, AnchorMode, FilterCriterion, PivotSlicer, PivotTimeline, Slicer, SlicerItem, SlicerSort, SlicerValue, Table, TimeUnit, TimelineRange,
+    Workbook,
 };
 
 use crate::package::normalize;
@@ -852,7 +862,7 @@ fn read_timelines(wb: &mut Workbook, cx: &mut Ctx<'_>) -> Option<TimelinesRead> 
                     why = Some(format!("{}: not XML", cache.name));
                     break 'sheets;
                 };
-                let state = match timeline_cache_problem(&croot) {
+                let state = match timeline_cache_problem(wb, &croot) {
                     Ok(s) => s,
                     Err(e) => {
                         why = Some(format!("{}: {e}", cache.name));
@@ -877,9 +887,10 @@ fn read_timelines(wb: &mut Workbook, cx: &mut Ctx<'_>) -> Option<TimelinesRead> 
                 }
                 widget.pivot_tables = pivots.clone();
                 widget.field = croot.attr("sourceName").unwrap_or("").to_string();
-                if let Some(id) = state.and_then(|s| s.attr_u32("pivotCacheId")) {
+                if let Some(id) = state.state.attr_u32("pivotCacheId") {
                     widget.pivot_cache_id = id;
                 }
+                widget.range = state.range;
                 if widget.caption.is_empty() {
                     widget.caption = widget.field.clone();
                 }
@@ -901,9 +912,16 @@ fn read_timelines(wb: &mut Workbook, cx: &mut Ctx<'_>) -> Option<TimelinesRead> 
     Some(out)
 }
 
-/// Why a timeline cache cannot be modelled, if it cannot: a selected date range, a filter, a
-/// refresh version this model does not carry, an extension, or a child we do not know.
-fn timeline_cache_problem(root: &El) -> Result<Option<&El>, String> {
+/// What a timeline cache's `<state>` says, besides the PivotTable list: the element (for its
+/// `pivotCacheId`) and the selected date range, if it has one.
+struct TimelineState<'a> {
+    state: &'a El,
+    range: Option<TimelineRange>,
+}
+
+/// Why a timeline cache cannot be modelled, if it cannot: a state, filter or range this model does
+/// not carry, an extension, or a child we do not know.
+fn timeline_cache_problem<'a>(wb: &Workbook, root: &'a El) -> Result<TimelineState<'a>, String> {
     if root.name != "timelineCacheDefinition" {
         return Err("not a timeline cache definition".into());
     }
@@ -925,24 +943,79 @@ fn timeline_cache_problem(root: &El) -> Result<Option<&El>, String> {
         return Err("its extensions are not modelled".into());
     }
     let Some(state) = state else { return Err("it has no state".into()) };
-    // The state is not modelled: only the one GridCraft writes (no range selection, no filter and
-    // no refresh version) can be written back.
+    // The refresh versions and the single-range flag are not modelled: only the values GridCraft
+    // writes itself can be written back.
     let defaults: [(&str, &str); 3] = [("minimalRefreshVersion", "0"), ("lastRefreshVersion", "0"), ("singleRangeFilterState", "true")];
     if !attrs_match(state, &["pivotCacheId", "filterType"], &defaults) {
         return Err("its state carries a refresh version or a filter state GridCraft does not model".into());
     }
-    if !state.attr("filterType").is_some_and(|f| f.eq_ignore_ascii_case("unknown")) {
-        return Err("its date filter is not modelled".into());
-    }
+    // `filterType` and the selection are one statement: `dateBetween` means a range, `unknown`
+    // means none. Any other type, or one contradicting the children, is not ours to rewrite.
+    let filter = state.attr("filterType").unwrap_or("unknown").trim().to_ascii_lowercase();
+    let mut range: Option<TimelineRange> = None;
     for c in &state.children {
-        if c.name == "selection" {
-            return Err("its selected date range is not modelled".into());
-        }
-        if c.name != "bounds" {
-            return Err(format!("<{}> in its state is not modelled", c.name));
+        match c.name.as_str() {
+            "bounds" => {}
+            "selection" => {
+                if range.is_some() {
+                    return Err("its state has more than one selection".into());
+                }
+                if filter != "datebetween" {
+                    return Err("its state has a selection its filter type does not name".into());
+                }
+                range = Some(timeline_range(wb, c)?);
+            }
+            other => return Err(format!("<{other}> in its state is not modelled")),
         }
     }
-    Ok(Some(state))
+    match (filter.as_str(), range.is_some()) {
+        ("datebetween", true) | ("unknown", false) => {}
+        ("datebetween", false) => return Err("its filter type names a date range it does not carry".into()),
+        ("unknown", true) => return Err("its state says no date filter but carries a selection".into()),
+        (other, _) => return Err(format!("its date filter type `{other}` is not modelled")),
+    }
+    Ok(TimelineState { state, range })
+}
+
+/// The range a `<selection>` states. Its two dates are required and the start must not be after
+/// the end; a date written in a form a save could not spell back exactly is refused so the part
+/// stays byte-identical rather than being rewritten in another spelling.
+fn timeline_range(wb: &Workbook, el: &El) -> Result<TimelineRange, String> {
+    if !el.children.is_empty() {
+        return Err("its selection has children that are not modelled".into());
+    }
+    if !attrs_match(el, &["startDate", "endDate"], &[]) {
+        return Err("an attribute of its selection is not modelled".into());
+    }
+    let (Some(start), Some(end)) = (el.attr("startDate"), el.attr("endDate")) else {
+        return Err("its selection needs a start and an end date".into());
+    };
+    let (Some(start), Some(end)) = (timeline_date(wb, start), timeline_date(wb, end)) else {
+        return Err("a date of its selection is not one GridCraft writes back verbatim".into());
+    };
+    if start > end {
+        return Err("its selection ends before it starts".into());
+    }
+    Ok(TimelineRange::new(start, end))
+}
+
+/// The serial a timeline cache's date attribute holds, or `None` unless the text is exactly the
+/// `YYYY-MM-DDThh:mm:ss` form [`iso_datetime`] writes for it (a fraction of a second, a zone or a
+/// short date would be lost by writing it back, so such a file stays on the kept path).
+fn timeline_date(wb: &Workbook, text: &str) -> Option<f64> {
+    let (date, time) = text.split_once('T')?;
+    let mut d = date.split('-');
+    let (y, m, day) = (d.next()?.parse::<i64>().ok()?, d.next()?.parse::<i64>().ok()?, d.next()?.parse::<i64>().ok()?);
+    if d.next().is_some() {
+        return None;
+    }
+    let mut t = time.split(':');
+    let (h, min, sec) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+    if t.next().is_some() || !(0..=23).contains(&h) || !(0..=59).contains(&min) || !(0..=59).contains(&sec) {
+        return None;
+    }
+    let serial = serial_from_ymd(wb.date_system, y, m, day)? + time_fraction(h as f64, min as f64, sec as f64);
+    (iso_datetime(wb, serial).as_deref() == Some(text)).then_some(serial)
 }
 
 fn timeline_widget(el: &El, cache: &str) -> Option<PivotTimeline> {
@@ -1325,12 +1398,16 @@ impl SlicerWriter {
             for p in &pivot_names {
                 let _ = write!(cache_xml, "<pivotTable tabId=\"{}\" name=\"{}\"/>", self.tab_id(wb, p), esc_attr(p));
             }
-            // The state is not modelled: no selection, no filter (`unknown` is the format's "no
-            // date filter"), no refresh version, and the bounds the source data gives the timeline.
+            // The state: the date range the model holds (if any), no refresh version, and the
+            // bounds the source data gives the timeline. `filterType` and the selection are written
+            // together, as the format pairs them.
             let (start, end) = (iso_date(wb, tl.bounds.0), iso_date(wb, tl.bounds.1));
+            let selection = tl.widget.range.and_then(|r| timeline_selection_xml(wb, r));
+            let filter_type = if selection.is_some() { "dateBetween" } else { "unknown" };
             let _ = write!(
                 cache_xml,
-                "</pivotTables><state minimalRefreshVersion=\"0\" lastRefreshVersion=\"0\" pivotCacheId=\"{pivot_cache_id}\" filterType=\"unknown\" singleRangeFilterState=\"1\"><bounds startDate=\"{start}\" endDate=\"{end}\"/></state></timelineCacheDefinition>"
+                "</pivotTables><state minimalRefreshVersion=\"0\" lastRefreshVersion=\"0\" pivotCacheId=\"{pivot_cache_id}\" filterType=\"{filter_type}\" singleRangeFilterState=\"1\">{}<bounds startDate=\"{start}\" endDate=\"{end}\"/></state></timelineCacheDefinition>",
+                selection.unwrap_or_default()
             );
             out.part(&tl.cache_part, Some(CT_TIMELINE_CACHE), cache_xml.into_bytes());
             let rid = wb_rels.add_uri(REL_TIMELINE_CACHE, &from_workbook(&tl.cache_part));
@@ -1385,8 +1462,9 @@ fn slicer_view_xml(name: &str, cache: &str, caption: &str, style: &str, columns:
     s
 }
 
-/// One `<timeline>` view ([MS-XLSX] 2.6.111). `level` and `selectionLevel` are required; with no
-/// range selection the selection was made at the level shown.
+/// One `<timeline>` view ([MS-XLSX] 2.6.111). `level` and `selectionLevel` are required; the
+/// model has one time unit, so a selection is made at the level shown (a file whose
+/// `selectionLevel` differs is not modelled — see [`timeline_widget`]).
 fn timeline_view_xml(tl: &PivotTimeline) -> String {
     let mut s = format!("<timeline name=\"{}\" cache=\"{}\"", esc_attr(&tl.name), esc_attr(&tl.cache));
     if !tl.caption.is_empty() {
@@ -1401,13 +1479,34 @@ fn timeline_view_xml(tl: &PivotTimeline) -> String {
     s
 }
 
-/// The serial `serial` as an ISO 8601 date and time, the form a timeline cache's bounds use.
-fn iso_date(wb: &Workbook, serial: f64) -> String {
-    match datetime_from_serial(wb.date_system, serial) {
-        Some(d) => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute, d.second),
-        // Unreachable for a bounds value (a finite number from a cell), and a date is required.
-        None => "1900-01-01T00:00:00".to_string(),
+/// The `<selection>` a timeline's range writes, or `None` when the model's range is not a date
+/// range a reader could use (reversed, non-finite, or a serial no date system can show); the
+/// cache then states no filter, which is what `filterType="unknown"` means.
+fn timeline_selection_xml(wb: &Workbook, range: TimelineRange) -> Option<String> {
+    if !range.is_valid() {
+        return None;
     }
+    let start = iso_datetime(wb, range.start)?;
+    let end = iso_datetime(wb, range.end)?;
+    Some(format!("<selection startDate=\"{start}\" endDate=\"{end}\"/>"))
+}
+
+/// The serial `serial` as an ISO 8601 date and time, the form a timeline cache's dates use.
+/// `None` when no date can be written for it — including serial 0, the 1900 system's
+/// day-before-the-epoch that would spell as the impossible `1900-01-00`.
+fn iso_datetime(wb: &Workbook, serial: f64) -> Option<String> {
+    let d = datetime_from_serial(wb.date_system, serial)?;
+    if d.day == 0 {
+        return None;
+    }
+    Some(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", d.year, d.month, d.day, d.hour, d.minute, d.second))
+}
+
+/// [`iso_datetime`] for a value a timeline's `bounds` must have (a finite serial from a cell).
+fn iso_date(wb: &Workbook, serial: f64) -> String {
+    // Unreachable for a bounds value (the source's finite minimum and maximum), and a date is
+    // required by the schema, so the 1900 epoch stands in rather than writing nothing.
+    iso_datetime(wb, serial).unwrap_or_else(|| "1900-01-01T00:00:00".to_string())
 }
 
 /// The PivotTables of `names` whose source (and, when `field` is given, that field) can be
