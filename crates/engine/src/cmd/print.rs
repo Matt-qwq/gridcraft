@@ -23,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export as PDF",
             ["File", "Export"],
             None,
-            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
+            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool, fontPath?: a .ttf/.ttc file or family name} → {pages, bytes, font?, path} or {pages, bytes, font?, base64} when no path. Honours each sheet's Page Setup; text outside WinAnsiEncoding embeds a subset of `fontPath`, else of a system face that covers it.",
             has_doc,
             export_pdf
         ),
@@ -32,7 +32,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Print…",
             ["File"],
             Some("Cmd+P"),
-            "{path?, sheets?: active|all, range?, fitToPage?: bool} → {pages, bytes, base64} — the PDF the UI hands to the system print dialog",
+            "{path?, sheets?: active|all, range?, fitToPage?: bool, fontPath?} → {pages, bytes, font?, base64} — the PDF the UI hands to the system print dialog",
             has_doc,
             print
         ),
@@ -683,12 +683,27 @@ fn cell_look(wb: &Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut Option<c
     Look { style, fill, cf: cfl }
 }
 
-/// PDF measurement for chart layout.
-struct PdfMeasure;
+/// Chart layout measures text with the same font the page will draw it in.
+struct PdfMeasure<'a> {
+    m: &'a Metrics<'a>,
+}
 
-impl gridcraft_chart::Measure for PdfMeasure {
+impl gridcraft_chart::Measure for PdfMeasure<'_> {
     fn text_width(&self, text: &str, size: f32, bold: bool) -> f32 {
-        gridcraft_pdf::text_width(if bold { Font::HelveticaBold } else { Font::Helvetica }, size, text)
+        self.m.w(if bold { Font::HelveticaBold } else { Font::Helvetica }, size, text)
+    }
+}
+
+/// How wide the document's text is: the embedded face's `hmtx` for the characters it covers and
+/// the standard font's table for the rest — the same rule the PDF writer draws with.
+#[derive(Clone, Copy)]
+struct Metrics<'a> {
+    face: Option<&'a gridcraft_pdf::Face>,
+}
+
+impl Metrics<'_> {
+    fn w(&self, font: Font, size: f32, text: &str) -> f32 {
+        gridcraft_pdf::text_width_with(self.face, font, size, text)
     }
 }
 
@@ -710,7 +725,7 @@ impl Xf {
 }
 
 /// Draws chart primitives onto a page.
-fn draw_prims(pg: &mut Page, prims: &[gridcraft_chart::Prim], xf: Xf) {
+fn draw_prims(pg: &mut Page, prims: &[gridcraft_chart::Prim], xf: Xf, m: &Metrics) {
     use gridcraft_chart::{HAlign as H, Prim, VAlign as V};
     let k = xf.k;
     for p in prims {
@@ -750,7 +765,7 @@ fn draw_prims(pg: &mut Page, prims: &[gridcraft_chart::Prim], xf: Xf) {
             Prim::Text { x, y, text, size, color, bold, align, valign, rotation } => {
                 let font = if *bold { Font::HelveticaBold } else { Font::Helvetica };
                 let size = size * k;
-                let w = gridcraft_pdf::text_width(font, size, text);
+                let w = m.w(font, size, text);
                 let dx = match align {
                     H::Left => 0.0,
                     H::Center => -w / 2.0,
@@ -772,24 +787,24 @@ fn draw_prims(pg: &mut Page, prims: &[gridcraft_chart::Prim], xf: Xf) {
 const PAD_PX: f32 = 2.0;
 
 /// Word-wraps `text` to `width` points.
-fn wrap_lines(text: &str, font: Font, size: f32, width: f32) -> Vec<String> {
+fn wrap_lines(text: &str, font: Font, size: f32, width: f32, m: &Metrics) -> Vec<String> {
     let mut out = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
         for word in para.split(' ') {
             let cand = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if line.is_empty() || gridcraft_pdf::text_width(font, size, &cand) <= width {
+            if line.is_empty() || m.w(font, size, &cand) <= width {
                 line = cand;
             } else {
                 out.push(std::mem::take(&mut line));
                 line = word.to_string();
             }
             // Break a single over-long word by characters.
-            while gridcraft_pdf::text_width(font, size, &line) > width && line.chars().count() > 1 {
+            while m.w(font, size, &line) > width && line.chars().count() > 1 {
                 let mut cut = String::new();
                 let mut rest = String::new();
                 for ch in line.chars() {
-                    if rest.is_empty() && gridcraft_pdf::text_width(font, size, &format!("{cut}{ch}")) <= width || cut.is_empty() {
+                    if rest.is_empty() && m.w(font, size, &format!("{cut}{ch}")) <= width || cut.is_empty() {
                         cut.push(ch);
                     } else {
                         rest.push(ch);
@@ -882,7 +897,7 @@ fn font_for(style: &Style) -> Font {
 }
 
 /// Draws the cells of a block: fills, gridlines, data bars, borders and text.
-fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Option<crate::cf::CfCache>) {
+fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Option<crate::cf::CfCache>, m: &Metrics) {
     let (bx, by) = (b.xs.first().copied().unwrap_or(0.0), b.ys.first().copied().unwrap_or(0.0));
     let (bw, bh) = (b.xs.last().copied().unwrap_or(bx) - bx, b.ys.last().copied().unwrap_or(by) - by);
     if bw <= 0.0 || bh <= 0.0 {
@@ -997,7 +1012,7 @@ fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Option<crate::
         if let Some(picture) = sh.cell_pictures.get(c) {
             draw_cell_picture(pg, &picture.data, (x, y, w, h), b.k);
         } else {
-            draw_text(pg, b, *c, l, (x, y, w, h), merged, &merges, (bx, bx + bw));
+            draw_text(pg, b, *c, l, (x, y, w, h), merged, &merges, (bx, bx + bw), m);
         }
     }
     pg.restore();
@@ -1105,7 +1120,17 @@ fn center_across_width(styles: &StyleTable, sh: &Sheet, c: CellRef, merges: &[Ra
     ext
 }
 
-fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f32, f32), merged: bool, merges: &[RangeRef], limits: (f32, f32)) {
+fn draw_text(
+    pg: &mut Page,
+    b: &Block,
+    c: CellRef,
+    l: &Look,
+    rect: (f32, f32, f32, f32),
+    merged: bool,
+    merges: &[RangeRef],
+    limits: (f32, f32),
+    m: &Metrics,
+) {
     let (x, y, w, h) = rect;
     let sh = b.sh;
     let wb = b.wb;
@@ -1135,7 +1160,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
     } else if code == "General"
         && let Value::Number(n) = v
     {
-        let digit = gridcraft_pdf::text_width(font, size, "0").max(0.1);
+        let digit = m.w(font, size, "0").max(0.1);
         let max_chars = (avail / digit).floor().max(1.0) as usize;
         gridcraft_numfmt::format_general_fit(n, max_chars.min(11)).unwrap_or_else(|| "#".repeat(max_chars.min(255)))
     } else {
@@ -1148,15 +1173,15 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
     if text.is_empty() {
         return;
     }
-    let mut tw = gridcraft_pdf::text_width(font, size, &text);
+    let mut tw = m.w(font, size, &text);
     if st.align.shrink && !wrap && tw > avail && tw > 0.0 {
         size = (size * avail / tw).max(1.0);
-        tw = gridcraft_pdf::text_width(font, size, &text);
+        tw = m.w(font, size, &text);
     }
     if is_num && !wrap && tw > avail + 0.01 && !sh.show_formulas {
-        let hash = gridcraft_pdf::text_width(font, size, "#").max(0.1);
+        let hash = m.w(font, size, "#").max(0.1);
         text = "#".repeat(((avail / hash).floor().max(1.0) as usize).min(255));
-        tw = gridcraft_pdf::text_width(font, size, &text);
+        tw = m.w(font, size, &text);
     }
     let h_align = match st.align.h {
         HAlign::General => {
@@ -1176,8 +1201,8 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
     let rotated = rot != 0 && rot != 255;
     // Rotated text wraps along its own direction: upright (±90°) text to the row height.
     let lines: Vec<String> = match (wrap, rotated) {
-        (true, false) => wrap_lines(&text, font, size, avail.max(size)),
-        (true, true) if rot.abs() == 90 => wrap_lines(&text, font, size, (h - 2.0 * pad).max(size)),
+        (true, false) => wrap_lines(&text, font, size, avail.max(size), m),
+        (true, true) if rot.abs() == 90 => wrap_lines(&text, font, size, (h - 2.0 * pad).max(size), m),
         (true, true) => vec![text.lines().next().unwrap_or_default().to_string()],
         (false, _) => vec![text],
     };
@@ -1251,7 +1276,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
         let mut yy = y + pad + size * 0.8;
         for ch in chars {
             let s = ch.to_string();
-            let cw = gridcraft_pdf::text_width(font, size, &s);
+            let cw = m.w(font, size, &s);
             pg.text(x + (w - cw) / 2.0, yy, size, font, color, &s);
             yy += line_h;
             if yy > y + h + line_h {
@@ -1262,7 +1287,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
         return;
     }
     for (i, line) in lines.iter().enumerate() {
-        let lw = gridcraft_pdf::text_width(font, size, line);
+        let lw = m.w(font, size, line);
         let lx = match h_align {
             HAlign::Right => x + w - pad - lw - indent,
             HAlign::Center => x + (w + across - lw) / 2.0,
@@ -1306,7 +1331,7 @@ fn decode_image(data: &[u8], max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u3
 }
 
 /// Draws charts, pictures, shapes and sparklines overlapping the body block of a page.
-fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) {
+fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block, m: &Metrics) {
     let block = b.range();
     let (sx0, sy0) = (sh.col_left(block.start.col), sh.row_top(block.start.row));
     let (sx1, sy1) = (sh.col_left(block.end.col.saturating_add(1)), sh.row_top(block.end.row.saturating_add(1)));
@@ -1328,7 +1353,7 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
         let (x, y, w, h) = b.rect(RangeRef::cell(sp.cell));
         let (wpx, hpx) = (w / b.k, h / b.k);
         let prims = gridcraft_chart::render_sparkline(sp.kind, &vals, [color[0], color[1], color[2], 255], sp.markers, wpx, hpx);
-        draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k });
+        draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k }, m);
     }
     for im in &sh.images {
         let r = anchor_rect(sh, &im.anchor);
@@ -1384,7 +1409,7 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
             let color = fm.text_color.and_then(|c| rgb_of(c, wb)).unwrap_or([0, 0, 0]);
             let align = fm.align.unwrap_or(if text_box { ShapeTextAlign::Left } else { ShapeTextAlign::Center });
             let anchor = fm.anchor.unwrap_or(if text_box { ShapeTextAnchor::Top } else { ShapeTextAnchor::Middle });
-            let lines = wrap_lines(&shp.text, font, size, (w - 4.0 * b.k).max(size));
+            let lines = wrap_lines(&shp.text, font, size, (w - 4.0 * b.k).max(size), m);
             let block_h = lines.len().min(500) as f32 * size * 1.2;
             let mut yy = match anchor {
                 ShapeTextAnchor::Top => y + 2.0 * b.k,
@@ -1392,7 +1417,7 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
                 ShapeTextAnchor::Bottom => y + h - 2.0 * b.k - block_h,
             } + size * 0.8;
             for l in lines.iter().take(500) {
-                let lw = gridcraft_pdf::text_width(font, size, l);
+                let lw = m.w(font, size, l);
                 let lx = match align {
                     ShapeTextAlign::Left => x + 2.0 * b.k,
                     ShapeTextAlign::Center => x + (w - lw) / 2.0,
@@ -1410,8 +1435,8 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
         }
         let (x, y, _, _) = place(r);
         let data = gridcraft_chart::resolve(wb, si, ch);
-        let prims = gridcraft_chart::render(ch, &data, r.2 as f32, r.3 as f32, &PdfMeasure);
-        draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k });
+        let prims = gridcraft_chart::render(ch, &data, r.2 as f32, r.3 as f32, &PdfMeasure { m });
+        draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k }, m);
     }
     pg.restore();
 }
@@ -1451,7 +1476,7 @@ fn draw_headings(pg: &mut Page, b: &Block, col_heads: bool, row_heads: bool, at:
     }
 }
 
-fn draw_header_footer(pg: &mut Page, lay: &SheetLayout, which: gridcraft_model::HfPage, cx: &HfContext) {
+fn draw_header_footer(pg: &mut Page, lay: &SheetLayout, which: gridcraft_model::HfPage, cx: &HfContext, m: &Metrics) {
     let [l, r, _, _, hm, fm] = lay.margins;
     let pw = lay.page_w;
     let ph = lay.page_h;
@@ -1469,7 +1494,7 @@ fn draw_header_footer(pg: &mut Page, lay: &SheetLayout, which: gridcraft_model::
             let lines: Vec<&str> = sec.text.split('\n').take(20).collect();
             let n = lines.len() as f32;
             for (j, line) in lines.iter().enumerate() {
-                let lw = gridcraft_pdf::text_width(font, size, line);
+                let lw = m.w(font, size, line);
                 let x = match i {
                     0 => l,
                     1 => (pw - lw) / 2.0,
@@ -1518,9 +1543,14 @@ fn seg_size(sh: &Sheet, seg: (u32, u32), rows: bool) -> f32 {
     if rows { (seg.0..=seg.1).map(|r| sh.row_height(r)).sum() } else { (seg.0..=seg.1).map(|c| sh.col_width(c)).sum() }
 }
 
-/// Renders laid-out sheets to a PDF.
-pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str) -> (Vec<u8>, usize) {
+/// Renders laid-out sheets to a PDF. `face` is the font embedded for text WinAnsiEncoding cannot
+/// set; `None` keeps the standard fonts (and their bytes) as they were.
+pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str, face: Option<&gridcraft_pdf::Face>) -> (Vec<u8>, usize) {
+    let m = Metrics { face };
     let mut doc = PdfDoc::new();
+    if let Some(f) = face {
+        doc.set_font(f.clone());
+    }
     doc.info.title = if wb.props.title.is_empty() { file.to_string() } else { wb.props.title.clone() };
     doc.info.author = wb.props.author.clone();
     let total: usize = layouts.iter().map(|l| l.pages.len()).sum();
@@ -1550,7 +1580,7 @@ pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str
                 let mut x = ox + lay.heading_w * k;
                 for (csi, cs) in csegs.iter().enumerate() {
                     let b = make_block(wb, lay.sheet, sh, *rs, *cs, x, y, lay);
-                    draw_block(pg, &b, lay.settings.gridlines, &mut cf);
+                    draw_block(pg, &b, lay.settings.gridlines, &mut cf, &m);
                     draw_block_links(pg, &b, page_index, &mut pending_links);
                     printed_blocks.push(PrintedBlock { page: page_index, sheet: lay.sheet, rows: *rs, cols: *cs, x, y, k });
                     if lay.settings.headings {
@@ -1564,7 +1594,7 @@ pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str
                 y += seg_size(sh, *rs, true) * k;
             }
             if let Some(b) = &body {
-                draw_objects(pg, wb, lay.sheet, sh, b);
+                draw_objects(pg, wb, lay.sheet, sh, b, &m);
             }
             if lay.settings.headings {
                 let fill = [0xF2, 0xF2, 0xF2];
@@ -1580,7 +1610,7 @@ pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str
                 date: date.clone(),
                 time: time.clone(),
             };
-            draw_header_footer(pg, lay, lay.settings.hf_page(pi == 0, page_no), &cx);
+            draw_header_footer(pg, lay, lay.settings.hf_page(pi == 0, page_no), &cx, &m);
         }
     }
     for link in pending_links {
@@ -1597,28 +1627,126 @@ pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str
 
 // ---------------------------------------------------------------- commands
 
-fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
+fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize, Option<String>)> {
     let opts = PrintOptions::from_params(p, cmd)?;
     let d = s.doc()?;
     let lays = layouts(&d.wb, &opts);
     let path = d.path.clone().unwrap_or_default();
-    Ok(render_pdf(&d.wb, &lays, &d.display_title(), &path))
+    let font = resolve_font(p, &needed_chars(&d.wb, &lays), cmd)?;
+    let name = font.as_ref().map(|(path, _)| path.display().to_string());
+    let (bytes, pages) = render_pdf(&d.wb, &lays, &d.display_title(), &path, font.as_ref().map(|(_, face)| face));
+    Ok((bytes, pages, name))
 }
 
-pub(crate) fn export_pdf(s: &mut Session, p: &Json) -> Result<Json> {
-    let (bytes, pages) = build_pdf(s, p, "file.exportPdf")?;
-    match str_param(p, "path").filter(|x| !x.is_empty()) {
-        Some(path) => {
-            crate::io::write_file(path, &bytes)?;
-            Ok(json!({"pages": pages, "bytes": bytes.len(), "path": path}))
+/// Most characters the pre-scan collects (bounds the work and the memory for a huge workbook).
+const MAX_SCAN_CHARS: usize = 4096;
+
+/// The characters the printed text needs a font for: everything outside WinAnsiEncoding, from
+/// cells, sheet names, drawing text and headers/footers of the sheets being printed.
+///
+/// An empty result means the document stays inside the standard fonts, so its bytes do not
+/// change. The scan is deliberately a superset of what is drawn: a character that is collected
+/// but never drawn only makes the subset a glyph larger.
+fn needed_chars(wb: &Workbook, layouts: &[SheetLayout]) -> String {
+    let mut out = String::new();
+    for lay in layouts {
+        let Some(sh) = wb.sheet(lay.sheet) else { continue };
+        collect_chars(&mut out, &sh.name);
+        for (_, cell) in sh.cells.iter() {
+            if let Value::Text(t) = &cell.value {
+                collect_chars(&mut out, t);
+            }
+            if out.len() >= MAX_SCAN_CHARS {
+                return out;
+            }
         }
-        None => Ok(json!({"pages": pages, "bytes": bytes.len(), "base64": crate::io::base64_encode(&bytes)})),
+        for value in sh.spill.values() {
+            if let Value::Text(t) = value {
+                collect_chars(&mut out, t);
+            }
+        }
+        for shape in &sh.shapes {
+            collect_chars(&mut out, &shape.text);
+        }
+        for chart in &sh.charts {
+            for t in [&chart.title, &chart.x_title, &chart.y_title].into_iter().flatten() {
+                collect_chars(&mut out, t);
+            }
+        }
+        let ps = &sh.print;
+        for spec in [&ps.header, &ps.footer, &ps.first_header, &ps.first_footer, &ps.even_header, &ps.even_footer] {
+            collect_chars(&mut out, spec);
+        }
+        if out.len() >= MAX_SCAN_CHARS {
+            break;
+        }
+    }
+    out
+}
+
+fn collect_chars(out: &mut String, text: &str) {
+    for c in text.chars() {
+        if out.len() >= MAX_SCAN_CHARS {
+            return;
+        }
+        // `win_ansi(c) == b'?'` is the writer's own test for "no WinAnsi byte for this".
+        if !c.is_control() && gridcraft_pdf::win_ansi(c) == b'?' {
+            out.push(c);
+        }
     }
 }
 
+/// Picks the face to embed: an explicit `fontPath`, else a system face that covers the text. A
+/// resolution failure is not fatal — the non-embedded CID font still sets the characters — but a
+/// `fontPath` that does not load is the caller's mistake and is reported.
+fn resolve_font(p: &Json, needed: &str, cmd: &str) -> Result<Option<(std::path::PathBuf, gridcraft_pdf::Face)>> {
+    if needed.is_empty() {
+        return Ok(None);
+    }
+    let found = match str_param(p, "fontPath").map(str::trim).filter(|s| !s.is_empty()) {
+        Some(path) => gridcraft_core::fonts::load_named(path).map_err(|e| bad(cmd, format!("`fontPath`: {e}")))?,
+        None => match gridcraft_core::fonts::resolve_for_text(needed) {
+            Ok(font) => font,
+            Err(e) => {
+                log::warn!("PDF export: no embeddable font covers the text ({e}); using the CID fallback");
+                return Ok(None);
+            }
+        },
+    };
+    match gridcraft_pdf::Face::parse(found.data) {
+        Ok(face) => Ok(Some((found.path, face))),
+        Err(e) => {
+            log::warn!("PDF export: {} does not parse ({e}); using the CID fallback", found.path.display());
+            if str_param(p, "fontPath").is_some() {
+                return Err(bad(cmd, format!("`fontPath`: {e}")));
+            }
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn export_pdf(s: &mut Session, p: &Json) -> Result<Json> {
+    let (bytes, pages, font) = build_pdf(s, p, "file.exportPdf")?;
+    let mut out = json!({"pages": pages, "bytes": bytes.len()});
+    if let Some(font) = font {
+        out["font"] = json!(font);
+    }
+    match str_param(p, "path").filter(|x| !x.is_empty()) {
+        Some(path) => {
+            crate::io::write_file(path, &bytes)?;
+            out["path"] = json!(path);
+        }
+        None => out["base64"] = json!(crate::io::base64_encode(&bytes)),
+    }
+    Ok(out)
+}
+
 fn print(s: &mut Session, p: &Json) -> Result<Json> {
-    let (bytes, pages) = build_pdf(s, p, "file.print")?;
+    let (bytes, pages, font) = build_pdf(s, p, "file.print")?;
     let mut out = json!({"pages": pages, "bytes": bytes.len(), "base64": crate::io::base64_encode(&bytes)});
+    if let Some(font) = font {
+        out["font"] = json!(font);
+    }
     if let Some(path) = str_param(p, "path").filter(|x| !x.is_empty()) {
         crate::io::write_file(path, &bytes)?;
         out["path"] = json!(path);
@@ -1998,10 +2126,83 @@ mod tests {
     fn pdf_prints_cjk_text_instead_of_question_marks() {
         let mut s = s();
         s.execute("range.setValues", json!({"range": "A1", "values": [["签字清单", 2]]})).unwrap();
-        let (pdf, _) = pdf_of(&mut s, json!({}));
+        let r = s.execute("file.exportPdf", json!({})).unwrap();
+        let pdf = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
         assert!(!contains(&pdf, "(????) Tj"), "CJK cell printed as (????) Tj");
-        assert!(contains(&pdf, "<7B7E5B576E055355> Tj"));
         assert!(contains(&pdf, "(2) Tj"));
+        match r.get("font") {
+            // A CJK face is installed: the characters are an embedded subset with a ToUnicode
+            // map, so the PDF renders anywhere and the text stays copyable.
+            Some(font) => {
+                assert!(!font.as_str().unwrap().is_empty());
+                assert!(contains(&pdf, "/Subtype /CIDFontType2"), "embedded CID font");
+                assert!(contains(&pdf, "/FontFile2"), "the font program is embedded");
+                assert!(contains(&pdf, "/ToUnicode"), "glyphs map back to characters");
+                for c in ["7B7E", "5B57", "6E05", "5355"] {
+                    assert!(contains(&pdf, &format!("<{c}>")), "ToUnicode covers {c}");
+                }
+            }
+            // No CJK face on this machine: the predefined CID font still sets the text instead of
+            // the question marks the old writer produced.
+            None => {
+                assert!(contains(&pdf, "<7B7E5B576E055355> Tj"));
+                assert!(contains(&pdf, "/Encoding /UniGB-UTF16-H"));
+            }
+        }
+    }
+
+    /// A Cyrillic and Greek cell is embedded when a face covers it; the export names the font it
+    /// used. Skipped honestly when the machine has no such face.
+    #[test]
+    fn pdf_embeds_a_font_for_cyrillic_and_greek() {
+        if gridcraft_core::fonts::resolve_for_char('Ж').is_err() {
+            eprintln!("skipped: no Cyrillic face installed");
+            return;
+        }
+        let mut s = s();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Привет", "Ωμέγα"]]})).unwrap();
+        let r = s.execute("file.exportPdf", json!({})).unwrap();
+        let font = r["font"].as_str().expect("the result names the embedded font");
+        assert!(!font.is_empty());
+        let pdf = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
+        assert!(contains(&pdf, "/Subtype /CIDFontType2"));
+        assert!(contains(&pdf, "/FontFile2"));
+        // The ToUnicode CMap maps the glyphs back to `П` (U+041F) and `Ω` (U+03A9).
+        assert!(contains(&pdf, "<041F>"), "П is in the ToUnicode map");
+        assert!(contains(&pdf, "<03A9>"), "Ω is in the ToUnicode map");
+        assert!(!contains(&pdf, "(??????)"), "Cyrillic text was replaced by question marks");
+        // Nothing changed for the ASCII-only path: no font is named there.
+        let mut ascii = self::tests::s();
+        ascii.execute("range.setValues", json!({"range": "A1", "values": [["Total", 3]]})).unwrap();
+        assert!(ascii.execute("file.exportPdf", json!({})).unwrap().get("font").is_none());
+    }
+
+    /// `fontPath` picks the face explicitly, for a machine whose default face is wrong (or has no
+    /// font directory to scan). Gated on a font file this test machine actually ships.
+    #[test]
+    fn font_path_selects_the_embedded_face() {
+        let path = "C:/Windows/Fonts/segoeui.ttf";
+        if !std::path::Path::new(path).is_file() {
+            eprintln!("skipped: {path} is not installed");
+            return;
+        }
+        let mut s = s();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Привет"]]})).unwrap();
+        let r = s.execute("file.exportPdf", json!({"fontPath": path})).unwrap();
+        assert_eq!(r["font"].as_str().unwrap().replace('\\', "/").to_lowercase(), path.to_lowercase());
+        let pdf = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
+        assert!(contains(&pdf, "/FontFile2"));
+        assert!(contains(&pdf, "<041F>"));
+        // `file.print` takes the same parameter.
+        let r = s.execute("file.print", json!({"fontPath": path})).unwrap();
+        assert_eq!(r["font"].as_str().unwrap().replace('\\', "/").to_lowercase(), path.to_lowercase());
+        // A `fontPath` that is not a font is an error, not a silent fallback.
+        assert!(s.execute("file.exportPdf", json!({"fontPath": "not/a/font.ttf"})).is_err());
+        // The font is ignored for a document that needs none, which keeps its bytes stable.
+        let mut ascii = self::tests::s();
+        ascii.execute("range.setValues", json!({"range": "A1", "values": [["Total"]]})).unwrap();
+        let chosen = ascii.execute("file.exportPdf", json!({"fontPath": path})).unwrap();
+        assert!(chosen.get("font").is_none());
     }
 
     #[test]
@@ -2309,10 +2510,11 @@ mod tests {
         let b = bands(0, 2, |r| if r == 1 { 100.0 } else { 10.0 }, |_| 35.0, &[], 100);
         assert_eq!(b, vec![(0, 0), (1, 1), (2, 2)]);
         assert_eq!(bands(0, 1_000_000, |_| 10.0, |_| 5.0, &[], 3).len(), 3);
-        let w = wrap_lines("the quick brown fox jumps", Font::Helvetica, 10.0, 50.0);
+        let m = Metrics { face: None };
+        let w = wrap_lines("the quick brown fox jumps", Font::Helvetica, 10.0, 50.0, &m);
         assert!(w.len() >= 2);
         assert!(w.iter().all(|l| gridcraft_pdf::text_width(Font::Helvetica, 10.0, l) <= 50.0 || !l.contains(' ')));
-        let w = wrap_lines("Supercalifragilistic", Font::Helvetica, 10.0, 20.0);
+        let w = wrap_lines("Supercalifragilistic", Font::Helvetica, 10.0, 20.0, &m);
         assert!(w.len() > 2);
     }
 
