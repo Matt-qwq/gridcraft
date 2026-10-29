@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** minor (the chart Format pane and drag-resize landed — §4 4–9 h → 2–6 h left; PivotTable slicers and timelines are modelled, editable and written from the model, and a selection filters the pivot — §8 20–30 h → 14–22 h; chart edits patch the kept part, unmodelled kinds kept whole, secondary axis) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** major (a documentation-derived formula oracle suite lands and §6 closes; encryption hardening — OS CSPRNG, integrity HMAC verified on read, web refuses a password save — leaves §7 at 10–21 h; the chart Format pane and drag-resize landed, §4 2–6 h; slicers and timelines modelled, §8 14–22 h) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -231,23 +231,45 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   [localization-parity.md](localization-parity.md)
 
 ### 6. Calculation correctness bugs (F)
-- **Missing:** nothing known. The four this entry tracked have landed: 15-significant-digit
+- **Closed 10-30.** Missing: nothing known. The four this entry tracked have landed: 15-significant-digit
   equality (#57, so `=0.1+0.2=0.3` is TRUE and MATCH and COUNTIF agree), spill updates after
   structural edits and cleared blockers (#133, #139; PRs #148, #157), 3-D span deletion (#140),
   and qualified names after a sheet rename (#134). Iterative calculation for circular references
   landed too (no Options dialog yet, which is §13's).
-- **Impact:** wrong numbers are worse than missing features, so this entry is kept until the
-  oracle suite of §15 can say the category is clear rather than only these five reports being so.
-- **Estimate:** — [function-parity.md](function-parity.md#formula-language)
+- **Oracle suite (10-30):** `crates/calc/tests/formula_oracle.rs` runs **595 documented examples over
+  275 functions** through the real calc path (`gridcraft_calc::evaluate`), plus dedicated tests for
+  real spills, `#SPILL!` unblocking, the 1904 date system, 3-D references and qualified names. Each
+  row cites the published example it comes from. It is **documentation-derived, not
+  Excel-computed**, and it is labelled that way: it can say the documented behaviour holds, not that
+  installed Excel agrees. It found no implementation defect — every disagreement was a
+  transcription error resolved by the documented rule. An Excel-computed corpus run stays part of
+  gate #1.
+- **Impact:** wrong numbers are worse than missing features.
+- **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus once Excel is
+  available. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls` only partly read; encrypted workbooks can't be saved with a password (FF)
+### 7. Legacy `.xls` only partly read; Standard/RC4 encryption cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
   `file.save` — the silent loss of a file's protection is fixed. `password: ""` removes protection;
   a password on a format that cannot carry one is refused, never dropped. Standard (RC4/AES-128) and
-  certificate encryption are not written; the integrity HMAC is written but not yet verified on
-  read, and key material still comes from a non-cryptographic source (both in flight).
+  certificate encryption are not written.
+- **Landed 10-30 (encryption hardening):** keys and salts come from the **operating system's CSPRNG**
+  (`getrandom`, native targets only) instead of stretched SipHash seeds; the Agile `dataIntegrity`
+  HMAC-SHA-512 is **verified on read** after the password check (both fields decrypted with the
+  package key under their own block keys' IVs, HMAC computed with the `keyData` hash over the
+  plaintext package, constant-time compare, and the segments must cover the stated package size), so
+  a flipped byte, a tampered key or a truncated package is an error; `DecryptError::Corrupted` is a
+  distinct failure, so a damaged file no longer reads as a wrong password. The landed writer had
+  encrypted those two fields with a password-derived key and one shared block key, which
+  [MS-OFFCRYPTO] 2.3.4.14 does not allow — Excel would have rejected our files, and our own verifier
+  Excel's; both directions are fixed. The **web build refuses** a password-protected save
+  ("needs a secure random source this build does not have") rather than writing predictable salts,
+  because `getrandom`'s `wasm_js` backend would add JavaScript glue and the repo is Rust only. An
+  independent CFB reader (a dev-only dependency, no shared code) validates the written container at
+  every size class and through the DIFAT chain, and found a real defect: the mini FAT's last sector
+  was zero-padded, and a zero entry names mini sector 0 (now `FREESECT`).
 - **Landed 10-29 (`.xls` styles):** `FONT`, `FORMAT`, `PALETTE`, `XF`, `STYLE` build a real style
   table (family, size, bold/italic/strike/underline, palette colour, number format, fill pattern and
   colours, four borders, alignment/wrap/rotation/indent, protection, named styles), cells pick up
@@ -267,7 +289,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   RC4-encrypted files are still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 14–21 h (`.xls` styles and objects 10–15, encryption 4–6). [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 10–21 h (`.xls` objects 8–15, Standard/RC4 encryption write 2–3, an Excel run over an
+  encrypted file 0–3). [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: no slicer UI, calculated items, PivotCharts; unverified in Excel (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
