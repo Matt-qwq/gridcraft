@@ -35,6 +35,17 @@ pub fn encrypt_workbook_standard(package: &[u8], password: &str) -> Vec<u8> {
     compound_file(&[("EncryptionInfo", &info), ("EncryptedPackage", &encrypted)])
 }
 
+/// `file` (Agile-encrypted, as [`crate::encrypt_workbook`] writes it) with one byte of the
+/// `EncryptedPackage` ciphertext changed: the file's own data-integrity check has to refuse it.
+/// `None` when `file` isn't an encrypted workbook with that stream.
+pub fn corrupt_encrypted_package(file: &[u8]) -> Option<Vec<u8>> {
+    let (info, mut package) = crate::crypto::streams(file).ok()?;
+    // Byte 8 is the first ciphertext byte, after the 8-byte plaintext size: every real package
+    // has at least one AES block there, and it decrypts into the first 16 bytes of every package.
+    *package.get_mut(8)? ^= 0xFF;
+    crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &package)]).ok()
+}
+
 /// A version 3 compound file (512-byte sectors) holding `streams` under the root, laid out as
 /// Excel lays it out: streams under 4096 bytes in the mini stream, larger ones in regular
 /// sectors. Up to 109 FAT sectors (about 7 MB of streams).
@@ -204,6 +215,20 @@ fn package(size: usize, body: Vec<u8>) -> Vec<u8> {
 
 /// The Agile XML descriptor: AES-256, SHA-512, a password encryptor salted with 0..16.
 pub(crate) fn agile_info(password: &str, spin: u32) -> String {
+    agile_xml(password, spin, None)
+}
+
+/// [`agile_info`] with a `dataIntegrity` element for `plain`: the HMAC key and value encrypted
+/// with the **package key** (not a password-derived key), each under its own block key's IV from
+/// the keyData salt ([MS-OFFCRYPTO] 2.3.4.14). Written out here with this module's own AES and
+/// XML rather than through `crypto::encrypt_workbook`, so a reader that confuses the two block
+/// keys, or derives the fields from the password, fails a test instead of passing its own
+/// round-trip.
+pub(crate) fn agile_info_with_integrity(password: &str, spin: u32, plain: &[u8]) -> String {
+    agile_xml(password, spin, Some(plain))
+}
+
+fn agile_xml(password: &str, spin: u32, integrity_for: Option<&[u8]>) -> String {
     let key = Params { hash: Hash::Sha512, salt: PASSWORD_SALT.to_vec(), key_len: 32 };
     let h = iterated_hash(Hash::Sha512, password, &key.salt, spin);
     let iv = key.iv(None);
@@ -217,8 +242,23 @@ pub(crate) fn agile_info(password: &str, spin: u32) -> String {
             base64_encode(salt)
         )
     };
+    // A fixed HMAC key (64 bytes, SHA-512's digest size) and the two block keys of section 2.3.4.14.
+    let hmac_key = [0x11u8; 64];
+    let integrity = match integrity_for {
+        Some(plain) => {
+            let field_iv = |block_key: &[u8]| {
+                let mut d = Hash::Sha512.digest(&[&KEY_DATA_SALT[..], block_key]);
+                d.truncate(16);
+                d
+            };
+            let key = encrypt_cbc(&SECRET_KEY, &field_iv(&crate::crypto::BLOCK_HMAC_KEY), &hmac_key);
+            let value = encrypt_cbc(&SECRET_KEY, &field_iv(&crate::crypto::BLOCK_HMAC_VALUE), &crate::crypto::hmac_sha512(&hmac_key, plain));
+            format!("<dataIntegrity encryptedHmacKey=\"{}\" encryptedHmacValue=\"{}\"/>", base64_encode(&key), base64_encode(&value))
+        }
+        None => String::new(),
+    };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<encryption xmlns=\"http://schemas.microsoft.com/office/2006/encryption\" xmlns:p=\"http://schemas.microsoft.com/office/2006/keyEncryptor/password\"><keyData {}/><keyEncryptors><keyEncryptor uri=\"{PASSWORD_ENCRYPTOR}\"><p:encryptedKey spinCount=\"{spin}\" {} encryptedVerifierHashInput=\"{input}\" encryptedVerifierHashValue=\"{value}\" encryptedKeyValue=\"{secret}\"/></keyEncryptor></keyEncryptors></encryption>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n<encryption xmlns=\"http://schemas.microsoft.com/office/2006/encryption\" xmlns:p=\"http://schemas.microsoft.com/office/2006/keyEncryptor/password\"><keyData {}/>{integrity}<keyEncryptors><keyEncryptor uri=\"{PASSWORD_ENCRYPTOR}\"><p:encryptedKey spinCount=\"{spin}\" {} encryptedVerifierHashInput=\"{input}\" encryptedVerifierHashValue=\"{value}\" encryptedKeyValue=\"{secret}\"/></keyEncryptor></keyEncryptors></encryption>",
         params(&KEY_DATA_SALT),
         params(&PASSWORD_SALT),
     )
@@ -233,12 +273,22 @@ pub(crate) fn with_agile_header(xml: &str) -> Vec<u8> {
 
 /// `EncryptionInfo` and `EncryptedPackage` for `plain`, Agile (AES-256, SHA-512).
 pub(crate) fn encrypt_agile(plain: &[u8], password: &str, spin: u32) -> (Vec<u8>, Vec<u8>) {
+    encrypt_agile_as(plain, password, spin, false)
+}
+
+/// [`encrypt_agile`] with a `dataIntegrity` element ([MS-OFFCRYPTO] 2.3.4.14) over `plain`.
+pub(crate) fn encrypt_agile_with_integrity(plain: &[u8], password: &str, spin: u32) -> (Vec<u8>, Vec<u8>) {
+    encrypt_agile_as(plain, password, spin, true)
+}
+
+fn encrypt_agile_as(plain: &[u8], password: &str, spin: u32, integrity: bool) -> (Vec<u8>, Vec<u8>) {
     let key_data = Params { hash: Hash::Sha512, salt: KEY_DATA_SALT.to_vec(), key_len: 32 };
     let mut body = vec![];
     for (i, segment) in plain.chunks(SEGMENT).enumerate() {
         body.extend(encrypt_cbc(&SECRET_KEY, &key_data.iv(Some(&(i as u32).to_le_bytes())), segment));
     }
-    (with_agile_header(&agile_info(password, spin)), package(plain.len(), body))
+    let info = if integrity { agile_info_with_integrity(password, spin, plain) } else { agile_info(password, spin) };
+    (with_agile_header(&info), package(plain.len(), body))
 }
 
 /// `EncryptionInfo` and `EncryptedPackage` for `plain`, Standard (AES-128, SHA-1).

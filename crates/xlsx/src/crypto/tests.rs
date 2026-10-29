@@ -3,7 +3,7 @@
 //! files are built in code by `crate::testing`. No Excel-produced file is used.
 
 use super::*;
-use crate::testing::{agile_info, encrypt_agile, encrypt_standard, with_agile_header};
+use crate::testing::{agile_info, encrypt_agile, encrypt_agile_with_integrity, encrypt_standard, with_agile_header};
 
 const PASSWORD: &str = "Pass1234";
 
@@ -182,6 +182,29 @@ fn hmac_sha512_matches_rfc_4231() {
 }
 
 #[test]
+fn agile_integrity_ivs_and_block_keys_match_the_spec() {
+    // [MS-OFFCRYPTO] 2.3.4.14: the data-integrity fields have two block keys of their own, and
+    // each field's IV is H(keyData salt ‖ block key) cut to one AES block. The reference values
+    // come from Python's hashlib (an independent SHA-512), reproducing msoffcrypto-tool 6.0.0's
+    // `verify_integrity`, which cites the same section: a wrong block key or a shared IV shows up
+    // here as a wrong 16 bytes, not as a file Excel silently refuses.
+    let key_data = Params { hash: Hash::Sha512, salt: (16u8..32).collect(), key_len: 32 };
+    assert_eq!(key_data.iv(Some(&BLOCK_HMAC_KEY)), hex("7d786688805c5934859055665c8e1a80"));
+    assert_eq!(key_data.iv(Some(&BLOCK_HMAC_VALUE)), hex("21c5bb2dfaab23710918879eafcd6b11"));
+    assert_eq!(BLOCK_HMAC_KEY, [0x5F, 0xB2, 0xAD, 0x01, 0x0C, 0xB9, 0xE1, 0xF6]);
+    assert_eq!(BLOCK_HMAC_VALUE, [0xA0, 0x67, 0x7F, 0x02, 0xB2, 0x2C, 0x84, 0x33]);
+}
+
+#[test]
+fn hmac_covers_the_shorter_hashes_a_foreign_file_may_name() {
+    // RFC 4231 test case 1 for SHA-256 and RFC 2202's for SHA-1: a file written by another tool
+    // can name either for its data integrity, and the check must still be the real HMAC.
+    assert_eq!(hmac(Hash::Sha256, &[0x0b; 20], b"Hi There"), hex("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"));
+    assert_eq!(hmac(Hash::Sha1, &[0x0b; 20], b"Hi There"), hex("b617318655057264e28bc0b6fb378c8ef146be00"));
+    assert_eq!(hmac(Hash::Sha384, &[0x0b; 20], b"Hi There").len(), 48);
+}
+
+#[test]
 fn agile_encryption_round_trips_at_every_size() {
     for len in [0usize, 1, 15, 16, 17, 4095, 4096, 4097, 8192, 10_000] {
         let plain = payload(len);
@@ -218,24 +241,27 @@ fn a_saved_workbook_carries_a_data_integrity_hmac_that_matches() {
     let file = encrypt(&plain, PASSWORD);
     let (info, package) = streams(&file).unwrap();
     let d = agile_descriptor(info.get(8..).unwrap()).unwrap();
+    // The password key encryptor's own fields: a key derived from the password, the salt as IV.
     let h = iterated_hash(d.key.hash, PASSWORD, &d.key.salt, d.spin);
     let mut iv = d.key.salt.clone();
     iv.resize(16, 0x36);
-    let field = |data: &[u8]| {
-        let key = derive(d.key.hash, &h, &BLOCK_HMAC, 32);
+    let password_field = |data: &[u8], block_key: &[u8]| {
         let mut data = data.to_vec();
-        Aes::new(&key).unwrap().decrypt_cbc(&iv, &mut data).unwrap();
+        Aes::new(&derive(d.key.hash, &h, block_key, 32)).unwrap().decrypt_cbc(&iv, &mut data).unwrap();
         data
     };
-    // The descriptor's XML names the two HMAC values; read them the way Excel's writer put them.
-    let xml = std::str::from_utf8(info.get(8..).unwrap()).unwrap();
-    let attr = |name: &str| {
-        let at = xml.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
-        let end = xml.get(at..).unwrap().find('"').unwrap() + at;
-        base64(xml.get(at..end).unwrap()).unwrap()
+    let secret = password_field(&d.key_value, &BLOCK_KEY);
+    // The data-integrity fields: encrypted with the package key, each under its own block key's
+    // IV, derived from the keyData salt ([MS-OFFCRYPTO] 2.3.4.14).
+    let aes = Aes::new(secret.get(..32).unwrap()).unwrap();
+    let integrity_field = |data: &[u8], block_key: &[u8]| {
+        let mut data = data.to_vec();
+        aes.decrypt_cbc(&d.key_data.iv(Some(block_key)), &mut data).unwrap();
+        data
     };
-    let hmac_key = field(&attr("encryptedHmacKey"));
-    let hmac_value = field(&attr("encryptedHmacValue"));
+    let (encrypted_key, encrypted_value) = d.integrity.clone().unwrap();
+    let hmac_key = integrity_field(&encrypted_key, &BLOCK_HMAC_KEY);
+    let hmac_value = integrity_field(&encrypted_value, &BLOCK_HMAC_VALUE);
     assert_eq!(hmac_key.len(), 64);
     assert_eq!(&hmac_value[..64], &hmac_sha512(&hmac_key, &plain)[..]);
     // ...and the package stream is the plaintext's length followed by whole AES blocks: every
@@ -285,12 +311,103 @@ fn a_truncated_or_mangled_encrypted_workbook_is_an_error() {
         b[at] ^= 0xFF;
         let _ = decrypt(&b, PASSWORD);
     }
-    let (info, package) = streams(&good).unwrap();
-    let mut stream = package.clone();
-    stream[8 + 100] ^= 0xFF; // inside the first encrypted segment
-    let flipped = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &stream)]).unwrap();
-    match decrypt(&flipped, PASSWORD) {
-        Ok(out) => assert_ne!(out, plain, "a flipped ciphertext byte came back as the package"),
-        Err(_) => {}
+}
+
+/// `file` with its `EncryptionInfo` XML edited, keeping the same package stream.
+fn with_edited_info(file: &[u8], edit: impl Fn(&str) -> String) -> Vec<u8> {
+    let (info, package) = streams(file).unwrap();
+    let xml = std::str::from_utf8(info.get(8..).unwrap()).unwrap();
+    let edited = with_agile_header(&edit(xml));
+    crate::cfb::write_compound(&[("EncryptionInfo", &edited), ("EncryptedPackage", &package)]).unwrap()
+}
+
+/// `xml` with the first base64 character of `name` replaced by another one: still valid base64,
+/// so the file parses and decrypts to different bytes.
+fn alter_attr(xml: &str, name: &str) -> String {
+    let at = xml.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+    let mut b = xml.as_bytes().to_vec();
+    b[at] = if b[at] == b'A' { b'B' } else { b'A' };
+    String::from_utf8(b).unwrap()
+}
+
+#[test]
+fn a_flipped_ciphertext_byte_is_corrupted_not_a_silently_decrypted_file() {
+    let plain = payload(9000);
+    let file = encrypt(&plain, PASSWORD);
+    let (info, package) = streams(&file).unwrap();
+    // The first segment, a later segment and the final block all cover real package bytes.
+    for at in [8usize, 8 + 100, 8 + SEGMENT + 5, package.len() - 1] {
+        let mut stream = package.clone();
+        stream[at] ^= 0x01;
+        let flipped = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &stream)]).unwrap();
+        assert_eq!(decrypt(&flipped, PASSWORD), Err(DecryptError::Corrupted), "a flipped byte at {at}");
     }
+    // The size prefix: one byte less promises a shorter package, whose HMAC cannot match either.
+    let mut stream = package.clone();
+    stream[0] = stream[0].wrapping_sub(1);
+    let flipped = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &stream)]).unwrap();
+    assert_eq!(decrypt(&flipped, PASSWORD), Err(DecryptError::Corrupted));
+}
+
+#[test]
+fn a_tampered_integrity_or_key_field_is_corrupted() {
+    let plain = payload(9000);
+    let file = encrypt(&plain, PASSWORD);
+    // The integrity key and value are the check itself: changing either must fail it.
+    for name in ["encryptedHmacValue", "encryptedHmacKey"] {
+        let tampered = with_edited_info(&file, |xml| alter_attr(xml, name));
+        assert_eq!(decrypt(&tampered, PASSWORD), Err(DecryptError::Corrupted), "{name}");
+    }
+    // The encrypted package key is the rest of the chain: a different key decrypts the package to
+    // nonsense, and the HMAC refuses it rather than handing the nonsense back as the workbook.
+    let tampered = with_edited_info(&file, |xml| alter_attr(xml, "encryptedKeyValue"));
+    assert_eq!(decrypt(&tampered, PASSWORD), Err(DecryptError::Corrupted));
+    // The verifier can only say "wrong password" when its own fields are changed — which is why
+    // the HMAC, not the verifier, is what proves the data.
+    let tampered = with_edited_info(&file, |xml| alter_attr(xml, "encryptedVerifierHashValue"));
+    assert_eq!(decrypt(&tampered, PASSWORD), Err(DecryptError::WrongPassword));
+}
+
+#[test]
+fn a_package_shorter_than_its_stated_size_is_damage() {
+    let plain = payload(9000);
+    let file = encrypt(&plain, PASSWORD);
+    let (info, package) = streams(&file).unwrap();
+    // Two ciphertext blocks short of the 9000 bytes the stream promises: the loop cannot fill the
+    // package, which is damage, not a 8968-byte workbook.
+    let mut stream = package.clone();
+    stream.truncate(package.len() - 32);
+    let short = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &stream)]).unwrap();
+    assert!(matches!(decrypt(&short, PASSWORD), Err(DecryptError::Malformed(_))));
+}
+
+#[test]
+fn a_descriptor_without_data_integrity_still_decrypts() {
+    // Not every writer writes `dataIntegrity`; those files have no check to make, and refusing
+    // them would lock readers out of their own workbooks.
+    let plain = payload(5000);
+    let (info, package) = encrypt_agile(&plain, PASSWORD, 1000);
+    assert!(!std::str::from_utf8(info.get(8..).unwrap()).unwrap().contains("dataIntegrity"));
+    assert_eq!(decrypt_streams(&info, &package, PASSWORD).unwrap(), plain);
+}
+
+#[test]
+fn a_data_integrity_file_written_by_another_implementation_reads() {
+    // The descriptor and the package come from the test support module: fixed keys and salts,
+    // its own AES and its own XML, the HMAC fields encrypted with the package key under each
+    // field's own block key. A reader that swaps the two block keys, derives those fields from
+    // the password, or skips the check cannot pass this.
+    let plain = payload(9000);
+    let (info, package) = encrypt_agile_with_integrity(&plain, PASSWORD, 1000);
+    assert!(std::str::from_utf8(&info).unwrap().contains("dataIntegrity"));
+    assert_eq!(decrypt_streams(&info, &package, PASSWORD).unwrap(), plain);
+    // One wrong byte in the package, and one in the HMAC value: both refused as corruption.
+    let mut stream = package.clone();
+    stream[8 + 500] ^= 0x01;
+    assert_eq!(decrypt_streams(&info, &stream, PASSWORD), Err(DecryptError::Corrupted));
+    let xml = String::from_utf8(info[8..].to_vec()).unwrap();
+    let tampered = with_agile_header(&alter_attr(&xml, "encryptedHmacValue"));
+    assert_eq!(decrypt_streams(&tampered, &package, PASSWORD), Err(DecryptError::Corrupted));
+    // And a wrong password is still its own failure, not corruption.
+    assert_eq!(decrypt_streams(&info, &package, "wrong"), Err(DecryptError::WrongPassword));
 }
