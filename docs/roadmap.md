@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (chart edits patch the kept part, unmodelled kinds kept whole, secondary axis; gate #4 down to 4–9 h; beta total ~110–184) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (PivotTable slicers and timelines modelled, command-driven and written from the model — a selection filters the pivot; gates #4 4–9 h and #8 14–22 h; beta total ~104–176) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -30,7 +30,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi (PDF half landed 10-29: subset TrueType embedding) | #5 | 6–12 | Parallel with 2; needs the ui-egui text path. |
 | **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
 | **3** | `.xls` import and password-protected workbooks | #7 | 12–24 | **Encryption write and `.xls` styles/comments landed 10-29**; DV/CF records, BIFF5 and hardening remain. |
-| **3b** | PivotTables: slicers, PivotCharts, Excel verification | #8 | 20–30 | After #1's Excel loop exists; needs #7's Excel-side practice less than it seems. |
+| **3b** | PivotTables: slicer UI, PivotCharts, calculated items, Excel verification | #8 | 14–22 | **Slicers and timelines landed 10-30** (model, XLSX, six commands, a selection filters the pivot); the widgets are not drawn yet. Excel verification waits for #1. |
 | **4** | **Beta exit**: stability soak, all gates green, full `cargo xtask ci`, docs, release, corpus re-run | all | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read half and linked tables (20–30 h) · M17 zone maps (8–12 h) · localization, twelve languages (100–165 h) · Get & Transform/data model (60–100 h) · full chart depth, collaboration, mobile, AI · M22 only if a measured trigger fires | M17/M21/M22 | — | Not beta blockers. Keep the 100M/paging base stable; no native format before a trigger. |
 
@@ -73,10 +73,10 @@ and edge features. Each gate links its gap.
 | Text in every script renders and exports | #5 | **partial 10-29**: PDF export embeds subset TrueType, so Latin Ext/Greek/Cyrillic/Hebrew/Arabic/Devanagari/Thai/CJK/Hangul print (ASCII bytes unchanged, `pdftotext` verified); shaping, bidi and the on-screen path remain | 6–12 |
 | Calculation correctness bugs closed; iterative calculation | #6 | **open** | 10–15 |
 | `.xls` import, password-protected workbooks | #7 | **partial 10-29**: Agile encryption is written and a remembered password survives a save; `.xls` styles/comments read (DV, CF and BIFF5 still refused) | 12–24 |
-| PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
+| PivotTables: slicers, calculated items, PivotCharts, verified in Excel | #8 | **partial 10-30**: slicers and timelines are modelled, written from the model and command-driven (`insert.slicer`, `insert.timeline`, `slicer.setSelection/setStyle/move/delete`) and a selection filters the pivot through its own refresh path, undoably and across save/reopen; no widget UI, no placement shape, no PivotCharts or calculated items yet | 14–22 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **met 10-29** (417 sequences, keyboard context menus, six shortcuts; the Menu key itself is blocked upstream) | 0–6 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #4, #6, #8, #10 (pass-through #3, keyboard #9 met; charts #4, text #5, `.xls`/encryption #7 partly) | **~90–154 + 20–30 base = ~110–184** |
+| **Total** | | gates #1, #4, #6, #8, #10 (pass-through #3, keyboard #9 met; charts #4, text #5, `.xls`/encryption #7, PivotTables #8 partly) | **~84–146 + 20–30 base = ~104–176** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
@@ -818,7 +818,8 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-29 | minor | Chart edits patch the kept chart part field by field (`chart_patch.rs`): only the changed element is rewritten, so unmodelled chart XML survives an edit; unmodelled kinds kept whole instead of dropped; secondary axis modelled, written, patched, drawn. Gate #4 down to 4–9 h, beta total ~110–184 |
+| 2026-10-30 | minor | PivotTable slicers and timelines modelled (cache field, filtered pivots, item values and selected tiles, caption, style, column count, timeline unit, anchor), written once from the model and driven by six commands; a selection writes the field's `PivotFilter` and refreshes in one undo step, so it really filters and survives save/reopen. Unmodellable widget content stays byte-identical. Catalog 280/295, gate #8 → 14–22 h, beta ~104–176 h |
+| 2026-10-30 | minor | Chart edits patch the kept chart part field by field (`chart_patch.rs`): only the changed element is rewritten, so unmodelled chart XML survives an edit; unmodelled kinds kept whole instead of dropped; secondary axis modelled, written, patched, drawn. Gate #4 → 4–9 h |
 | 2026-10-29 | minor | M19 per-sheet save: worksheet XML deflates on a background worker as it is written, `write_zip` mixes raw/pre-deflated parts in order, wasm uses inline/sequential paths; 100M save **28.42 s / 1,814.3 MiB** (was 26.37 s / 6,049.8), 31.7M **3.48 s / 1,283.9 MiB**, byte-identical output; 273 xlsx / 423 engine tests |
 | 2026-10-29 | minor | Measured save peak after S4a: 31.7M cells saves in **3.92 s / 1,655.8 MiB peak**, 100M cells in **26.37 s / 6,049.8 MiB peak** (`session_breakdown`, release, counting allocator). The remaining peak is every sheet's XML in `Out.parts` plus the archive; S4b (per-sheet release) is next |
 | 2026-10-29 | minor | M19 writer ownership: `ZipOut::add` takes `Vec` parts, each moves into its deflate worker and is dropped there, zip64 is decided from a whole-archive bound before compression; output unchanged (37,153 bytes / `sha256 ae15eeb1…` pinned); 271 xlsx / 423 engine tests. Per-sheet release remains, after a measured save peak |

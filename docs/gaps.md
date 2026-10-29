@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-29 · **Change:** minor (chart edits patch the kept part field by field, unmodelled chart kinds kept whole, secondary axis modelled/drawn; §4 → 4–9 h left) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** minor (PivotTable slicers and timelines are modelled, editable and written from the model, and a selection filters the pivot; §8 20–30 h → 14–22 h left; chart edits patch the kept part, unmodelled kinds kept whole, secondary axis; §4 25–35 h → 4–9 h left) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -257,12 +257,28 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   routine in business.
 - **Estimate:** 14–21 h (`.xls` styles and objects 10–15, encryption 4–6). [file-format-parity.md](file-format-parity.md)
 
-### 8. PivotTables: no slicers, calculated items, PivotCharts; unverified in Excel (F)
-- **Evidence:** `parity-checklist.md` missing `insert.slicer`, `insert.timeline`,
-  `insert.pivotChart`, `table.insertSlicer`; calculated items and GETPIVOTDATA missing (calculated fields
-  and values on rows done).
+### 8. PivotTables: no slicer UI, calculated items, PivotCharts; unverified in Excel (F)
+- **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
+  field, the PivotTables they filter, item values with their selected flags, name, caption, style,
+  column count, timeline unit and anchor — read into the model and written once from it, so
+  `insert.slicer` (pivot or table), `insert.timeline`, `slicer.setSelection`, `slicer.setStyle`,
+  `slicer.move` and `slicer.delete` drive a real filter: `setSelection` writes the field's
+  `PivotFilter` on every PivotTable in the cache list and refreshes, in one undo step, and the
+  selection survives save/reopen. Catalog 279 → 280 (94.9 %). Everything GridCraft cannot model (an
+  OLAP cache, item properties, an unknown attribute or relationship, a timeline's date range) stays
+  byte-identical on the pass-through path, all-or-nothing per kind.
+- **Missing:** the slicer/timeline **UI** (the model and commands exist, the widgets are not drawn);
+  the slicer's **placement shape** is not written, so Excel lists a written slicer without placing it
+  on the sheet; a filter on a field outside Rows/Columns is drawn as an extra page-filter row
+  (`PivotFilter` has no flag to distinguish it); timeline date ranges are kept but not editable;
+  calculated items, PivotCharts, value/label filters, number grouping, GETPIVOTDATA and data-model
+  pivots; a table slicer is still not written to XLSX; `pivot.filter` does not sync a slicer's tiles.
+- **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
+  evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
+  is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
+  never been opened in Excel — gate #1.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 20–30 h for beta (25–40 h full).
+- **Estimate:** 14–22 h for beta (25–40 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
