@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M19 writer peak (S4a/S4b); M20 page-file rewrite deferred to M19 | M19 follow-up | **8–15** | M20, the byte-budget cache, the uncached save scan and spill-beside-document landed by 10-29. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: M19 writer per-sheet release (S4b) after measuring the save peak; M20 page-file rewrite deferred | M19 follow-up | **5–10** | S4a ownership landed 10-29. This is the last large-workbook debt before beta evidence. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -553,10 +553,20 @@ live with one info-bar warning. `GRIDCRAFT_PAGE_MB` pins the size threshold for 
 **104**, xlsx **268** (2 ignored), engine **423**. The Unix-only assertions are written but were not
 run on this Windows machine; no peak-memory benchmark was run.
 
-**Scope (remaining).** The XLSX writer still retains every sheet's XML (the real save peak,
-S4a/S4b); and a page-file rewrite (bytes appended by compaction) is deferred. Bands outside the
-working set do leave memory, decompressed when the viewport, calculation or a command touches them,
-which is the phase's core.
+**Writer ownership (10-29).** The save no longer copies every part into the zip or keeps the whole
+uncompressed set alive while the archive is assembled: `ZipOut::add` takes the `Vec`, each part
+moves into its deflate worker and is dropped there, and the zip64 decision is taken up front from
+a bound that covers both headers, worst-case deflate and the end record. A full-feature workbook
+still saves to the same **37,153 bytes** (`sha256 ae15eeb1…`), pinned by a test; a worker panic now
+fails the save instead of writing an empty part. `Out` still retains the sheet XMLs until layout
+(and `image_part` reads them back), so the writer still holds every sheet's XML: the per-sheet
+release (S4b) is the remaining peak, to be done after a measured save peak. Xlsx **271**, engine
+**423** tests.
+
+**Scope (remaining).** The XLSX writer still retains every sheet's XML (the real save peak, S4b),
+and a page-file rewrite (bytes appended by compaction) is deferred. Bands outside the working set
+do leave memory, decompressed when the viewport, calculation or a command touches them, which is
+the phase's core.
 
 **Acceptance.**
 - Working set after opening a 100M-cell workbook ≤ 600 MB, whatever the file size: **16.7 MiB live,
@@ -791,6 +801,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M19 writer ownership: `ZipOut::add` takes `Vec` parts, each moves into its deflate worker and is dropped there, zip64 is decided from a whole-archive bound before compression; output unchanged (37,153 bytes / `sha256 ae15eeb1…` pinned); 271 xlsx / 423 engine tests. Per-sheet release remains, after a measured save peak |
 | 2026-10-29 | minor | M19 spill beside the document: document folder then temp, `GRIDCRAFT_SPILL=temp|off`, UNC skip, sanitized name, Unix 0600 + unlink-after-open, Windows delete-on-close, write-failure latch and one warning when paging is unavailable; 104 model / 268 xlsx / 423 engine tests |
 | 2026-10-29 | minor | M19 uncached save scan: `iter_scan`/`visit_scan` decode one band at a time without touching the page cache, and the XLSX writer uses it (cache stats unchanged, decodes = paged band count, byte-identical output); 97 model / 266 xlsx / 422 engine tests |
 | 2026-10-29 | minor | M19 byte-budget page cache: 64 MiB default (`GRIDCRAFT_PAGE_CACHE_MB` clamped 8–512), per-page-file sharing, decode-time heap charging with generation/`Weak` eviction, `PageCacheStats`, compaction-primed pages charged; 93 model / 422 engine tests; spill placement, save/scan and page-file rewrite remain |
