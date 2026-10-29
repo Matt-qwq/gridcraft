@@ -47,6 +47,7 @@ fn series(name: &str, values: &str) -> Series {
         smooth: false,
         trendlines: Vec::new(),
         quartiles: Default::default(),
+        ..Series::default()
     }
 }
 
@@ -82,6 +83,7 @@ fn chart_names_are_written_qualified() {
         source: None,
         by_rows: false,
         pivot: None,
+        ..Chart::default()
     });
     wb.sheets = vec![Arc::new(s), Arc::new(Sheet::new("My Data"))];
     wb.names = vec![

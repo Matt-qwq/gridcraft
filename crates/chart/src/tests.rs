@@ -49,6 +49,7 @@ fn chart(kind: ChartKind) -> Chart {
         source: None,
         by_rows: false,
         pivot: None,
+        ..Chart::default()
     }
 }
 
@@ -64,6 +65,7 @@ fn series(name: &str, values: &[f64], color: Rgba, kind: ChartKind) -> SeriesDat
         smooth: false,
         trendlines: Vec::new(),
         number_format: "$#,##0".into(),
+        ..SeriesData::default()
     }
 }
 
@@ -231,6 +233,7 @@ fn resolve_from_workbook() {
             quartiles: Default::default(),
             smooth: false,
             trendlines: Vec::new(),
+            ..Series::default()
         },
         Series {
             name: None,
@@ -243,6 +246,7 @@ fn resolve_from_workbook() {
             quartiles: Default::default(),
             smooth: false,
             trendlines: Vec::new(),
+            ..Series::default()
         },
         Series {
             name: Some("Literal".into()),
@@ -255,6 +259,7 @@ fn resolve_from_workbook() {
             quartiles: Default::default(),
             smooth: false,
             trendlines: Vec::new(),
+            ..Series::default()
         },
     ];
     let d = resolve(&wb, 0, &c);
@@ -294,6 +299,7 @@ fn resolve_from_workbook() {
             quartiles: Default::default(),
             smooth: false,
             trendlines: Vec::new(),
+            ..Series::default()
         },
         Series {
             name: None,
@@ -306,6 +312,7 @@ fn resolve_from_workbook() {
             quartiles: Default::default(),
             smooth: false,
             trendlines: Vec::new(),
+            ..Series::default()
         },
     ];
     let d = resolve(&wb, 0, &c);
@@ -323,6 +330,7 @@ fn resolve_from_workbook() {
         quartiles: Default::default(),
         smooth: false,
         trendlines: Vec::new(),
+        ..Series::default()
     }];
     let d = resolve(&wb, 0, &c);
     assert_eq!(d.series[0].x.as_ref().map(|x| x.len()), Some(3));
@@ -341,6 +349,7 @@ fn resolve_from_workbook() {
         quartiles: Default::default(),
         smooth: false,
         trendlines: Vec::new(),
+        ..Series::default()
     }];
     let d = resolve(&wb, 7, &c);
     assert_eq!(d.series.len(), 1);
@@ -651,6 +660,7 @@ fn fuzz_random_data_and_sizes() {
                     })
                     .collect(),
                 number_format: ["General", "$#,##0", "0.00%", "yyyy-mm-dd", "#,##0.0;[Red]-#,##0.0", "@"][(r.next() % 6) as usize].into(),
+                ..SeriesData::default()
             })
             .collect();
         let ncat = (r.next() % 50) as usize;
@@ -1042,6 +1052,7 @@ fn pie_points_follow_workbook_theme() {
         quartiles: Default::default(),
         smooth: false,
         trendlines: Vec::new(),
+        ..Series::default()
     }];
     let d = resolve(&wb, 0, &c);
     let expected = vec![series_color(&wb.theme, 0), series_color(&wb.theme, 1)];
@@ -1214,4 +1225,256 @@ fn box_whisker_draws_each_series_quartile_method() {
     assert_eq!(heights.len(), 2);
     // The boxes span 3.5 and 2.5 data units on the same value axis.
     assert!((heights[0] / heights[1] - 1.4).abs() < 0.001);
+}
+
+#[test]
+fn axis_bounds_and_major_unit_set_the_scale() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.y_axis = AxisOptions { min: Some(10000.0), max: Some(70000.0), major_unit: Some(20000.0), ..AxisOptions::default() };
+    let prims = render(&c, &sample(ChartKind::ColumnClustered), 640.0, 400.0, &m);
+    let t = texts(&prims);
+    for want in ["$10,000", "$30,000", "$50,000", "$70,000"] {
+        assert!(t.contains(&want), "no {want} label: {t:?}");
+    }
+    assert!(!t.contains(&"$0"), "the automatic zero bound is still there: {t:?}");
+    // The same options on a log axis: powers of the base, no zero.
+    let mut log = chart(ChartKind::Line);
+    log.y_axis = AxisOptions { log_base: Some(10.0), ..AxisOptions::default() };
+    let log_data = ChartData {
+        categories: vec!["a".into(), "b".into(), "c".into()],
+        series: vec![SeriesData { values: vec![Some(1.0), Some(100.0), Some(1000.0)], ..SeriesData::default() }],
+        ..ChartData::default()
+    };
+    let prims = render(&log, &log_data, 640.0, 400.0, &m);
+    let t = texts(&prims).join(" ");
+    assert!(t.contains("1000"), "no top power: {t}");
+    assert!(t.contains("10"), "no power 10: {t}");
+}
+
+#[test]
+fn display_units_divide_the_axis_labels() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.y_axis = AxisOptions { display_units: Some(DisplayUnits::Thousands), ..AxisOptions::default() };
+    let prims = render(&c, &sample(ChartKind::ColumnClustered), 640.0, 400.0, &m);
+    let t = texts(&prims);
+    assert!(t.contains(&"Thousands"), "the unit is named beside the axis: {t:?}");
+    assert!(t.contains(&"$70"), "70 000 shows as $70: {t:?}");
+    assert!(!t.contains(&"$70,000"), "raw value still shown: {t:?}");
+}
+
+#[test]
+fn a_reversed_axis_maps_high_values_to_the_bottom() {
+    let s = crate::axis::axis_scale(0.0, 100.0, false, &AxisOptions { reversed: true, ..AxisOptions::default() });
+    assert!(s.frac(s.min) > 0.99 && s.frac(s.max) < 0.01, "{s:?}");
+    // A major unit on a log axis spaces the ticks by powers of the base.
+    let log = crate::axis::axis_scale(1.0, 1000.0, false, &AxisOptions { log_base: Some(10.0), major_unit: Some(2.0), ..AxisOptions::default() });
+    assert_eq!(log.ticks(), vec![1.0, 100.0], "{log:?}");
+    // Crossing the value axis at a fixed value moves the category axis line away from zero.
+    let m = ApproxMeasure;
+    let axis_lines = |prims: &[Prim]| -> Vec<f32> {
+        prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { pts, width, color, .. }
+                    if (*width - 0.75).abs() < 1e-6
+                        && *color == [0xBF, 0xBF, 0xBF, 0xFF]
+                        && pts.len() == 2
+                        && (pts[0][1] - pts[1][1]).abs() < 1e-6 =>
+                {
+                    Some(pts[0][1])
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let d = sample(ChartKind::ColumnClustered);
+    let auto = render(&chart(ChartKind::ColumnClustered), &d, 640.0, 400.0, &m);
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.y_axis = AxisOptions { crosses: AxisCrossing::At(30000.0), ..AxisOptions::default() };
+    let crossed = render(&c, &d, 640.0, 400.0, &m);
+    let y_auto = *axis_lines(&auto).first().unwrap_or(&0.0);
+    let Some(y_cross) = axis_lines(&crossed).first().copied() else { panic!("no category axis line") };
+    // Positive data puts the automatic category axis at the bottom; crossing at 30 000 (of a
+    // 0..70 000 scale) moves it well up the plot.
+    assert!(y_cross < y_auto - 40.0, "crossing did not move the axis: {y_cross} vs {y_auto}");
+}
+
+#[test]
+fn data_labels_show_the_parts_asked_for() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.labels = LabelOptions { show_value: true, show_category: true, show_series: true, separator: Some(" / ".into()), ..LabelOptions::default() };
+    let prims = render(&c, &sample(ChartKind::ColumnClustered), 640.0, 400.0, &m);
+    let t: Vec<String> = texts(&prims).iter().map(|s| (*s).to_string()).collect();
+    assert!(t.iter().any(|s| s == "North / Q1 / $12,000"), "no composed label: {t:?}");
+    // Only the percentage on a pie: a share of the whole.
+    let mut pie = chart(ChartKind::Pie);
+    pie.labels = LabelOptions { show_percentage: true, ..LabelOptions::default() };
+    let prims = render(&pie, &sample(ChartKind::Pie), 640.0, 400.0, &m);
+    let t = texts(&prims);
+    assert!(t.iter().any(|s| s.ends_with('%')), "no percentage label: {t:?}");
+}
+
+#[test]
+fn a_deleted_point_label_is_not_drawn() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    let mut d = sample(ChartKind::ColumnClustered);
+    d.series[0].points = vec![PointStyle { index: 0, no_label: true, ..PointStyle::default() }];
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let t = texts(&prims);
+    assert!(!t.contains(&"$12,000"), "the deleted label is still drawn: {t:?}");
+    assert!(t.contains(&"$9,000"), "another series' label is missing: {t:?}");
+}
+
+#[test]
+fn a_series_can_hide_its_labels_while_the_chart_keeps_them() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    let mut d = sample(ChartKind::ColumnClustered);
+    d.series[1].labels = Some(LabelOptions { hidden: true, ..LabelOptions::default() });
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let t = texts(&prims);
+    assert!(t.contains(&"$12,000"), "the other series keeps its labels: {t:?}");
+    assert!(!t.contains(&"$38,000"), "the hidden series still shows labels: {t:?}");
+}
+
+#[test]
+fn error_bars_are_drawn_with_caps() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.data_labels = false;
+    let mut d = sample(ChartKind::ColumnClustered);
+    d.series[0].error_bars = Some(ErrorBarsData {
+        spec: ErrorBars { direction: ErrorBarDirection::Both, kind: ErrorBarKind::Fixed(5000.0), no_end_cap: false },
+        plus: vec![],
+        minus: vec![],
+    });
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    // Six points: a stem and two 6-point caps each.
+    let thin: Vec<&Prim> = prims.iter().filter(|p| matches!(p, Prim::Line { width, .. } if (*width - 1.0).abs() < 1e-6)).collect();
+    assert!(thin.len() >= 6 * 3, "{} error-bar lines: {thin:?}", thin.len());
+    // Without caps the stems stay.
+    d.series[0].error_bars.as_mut().unwrap().spec.no_end_cap = true;
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let thin = prims.iter().filter(|p| matches!(p, Prim::Line { width, .. } if (*width - 1.0).abs() < 1e-6)).count();
+    assert!((6..=6 * 2).contains(&thin), "{thin} lines without caps");
+}
+
+#[test]
+fn per_point_fill_colours_the_right_point() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.data_labels = false;
+    let mut d = sample(ChartKind::ColumnClustered);
+    let red = [0xC0, 0x00, 0x00, 0xFF];
+    d.series[0].points =
+        vec![gridcraft_model::PointFormat { index: 1, fill: Some(gridcraft_model::Color::Rgb(0xC00000)), ..gridcraft_model::PointFormat::default() }]
+            .into_iter()
+            .map(|p| PointStyle { index: p.index as usize, fill: Some(red), line: None, marker: None, no_label: false })
+            .collect();
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let reds = prims.iter().filter(|p| matches!(p, Prim::Rect { fill: Some(f), .. } if *f == red)).count();
+    assert_eq!(reds, 1, "the override must colour exactly one bar: {prims:?}");
+}
+
+#[test]
+fn every_kind_renders_sanely_with_every_option_set() {
+    let m = ApproxMeasure;
+    for kind in ALL_KINDS {
+        let mut c = chart(kind);
+        c.x_axis = AxisOptions {
+            min: Some(1.0),
+            max: Some(5.0),
+            major_unit: Some(2.0),
+            reversed: true,
+            crosses: AxisCrossing::At(2.0),
+            number_format: Some("0".into()),
+            ..AxisOptions::default()
+        };
+        c.y_axis = AxisOptions {
+            min: Some(-100_000.0),
+            max: Some(100_000.0),
+            major_unit: Some(5_000.0),
+            log_base: Some(10.0),
+            reversed: true,
+            crosses: AxisCrossing::Max,
+            display_units: Some(DisplayUnits::Millions),
+            number_format: Some("0.0".into()),
+        };
+        c.labels = LabelOptions {
+            show_value: true,
+            show_percentage: true,
+            show_series: true,
+            show_category: true,
+            show_legend_key: true,
+            position: LabelPosition::OutsideEnd,
+            separator: Some(" | ".into()),
+            number_format: Some("0.0".into()),
+            hidden: false,
+        };
+        let mut d = sample(kind);
+        for (i, s) in d.series.iter_mut().enumerate() {
+            s.labels = Some(LabelOptions { show_category: true, position: LabelPosition::Center, ..LabelOptions::default() });
+            s.error_bars = Some(ErrorBarsData {
+                spec: ErrorBars {
+                    direction: match i % 3 {
+                        0 => ErrorBarDirection::Both,
+                        1 => ErrorBarDirection::Plus,
+                        _ => ErrorBarDirection::Minus,
+                    },
+                    kind: match i % 4 {
+                        0 => ErrorBarKind::Fixed(1_000.0),
+                        1 => ErrorBarKind::Percentage(50.0),
+                        2 => ErrorBarKind::StdDev(2.0),
+                        _ => ErrorBarKind::StdErr,
+                    },
+                    no_end_cap: i % 2 == 0,
+                },
+                plus: vec![Some(1.0), None, Some(2.0)],
+                minus: vec![Some(2.0), Some(1.0)],
+            });
+            s.points = vec![PointStyle {
+                index: i,
+                fill: Some([0xC0, 0x00, 0x00, 0xFF]),
+                line: Some([0x00, 0xB0, 0x50, 0xFF]),
+                marker: Some([0x00, 0x70, 0xC0, 0xFF]),
+                no_label: i % 2 == 0,
+            }];
+        }
+        let (w, h) = (640.0, 400.0);
+        let prims = render(&c, &d, w, h, &m);
+        assert_sane(&prims, w, h);
+    }
+}
+
+#[test]
+fn hostile_chart_options_do_not_panic_or_go_non_finite() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::Scatter);
+    c.y_axis = AxisOptions {
+        min: Some(f64::NAN),
+        max: Some(f64::INFINITY),
+        major_unit: Some(f64::NAN),
+        log_base: Some(1e300),
+        reversed: true,
+        crosses: AxisCrossing::At(f64::NAN),
+        display_units: None,
+        number_format: Some("General".into()),
+    };
+    c.x_axis = AxisOptions { min: Some(-1e300), max: Some(1e300), major_unit: Some(1e-300), ..AxisOptions::default() };
+    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    let mut d = sample(ChartKind::Scatter);
+    d.series[0].error_bars = Some(ErrorBarsData {
+        spec: ErrorBars { direction: ErrorBarDirection::Both, kind: ErrorBarKind::Fixed(1e300), no_end_cap: false },
+        plus: vec![],
+        minus: vec![],
+    });
+    d.series[0].points = vec![PointStyle { index: usize::MAX, fill: Some([1, 2, 3, 255]), ..PointStyle::default() }];
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    assert_sane(&prims, 640.0, 400.0);
 }

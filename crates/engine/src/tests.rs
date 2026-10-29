@@ -5299,3 +5299,152 @@ fn document_compact_does_not_orphan_on_a_protected_sheet() {
     assert_eq!(v(&s, "D1"), Value::Number(20.0));
     assert_eq!(v(&s, "D2"), Value::Number(30.0));
 }
+
+#[test]
+fn chart_formatting_commands_set_every_modelled_option() {
+    use gridcraft_model::{AxisCrossing, DisplayUnits, ErrorBarDirection, ErrorBarKind, LabelPosition};
+    let mut s = s();
+    chart_data(&mut s);
+    s.execute("insert.chart", json!({"type": "column", "range": "A1:E7"})).unwrap();
+    let chart = |s: &Session| s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    s.execute(
+        "chart.setAxis",
+        json!({"axis": "y", "min": 10, "max": 90, "majorUnit": 20, "logBase": 10, "reversed": true, "crosses": 30, "displayUnits": "thousands", "numberFormat": "0.0"}),
+    )
+    .unwrap();
+    let y = chart(&s).y_axis;
+    assert_eq!((y.min, y.max, y.major_unit, y.log_base), (Some(10.0), Some(90.0), Some(20.0), Some(10.0)));
+    assert!(y.reversed);
+    assert_eq!(y.crosses, AxisCrossing::At(30.0));
+    assert_eq!(y.display_units, Some(DisplayUnits::Thousands));
+    assert_eq!(y.number_format.as_deref(), Some("0.0"));
+
+    s.execute("chart.setAxis", json!({"axis": "x", "reversed": true, "majorUnit": 2, "numberFormat": ""})).unwrap();
+    let x = chart(&s).x_axis;
+    assert!(x.reversed);
+    assert_eq!(x.major_unit, Some(2.0));
+    assert_eq!(x.number_format, None);
+
+    // Options are validated before the edit lands.
+    let before = chart(&s).y_axis;
+    assert!(s.execute("chart.setAxis", json!({})).is_err(), "nothing to change");
+    assert!(s.execute("chart.setAxis", json!({"logBase": 1})).is_err());
+    assert!(s.execute("chart.setAxis", json!({"min": 5, "max": 5})).is_err());
+    assert!(s.execute("chart.setAxis", json!({"axis": "z", "min": 1})).is_err());
+    assert_eq!(chart(&s).y_axis, before, "a refused axis change leaves the chart as it was");
+    s.execute("chart.setAxis", json!({"axis": "y", "reset": true})).unwrap();
+    assert_eq!(chart(&s).y_axis, gridcraft_model::AxisOptions::default());
+
+    s.execute("chart.setDataLabels", json!({"value": true, "categoryName": true, "separator": " / ", "position": "outsideEnd"})).unwrap();
+    let c = chart(&s);
+    assert!(c.data_labels);
+    assert!(c.labels.show_value && c.labels.show_category && !c.labels.show_percentage);
+    assert_eq!(c.labels.position, LabelPosition::OutsideEnd);
+    assert_eq!(c.labels.separator.as_deref(), Some(" / "));
+    s.execute("chart.setDataLabels", json!({"series": 1, "percentage": true})).unwrap();
+    let se = chart(&s).series[1].labels.clone().unwrap();
+    assert!(se.show_percentage && !se.show_value);
+    // One series hides its labels while the chart keeps them.
+    s.execute("chart.setDataLabels", json!({"series": 2, "on": false})).unwrap();
+    assert!(chart(&s).series[2].labels.as_ref().is_some_and(|l| l.hidden));
+    s.execute("chart.setDataLabels", json!({"series": 2, "on": true, "value": true})).unwrap();
+    assert!(chart(&s).series[2].labels.as_ref().is_some_and(|l| !l.hidden && l.show_value));
+    s.execute("chart.setDataLabels", json!({"deletePoint": 0})).unwrap();
+    assert!(chart(&s).series.iter().all(|se| se.point(0).is_some_and(|p| p.no_label)));
+    s.execute("chart.setDataLabels", json!({"showPoint": 0})).unwrap();
+    assert!(chart(&s).series.iter().all(|se| se.point(0).is_some_and(|p| !p.no_label)));
+    s.execute("chart.setDataLabels", json!({"on": false})).unwrap();
+    assert!(!chart(&s).data_labels);
+    assert!(chart(&s).labels.show_value, "turning labels off keeps their options");
+    assert!(s.execute("chart.setDataLabels", json!({"series": 99, "value": true})).is_err());
+
+    s.execute("chart.setErrorBars", json!({"type": "fixed", "value": 2.5, "direction": "plus", "noEndCap": true})).unwrap();
+    for se in &chart(&s).series {
+        let e = se.error_bars.clone().unwrap();
+        assert_eq!((e.direction, e.kind, e.no_end_cap), (ErrorBarDirection::Plus, ErrorBarKind::Fixed(2.5), true));
+    }
+    s.execute("chart.setErrorBars", json!({"series": 0, "type": "percentage", "value": 15})).unwrap();
+    assert_eq!(chart(&s).series[0].error_bars.as_ref().unwrap().kind, ErrorBarKind::Percentage(15.0));
+    assert_eq!(chart(&s).series[1].error_bars.as_ref().unwrap().kind, ErrorBarKind::Fixed(2.5));
+    s.execute("chart.setErrorBars", json!({"series": 0, "type": "stdDev", "value": 2})).unwrap();
+    assert_eq!(chart(&s).series[0].error_bars.as_ref().unwrap().kind, ErrorBarKind::StdDev(2.0));
+    s.execute("chart.setErrorBars", json!({"series": 0, "type": "custom", "plus": "{1,2,3,4,5,6}", "minus": "{6,5,4,3,2,1}"})).unwrap();
+    assert!(matches!(chart(&s).series[0].error_bars.as_ref().unwrap().kind, ErrorBarKind::Custom { .. }));
+    s.execute("chart.setErrorBars", json!({"series": 0, "type": "none"})).unwrap();
+    assert!(chart(&s).series[0].error_bars.is_none());
+    assert!(chart(&s).series[1].error_bars.is_some());
+    assert!(s.execute("chart.setErrorBars", json!({})).is_err(), "a type is required");
+    assert!(s.execute("chart.setErrorBars", json!({"type": "wat"})).is_err());
+    assert!(s.execute("chart.setErrorBars", json!({"type": "custom"})).is_err(), "custom needs a reference");
+
+    s.execute("chart.formatPoint", json!({"series": 0, "point": 2, "fill": "C00000", "line": "00B050", "deleteLabel": true})).unwrap();
+    let p = chart(&s).series[0].point(2).copied().unwrap();
+    assert_eq!((p.index, p.fill, p.line), (2, Some(gridcraft_model::Color::Rgb(0xC00000)), Some(gridcraft_model::Color::Rgb(0x00B050))));
+    assert!(p.no_label);
+    assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 2, "marker": "0070C0"})).is_err(), "a bar point has no marker");
+    s.execute("chart.formatPoint", json!({"series": 0, "point": 2, "clear": true})).unwrap();
+    assert!(chart(&s).series[0].point(2).is_none());
+    assert!(s.execute("chart.formatPoint", json!({"series": 0})).is_err(), "a point is required");
+    assert!(s.execute("chart.formatPoint", json!({"series": 99, "point": 0, "fill": "FF0000"})).is_err());
+    assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 0, "fill": "not a colour"})).is_err());
+    assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 0})).is_err(), "nothing to change");
+
+    // A line point does have a marker: the colour is stored with it.
+    s.execute("insert.chart", json!({"type": "line", "range": "A1:E7"})).unwrap();
+    s.execute("chart.formatPoint", json!({"series": 0, "point": 1, "marker": "0070C0"})).unwrap();
+    let line = s.doc().unwrap().wb.active().unwrap().charts[1].series[0].point(1).copied().unwrap();
+    assert_eq!(line.marker, Some(gridcraft_model::Color::Rgb(0x0070C0)));
+
+    // Everything above survives a save and reopen.
+    let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    s.execute("file.open", json!({"name": "chart.xlsx", "base64": b64})).unwrap();
+    let c = chart(&s);
+    assert!(c.x_axis.reversed);
+    assert_eq!(c.y_axis, gridcraft_model::AxisOptions::default(), "reset before saving");
+    // Labels were switched off before the save, so no label XML is written: the options (an
+    // Excel "Data Labels: None" behaviour) go with them.
+    assert!(!c.data_labels);
+    assert_eq!(c.labels.position, LabelPosition::Auto);
+    assert_eq!(c.series[1].labels, None);
+    assert_eq!(c.series[1].error_bars.as_ref().unwrap().kind, ErrorBarKind::Fixed(2.5));
+    assert!(c.series[0].error_bars.is_none());
+}
+
+#[test]
+fn chart_options_are_refused_where_they_cannot_be_saved() {
+    let mut pie = s();
+    chart_data(&mut pie);
+    pie.execute("insert.chart", json!({"type": "pie", "range": "A1:B7"})).unwrap();
+    assert!(pie.execute("chart.setAxis", json!({"min": 1})).is_err(), "a pie has no axes");
+    assert!(pie.execute("chart.setErrorBars", json!({"type": "fixed", "value": 1})).is_err(), "no error bars on a pie");
+
+    // A histogram keeps its options in a chartex part, which GridCraft regenerates: refuse rather
+    // than store an option that the next save drops.
+    let mut h = s();
+    chart_data(&mut h);
+    h.execute("insert.chart", json!({"type": "histogram", "range": "A1:B7"})).unwrap();
+    assert!(h.execute("chart.setAxis", json!({"min": 1})).is_err());
+    assert!(h.execute("chart.setDataLabels", json!({"percentage": true})).is_err());
+    assert!(h.execute("chart.formatPoint", json!({"series": 0, "point": 0, "fill": "FF0000"})).is_err());
+}
+
+#[test]
+fn labels_on_one_series_only_survive_a_save() {
+    let mut s = s();
+    chart_data(&mut s);
+    s.execute("insert.chart", json!({"type": "line", "range": "A1:E7"})).unwrap();
+    s.execute("chart.setDataLabels", json!({"on": false})).unwrap();
+    s.execute("chart.setDataLabels", json!({"series": 1, "value": true})).unwrap();
+    let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    s.execute("file.open", json!({"name": "labels.xlsx", "base64": b64})).unwrap();
+    let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    assert!(c.data_labels);
+    assert!(c.series[1].labels.as_ref().is_some_and(|l| l.show_value && !l.hidden));
+    for (i, se) in c.series.iter().enumerate() {
+        if i != 1 {
+            assert!(se.labels.as_ref().is_some_and(|l| l.hidden), "series {i} should show no labels: {:?}", se.labels);
+        }
+    }
+}

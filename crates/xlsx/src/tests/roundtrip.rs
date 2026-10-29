@@ -411,6 +411,7 @@ fn sample() -> Workbook {
             quartiles: Default::default(),
             smooth: false,
             trendlines: Vec::new(),
+            ..Series::default()
         }],
         legend: LegendPos::Bottom,
         data_labels: true,
@@ -421,6 +422,7 @@ fn sample() -> Workbook {
         source: None,
         by_rows: false,
         pivot: None,
+        ..Chart::default()
     };
     for kind in [
         ChartKind::ColumnClustered,

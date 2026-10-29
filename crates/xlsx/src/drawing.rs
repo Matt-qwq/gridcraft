@@ -164,12 +164,22 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                     if let Some(rid) = gd.child("chart").and_then(|c| c.attr("id")) {
                         let Some(rel) = rels.iter().find(|r| r.id == rid) else { continue };
                         let target = rel.target.clone();
-                        if let Some(cx_xml) = cx.optional_xml(&target)? {
-                            let chartex = uri.contains("chartex");
+                        let chartex = uri.contains("chartex");
+                        // A chart part with relationships of its own (external data, user shapes) can't
+                        // be written back on its own: those parts are not kept, and its `r:id`s
+                        // would dangle.
+                        let linked = !cx.pkg.rels(&target)?.is_empty();
+                        let part = cx.optional_xml_text(&target)?;
+                        if let Some((cx_xml, text)) = part {
                             match if chartex { crate::chartex::read_chartex(&cx_xml) } else { crate::chart::read_chart(&cx_xml) } {
                                 Some(mut ch) => {
                                     ch.id = cx.next_object_id();
                                     ch.anchor = anchor;
+                                    // Classic chart parts are kept so unmodelled options survive a save;
+                                    // a chartex part refers to hidden defined names, which are not kept.
+                                    if !chartex && !linked {
+                                        ch.keep_part(text.into());
+                                    }
                                     sheet.charts.push(ch);
                                 }
                                 None => cx.warn(format!("chart {target} has no supported plot and was skipped")),

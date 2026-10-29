@@ -2,10 +2,10 @@
 
 use gridcraft_calc::evaluate;
 use gridcraft_core::{CellRef, RangeRef, Value, category_levels, number_to_text};
-use gridcraft_model::{Chart, ChartKind, Theme, Workbook, style::apply_tint};
+use gridcraft_model::{Chart, ChartKind, ErrorBars, PointFormat, Theme, Workbook, style::apply_tint};
 use gridcraft_numfmt::{NumberFormat, format_value};
 
-use crate::{ChartData, Rgba, SeriesData, TrendlineData};
+use crate::{ChartData, ErrorBarsData, PointStyle, Rgba, SeriesData, TrendlineData};
 
 /// Cap on points per series (keeps whole-column references from exploding).
 pub(crate) const MAX_POINTS: usize = 100_000;
@@ -13,6 +13,8 @@ pub(crate) const MAX_POINTS: usize = 100_000;
 pub(crate) const MAX_SERIES: usize = 255;
 /// Cap on trendlines drawn per series.
 pub(crate) const MAX_TRENDLINES: usize = 16;
+/// Cap on per-point formatting overrides drawn per series.
+pub(crate) const MAX_POINT_STYLES: usize = 4096;
 
 /// Tints used for series beyond the six theme accents: lighter, darker, lighter still…
 const CYCLE_TINTS: [f64; 6] = [0.0, 0.4, -0.25, 0.6, -0.5, 0.2];
@@ -120,6 +122,37 @@ fn ref_format(wb: &Workbook, sheet: usize, formula: &str) -> String {
     parse_ref(wb, sheet, formula)
         .and_then(|(sh, r)| wb.sheet(sh).map(|s| wb.styles.get(s.style_id(r.start)).num_fmt.0.to_string()))
         .unwrap_or_else(|| "General".into())
+}
+
+/// Colours of a point override, resolved against the workbook theme.
+fn point_styles(points: &[PointFormat], theme: &Theme) -> Vec<PointStyle> {
+    let rgba = |c: &Option<gridcraft_model::Color>| c.as_ref().and_then(|c| c.resolve(theme)).map(|[r, g, b]| [r, g, b, 0xFF]);
+    let mut out: Vec<PointStyle> = points
+        .iter()
+        .take(MAX_POINT_STYLES)
+        .filter_map(|p| usize::try_from(p.index).ok().map(|index| (index, p)))
+        .map(|(index, p)| PointStyle { index, fill: rgba(&p.fill), line: rgba(&p.line), marker: rgba(&p.marker), no_label: p.no_label })
+        .collect();
+    // Sorted by index, so a lookup is a binary search: a file may list its points in any order.
+    out.sort_by_key(|p| p.index);
+    out
+}
+
+/// A custom error bar's amounts: references and array constants are evaluated like a series.
+fn custom_amounts(wb: &Workbook, sheet: usize, f: Option<&String>) -> Vec<Option<f64>> {
+    f.map(|f| nums(wb, sheet, f)).unwrap_or_default()
+}
+
+/// Error bars with the custom amounts resolved; the other kinds are computed from the values when
+/// they are drawn.
+fn error_bars(wb: &Workbook, sheet: usize, e: &ErrorBars) -> ErrorBarsData {
+    let (plus, minus) = match &e.kind {
+        gridcraft_model::ErrorBarKind::Custom { plus, minus } => {
+            (custom_amounts(wb, sheet, plus.as_ref()), custom_amounts(wb, sheet, minus.as_ref()))
+        }
+        _ => (vec![], vec![]),
+    };
+    ErrorBarsData { spec: e.clone(), plus, minus }
 }
 
 fn value_text(v: &Value) -> String {
@@ -269,6 +302,9 @@ pub fn resolve(wb: &Workbook, sheet: usize, chart: &Chart) -> ChartData {
             smooth: s.smooth,
             trendlines,
             number_format: ref_format(wb, sheet, &s.values),
+            labels: s.labels.clone(),
+            error_bars: s.error_bars.as_ref().map(|e| error_bars(wb, sheet, e)),
+            points: point_styles(&s.points, &wb.theme),
         });
     }
     let n = series.iter().map(|s| s.values.len()).max().unwrap_or(0);

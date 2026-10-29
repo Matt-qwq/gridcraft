@@ -1551,6 +1551,7 @@ pub fn chart_series(sheet: &str, origin: CellRef, out: &Output) -> Vec<Series> {
                 quartiles: Default::default(),
                 smooth: false,
                 trendlines: Vec::new(),
+                ..Series::default()
             })
         })
         .collect()

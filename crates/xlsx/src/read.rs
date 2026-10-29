@@ -92,6 +92,30 @@ impl Ctx<'_> {
             }
         }
     }
+
+    /// Reads and parses an optional part, also returning its text: a chart part is kept byte for
+    /// byte so its unmodelled options survive a save. Problems other than size limits become
+    /// warnings, as in [`Self::optional_xml`].
+    pub fn optional_xml_text(&mut self, part: &str) -> Result<Option<(El, String)>, IoError> {
+        match self.pkg.read(part) {
+            Ok(Some(bytes)) => match xml::parse(&bytes) {
+                Ok(e) => Ok(Some((e, String::from_utf8_lossy(&bytes).into_owned()))),
+                Err(e) => {
+                    self.warn(format!("skipped {part}: {e}"));
+                    Ok(None)
+                }
+            },
+            Ok(None) => {
+                self.warn(format!("missing part {part}"));
+                Ok(None)
+            }
+            Err(IoError::TooLarge(m)) => Err(IoError::TooLarge(m)),
+            Err(e) => {
+                self.warn(format!("skipped {part}: {e}"));
+                Ok(None)
+            }
+        }
+    }
 }
 
 pub fn find_rel<'r>(rels: &'r [Rel], kind: &str) -> Option<&'r Rel> {
