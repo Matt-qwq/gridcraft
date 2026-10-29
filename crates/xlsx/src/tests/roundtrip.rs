@@ -675,6 +675,42 @@ fn saved_package_bytes_are_stable() {
     assert_eq!(digest, "ae15eeb11cee78f1259127f7bbfc3d7f8ffa46e228d2eb089388f593b3a712d7", "the package changed bytes");
 }
 
+/// Every sheet is deflated as it is produced, which must not change a byte, drop a part or make
+/// the package unreadable. Several sheets are written through both paths and compared.
+#[test]
+fn precompressed_sheets_write_the_same_package() {
+    let mut wb = Workbook::new();
+    wb.sheets.clear();
+    for i in 0..4u32 {
+        let mut s = Sheet::new(format!("Sheet{}", i + 1));
+        for row in 0..200u32 {
+            for col in 0..20u32 {
+                s.set_value(CellRef::new(row, col), Value::Number((row * 20 + col + i * 7) as f64));
+            }
+        }
+        s.set_value(at("A1"), Value::text(format!("sheet {i}")));
+        wb.sheets.push(Arc::new(s));
+    }
+    let packed = write_xlsx(&wb).unwrap();
+    let raw = crate::write::write_xlsx_all_raw(&wb, crate::XlsxKind::Workbook).unwrap();
+    assert_eq!(packed, raw, "pre-deflating the sheets changed the package");
+
+    // Every part is there, and the package opens and reads back.
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&packed)).unwrap();
+    let names: Vec<String> = (0..archive.len()).filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string())).collect();
+    for i in 1..=4 {
+        assert!(names.iter().any(|n| n == &format!("xl/worksheets/sheet{i}.xml")), "sheet{i} is missing: {names:?}");
+    }
+    let (back, _) = read_xlsx(&packed).unwrap();
+    assert_eq!(back.sheets.len(), 4);
+    for (i, sheet) in back.sheets.iter().enumerate() {
+        assert_eq!(sheet.name, format!("Sheet{}", i + 1));
+        assert_eq!(sheet.cell(at("A1")).map(|c| c.value.clone()), Some(Value::text(format!("sheet {i}"))));
+        let last = 199 * 20 + 19 + i * 7;
+        assert_eq!(sheet.cell(CellRef::new(199, 19)).map(|c| c.value.clone()), Some(Value::Number(last as f64)));
+    }
+}
+
 #[test]
 fn iterative_calculation_settings_roundtrip() {
     let calc_pr = |wb: &Workbook| {

@@ -7,7 +7,9 @@ use gridcraft_core::RangeRef;
 use gridcraft_formula::quote_sheet;
 use gridcraft_model::{CalcMode, CalcSettings, PhoneticString, ShowObjects, Style, Visibility, Workbook};
 
-use crate::package::ZipOut;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::package::Packed;
+use crate::package::{Part, ZipOut};
 use crate::xml::{esc, esc_attr};
 use crate::{IoError, XlsxKind};
 
@@ -104,13 +106,56 @@ impl Sst {
     }
 }
 
+/// The thread that deflates worksheet XML while the next sheet is written. One worker and a
+/// one-job queue are enough because a sheet takes longer to write than to deflate; if deflate does
+/// fall behind, `send` blocks the writer instead of letting raw XML pile up. Native only: wasm has
+/// no OS threads and deflates each sheet inline instead.
+#[cfg(not(target_arch = "wasm32"))]
+struct SheetPacker {
+    jobs: std::sync::mpsc::SyncSender<(usize, String, Vec<u8>)>,
+    results: std::sync::mpsc::Receiver<(usize, Result<Packed, IoError>)>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SheetPacker {
+    fn start() -> Result<SheetPacker, IoError> {
+        let (jobs, job_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, results) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("gridcraft-xlsx-sheet-pack".into())
+            .spawn(move || {
+                for (index, name, data) in job_rx {
+                    // A part that fails still travels back, so the save reports it instead of
+                    // waiting for a result that never comes.
+                    if result_tx.send((index, crate::package::pack(name, data))).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| IoError::Zip(format!("cannot start the sheet compression thread: {e}")))?;
+        Ok(SheetPacker { jobs, results, worker })
+    }
+}
+
 /// Package being assembled. Each part's bytes are held once: they are built straight into
 /// [`Out::part`], kept for the package's layout, and then moved into the zip rather than copied.
+/// Worksheet XML is deflated as it is produced ([`Out::part_precompressed`]), because the sheets are
+/// most of a large workbook and holding every sheet's XML until the archive is assembled is what
+/// made a 100-million-cell save peak at 6 GB. Native saves deflate it on a worker thread while the
+/// next sheet is written; wasm has no threads and deflates inline.
 pub struct Out {
-    /// The parts, in creation order, until the layout hands each to [`ZipOut`]. [`Out::image_part`]
-    /// reads them back to write a picture used twice as one media part, which is why a part cannot
-    /// be dropped as soon as it is added.
-    parts: Vec<(String, Vec<u8>)>,
+    /// The parts, in creation order, until the layout hands each to [`ZipOut`]. Media parts stay
+    /// raw because [`Out::image_part`] reads them back to write a picture used twice as one media
+    /// part; worksheet parts are already deflated and are not read back.
+    parts: Vec<(String, Part)>,
+    /// The thread deflating worksheet XML while the next sheet is written; `None` until the first
+    /// precompressed part. Wasm deflates inline and needs no worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    packer: Option<SheetPacker>,
+    /// Worksheet parts waiting for the packer's result. Wasm writes them in place.
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_sheets: usize,
     overrides: Vec<(String, String)>,
     defaults: BTreeMap<String, String>,
     pub dxfs: Vec<Style>,
@@ -138,6 +183,10 @@ impl Default for Out {
     fn default() -> Self {
         Out {
             parts: vec![],
+            #[cfg(not(target_arch = "wasm32"))]
+            packer: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_sheets: 0,
             overrides: vec![],
             defaults: BTreeMap::new(),
             dxfs: vec![],
@@ -164,13 +213,81 @@ impl Out {
         if let Some(ct) = content_type {
             self.overrides.push((format!("/{name}"), ct.to_string()));
         }
-        self.parts.push((name.to_string(), data));
+        self.parts.push((name.to_string(), Part::Raw(data)));
+    }
+    /// A part that is deflated while the rest of the workbook is written, and whose raw bytes are
+    /// then dropped: worksheet XML, which is most of a large workbook. Its archive bytes are the
+    /// same as [`Out::part`] would produce, because both use the same deflate. Native saves use a
+    /// worker thread; wasm has no OS threads, so it deflates here and keeps the packed part.
+    pub fn part_precompressed(&mut self, name: &str, content_type: Option<&str>, data: Vec<u8>) -> Result<(), IoError> {
+        if let Some(ct) = content_type {
+            self.overrides.push((format!("/{name}"), ct.to_string()));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.parts.push((name.to_string(), Part::Packed(crate::package::pack(name.to_string(), data)?)));
+            Ok(())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let index = self.parts.len();
+            // The place keeps the part in creation order; `finish_pending` fills it with the packed
+            // result. A save never lays out the parts without calling that first.
+            self.parts.push((name.to_string(), Part::Raw(Vec::new())));
+            self.pending_sheets += 1;
+            if self.packer.is_none() {
+                self.packer = Some(SheetPacker::start()?);
+            }
+            let packer = self.packer.as_ref().ok_or_else(|| IoError::Zip("the sheet compression thread is not running".into()))?;
+            packer.jobs.send((index, name.to_string(), data)).map_err(|_| IoError::Zip("the sheet compression thread stopped".into()))
+        }
+    }
+    /// Waits for every precompressed part to be deflated and puts it in its place. The worker runs
+    /// while the later parts are built, so this is the only point a save waits for it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_pending(&mut self) -> Result<(), IoError> {
+        let count = std::mem::take(&mut self.pending_sheets);
+        let Some(packer) = self.packer.take() else {
+            return if count == 0 { Ok(()) } else { Err(IoError::Zip("the sheet compression thread is not running".into())) };
+        };
+        let SheetPacker { jobs, results, worker } = packer;
+        // Closing the queue lets the worker reach the end of its loop after the last part.
+        drop(jobs);
+        let mut finished = Vec::with_capacity(count);
+        for _ in 0..count {
+            match results.recv() {
+                Ok(part) => finished.push(part),
+                Err(_) => {
+                    // The worker stopped before reporting every part; join it so no thread outlives
+                    // the failed save, then report the failure.
+                    let _ = worker.join();
+                    return Err(IoError::Zip("the sheet compression thread stopped".into()));
+                }
+            }
+        }
+        worker.join().map_err(|_| IoError::Zip("a compression thread panicked".into()))?;
+        for (index, packed) in finished {
+            let packed = packed?;
+            match self.parts.get_mut(index) {
+                Some(slot) => slot.1 = Part::Packed(packed),
+                None => return Err(IoError::Zip("a compressed sheet has no part to go in".into())),
+            }
+        }
+        Ok(())
+    }
+    /// Nothing to wait for: on wasm every precompressed part was deflated inline as it was made.
+    #[cfg(target_arch = "wasm32")]
+    fn finish_pending(&mut self) -> Result<(), IoError> {
+        Ok(())
     }
     /// The `xl/media` file name (`imageN.ext`) holding `data`. A picture used on several sheets,
     /// or twice on one, is written once and every drawing points to that part, as in Excel.
     pub fn image_part(&mut self, ext: &str, data: &[u8]) -> String {
-        let existing = self.parts.iter().find(|(name, bytes)| {
-            name.strip_prefix("xl/media/image").is_some_and(|rest| rest.ends_with(&format!(".{ext}"))) && bytes.as_slice() == data
+        // Media parts are kept raw: this lookup compares their bytes, and an image is small next to
+        // a sheet's XML. A packed part is skipped rather than expanded for every lookup.
+        let existing = self.parts.iter().find(|(name, part)| {
+            name.strip_prefix("xl/media/image").is_some_and(|rest| rest.ends_with(&format!(".{ext}")))
+                && matches!(part, Part::Raw(bytes) if bytes.as_slice() == data)
         });
         if let Some((name, _)) = existing {
             return name.trim_start_matches("xl/media/").to_string();
@@ -240,6 +357,17 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
 /// Writes the workbook for the file `book_name` (a bare file name). A PivotChart is bound to its
 /// PivotTable in Excel only when its link starts with the workbook in brackets.
 pub fn write_xlsx_named(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>) -> Result<Vec<u8>, IoError> {
+    write_xlsx_impl(wb, kind, book_name, true)
+}
+
+/// The writer with the worksheet parts left raw. Tests compare it with the normal writer to prove
+/// that deflating each sheet as it is produced changes no byte; nothing else calls it.
+#[cfg(test)]
+pub(crate) fn write_xlsx_all_raw(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
+    write_xlsx_impl(wb, kind, None, false)
+}
+
+fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, precompress_sheets: bool) -> Result<Vec<u8>, IoError> {
     if wb.sheets.is_empty() {
         return Err(IoError::Format("a workbook needs at least one sheet".into()));
     }
@@ -249,6 +377,10 @@ pub fn write_xlsx_named(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>) 
     check_sheet_names(wb)?;
     let mut out = Out {
         parts: vec![],
+        #[cfg(not(target_arch = "wasm32"))]
+        packer: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        pending_sheets: 0,
         overrides: vec![],
         defaults: BTreeMap::new(),
         dxfs: vec![],
@@ -292,7 +424,11 @@ pub fn write_xlsx_named(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>) 
         let (xml, mut rels) = crate::sheet_write::write_sheet(wb, i, i == active, &mut out);
         pivots.add_sheet(wb, i, &mut out, &mut rels);
         let name = format!("xl/worksheets/sheet{}.xml", i + 1);
-        out.part(&name, Some(CT_WORKSHEET), xml.into_bytes());
+        if precompress_sheets {
+            out.part_precompressed(&name, Some(CT_WORKSHEET), xml.into_bytes())?;
+        } else {
+            out.part(&name, Some(CT_WORKSHEET), xml.into_bytes());
+        }
         if !rels.is_empty() {
             out.part(&format!("xl/worksheets/_rels/sheet{}.xml.rels", i + 1), None, rels.xml().into_bytes());
         }
@@ -533,11 +669,15 @@ pub fn write_xlsx_named(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>) 
         n if n.starts_with("docProps/") => 4,
         _ => 3,
     };
+    // Native: the sheets were deflated on their thread while everything above was written; wait
+    // for them before the package is laid out. Wasm already deflated them inline.
+    out.finish_pending()?;
     let mut parts = std::mem::take(&mut out.parts);
     parts.sort_by_key(|(n, _)| rank(n));
-    // Each part is handed to the zip by value, which drops it once it is deflated.
-    for (name, data) in parts {
-        zip.add(&name, data)?;
+    // Each part is handed to the zip by value, which drops it once it is deflated (or immediately,
+    // when it was already packed as its sheet was written).
+    for (name, part) in parts {
+        zip.add_part(&name, part);
     }
     zip.finish()
 }

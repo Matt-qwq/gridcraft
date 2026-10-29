@@ -1,6 +1,7 @@
 //! OPC package access: reading zip parts with decompression limits, relationships and part-name
 //! resolution; writing a zip package deterministically.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 
@@ -283,7 +284,7 @@ pub fn resolve(dir: &str, target: &str) -> String {
 /// Any archive that would need zip64 (a part at 4 GB, an offset past it) is handed to `zip`
 /// instead; an xlsx that large is rare, and a second writer for it is cheaper than zip64 here.
 pub struct ZipOut {
-    entries: Vec<(String, Vec<u8>)>,
+    entries: Vec<(String, Part)>,
 }
 
 impl ZipOut {
@@ -298,8 +299,13 @@ impl ZipOut {
     ///
     /// The part is taken, not copied: the save holds each part's bytes once.
     pub fn add(&mut self, name: &str, data: Vec<u8>) -> Result<(), IoError> {
-        self.entries.push((name.to_string(), data));
+        self.add_part(name, Part::Raw(data));
         Ok(())
+    }
+
+    /// Adds a part that may already be deflated (a worksheet, packed while it was written).
+    pub(crate) fn add_part(&mut self, name: &str, part: Part) {
+        self.entries.push((name.to_string(), part));
     }
 
     pub fn finish(self) -> Result<Vec<u8>, IoError> {
@@ -334,12 +340,23 @@ fn deflate_bound(len: usize) -> usize {
     len.saturating_add(len / 4096).saturating_add(len / 16384).saturating_add(len / 33_554_432).saturating_add(13)
 }
 
+/// The part's size before deflate. A pre-deflated part records the size it was packed from, so the
+/// decision below is the same whether a part is raw or packed.
+fn unpacked_size(part: &Part) -> usize {
+    match part {
+        Part::Raw(data) => data.len(),
+        Part::Packed(packed) => packed.size,
+    }
+}
+
 /// The largest the archive can come out as: both headers of every part, its worst-case deflated
 /// size, and the end record.
-fn zip64_bound(entries: &[(String, Vec<u8>)]) -> usize {
+fn zip64_bound(entries: &[(String, Part)]) -> usize {
     let mut bound: usize = 22;
-    for (name, data) in entries {
-        bound = bound.saturating_add(30 + 46 + 2 * name.len()).saturating_add(deflate_bound(data.len()));
+    for (name, part) in entries {
+        // A packed body is already smaller than this bound, but the uncompressed size is used so
+        // pre-compressing a part cannot change which archive writer a package takes.
+        bound = bound.saturating_add(30 + 46 + 2 * name.len()).saturating_add(deflate_bound(unpacked_size(part)));
     }
     bound
 }
@@ -349,25 +366,52 @@ fn zip64_bound(entries: &[(String, Vec<u8>)]) -> usize {
 /// afterwards: the decision is taken here, from a bound that covers the whole layout, and an
 /// archive that passes it places no size and no offset past 4 GB. That is why the layout is no
 /// longer re-checked while the parts are written.
-fn needs_zip64(entries: &[(String, Vec<u8>)]) -> bool {
+fn needs_zip64(entries: &[(String, Part)]) -> bool {
     // The estimate the writer has always used is checked first, so the same packages take the same
     // writer as before: it credits deflate with packing every part to a third, and therefore sends
     // a package of a few GB to the other writer well before its offsets could reach 4 GB.
-    let estimated: usize = entries.iter().map(|(_, data)| data.len() / 3 + data.len()).sum();
-    estimated >= ZIP64_PART || zip64_bound(entries) >= ZIP64_PART || entries.iter().any(|(_, data)| data.len() >= ZIP64_PART)
+    let estimated: usize = entries
+        .iter()
+        .map(|(_, part)| {
+            let size = unpacked_size(part);
+            size / 3 + size
+        })
+        .sum();
+    estimated >= ZIP64_PART || zip64_bound(entries) >= ZIP64_PART || entries.iter().any(|(_, part)| unpacked_size(part) >= ZIP64_PART)
 }
 
 /// One part, deflated, with what its headers need.
-struct Packed {
+pub(crate) struct Packed {
     name: String,
     body: Vec<u8>,
     crc: u32,
     size: usize,
 }
 
+impl Packed {
+    /// The part before deflate. The zip64 writer compresses each part itself and cannot take an
+    /// already-deflated body, so the rare mixed archive pays an inflate rather than dropping the
+    /// part.
+    fn inflate(&self) -> Result<Vec<u8>, IoError> {
+        let mut raw = Vec::with_capacity(self.size);
+        flate2::read::DeflateDecoder::new(self.body.as_slice()).read_to_end(&mut raw).map_err(|e| IoError::Zip(format!("{}: {e}", self.name)))?;
+        if raw.len() != self.size || crc32fast::hash(&raw) != self.crc {
+            return Err(IoError::Zip(format!("{}: a packed part does not match its recorded size and CRC", self.name)));
+        }
+        Ok(raw)
+    }
+}
+
+/// A part handed to the archive: bytes still to deflate, or a part that was deflated as it was
+/// produced.
+pub(crate) enum Part {
+    Raw(Vec<u8>),
+    Packed(Packed),
+}
+
 /// Deflates one part and reports what its headers need. The part arrives by value, so it is dropped
 /// when this returns instead of being held until the whole archive is assembled.
-fn pack(name: String, data: Vec<u8>) -> Result<Packed, IoError> {
+pub(crate) fn pack(name: String, data: Vec<u8>) -> Result<Packed, IoError> {
     let crc = crc32fast::hash(&data);
     let size = data.len();
     let body = deflate(&data)?;
@@ -375,17 +419,27 @@ fn pack(name: String, data: Vec<u8>) -> Result<Packed, IoError> {
 }
 
 /// The archive: local headers and data in order, then the central directory.
-fn write_zip(entries: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, IoError> {
+fn write_zip(entries: Vec<(String, Part)>) -> Result<Vec<u8>, IoError> {
     // A part or an offset past 4 GB needs zip64, which this writer does not do.
     if needs_zip64(&entries) {
-        return write_zip_general(&entries);
+        return write_zip_general(entries);
     }
     // The parts compress on the threads the machine has, and each worker takes its part with it
     // and drops it once deflated: the peak is the parts not yet compressed plus the packed ones,
-    // never both full sets plus the archive. The order they are written in is the caller's, so the
-    // directory is deterministic.
+    // never both full sets plus the archive. A part that was already packed (a sheet) costs its
+    // worker nothing. The order they are written in is the caller's, so the directory is
+    // deterministic.
+    #[cfg(not(target_arch = "wasm32"))]
     let packed: Vec<Packed> = std::thread::scope(|scope| {
-        let handles: Vec<_> = entries.into_iter().map(|(name, data)| scope.spawn(move || pack(name, data))).collect();
+        let handles: Vec<_> = entries
+            .into_iter()
+            .map(|(name, part)| {
+                scope.spawn(move || match part {
+                    Part::Raw(data) => pack(name, data),
+                    Part::Packed(packed) => Ok(packed),
+                })
+            })
+            .collect();
         handles
             .into_iter()
             .map(|handle| match handle.join() {
@@ -396,9 +450,22 @@ fn write_zip(entries: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, IoError> {
             })
             .collect::<Result<Vec<_>, _>>()
     })?;
-    let mut out: Vec<u8> = Vec::with_capacity(packed.iter().map(|p| p.body.len()).sum::<usize>() + packed.len() * 128 + 22);
-    let mut directory: Vec<u8> = Vec::with_capacity(packed.len() * 64);
-    for Packed { name, body, crc, size } in &packed {
+    // Wasm has no OS threads: deflate each part here instead. A packed sheet passes through, and
+    // the same deflate makes the same bytes.
+    #[cfg(target_arch = "wasm32")]
+    let packed: Vec<Packed> = entries
+        .into_iter()
+        .map(|(name, part)| match part {
+            Part::Raw(data) => pack(name, data),
+            Part::Packed(packed) => Ok(packed),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let count = packed.len();
+    let mut out: Vec<u8> = Vec::with_capacity(packed.iter().map(|p| p.body.len()).sum::<usize>() + count * 128 + 22);
+    let mut directory: Vec<u8> = Vec::with_capacity(count * 64);
+    // Each body is copied into the archive and dropped there: the packed set and the archive are
+    // never both whole in memory.
+    for Packed { name, body, crc, size } in packed {
         // `needs_zip64` bounded the whole layout below 4 GB, so every offset and size fits a u32.
         let offset = out.len() as u32;
         // Local file header. The DOS date is 1980-01-01, which is what `zip` wrote.
@@ -408,13 +475,13 @@ fn write_zip(entries: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, IoError> {
         push_u16(&mut out, 8);
         push_u16(&mut out, 0);
         push_u16(&mut out, 0x0021);
-        push_u32(&mut out, *crc);
+        push_u32(&mut out, crc);
         push_u32(&mut out, body.len() as u32);
-        push_u32(&mut out, *size as u32);
+        push_u32(&mut out, size as u32);
         push_u16(&mut out, name.len() as u16);
         push_u16(&mut out, 0);
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(body);
+        out.extend_from_slice(&body);
         // Central directory entry.
         push_u32(&mut directory, 0x0201_4b50);
         push_u16(&mut directory, 20);
@@ -423,9 +490,9 @@ fn write_zip(entries: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, IoError> {
         push_u16(&mut directory, 8);
         push_u16(&mut directory, 0);
         push_u16(&mut directory, 0x0021);
-        push_u32(&mut directory, *crc);
+        push_u32(&mut directory, crc);
         push_u32(&mut directory, body.len() as u32);
-        push_u32(&mut directory, *size as u32);
+        push_u32(&mut directory, size as u32);
         push_u16(&mut directory, name.len() as u16);
         push_u16(&mut directory, 0);
         push_u16(&mut directory, 0);
@@ -441,25 +508,33 @@ fn write_zip(entries: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, IoError> {
     push_u32(&mut out, 0x0605_4b50);
     push_u16(&mut out, 0);
     push_u16(&mut out, 0);
-    push_u16(&mut out, packed.len() as u16);
-    push_u16(&mut out, packed.len() as u16);
+    push_u16(&mut out, count as u16);
+    push_u16(&mut out, count as u16);
     push_u32(&mut out, directory_size);
     push_u32(&mut out, directory_offset);
     push_u16(&mut out, 0);
     Ok(out)
 }
 
-/// The `zip` crate's writer, for an archive this one does not handle (zip64).
-fn write_zip_general(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, IoError> {
+/// The `zip` crate's writer, for an archive this one does not handle (zip64). Each entry is taken
+/// by value so its bytes are dropped once written: the archive's own buffer is the one copy the
+/// caller's parts must not double.
+fn write_zip_general(entries: Vec<(String, Part)>) -> Result<Vec<u8>, IoError> {
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, data) in entries {
+    for (name, part) in entries {
+        // This writer deflates each part itself, so a part packed while it was written is inflated
+        // back here. Only the rare zip64 path does that; the fast path writes a packed part as is.
+        let data: Cow<'_, [u8]> = match &part {
+            Part::Raw(data) => Cow::Borrowed(data.as_slice()),
+            Part::Packed(packed) => Cow::Owned(packed.inflate()?),
+        };
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .compression_level(Some(i64::from(DEFLATE_LEVEL)))
             .last_modified_time(zip::DateTime::default())
             .large_file(data.len() as u64 >= u32::MAX as u64);
         zip.start_file(name.as_str(), opts).map_err(|e| IoError::Zip(e.to_string()))?;
-        zip.write_all(data).map_err(|e| IoError::Zip(e.to_string()))?;
+        zip.write_all(data.as_ref()).map_err(|e| IoError::Zip(e.to_string()))?;
     }
     zip.finish().map(|c| c.into_inner()).map_err(|e| IoError::Zip(e.to_string()))
 }
@@ -514,17 +589,71 @@ mod tests {
     /// its bound must cover the archive the writer then lays out: no offset is re-checked.
     #[test]
     fn the_zip64_bound_covers_the_archive_it_decides_about() {
-        let entries: Vec<(String, Vec<u8>)> = (0..12usize)
+        let entries: Vec<(String, Part)> = (0..12usize)
             .map(|i| {
                 let name = format!("xl/worksheets/sheet{}.xml", i + 1);
-                (name, (0..(i + 1) * 5_000).map(|b| (b % 253) as u8).collect())
+                (name, Part::Raw((0..(i + 1) * 5_000).map(|b| (b % 253) as u8).collect()))
             })
             .collect();
         assert!(!needs_zip64(&entries), "a package this size does not need zip64");
-        let unpacked: usize = entries.iter().map(|(_, data)| data.len()).sum();
+        let unpacked: usize = entries.iter().map(|(_, part)| unpacked_size(part)).sum();
         let bound = zip64_bound(&entries);
         assert!(bound > unpacked, "the bound allows for the headers and for deflate expanding: {bound} <= {unpacked}");
         let written = write_zip(entries).unwrap();
         assert!(written.len() <= bound, "the archive outgrew the bound it was checked against: {} > {bound}", written.len());
+    }
+
+    fn read_zip(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut parts = Vec::with_capacity(archive.len());
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut body = Vec::new();
+            f.read_to_end(&mut body).unwrap();
+            parts.push((name, body));
+        }
+        parts
+    }
+
+    /// A sheet deflated while it is written lands in the archive exactly as the same bytes deflated
+    /// by the zip would: same order, same names, same headers, same body. The mixed list also
+    /// survives the zip64 writer, which has to inflate a packed part before handing it to `zip`.
+    #[test]
+    fn packed_sheets_write_the_same_archive_as_raw_parts() {
+        let part_bytes = |n: usize, salt: u8| -> Vec<u8> { (0..n).map(|i| (i as u8) ^ salt ^ ((i / 251) as u8)).collect() };
+        let content: Vec<(String, Vec<u8>)> = vec![
+            ("[Content_Types].xml".to_string(), Vec::from("<Types/>")),
+            ("xl/worksheets/sheet1.xml".to_string(), part_bytes(220_000, 1)),
+            ("xl/worksheets/sheet2.xml".to_string(), part_bytes(37_000, 7)),
+            ("docProps/core.xml".to_string(), Vec::from("<core/>")),
+        ];
+        let build = |precompress: bool| -> Vec<(String, Part)> {
+            content
+                .iter()
+                .map(|(name, data)| {
+                    let part = if precompress && name.starts_with("xl/worksheets/") {
+                        Part::Packed(pack(name.clone(), data.clone()).unwrap())
+                    } else {
+                        Part::Raw(data.clone())
+                    };
+                    (name.clone(), part)
+                })
+                .collect()
+        };
+
+        let raw = write_zip(build(false)).unwrap();
+        let mixed = write_zip(build(true)).unwrap();
+        assert_eq!(mixed, raw, "pre-deflating a sheet changed the archive");
+        assert_eq!(read_zip(&raw), content, "the raw archive lost or reordered a part");
+        assert_eq!(read_zip(&mixed), content, "the mixed archive lost or reordered a part");
+        assert_eq!(needs_zip64(&build(false)), needs_zip64(&build(true)), "pre-deflating changed the zip64 decision");
+
+        // The zip64 path recompresses each part itself. Inflating a packed part must give the same
+        // archive as the raw list, and no part may go missing.
+        let raw_general = write_zip_general(build(false)).unwrap();
+        let mixed_general = write_zip_general(build(true)).unwrap();
+        assert_eq!(mixed_general, raw_general, "the general writer changed a packed part");
+        assert_eq!(read_zip(&mixed_general), content, "the general writer lost or reordered a part");
     }
 }
