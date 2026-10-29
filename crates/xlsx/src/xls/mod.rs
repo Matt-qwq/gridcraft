@@ -7,21 +7,29 @@
 //! widths, row heights, defined names, print areas, print titles and the calculation settings
 //! (mode, iteration, precision as displayed). Style records (_FONT_, _FORMAT_, _PALETTE_, _XF_,
 //! _STYLE_) are read into the workbook's style table, so cells keep their font, fill, borders,
-//! alignment and number format; cell comments are read with their author and text. Conditional
-//! formats, data validation, charts, pictures and OLE objects are skipped with a warning. Files
-//! encrypted with FILEPASS and pre-BIFF8 workbooks are refused with a message.
+//! alignment and number format; cell comments are read with their author and text. Data
+//! validation (_DVAL_/_DV_), conditional formats (_CONDFMT_/_CF_/_CFEX_, the cell-value and
+//! formula rules), hyperlinks (_HLINK_/_HLINKTOOLTIP_) and frozen panes (_PANE_/_WINDOW1_/_WINDOW2_)
+//! are read into the same model objects the `.xlsx` reader builds. Charts, pictures, OLE objects
+//! and PivotTables are skipped with a warning, as are the `CF12` rules (colour scales, data bars,
+//! icon sets). Files encrypted with FILEPASS and pre-BIFF8 workbooks are refused with a message.
 
+mod condfmt;
+mod dxf;
 mod formula;
 mod ftab;
+mod hyperlink;
 mod records;
 mod styles;
+mod validation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, DateSystem, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_model::{
-    CalcMode, CalcSettings, Cell, Comment, DefinedName, Formula, LineInfo, Sheet, Style, StyleId, StyleTable, Visibility, Workbook,
+    CalcMode, CalcSettings, Cell, CfRule, Comment, CondFormat, DefinedName, Formula, LineInfo, Sheet, Style, StyleId, StyleTable, Visibility,
+    Workbook,
 };
 
 use crate::cfb::Compound;
@@ -40,6 +48,10 @@ const MAX_XFS: usize = 65_536;
 const MAX_MERGES: usize = 100_000;
 /// Comments read per sheet (Excel allows far fewer).
 const MAX_COMMENTS: usize = 65_536;
+/// Hyperlink cells written per sheet (the `.xlsx` reader's limit, so both formats agree).
+const MAX_HYPERLINK_CELLS: usize = 10_000;
+/// Conditional format rules kept per sheet.
+const MAX_CONDFMTS: usize = 65_536;
 /// Records read from the whole Workbook stream at most (a 65,536 × 256 sheet has fewer). One
 /// allowance shared by every substream: many BoundSheet records pointing into one huge
 /// substream must not each get their own.
@@ -135,6 +147,8 @@ struct Globals {
     links: Links,
     names: Vec<Lbl>,
     precision_as_displayed: bool,
+    /// `Window1.itabCur` ([MS-XLS] 2.4.345): the selected sheet, in BoundSheet8 order.
+    itab_cur: Option<u16>,
 }
 
 /// Reads an Excel 97-2003 workbook. Inspect the report's warnings for what was skipped.
@@ -202,11 +216,16 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     }
     wb.calc.precision_as_displayed = g.precision_as_displayed;
     defined_names(&g, &model_index, &mut wb, &mut report);
-    wb.active_sheet = wb.sheets.iter().position(|s| s.visibility == Visibility::Visible).unwrap_or(0);
+    // Window1 names the selected sheet in BoundSheet8 order, as `activeTab` does in `.xlsx`.
+    let active = g
+        .itab_cur
+        .and_then(|i| model_index.get(usize::from(i)).copied().flatten())
+        .filter(|i| wb.sheets.get(*i).is_some_and(|s| s.visibility == Visibility::Visible));
+    wb.active_sheet = active.or_else(|| wb.sheets.iter().position(|s| s.visibility == Visibility::Visible)).unwrap_or(0);
     // The overview comes first.
     report.warnings.insert(
         0,
-        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments and defined names were read. Conditional formats, data validation, charts, pictures and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
+        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats, hyperlinks, frozen panes and defined names were read. Colour scales, data bars, icon sets, charts, pictures and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
     );
     Ok((wb, report))
 }
@@ -262,6 +281,13 @@ fn globals(stream: &[u8], budget: &mut Budget, report: &mut ReadReport) -> Resul
             }
             0x0022 => g.date1904 = c.u16()? == 1,
             0x000E => g.precision_as_displayed = c.u16()? == 0,
+            // Window1 ([MS-XLS] 2.4.345): the window's place, flags, then itabCur.
+            0x003D => {
+                if c.remaining() >= 12 {
+                    c.skip(10)?;
+                    g.itab_cur = Some(c.u16()?);
+                }
+            }
             // Font, number format, palette, cell format and named style records.
             0x0031 | 0x041E | 0x0092 | 0x00E0 | 0x0293 => g.styles.record(rec.id, &mut c)?,
             0x00FC => g.sst = shared_strings(&mut c, budget)?,
@@ -411,6 +437,30 @@ struct SheetState<'g> {
     dropped: usize,
     unsupported: Vec<&'static str>,
     calc: CalcSettings,
+    /// The `CondFmt` whose `CF` records follow ([MS-XLS] 2.4.56).
+    cf_group: Option<condfmt::Group>,
+    /// How many `CF` records the group still expects.
+    cf_left: usize,
+    /// `CondFmt` id → the rules it holds, for the `CFEx` records that extend them.
+    cf_ids: HashMap<u16, Vec<usize>>,
+    /// The priority the next rule gets: rules apply in the order the file lists them.
+    cf_seq: u32,
+    /// The `DVal` count of the sheet's validation rules, and how many `Dv` records were seen.
+    dv_expected: Option<usize>,
+    dv_seen: usize,
+    dv_overflow: bool,
+    /// Hyperlinks and their tooltips, paired once the whole sheet has been read.
+    links: Vec<hyperlink::Link>,
+    tooltips: Vec<(RangeRef, String)>,
+    link_cells: usize,
+    /// `Pane` ([MS-XLS] 2.4.189): x, y, rwTop, colLeft.
+    pane: Option<(u16, u16, u16, u16)>,
+    /// `Window2.fFrozenRt`: the panes are frozen.
+    frozen: bool,
+    /// `Window2.rwTop` and `colLeft`: the first visible row and column.
+    scrolled_to: Option<(u16, u16)>,
+    /// A `CF12` rule (a colour scale, data bar or icon set) was skipped.
+    cf12: bool,
 }
 
 impl SheetState<'_> {
@@ -474,6 +524,18 @@ fn rk(v: u32) -> Value {
     Value::number(if v & 1 != 0 { n / 100.0 } else { n })
 }
 
+/// A `Ref8U` ([MS-XLS] 2.5.209): first and last row, then first and last column. `None` when the
+/// range is inverted or starts outside the grid (the columns are 8-bit in BIFF8, so only 256
+/// exist).
+fn ref8(c: &mut Cursor<'_, '_>) -> Result<Option<RangeRef>, IoError> {
+    let (r0, r1, c0, c1) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+    let (r0, r1, c0, c1) = (u32::from(r0), u32::from(r1), u32::from(c0), u32::from(c1));
+    if r1 < r0 || c1 < c0 || c0 >= MAX_COLS.min(256) || r0 >= MAX_ROWS {
+        return Ok(None);
+    }
+    Ok(Some(RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1.min(MAX_ROWS - 1), c1.min(MAX_COLS.min(256) - 1)))))
+}
+
 fn worksheet(
     stream: &[u8],
     bs: &BoundSheet,
@@ -505,6 +567,20 @@ fn worksheet(
         dropped: 0,
         unsupported: vec![],
         calc: CalcSettings::default(),
+        cf_group: None,
+        cf_left: 0,
+        cf_ids: HashMap::new(),
+        cf_seq: 0,
+        dv_expected: None,
+        dv_seen: 0,
+        dv_overflow: false,
+        links: vec![],
+        tooltips: vec![],
+        link_cells: 0,
+        pane: None,
+        frozen: false,
+        scrolled_to: None,
+        cf12: false,
     };
     let mut depth = 1usize;
     while let Some(rec) = recs.next_record()? {
@@ -571,11 +647,59 @@ fn worksheet(
     for why in &st.unsupported {
         report.warn(format!("Some formulas use {why}; their saved results were kept as values."));
     }
+    // Frozen panes: `Pane` holds the split and `Window2.fFrozenRt` says it is frozen. `rwTop` and
+    // `colLeft` are the bottom-right pane's first cell, which is the scroll position, as a frozen
+    // `.xlsx` pane's `topLeftCell` is.
+    if let Some((x, y, rw_top, col_left)) = st.pane
+        && st.frozen
+    {
+        let rows = u32::from(y).min(MAX_ROWS - 1);
+        let cols = u32::from(x).min(MAX_COLS - 1);
+        if rows > 0 || cols > 0 {
+            st.sheet.freeze = Some((rows, cols));
+            st.sheet.view_top_left = CellRef::new(u32::from(rw_top).min(MAX_ROWS - 1), u32::from(col_left).min(MAX_COLS - 1));
+        }
+    } else if let Some((row, col)) = st.scrolled_to {
+        st.sheet.view_top_left = CellRef::new(u32::from(row).min(MAX_ROWS - 1), u32::from(col).min(MAX_COLS - 1));
+    }
+    // Hyperlinks: each `HLink` covers a range; the tooltip record that follows names the same range.
+    let (links, tooltips) = (std::mem::take(&mut st.links), std::mem::take(&mut st.tooltips));
+    for mut link in links {
+        if let Some((_, tip)) = tooltips.iter().find(|(r, _)| link.ranges.first() == Some(r)) {
+            link.link.tooltip = Some(tip.clone());
+        }
+        for range in &link.ranges {
+            for cell in range.iter() {
+                if st.link_cells >= MAX_HYPERLINK_CELLS {
+                    report.warn(format!("Hyperlinks past the first {MAX_HYPERLINK_CELLS} cells were dropped."));
+                    break;
+                }
+                st.link_cells += 1;
+                st.sheet.hyperlinks.insert(cell, link.link.clone());
+            }
+        }
+    }
+    if st.cf12 {
+        report.warn("Colour scales, data bars and icon sets in .xls files are not imported yet (their CF12 record's layout is not determined); other conditional formats were read.");
+    }
     Ok(Some((st.sheet, st.calc)))
 }
 
 /// The shortest WINDOW2 a file holds (the chart-sheet form); a shorter one is truncated.
 const WINDOW2_MIN_LEN: usize = 10;
+
+/// A record reader's outcome, with a truncated or malformed record turned into a warning so the
+/// rest of the file still opens. A budget error still stops the import.
+fn soft<T>(report: &mut ReadReport, what: &str, r: Result<T, IoError>) -> Result<Option<T>, IoError> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(IoError::Format(_)) => {
+            report.warn(format!("A {what} record was truncated or malformed and was skipped."));
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
 
 fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, report: &mut ReadReport) -> Result<(), IoError> {
     let mut c = Cursor::new(&rec.parts);
@@ -765,6 +889,14 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             st.sheet.show_headings = on(0x0004);
             st.sheet.show_zeros = on(0x0010);
             st.sheet.right_to_left = on(0x0040);
+            // `fFrozenRt` (bit 3) says the `Pane` record's split is frozen; `rwTop` and `colLeft`
+            // follow the flags and hold the first visible row and column.
+            st.frozen = on(0x0008);
+            if c.remaining() >= 4
+                && let (Ok(row), Ok(col)) = (c.u16(), c.u16())
+            {
+                st.scrolled_to = Some((row, col));
+            }
         }
         0x001C => {
             // NOTE ([MS-XLS] 2.4.176): row, column, XF, flags, then the author as an
@@ -796,9 +928,101 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             }
         }
         0x00EC => report.warn("Pictures, charts and shapes in .xls files are not imported yet."),
-        0x01B0 | 0x01B1 | 0x0879 => report.warn("Conditional formatting in .xls files is not imported yet."),
-        0x01B2 | 0x01BE => report.warn("Data validation in .xls files is not imported yet."),
-        0x01B8 => report.warn("Hyperlinks in .xls files are not imported yet."),
+        0x01B0 => {
+            // CondFmt ([MS-XLS] 2.4.56): the ranges and the id its CF records are stored under.
+            if let Some(group) = soft(report, "conditional format", condfmt::condfmt(&mut c))? {
+                st.cf_left = group.count;
+                st.cf_ids.insert(group.id, vec![]);
+                st.cf_group = Some(group);
+            }
+        }
+        0x01B1 => {
+            // CF (2.4.42): one cell-value comparison or one formula.
+            let Some(group) = st.cf_group.as_ref() else { return Ok(()) };
+            if group.ranges.is_empty() || st.cf_left == 0 || st.sheet.cond_formats.len() >= MAX_CONDFMTS {
+                return Ok(());
+            }
+            let base = group.ranges.first().map_or_else(CellRef::default, |r| r.start);
+            let (ranges, id) = (group.ranges.clone(), group.id);
+            st.cf_left -= 1;
+            let rule = soft(report, "conditional format", condfmt::cf(&mut c, base, &st.g.links, &st.g.styles.palette, &st.g.styles.formats))?;
+            match rule {
+                Some(Some(rule)) => {
+                    st.cf_seq += 1;
+                    let at = st.sheet.cond_formats.len();
+                    st.sheet.cond_formats.push(CondFormat { ranges, rule, priority: st.cf_seq, stop_if_true: false });
+                    if let Some(ids) = st.cf_ids.get_mut(&id) {
+                        ids.push(at);
+                    }
+                }
+                Some(None) => report.warn("A conditional format whose condition could not be read was skipped."),
+                None => {}
+            }
+        }
+        0x087B => {
+            let ext = soft(report, "conditional format extension", condfmt::cfex(&mut c, &st.g.styles.palette, &st.g.styles.formats))?;
+            if let Some(ext) = ext {
+                if ext.cf12 {
+                    st.cf12 = true;
+                } else {
+                    let at = st.cf_ids.get(&ext.id).and_then(|v| v.get(ext.icf)).copied();
+                    if let Some(cf) = at.and_then(|i| st.sheet.cond_formats.get_mut(i)) {
+                        cf.priority = ext.priority;
+                        cf.stop_if_true = ext.stop_if_true;
+                        if let Some(style) = ext.style {
+                            match &mut cf.rule {
+                                CfRule::CellIs { style: s, .. } | CfRule::Expression { style: s, .. } => **s = style,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // CondFmt12 / CF12: colour scales, data bars and icon sets.
+        0x0879 | 0x087A => st.cf12 = true,
+        0x01B2 => {
+            if let Some(count) = soft(report, "data validation count", validation::dval(&mut c))? {
+                if count > validation::MAX_DV_COUNT {
+                    report.warn("A sheet's data validation count was larger than Excel allows; the rules present were read.");
+                }
+                st.dv_expected = Some(count.min(validation::MAX_DV_COUNT));
+            }
+        }
+        0x01BE => {
+            st.dv_seen += 1;
+            if st.dv_expected.is_some_and(|n| st.dv_seen > n) {
+                if !st.dv_overflow {
+                    st.dv_overflow = true;
+                    report.warn("A sheet had more data validation rules than its DVal record announced; the extra ones were skipped.");
+                }
+                return Ok(());
+            }
+            let rule = soft(report, "data validation", validation::dv(&mut c, &st.g.links, budget))?;
+            if let Some(Some(v)) = rule
+                && st.sheet.validations.len() < validation::MAX_DV_COUNT
+            {
+                st.sheet.validations.push(v);
+            }
+        }
+        0x01B8 => {
+            if let Some(Some(link)) = soft(report, "hyperlink", hyperlink::hlink(&mut c))? {
+                st.links.push(link);
+            }
+        }
+        0x0800 => {
+            if let Some(Some(t)) = soft(report, "hyperlink tooltip", hyperlink::tooltip(&mut c))? {
+                st.tooltips.push(t);
+            }
+        }
+        0x0041 => {
+            // Pane (2.4.189): the split, the bottom-right pane's first cell, the active pane.
+            if c.remaining() < 10 {
+                report.warn("A pane record was truncated or malformed and was skipped.");
+            } else {
+                st.pane = Some((c.u16()?, c.u16()?, c.u16()?, c.u16()?));
+            }
+        }
         0x00B0 => report.warn("PivotTables in .xls files are not imported yet; their values were kept."),
         _ => {}
     }

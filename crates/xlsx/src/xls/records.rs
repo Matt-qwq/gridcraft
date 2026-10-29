@@ -105,6 +105,18 @@ impl<'a, 'b> Cursor<'a, 'b> {
         Ok(f64::from_le_bytes(b))
     }
 
+    /// `n` bytes as one buffer.
+    pub fn bytes(&mut self, n: usize) -> Result<Vec<u8>, IoError> {
+        if n > self.remaining() {
+            return Err(invalid("record is shorter than its contents"));
+        }
+        let mut out = Vec::with_capacity(n.min(4096));
+        for _ in 0..n {
+            out.push(self.u8()?);
+        }
+        Ok(out)
+    }
+
     pub fn skip(&mut self, n: usize) -> Result<(), IoError> {
         for _ in 0..n {
             self.u8()?;
