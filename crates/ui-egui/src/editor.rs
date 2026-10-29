@@ -28,6 +28,10 @@ pub struct EditState {
     pub from_formula_bar: bool,
     /// Caret position (char index), mirrored from the text widget.
     pub caret: usize,
+    /// Where a selection started, when the caret is extended with Shift+Left/Right through the
+    /// *visual* clusters of right-to-left text. Cleared whenever the caret is moved otherwise, so
+    /// an ordinary move always collapses the selection.
+    pub caret_anchor: Option<usize>,
     /// The reference most recently inserted by point mode (byte range) — arrows/clicks replace it.
     pub point: Option<(usize, usize)>,
     /// Where point mode's keyboard cursor is.
@@ -56,6 +60,7 @@ impl EditState {
             enter_mode,
             from_formula_bar,
             caret,
+            caret_anchor: None,
             point: None,
             point_cell: None,
             point_anchor: None,
@@ -108,6 +113,7 @@ impl EditState {
         let new_end = start + r.len();
         self.point = Some((start, new_end));
         self.caret = self.text.get(..new_end).map(|s| s.chars().count()).unwrap_or(0);
+        self.caret_anchor = None;
         self.caret_to_end = false;
         self.sync_caret = true;
     }
@@ -155,6 +161,7 @@ impl EditState {
         self.text = format!("{a}{name}({b}");
         self.caret = self.text.get(..start + name.len() + 1).map(|s| s.chars().count()).unwrap_or(0);
         self.autocomplete.clear();
+        self.caret_anchor = None;
         self.caret_to_end = false;
         self.sync_caret = true;
         true
@@ -193,6 +200,7 @@ impl EditState {
         self.caret += inserted.chars().count();
         self.autocomplete.clear();
         self.completion = None;
+        self.caret_anchor = None;
         self.caret_to_end = false;
         self.sync_caret = true;
         true

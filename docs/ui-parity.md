@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (the Format Chart pane drives the four chart formatting commands; chart, picture, shape and slicer resize with eight handles, Shift, Esc and keyboard nudging, #190) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (grid and in-cell editor text is shaped and bidi-ordered: Arabic joining, Indic reordering, mixed runs in visual order, a visual caret in the editor, a `sys-devanagari` fallback face) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Interaction, controls and feel, against Excel. Part of [target-app-parity.md](target-app-parity.md).
 **UI/UX fidelity: ~55% ready, 50–80 h** (estimated). Ribbon command coverage is measured
@@ -33,7 +33,9 @@ AutoFit column width includes dropdown space only for filter header cells (table
 AutoFilters), then takes the maximum against body cells. Windows Excel 16.0 build 20326,
 observed using synthetic workbooks via its public automation API on 2026-10-11, reserves
 12.5 points at 100-200% zoom and 25 points at 50%, independently of row height. GridCraft
-uses that allowance in its grid units; its existing approximate font measurement remains.
+uses that allowance in its grid units and measures with the fonts the grid draws in
+(`Session::text_width` → `GridText::cell_text_width`: the shaped width for a non-ASCII cell, the
+unshaped galley width for ASCII, the average-glyph estimate when no font is available).
 Header text aligns and clips before the button. Command and header-double-click paths share
 this logic, with one undo step.
 
@@ -63,6 +65,7 @@ this logic, with one undo step.
 | Quick Analysis (Ctrl+Q) | missing |
 | Smooth scrolling, scrollbars | done; vertical scrollbar added 10-09 (#73); horizontal scrollbar in the tab bar (60/40 split, drag, track click pages) 10-13 (#176, #840); the tabs/scrollbar split can't be dragged yet |
 | Text overflow into empty neighbours, wrap, rotation, shrink to fit | done |
+| Complex-script and bidirectional cell text | done for the grid and the in-cell editor: `crates/ui-egui/src/text.rs` owns one `gridcraft_core::text` engine per app and registers the very faces egui paints cells with (read from the live `FontDefinitions`), shapes each line into bidi runs in visual order and folds the runs back into one galley. Arabic joins, Devanagari reorders and merges clusters, Thai marks position, a Latin/digit island inside Hebrew or Arabic keeps left-to-right order, general right-to-left text aligns right, and neutral text on a Sheet Right-to-Left follows the sheet. Printable ASCII keeps the old unshaped path bit for bit (`text::needs_shaping`). The in-cell editor draws its shaped line, selection and caret itself and moves the caret through visual clusters with →/← and clicks, while the buffer, the formula bar and tooltips stay logical. Not shaped yet: wrapped cells, multi-line cells, rotated cells drawn from a wrap job, text boxes, chart labels and PDF export (`docs/localization-parity.md`) |
 
 ## Keyboard
 
@@ -314,6 +317,7 @@ scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | Grid and in-cell editor text is shaped and bidi-ordered through one `gridcraft_core::text` engine per app (`crates/ui-egui/src/text.rs`): Arabic joins, Devanagari reorders and merges clusters, Thai marks position, mixed left-to-right and right-to-left runs draw in visual order with digits keeping their reading order, general right-to-left text aligns right, and the editor's caret and selection move through visual clusters while the buffer stays logical. A `sys-devanagari` fallback face (Nirmala UI / Kohinoor / Noto Sans Devanagari) joins the other script fallbacks, so Hindi cells draw instead of boxes. Printable ASCII keeps the unshaped path bit for bit |
 | 2026-10-30 | minor | The Format Chart pane drives axes, data labels, error bars and data points through the engine's four chart commands, with a Chart Elements selection list; options the chart kind cannot store are missing from the pane and the section says why |
 | 2026-10-30 | minor | Chart, picture, shape and slicer resize (#190): all eight handles work (before, only the bottom-right corner did, and a drag of any other handle moved the object instead), a left/top edge drag carries the anchor, Shift keeps the aspect ratio, a 20-point minimum size, Esc cancels the drag and drops its undo step, one drag is one undo step, and arrow keys nudge or (with Shift) resize the selected object |
 | 2026-10-30 | major | Key tips across the whole ribbon: 417 sequences, every standard tab and the contextual Table Design / Chart Design / Header & Footer tabs, per-control badges for what had none (strikethrough, Draw pens/eraser, Slicer, Checkbox, Show/Hide Detail, Data Analysis, Solver, Forecast Sheet, Show Comments, Insert Slicer, chart controls, header/footer fields, Automate), sparkline paths cut to four keys, and tests for length, uniqueness, per-scope badge collisions, tab reachability and catalog targets. Shift+F10's context menus are keyboard-navigable (arrows/Home/End/Enter/Space/Esc, highlight painted, the grid keeps focus and selection and Space does not start an edit); the Menu key is blocked in egui-winit. Shortcut audit: Alt+; visible cells, Ctrl+Shift+O commented cells, Ctrl+F2 / Ctrl+Shift+F12 print, Alt+F5 / Ctrl+Alt+F5 pivot and query refresh added, the full Excel → command table written down |

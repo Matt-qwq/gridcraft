@@ -6,6 +6,7 @@ use serde_json::json;
 use crate::SheetApp;
 use crate::editor::{REF_COLORS, formula_refs};
 use crate::icons::{self, Icon};
+use crate::text::Line;
 use crate::theme::{self, Tokens};
 
 pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
@@ -182,6 +183,27 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     let mut action: Option<(i64, i64, bool, bool)> = None;
     let mut arrow = false;
     let mut cancel = false;
+    // Mixed-direction text in the in-cell editor: egui lays text out without the bidi algorithm,
+    // so its glyphs, caret and selection highlight would sit in stored order. The field keeps the
+    // buffer, the keyboard and the undo stack; the shaped line, the selection and the caret are
+    // drawn here from the same engine the grid paints cells with. Text the shaper cannot reorder
+    // (Latin, Cyrillic, CJK, a wrapped or multi-line cell) keeps egui's own editing untouched.
+    let sheet_rtl = app.session.active().and_then(|d| d.wb.sheet(ed.sheet)).is_some_and(|s| s.right_to_left);
+    let in_cell = id == egui::Id::new("gridcraft.cell_editor");
+    let cell_text_color = if in_cell { Color32::BLACK } else { Tokens::get(ui.ctx()).text };
+    let direction = crate::text::base_direction(&ed.text, sheet_rtl);
+    let engine = std::sync::Arc::clone(&app.text);
+    let shaped_line = (in_cell && !multiline && !ed.text.contains('\n') && crate::text::needs_shaping(&ed.text, direction))
+        .then(|| engine.line(ui.ctx(), &font, &ed.text, direction, cell_text_color));
+    let caret_map = shaped_line.as_ref().and_then(|line| engine.caret_map(&ed.text, line));
+    let visual = shaped_line.as_ref().is_some_and(Line::visual_order_differs) && caret_map.is_some();
+    let selection_color = ui.visuals().selection.bg_fill;
+    let caret_color = ui.visuals().text_cursor.stroke.color;
+    if visual {
+        // egui's own highlight and caret would sit at the stored-order positions: hide them.
+        ui.visuals_mut().selection.bg_fill = Color32::TRANSPARENT;
+        ui.visuals_mut().text_cursor.stroke.color = Color32::TRANSPARENT;
+    }
     // A message box over the editor (a data validation alert, a formula error) gets Enter and Esc;
     // the editor used to take them, so the first Esc cancelled the edit behind the message.
     if has_focus && mine && app.message.is_none() {
@@ -274,6 +296,31 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F4)) {
             cycle_anchor(&mut ed);
         }
+        // Left/Right in mixed-direction text: the caret moves through the *visual* clusters, so it
+        // follows what the reader sees instead of the stored byte order. Shift extends from where
+        // the selection started. Only the caret moves; the buffer and the insertion point stay
+        // logical (typing still inserts at character `ed.caret`).
+        if visual && !ed.enter_mode {
+            let (left, right, shift) = ui.input_mut(|i| {
+                let shift = i.modifiers.shift;
+                let left = i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft) || i.consume_key(egui::Modifiers::SHIFT, Key::ArrowLeft);
+                let right = i.consume_key(egui::Modifiers::NONE, Key::ArrowRight) || i.consume_key(egui::Modifiers::SHIFT, Key::ArrowRight);
+                (left, right, shift)
+            });
+            if (left || right)
+                && let Some(map) = &caret_map
+            {
+                let from = ed.caret;
+                let focus = map.step(from, right);
+                if focus != from || shift {
+                    // Shift keeps the anchor where the selection started; a plain move collapses it.
+                    ed.caret_anchor = if shift { Some(ed.caret_anchor.unwrap_or(from)) } else { None };
+                    ed.caret = focus;
+                    ed.caret_to_end = false;
+                    ed.sync_caret = true;
+                }
+            }
+        }
         // Ctrl+Shift+A (Control+Shift+A on a Mac) inserts the argument names. Consumed anywhere,
         // as in Excel, so it never falls through to the text's select-all.
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::A)) {
@@ -294,8 +341,10 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     // The text widget.
     let refs = formula_refs(&ed.text);
     let text_color = Tokens::get(ui.ctx()).text;
-    let cell_text_color = if id == egui::Id::new("gridcraft.cell_editor") { Color32::BLACK } else { text_color };
+    let in_cell = id == egui::Id::new("gridcraft.cell_editor");
+    let cell_text_color = if in_cell { Color32::BLACK } else { text_color };
     let font2 = font.clone();
+    let glyph_color = if visual { Color32::TRANSPARENT } else { cell_text_color };
     let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
         let s = buf.as_str();
         let mut job = egui::text::LayoutJob::default();
@@ -306,17 +355,16 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
             if a < pos || !s.is_char_boundary(a) || !s.is_char_boundary(b) {
                 continue;
             }
-            job.append(s.get(pos..a).unwrap_or(""), 0.0, egui::TextFormat::simple(font2.clone(), cell_text_color));
-            job.append(s.get(a..b).unwrap_or(""), 0.0, egui::TextFormat::simple(font2.clone(), REF_COLORS[idx]));
+            job.append(s.get(pos..a).unwrap_or(""), 0.0, egui::text::TextFormat::simple(font2.clone(), glyph_color));
+            job.append(s.get(a..b).unwrap_or(""), 0.0, egui::text::TextFormat::simple(font2.clone(), REF_COLORS[idx]));
             pos = b;
         }
-        job.append(s.get(pos..).unwrap_or(""), 0.0, egui::TextFormat::simple(font2.clone(), cell_text_color));
+        job.append(s.get(pos..).unwrap_or(""), 0.0, egui::text::TextFormat::simple(font2.clone(), glyph_color));
         job.wrap.max_width = if multiline { wrap_width } else { f32::INFINITY };
         ui.fonts_mut(|f| f.layout_job(job))
     };
     let chars_before = ed.text.chars().count();
     // The in-cell editor is as tall as its lines (a multiline field reserves four rows).
-    let in_cell = id == egui::Id::new("gridcraft.cell_editor");
     let edit = if multiline || ed.text.contains('\n') {
         TextEdit::multiline(&mut ed.text).desired_rows(if in_cell { 1 } else { 4 })
     } else {
@@ -333,15 +381,20 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
         .show(ui);
     let resp = output.response.clone();
     let synced = mine && (ed.request_focus || ed.sync_caret);
+    let mut range = output.cursor_range.unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(ed.caret)));
+    let mut store_cursor = false;
     if synced {
         if ed.request_focus {
             resp.request_focus();
         }
         ed.request_focus = false;
         ed.sync_caret = false;
-        let cursor = egui::text::CCursor::new(ed.caret);
-        output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(cursor)));
-        output.state.store(ui.ctx(), id);
+        range = egui::text::CCursorRange::one(egui::text::CCursor::new(ed.caret));
+        if let Some(anchor) = ed.caret_anchor.filter(|a| *a != ed.caret) {
+            range.secondary = egui::text::CCursor::new(anchor);
+        }
+        output.state.cursor.set_char_range(Some(range));
+        store_cursor = true;
     } else if resp.clicked() || resp.gained_focus() {
         // Clicking into the other editor moves editing there.
         ed.from_formula_bar = id == egui::Id::new("gridcraft.formula_bar");
@@ -350,8 +403,31 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     }
     if !synced && let Some(r) = output.cursor_range {
         ed.caret = r.primary.index.into();
+        ed.caret_anchor = (r.primary != r.secondary).then(|| r.secondary.index.into());
+    }
+    // A click or a drag into mixed-direction text selects the cluster under the pointer: the
+    // stored-order glyph x egui would pick is not the one on screen.
+    if visual
+        && let Some(map) = &caret_map
+        && (resp.clicked() || resp.dragged())
+        && let Some(p) = resp.interact_pointer_pos()
+    {
+        let focus = map.index_at_x(p.x - output.galley_pos.x);
+        let anchor = if resp.dragged() { ed.caret_anchor.unwrap_or(focus) } else { focus };
+        ed.caret = focus;
+        ed.caret_anchor = (anchor != focus).then_some(anchor);
+        range = egui::text::CCursorRange::one(egui::text::CCursor::new(focus));
+        if let Some(anchor) = ed.caret_anchor {
+            range.secondary = egui::text::CCursor::new(anchor);
+        }
+        output.state.cursor.set_char_range(Some(range));
+        store_cursor = true;
+    }
+    if store_cursor {
+        output.state.store(ui.ctx(), id);
     }
     if resp.changed() {
+        ed.caret_anchor = None;
         ed.completion = None;
         if app.ui.autocomplete
             && !ed.is_formula()
@@ -379,6 +455,23 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
         } else {
             gridcraft_engine::Mode::Edit
         };
+    }
+    // The shaped line, its selection islands and its caret. egui's own glyphs are transparent and
+    // its highlight and caret hidden (see above), so this is the whole picture of the text.
+    if visual && let (Some(line), Some(map)) = (&shaped_line, &caret_map) {
+        let focus: usize = range.primary.index.into();
+        let anchor: usize = range.secondary.index.into();
+        let (lo, hi) = (focus.min(anchor), focus.max(anchor));
+        let painter = ui.painter().with_clip_rect(resp.rect);
+        let top = output.galley_pos.y;
+        let bottom = top + output.galley.rect.height();
+        for (x0, x1) in map.selection_spans(lo, hi) {
+            let r = egui::Rect::from_min_max(pos2(output.galley_pos.x + x0, top), pos2(output.galley_pos.x + x1, bottom));
+            painter.rect_filled(r, 0.0, selection_color);
+        }
+        line.paint(&painter, output.galley_pos, cell_text_color);
+        let x = output.galley_pos.x + map.caret_x(focus);
+        painter.line_segment([pos2(x, top), pos2(x, bottom)], Stroke::new(1.0, caret_color));
     }
     // Column AutoComplete: the rest of the suggested entry, shown selected after the caret.
     if let Some(full) = &ed.completion

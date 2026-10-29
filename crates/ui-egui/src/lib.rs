@@ -31,6 +31,7 @@ pub mod pivot_pane;
 pub mod printing;
 pub mod ribbon;
 pub mod tabs;
+pub mod text;
 pub mod text_box;
 pub mod theme;
 pub mod widgets;
@@ -253,6 +254,10 @@ pub struct SheetApp {
     pub synthetic: std::collections::VecDeque<Vec<egui::Event>>,
     pub control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,
     pub grid: grid::GridState,
+    /// The app's text engine: the one place shaped cell text (bidi, Arabic joining, Indic
+    /// reordering) is produced, measured and mapped to caret positions. Shared with the engine's
+    /// AutoFit measure, so the width AutoFit fits and the width the grid paints are one number.
+    pub text: std::sync::Arc<text::GridText>,
     pub perf: Perf,
     pub fonts_ready: bool,
     fonts_set: bool,
@@ -323,6 +328,7 @@ impl SheetApp {
                 ..Default::default()
             },
             perf: Perf::default(),
+            text: std::sync::Arc::new(text::GridText::new()),
             fonts_ready: false,
             fonts_set: false,
             fonts_bound: Vec::new(),
@@ -1144,7 +1150,8 @@ impl SheetApp {
     pub fn logic(&mut self, ctx: &egui::Context) {
         if self.session.text_width.is_none() {
             let ctx = ctx.clone();
-            self.session.text_width = Some(std::sync::Arc::new(move |text, font, exact| theme::cell_text_width(&ctx, text, font, exact)));
+            let text = std::sync::Arc::clone(&self.text);
+            self.session.text_width = Some(std::sync::Arc::new(move |line, font, exact| text.cell_text_width(&ctx, line, font, exact)));
         }
         // A keytip control request lives one frame: the ribbon consumes it during `ui`, and
         // anything that never reached a control (collapsed ribbon, tab switch) is dropped.

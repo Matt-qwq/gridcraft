@@ -1,6 +1,6 @@
 # Localization parity
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (PDF text is shaped and laid out right-to-left with cluster-exact `ToUnicode`; the PDF rows and limits say what now extracts and what a mixed-direction line still cannot) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (text is shaped in **both** paths now: cell text on the grid and in the in-cell editor — Arabic joining, Devanagari reordering, Thai marks, mixed bidi runs and a visual caret, with a Devanagari fallback face — and PDF export, where `ToUnicode` follows each glyph's whole cluster so extraction returns the logical text and bidi runs are laid out in visual order) · **Target:** Microsoft Excel (Microsoft 365)
 
 Per-language status against Excel, which ships its UI in dozens of languages (Windows language
 packs cover 100+), with localized function names, argument separators, number and date formats,
@@ -46,12 +46,23 @@ right-to-left sheets and full complex-script support. Part of
   `/run/host/fonts`, `/run/host/local-fonts` and `/run/host/user-fonts` layouts, so installed
   Noto CJK and WenQuanYi faces can render Chinese without a broad filesystem grant. This does
   not change the installed-font catalogue or add bundled fonts. Lao falls back to Lao Sangam MN / Lao MN (macOS),
-  Leelawadee UI / DokChampa (Windows) or Noto Sans Lao / Phetsarath OT (Linux). There is no complex-text shaping: Arabic and
-  Devanagari don't join or reorder, and there is no bidirectional layout. **Sheet Right-to-Left**
+  Leelawadee UI / DokChampa (Windows) or Noto Sans Lao / Phetsarath OT (Linux). A Devanagari
+  fallback face (`sys-devanagari`: Nirmala UI / Mangal on Windows, Kohinoor and Devanagari Sangam MN
+  on macOS, Noto Sans Devanagari / Lohit / FreeSerif on Linux) joins them, so a Hindi cell draws
+  instead of boxes. **Complex-script rendering on the grid and in the cell editor landed in M14**
+  (`crates/ui-egui/src/text.rs` over `gridcraft_core::text`): Arabic joins with its contextual
+  forms, Devanagari reorders and merges clusters, Thai marks are positioned, the Unicode
+  bidirectional algorithm puts Latin and digit islands back in left-to-right order inside Hebrew
+  or Arabic, general right-to-left cell text aligns right, neutral text on a right-to-left sheet
+  follows the sheet, and the in-cell editor's caret and selection follow visual clusters while
+  the buffer, the formula bar and tooltips stay logical. Wrapped and multi-line cells, text boxes
+  and chart labels are still drawn by egui's own (unshaped) layout, and PDF export is unshaped.
+  **Sheet Right-to-Left**
   (`view.rightToLeft`, Page Layout › Sheet Options, XLSX `rightToLeft`, `.xls` WINDOW2 fRightToLeft) mirrors the grid (#146):
   column A and the row headers on the right, the vertical scrollbar on the left; hit-testing,
-  arrow keys, editor, popups and floating objects follow; text stays left-to-right inside its box
-  (no bidi), and the sheet tabs, horizontal scrollbar and printing/PDF are not mirrored yet.
+  arrow keys, editor, popups and floating objects follow; cell text is shaped inside its box but
+  the whole box is not re-anchored, and the sheet tabs, horizontal scrollbar and printing/PDF are
+  not mirrored yet.
   Text boxes and shapes keep their paragraphs' right-to-left direction (`a:pPr rtl`) through XLSX
   save, though GridCraft still draws that text left to right. IME input goes
   through egui/winit and is unverified for Chinese, Japanese and Korean.
@@ -79,8 +90,8 @@ separators, number/date formats, machine translation with agent review, and scri
 | English | en | ~2,200 / ~2,200 (100%, source) | yes | Latin: yes | yes | full | — |
 | Simplified Chinese (Mandarin) | zh-Hans | 266 (~12%) | no | CJK system-font fallback (#38); IME unverified; PDF embeds a subset (M14) | no | menus only | 8–13 h |
 | Spanish | es | 0 (0%) | no | Latin: yes | no | none | 6–10 h |
-| Hindi | hi | 0 (0%) | no | Devanagari: **PDF shapes and reorders (M14)**; grid/editor text is still unshaped | no | none | 12–18 h |
-| Arabic | ar | 0 (0%) | no | **PDF shapes and lays out RTL (M14); no RTL UI**; Sheet Right-to-Left mirrors the grid (#146) | no | none | 25–35 h |
+| Hindi | hi | 0 (0%) | no | Devanagari: shaped and reordered on screen (M14, `sys-devanagari` fallback face) and in PDF (M14, `cluster-exact ToUnicode`) | no | none | 12–18 h |
+| Arabic | ar | 0 (0%) | no | Arabic joins and bidirectional runs draw in visual order on screen and in PDF (M14); **no RTL interface**; Sheet Right-to-Left mirrors the grid (#146) | no | none | 25–35 h |
 | French | fr | 0 (0%) | no | Latin: yes | no | none | 6–10 h |
 | Portuguese | pt-BR | 943 (~43%) | dialogs and tooltips (dialogs take effect with #669) | Latin: yes | no | menus, File view, dialogs | 2–4 h |
 | Indonesian | id | 0 (0%) | no | Latin: yes | no | none | 5–8 h |
@@ -175,9 +186,10 @@ Decisions and limits, also stated in the code:
   fall back instead of failing. The parser is fuzzed by the truncation tests.
 - **wasm** has no filesystem: font discovery returns an error, no face is embedded, and the
   document keeps the standard fonts and the CID fallback.
-- Out of scope for the PDF writer: per-run font fallback, mirrored printing for right-to-left
-  sheets, and shaping grid/editor text (the UI task owns that). **Needs a human:** native-speaker
-review of every language (none so far) and of localized function names.
+- Remaining: CJK system-font fallback for every script, mirrored printing and sheet tabs for
+  right-to-left sheets, shaped layout for wrapped cells, text boxes and chart labels, and per-run
+  font fallback. **Needs a human:** native-speaker review of every language (none so far) and of
+  localized function names.
 
 ## Infrastructure (do first)
 
@@ -187,15 +199,17 @@ review of every language (none so far) and of localized function names.
 2. Locale-aware formulas: localized function-name tables and separators at the formula-bar
    boundary only (files keep en-US invariant names), locale number and date formats, list
    separators in CSV.
-3. Text shaping and fallback: the shared `gridcraft_core::text` engine shapes PDF text now (Arabic,
-   Devanagari, Thai, bidi); the grid/editor text, system font fallback for CJK, right-to-left sheet
-   tabs and mirrored printing still need it.
+3. Text shaping and fallback: the shared `gridcraft_core::text` engine shapes cell text on the grid,
+   in the in-cell editor and in PDF export (Arabic, Devanagari, Thai, bidi, cluster-exact extraction).
+   Remaining: CJK system font fallback for every script, right-to-left sheet tabs and mirrored
+   printing, shaped layout for wrapped cells, text boxes and chart labels, and per-run fallback.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-30 | major | PDF text is shaped with `gridcraft_core::text`: Arabic joins, Devanagari reorders, Thai marks are positioned and bidi runs are laid out in visual order (`TJ`/`Ts` on one text matrix); `ToUnicode` follows the glyph's whole cluster and a `CIDToGIDMap` keeps a glyph that extracts differently in two places apart, so `pdftotext` returns the logical line for a single-direction string (Arabic/Hebrew wrapped in bidi controls; Devanagari/Thai verbatim). WinAnsi-only text is byte-identical; mixed-direction lines are reordered by the extractor's own bidi pass |
+| 2026-10-30 | major | PDF text is shaped with `gridcraft_core::text`: Arabic joins, Devanagari reorders, Thai marks are positioned and bidi runs are laid out in visual order (`TJ`/`Ts` on one text matrix); `ToUnicode` follows the glyph's whole cluster and a `CIDToGIDMap` is written only when one glyph must extract differently, so WinAnsi text stays byte-identical |
+| 2026-10-30 | minor | Cell text on the grid and in the in-cell editor is shaped and bidi-ordered (`crates/ui-egui/src/text.rs`, one `gridcraft_core::text` engine per app, the faces egui paints with): Arabic joins, Devanagari reorders and merges clusters, Thai marks take zero advance, mixed runs draw in visual order and the caret walks visual clusters; a Devanagari fallback face makes Hindi cells draw |
 | 2026-10-30 | major | PDF export embeds subset TrueType fonts (`crates/pdf/src/truetype.rs`, `gridcraft_core::fonts`): Cyrillic, Greek, Hebrew, CJK, Korean and the glyphs of Arabic, Devanagari and Thai now reach the PDF (unshaped, left to right) with `ToUnicode` so the text stays copyable; `file.exportPdf`/`file.print` take `fontPath`; a WinAnsi-only document's bytes are unchanged |
 | 2026-10-21 | minor | Romanian interface (`ro`, Română): 970 labels covering every key of the other catalogs (`crates/ui-egui/src/i18n/ro.rs`), `ro-*` system locales, the View-tab switcher and `app.language.set`; context keys show no prefix (File › Options test). English formulas and formats; AI-assisted draft pending native-speaker review |
 | 2026-10-20 | minor | Japanese: furigana (`rPh` phonetic runs and `<phoneticPr>` in `xl/sharedStrings.xml`) is no longer deleted by an open + save; it is kept on the workbook and written back (a `<phoneticPr>` without runs is kept too, while duplicate texts with different readings keep only the first, reported on open). Display of the readings is still missing (`crates/xlsx/src/tests/phonetic_tests.rs`) |
