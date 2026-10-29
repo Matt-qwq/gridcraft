@@ -803,6 +803,8 @@ fn new_window(s: &mut Session, _: &Json) -> Result<Json> {
     let mut copy = crate::DocState::new((*d.wb).clone(), d.path.clone(), format!("{}:2", d.display_title()));
     copy.selection = d.selection.clone();
     copy.scripts_trusted = d.scripts_trusted;
+    // The second window saves the same file, so it keeps the password that file is saved with.
+    copy.password = d.password.clone();
     let i = s.add_document(copy);
     Ok(json!({"index": i}))
 }

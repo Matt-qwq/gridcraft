@@ -155,3 +155,142 @@ fn non_ascii_passwords_hash_as_utf16le_like_msoffcrypto() {
         hex("2bca96ca0a7e8d88d9314a2eb1819a1ece94ff9ce34266ff82f891a88c4240c4c9f39c729b7c5c410c27fc8e2b7ad90d8c005eb68a603377b8a4ab858041c76a")
     );
 }
+
+// ---- writing -------------------------------------------------------------------------------
+
+/// Faster than Excel's 100,000 rounds; the algorithm is the same.
+fn encrypt(package: &[u8], password: &str) -> Vec<u8> {
+    encrypt_workbook_with_spin(package, password, 1000).unwrap()
+}
+
+#[test]
+fn hmac_sha512_matches_rfc_4231() {
+    // RFC 4231 test cases 1, 2 and 6 (case 2's key is the 4-byte "Jefe").
+    assert_eq!(
+        hmac_sha512(&[0x0b; 20], b"Hi There"),
+        hex("87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854")
+    );
+    assert_eq!(
+        hmac_sha512(b"Jefe", b"what do ya want for nothing?"),
+        hex("164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737")
+    );
+    let long_key = [0xaa; 131];
+    assert_eq!(
+        hmac_sha512(&long_key, b"Test Using Larger Than Block-Size Key - Hash Key First"),
+        hex("80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598")
+    );
+}
+
+#[test]
+fn agile_encryption_round_trips_at_every_size() {
+    for len in [0usize, 1, 15, 16, 17, 4095, 4096, 4097, 8192, 10_000] {
+        let plain = payload(len);
+        let file = encrypt(&plain, PASSWORD);
+        assert_eq!(sniff_encrypted(&file), true, "a {len}-byte package");
+        assert_eq!(decrypt(&file, PASSWORD).unwrap(), plain, "a {len}-byte package");
+        assert_eq!(decrypt(&file, "wrong"), Err(DecryptError::WrongPassword));
+        assert_eq!(check_encryption(&file), Ok(()));
+    }
+}
+
+/// Whether the compound file names the encryption streams (the reader's own test).
+fn sniff_encrypted(bytes: &[u8]) -> bool {
+    crate::cfb::is_encrypted(bytes)
+}
+
+#[test]
+fn every_save_gets_fresh_salts_and_a_fresh_key() {
+    let plain = payload(100);
+    let a = encrypt(&plain, PASSWORD);
+    let b = encrypt(&plain, PASSWORD);
+    assert_ne!(a, b, "two saves of one package are identical");
+    assert_eq!(decrypt(&a, PASSWORD).unwrap(), plain);
+    assert_eq!(decrypt(&b, PASSWORD).unwrap(), plain);
+    // The two `EncryptionInfo` descriptors differ in every salt and every encrypted value.
+    let (info_a, _) = streams(&a).unwrap();
+    let (info_b, _) = streams(&b).unwrap();
+    assert_ne!(info_a, info_b);
+}
+
+#[test]
+fn a_saved_workbook_carries_a_data_integrity_hmac_that_matches() {
+    let plain = payload(9000);
+    let file = encrypt(&plain, PASSWORD);
+    let (info, package) = streams(&file).unwrap();
+    let d = agile_descriptor(info.get(8..).unwrap()).unwrap();
+    let h = iterated_hash(d.key.hash, PASSWORD, &d.key.salt, d.spin);
+    let mut iv = d.key.salt.clone();
+    iv.resize(16, 0x36);
+    let field = |data: &[u8]| {
+        let key = derive(d.key.hash, &h, &BLOCK_HMAC, 32);
+        let mut data = data.to_vec();
+        Aes::new(&key).unwrap().decrypt_cbc(&iv, &mut data).unwrap();
+        data
+    };
+    // The descriptor's XML names the two HMAC values; read them the way Excel's writer put them.
+    let xml = std::str::from_utf8(info.get(8..).unwrap()).unwrap();
+    let attr = |name: &str| {
+        let at = xml.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+        let end = xml.get(at..).unwrap().find('"').unwrap() + at;
+        base64(xml.get(at..end).unwrap()).unwrap()
+    };
+    let hmac_key = field(&attr("encryptedHmacKey"));
+    let hmac_value = field(&attr("encryptedHmacValue"));
+    assert_eq!(hmac_key.len(), 64);
+    assert_eq!(&hmac_value[..64], &hmac_sha512(&hmac_key, &plain)[..]);
+    // ...and the package stream is the plaintext's length followed by whole AES blocks: every
+    // 4096-byte segment is a multiple of 16 already, so only the last is padded.
+    let last = plain.len() % 4096;
+    let body = plain.len() - last + last.div_ceil(16) * 16;
+    assert_eq!(package.len(), 8 + body);
+    assert_eq!(u64::from_le_bytes(package[..8].try_into().unwrap()), plain.len() as u64);
+}
+
+#[test]
+fn passwords_of_every_shape_round_trip() {
+    let plain = payload(200);
+    // An empty password and a very long one (a 100 kB password must not slow a save down: it is
+    // hashed once, then the spin count walks the hash).
+    for pw in ["", "a", &"ü".repeat(50_000)] {
+        let file = encrypt(&plain, pw);
+        assert_eq!(decrypt(&file, pw).unwrap(), plain, "a {}-byte password", pw.len());
+        assert_eq!(decrypt(&file, "x"), Err(DecryptError::WrongPassword));
+        assert_eq!(decrypt(&file, ""), if pw.is_empty() { Ok(plain.clone()) } else { Err(DecryptError::WrongPassword) });
+    }
+}
+
+#[test]
+fn a_truncated_or_mangled_encrypted_workbook_is_an_error() {
+    let plain = payload(8000);
+    let good = encrypt(&plain, PASSWORD);
+    for cut in (0..good.len()).step_by(37) {
+        // A cut inside the final sector's padding still reads: the streams are complete. Any
+        // other cut is an error, never a panic and never a short package passed off as whole.
+        match decrypt(&good[..cut], PASSWORD) {
+            Ok(out) => assert_eq!(out, plain, "{cut} of {}", good.len()),
+            Err(_) => {}
+        }
+        let _ = check_encryption(&good[..cut]);
+    }
+    // Byte mutations anywhere: never a panic, never a hang. Bytes outside the streams (header
+    // padding, a sector's slack after the last stream byte) can still decrypt to the package,
+    // which is correct; a change inside the ciphertext must not.
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..400 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let at = (seed as usize) % good.len();
+        let mut b = good.clone();
+        b[at] ^= 0xFF;
+        let _ = decrypt(&b, PASSWORD);
+    }
+    let (info, package) = streams(&good).unwrap();
+    let mut stream = package.clone();
+    stream[8 + 100] ^= 0xFF; // inside the first encrypted segment
+    let flipped = crate::cfb::write_compound(&[("EncryptionInfo", &info), ("EncryptedPackage", &stream)]).unwrap();
+    match decrypt(&flipped, PASSWORD) {
+        Ok(out) => assert_ne!(out, plain, "a flipped ciphertext byte came back as the package"),
+        Err(_) => {}
+    }
+}

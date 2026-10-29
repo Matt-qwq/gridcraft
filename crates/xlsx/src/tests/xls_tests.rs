@@ -636,3 +636,241 @@ fn xls_short_window2_is_ignored() {
         assert_eq!(v(&wb, 0, "A1"), Value::Number(7.0));
     }
 }
+// ---------------------------------------------------------------- styles and comments
+
+/// A `FONT` record ([MS-XLS] 2.4.122): height in twips, flags, colour index, weight, escapement,
+/// underline, family, charset, reserved, then the name as a ShortXLUnicodeString.
+fn font(dy: u16, grbit: u16, icv: u16, bls: u16, uls: u8, charset: u8, name: &str) -> Vec<u8> {
+    let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let high = units.len() != name.len();
+    let cch = name.encode_utf16().count() as u8;
+    let mut p = u16s(&[dy, grbit, icv, bls, 0]);
+    p.extend_from_slice(&[uls, 0, charset, 0, cch, u8::from(high)]);
+    p.extend_from_slice(&units);
+    rec(0x0031, &p)
+}
+
+/// An `XF` record ([MS-XLS] 2.4.353) with every style field the reader takes.
+struct Xf {
+    ifnt: u16,
+    ifmt: u16,
+    flags: u16,
+    align: u8,
+    rotation: u8,
+    indent: u8,
+    /// left, right, top, bottom border styles.
+    borders: [u8; 4],
+    /// left, right, top, bottom colour indices.
+    colors: [u16; 4],
+    fill_pattern: u8,
+    fill_fg: u16,
+    fill_bg: u16,
+}
+
+impl Default for Xf {
+    fn default() -> Self {
+        Xf {
+            ifnt: 0,
+            ifmt: 0,
+            flags: 1,
+            align: 0x10,
+            rotation: 0,
+            indent: 0,
+            borders: [0; 4],
+            colors: [64; 4],
+            fill_pattern: 0,
+            fill_fg: 64,
+            fill_bg: 65,
+        }
+    }
+}
+
+fn xf(x: &Xf) -> Vec<u8> {
+    let mut p = u16s(&[x.ifnt, x.ifmt, x.flags]);
+    p.extend_from_slice(&[x.align, x.rotation, x.indent, 0xfc]);
+    p.extend_from_slice(&[x.borders[0] | (x.borders[1] << 4), x.borders[2] | (x.borders[3] << 4)]);
+    let lr = (x.colors[0] & 0x7F) | ((x.colors[1] & 0x7F) << 7);
+    let tb = (x.colors[2] & 0x7F) | ((x.colors[3] & 0x7F) << 7);
+    p.extend_from_slice(&u16s(&[lr, tb]));
+    p.extend_from_slice(&u16s(&[(u16::from(x.fill_pattern) << 10), (x.fill_fg & 0x7F) | ((x.fill_bg & 0x7F) << 7)]));
+    rec(0x00E0, &p)
+}
+
+/// A `PALETTE` record: colours for indices 8 onward.
+fn palette(colors: &[(u8, u8, u8)]) -> Vec<u8> {
+    let mut p = (colors.len() as u16).to_le_bytes().to_vec();
+    for (r, g, b) in colors {
+        p.extend_from_slice(&[*r, *g, *b, 0]);
+    }
+    rec(0x0092, &p)
+}
+
+/// A `STYLE` record with a built-in name.
+fn builtin_style(ixfe: u16, istd: u8) -> Vec<u8> {
+    rec(0x0293, &cat(&[&u16s(&[ixfe | 0x8000]), &[istd, 0xFF]]))
+}
+
+/// The workbook globals for a styled sheet: `sheet_records` run in the one worksheet.
+fn styled_book(globals: &[u8], sheet_records: &[u8]) -> Vec<u8> {
+    let g = |pos: u32| cat(&[&bof(0x0005), globals, &rec(0x0085, &cat(&[&pos.to_le_bytes(), &[0, 0, 6, 0], b"Sheet1"])), &eof()]);
+    let sheet = cat(&[&bof(0x0010), sheet_records, &eof()]);
+    compound("Workbook", &cat(&[&g(g(0).len() as u32), &sheet]))
+}
+
+#[test]
+fn xls_fonts_palette_fills_and_borders_reach_the_model() {
+    // Two custom palette colours; fonts: plain, then bold italic 14pt in palette colour 8 with
+    // single underline; a custom number format; two cell formats and a named style.
+    let globals = cat(&[
+        &palette(&[(0x12, 0x34, 0x56), (0xAB, 0xCD, 0xEF)]),
+        &font(200, 0, 0x7FFF, 400, 0, 0, "Arial"),
+        &font(280, 0x0003, 8, 700, 1, 134, "Times New Roman"),
+        &rec(0x041E, &cat(&[&u16s(&[164]), &xlstr("0.000")])),
+        &xf(&Xf::default()),
+        &xf(&Xf {
+            ifnt: 1,
+            ifmt: 164,
+            // centered, wrapped, bottom-aligned
+            align: 0x02 | 0x08 | 0x20,
+            // 120 is 30 degrees clockwise, which the model stores as -30.
+            rotation: 120,
+            indent: 2,
+            borders: [1, 1, 5, 6],
+            colors: [8, 9, 8, 64],
+            fill_pattern: 1,
+            fill_fg: 9,
+            fill_bg: 65,
+            ..Xf::default()
+        }),
+        &builtin_style(1, 3), // Comma
+    ]);
+    let sheet = cat(&[
+        &rec(0x0203, &cat(&[&cell(0, 0, 1), &1.0f64.to_le_bytes()])),
+        &rec(0x0203, &cat(&[&cell(1, 0, 1), &2.0f64.to_le_bytes()])),
+        &rec(0x0203, &cat(&[&cell(2, 0, 0), &3.0f64.to_le_bytes()])),
+    ]);
+    let (wb, _) = read_xls(&styled_book(&globals, &sheet)).unwrap();
+    let sh = &wb.sheets[0];
+    let style = |a1: &str| wb.styles.get(sh.style_id(CellRef::parse(a1).unwrap())).clone();
+    let s = style("A1");
+    assert_eq!(s.font.name, "Times New Roman");
+    assert_eq!(s.font.size, 14.0);
+    assert!(s.font.bold && s.font.italic);
+    assert_eq!(s.font.color, gridcraft_model::Color::Rgb(0x123456));
+    assert_eq!(s.font.underline, gridcraft_model::Underline::Single);
+    assert_eq!(s.font.charset, Some(134));
+    assert_eq!(s.num_fmt.as_str(), "0.000");
+    assert_eq!(s.align.h, gridcraft_model::HAlign::Center);
+    assert!(s.align.wrap);
+    assert_eq!(s.align.v, gridcraft_model::VAlign::Bottom);
+    assert_eq!((s.align.rotation, s.align.indent), (-30, 2));
+    assert_eq!(s.fill.pattern, gridcraft_model::PatternType::Solid);
+    assert_eq!(s.fill.fg, gridcraft_model::Color::Rgb(0xABCDEF));
+    assert_eq!(s.borders.left.style, gridcraft_model::BorderStyle::Thin);
+    assert_eq!(s.borders.top.style, gridcraft_model::BorderStyle::Thick);
+    assert_eq!(s.borders.bottom.style, gridcraft_model::BorderStyle::Double);
+    assert_eq!(s.borders.left.color, gridcraft_model::Color::Rgb(0x123456));
+    assert_eq!(s.borders.right.color, gridcraft_model::Color::Rgb(0xABCDEF));
+    assert_eq!(s.borders.bottom.color, gridcraft_model::Color::Auto);
+    // Cells that share an XF share a style id; the plain cell keeps General and no fill.
+    assert_eq!(sh.style_id(CellRef::parse("A1").unwrap()), sh.style_id(CellRef::parse("A2").unwrap()));
+    let plain = style("A3");
+    assert_eq!(plain.num_fmt.as_str(), "General");
+    assert_eq!(plain.fill.pattern, gridcraft_model::PatternType::None);
+    assert!(!plain.font.bold);
+    // The named style is bound to its format.
+    assert_eq!(wb.cell_styles.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["Comma"]);
+    // The Normal style (XF 0) is the workbook's default, and it round-trips through XLSX.
+    assert_eq!(wb.styles.get(gridcraft_model::StyleId::DEFAULT).font.name, "Arial");
+    let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    let back_s = back.styles.get(back.sheets[0].style_id(CellRef::parse("A1").unwrap()));
+    assert_eq!((back_s.font.name.as_str(), back_s.num_fmt.as_str()), ("Times New Roman", "0.000"));
+    assert_eq!(back_s.fill.fg, gridcraft_model::Color::Rgb(0xABCDEF));
+}
+
+#[test]
+fn xls_comments_carry_their_author_and_text() {
+    let note = |row: u16, col: u16, author: &str| {
+        let units: Vec<u8> = author.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        rec(0x001C, &cat(&[&u16s(&[row, col, 0, 0, author.encode_utf16().count() as u16]), &[1], &units]))
+    };
+    // A comment's text is the TXO's text, which continues into Continue records, each with its
+    // own compression flag (as Excel writes it).
+    let txo = |text: &str| {
+        let mut header = u16s(&[0x0212, 0, 0, 0, 0]);
+        header.extend_from_slice(&u16s(&[text.encode_utf16().count() as u16, 24, 0, 0]));
+        let mut first = text.to_string();
+        let second = first.split_off(first.len().min(3));
+        let first_units: Vec<u8> = first.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut parts: Vec<Vec<u8>> = vec![rec(0x01B6, &header), rec(0x003C, &cat(&[&[1], &first_units]))];
+        if !second.is_empty() {
+            let units: Vec<u8> = second.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            parts.push(rec(0x003C, &cat(&[&[1], &units])));
+        }
+        parts.concat()
+    };
+    let sheet = cat(&[
+        &rec(0x0203, &cat(&[&cell(0, 0, 0), &1.0f64.to_le_bytes()])),
+        &note(0, 0, "Ada"),
+        &note(1, 2, "Grace"),
+        &txo("first note"),
+        &txo("second note"),
+    ]);
+    let (wb, report) = read_xls(&styled_book(&[], &sheet)).unwrap();
+    let c = wb.sheets[0].comments.clone();
+    assert_eq!(c.len(), 2);
+    let a1 = c.get(&CellRef::new(0, 0)).unwrap();
+    assert_eq!((a1.author.as_str(), a1.text.as_str()), ("Ada", "first note"));
+    let c3 = c.get(&CellRef::new(1, 2)).unwrap();
+    assert_eq!((c3.author.as_str(), c3.text.as_str()), ("Grace", "second note"));
+    assert!(!report.warnings.iter().any(|w| w.contains("missing their text")), "{:?}", report.warnings);
+}
+
+#[test]
+fn a_comment_without_its_text_says_so_and_keeps_the_author() {
+    let author = "Ada";
+    let units: Vec<u8> = author.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let note = rec(0x001C, &cat(&[&u16s(&[0, 0, 0, 0, author.len() as u16]), &[1], &units]));
+    let (wb, report) = read_xls(&styled_book(&[], &note)).unwrap();
+    let c = wb.sheets[0].comments.get(&CellRef::new(0, 0)).unwrap();
+    assert_eq!((c.author.as_str(), c.text.as_str()), ("Ada", ""));
+    assert!(report.warnings.iter().any(|w| w.contains("missing their text")), "{:?}", report.warnings);
+}
+
+#[test]
+fn hostile_style_and_comment_records_never_panic() {
+    let globals = cat(&[
+        &palette(&[(1, 2, 3)]),
+        &font(200, 0, 8, 700, 1, 134, "Arial"),
+        &rec(0x041E, &cat(&[&u16s(&[164]), &xlstr("0.000")])),
+        &xf(&Xf { ifnt: 1, ifmt: 164, borders: [1, 6, 3, 9], colors: [8, 9, 10, 11], fill_pattern: 5, ..Xf::default() }),
+        &builtin_style(1, 3),
+    ]);
+    let units: Vec<u8> = "Ada".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let note = rec(0x001C, &cat(&[&u16s(&[0, 0, 0, 0, 3]), &[1], &units]));
+    let sheet = cat(&[&rec(0x0203, &cat(&[&cell(0, 0, 1), &1.0f64.to_le_bytes()])), &note]);
+    let file = styled_book(&globals, &sheet);
+    // Truncation anywhere.
+    for cut in (0..file.len()).step_by(29) {
+        let _ = read_xls(&file[..cut]);
+    }
+    // Every byte of the stream, flipped and zeroed.
+    let stream_start = 512 * 4;
+    for at in (stream_start..file.len()).step_by(3) {
+        for x in [0u8, 0x7F, 0xFF] {
+            let mut b = file.clone();
+            b[at] = x;
+            let _ = read_xls(&b);
+        }
+    }
+    // A style or comment record a few bytes short is an error, not a panic.
+    for id in [0x0031u16, 0x041E, 0x00E0, 0x0293, 0x001C, 0x01B6] {
+        for len in [0usize, 1, 2, 3, 5, 6, 7, 9, 10, 12, 16, 17, 18, 19] {
+            for fill in [0u8, 0xFF] {
+                let records = rec(id, &vec![fill; len]);
+                let file = styled_book(&globals, &records);
+                let _ = read_xls(&file);
+            }
+        }
+    }
+}

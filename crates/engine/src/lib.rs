@@ -115,6 +115,10 @@ pub struct DocState {
     /// The format `path`'s content was recognised as when its extension doesn't name one (an
     /// XLSX called `budget.dat`): Save writes it back in that format.
     pub content_kind: Option<io::FileKind>,
+    /// The password an encrypted document was opened with, kept so an ordinary Save writes the
+    /// protection back instead of silently dropping it. `None` for an unencrypted document; never
+    /// serialized, never in the journal, and never in a message.
+    pub password: Option<String>,
     /// Whether the scripts stored in this workbook may run (`automate.runScript`). A workbook
     /// that arrives already carrying scripts (opened from a file) starts untrusted until the
     /// user trusts it in this session (`automate.trustScripts`); one with no scripts starts
@@ -205,6 +209,7 @@ impl DocState {
             sheet_selections: vec![],
             unlocked_ranges: vec![],
             content_kind: None,
+            password: None,
             scripts_trusted,
             history_dropped: 0,
         }

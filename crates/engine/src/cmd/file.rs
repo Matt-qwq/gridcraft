@@ -9,9 +9,9 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(noundo "file.new", "New Workbook", ["File"], Some("Cmd+N"), "{sample?: \"budget\"|\"sales\"|\"grades\"}", always, new_workbook),
         cmd!(noundo "file.open", "Open…", ["File"], Some("Cmd+O"), "{path} | {name, base64}, plus {password} for a password-protected workbook and {csvAsText?: bool} to keep every csv/tsv/txt field as text, with no number or date conversion (xlsx, xlsm, xls import, xlsb and ods data import, csv, tsv, txt, json)", always, open),
-        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?} (xlsx by default; .csv/.tsv/.json/.html/.pdf by extension)", has_doc, save),
-        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet)", has_doc, save_as),
-        cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html} → {base64}", has_doc, save_bytes),
+        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?, password?} (xlsx by default; .csv/.tsv/.json/.html/.pdf by extension; without `password` the workbook keeps the one it was opened with, and `\"\"` removes it)", has_doc, save),
+        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path, password?} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet; a password encrypts an .xlsx)", has_doc, save_as),
+        cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html, password?} → {base64}", has_doc, save_bytes),
         cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
         cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
@@ -54,6 +54,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     // A workbook read straight from its file never comes back as bytes: a package of a gigabyte
     // whose sheets are small then costs the parts it reads instead of a gigabyte of buffer.
     let mut from_file: Option<(Workbook, Vec<String>)> = None;
+    let password = str_param(p, "password");
     let (name, bytes) = if let Some(b) = str_param(p, "base64") {
         (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
     } else if let Some(path) = str_param(p, "path") {
@@ -62,7 +63,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
             s.set_active(i);
             return Ok(json!({"index": i, "alreadyOpen": true}));
         }
-        match crate::io::open_from_path(path, path, str_param(p, "password"))? {
+        match crate::io::open_from_path(path, path, password)? {
             Some((wb, warnings)) => {
                 from_file = Some((wb, warnings));
                 (path.to_string(), Vec::new())
@@ -76,7 +77,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     let encrypted = from_file.is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
     let (mut wb, warnings) = match from_file {
         Some((wb, warnings)) => (wb, warnings),
-        None => crate::io::open_bytes_with(&name, &bytes, str_param(p, "password"), bool_param(p, "csvAsText").unwrap_or(false))?,
+        None => crate::io::open_bytes_with(&name, &bytes, password, bool_param(p, "csvAsText").unwrap_or(false))?,
     };
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
     // What `CELL("filename")` reports (#1489). A workbook opened from bytes knows its name but
@@ -94,10 +95,9 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     } else {
         std::path::Path::new(&name).file_name().and_then(|n| n.to_str()).unwrap_or("Book").to_string()
     };
-    // An import has no save target: ordinary Save must ask for a new destination. Neither does a
-    // workbook decrypted with its password, so Save never replaces the encrypted original with
-    // an unprotected copy.
-    let path = str_param(p, "path").filter(|_| !imported && !encrypted).map(str::to_string);
+    // An import has no save target: ordinary Save must ask for a new destination. An encrypted
+    // workbook keeps its file (and its password, below), so Save writes the protection back.
+    let path = str_param(p, "path").filter(|_| !imported).map(str::to_string);
     // Replace an untouched blank Book1 like Excel does.
     if s.documents().len() == 1
         && s.active().is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
@@ -105,6 +105,8 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.close_document(0);
     }
     let mut doc = DocState::new(wb, path, title);
+    // An encrypted workbook is saved back with the password it was opened with.
+    doc.password = if encrypted { password.map(str::to_string) } else { None };
     if crate::io::FileKind::from_path(&name).is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Xlsx {
         doc.content_kind = Some(crate::io::FileKind::Xlsx);
     }
@@ -137,14 +139,18 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         return super::print::export_pdf(s, &json!({"path": path}));
     }
     let d = s.doc_mut()?;
+    // The password the file keeps: a `password` param changes it (`""` removes the protection),
+    // and without one the document is saved with the password it was opened with.
+    let asked = str_param(p, "password").map(|pw| if pw.is_empty() { None } else { Some(pw.to_string()) });
+    let password = asked.clone().unwrap_or_else(|| d.password.clone());
     // The document's own file keeps the format its content had when opened; any other path
     // goes by its extension. Relative paths to linked workbooks are rewritten for the new folder.
     let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
     let rebased = crate::io::source_dir(&path).and_then(|f| gridcraft_xlsx::rebase_links(&d.wb, &f));
     let wb = rebased.as_ref().unwrap_or(&d.wb);
     let bytes = match kind {
-        Some(kind) => crate::io::save_bytes_as(wb, &path, kind)?,
-        None => crate::io::save_bytes(wb, &path)?,
+        Some(kind) => crate::io::save_bytes_as_with_password(wb, &path, kind, password.as_deref())?,
+        None => crate::io::save_bytes_with_password(wb, &path, password.as_deref())?,
     };
     crate::io::write_file(&path, &bytes)?;
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
@@ -162,6 +168,7 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         super::inspect::compact_document(d, None);
         d.saved = d.wb.clone();
         d.path = Some(path.clone());
+        d.password = password;
     }
     Ok(json!({"path": path, "bytes": bytes.len()}))
 }
@@ -178,8 +185,15 @@ fn save_bytes(s: &mut Session, p: &Json) -> Result<Json> {
     let fmt = str_param(p, "format").unwrap_or("xlsx");
     let d = s.doc()?;
     let name = format!("{}.{fmt}", std::path::Path::new(&d.display_title()).file_stem().and_then(|x| x.to_str()).unwrap_or("Book"));
-    // The file name goes into a PivotChart's link to its PivotTable.
-    let bytes = crate::io::save_bytes(&d.wb, &name)?;
+    // The file name goes into a PivotChart's link to its PivotTable. A password encrypts an
+    // `.xlsx`; any other format refuses one rather than writing it unprotected.
+    let asked = str_param(p, "password").map(|pw| if pw.is_empty() { None } else { Some(pw.to_string()) });
+    let password = match asked {
+        // An explicit `""` removes the protection; no param keeps the document's password.
+        Some(asked) => asked,
+        None => d.password.clone(),
+    };
+    let bytes = crate::io::save_bytes_with_password(&d.wb, &name, password.as_deref())?;
     Ok(json!({"name": name, "base64": crate::io::base64_encode(&bytes), "bytes": bytes.len()}))
 }
 
