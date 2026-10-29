@@ -239,6 +239,20 @@ fn chart_areas(s: &Session, p: &Json) -> Result<Vec<RangeRef>> {
 
 // ---------------------------------------------------------------- tables
 
+/// Would inserting one row at `r.start` inside `r`'s columns cut a merged area in two? The header
+/// row a table without headers needs is exactly such an insert, and a merge that straddles the
+/// table's columns cannot move with it, so the two halves would end up overlapping.
+fn cut_by_header_row(sh: &gridcraft_model::Sheet, r: RangeRef) -> bool {
+    sh.merges.iter().any(|m| {
+        if m.end.row < r.start.row {
+            return false;
+        }
+        let straddles_columns = m.start.col < r.start.col || m.end.col > r.end.col;
+        let inside_columns = m.end.col >= r.start.col && m.start.col <= r.end.col;
+        inside_columns && (straddles_columns || (m.start.row < r.start.row && m.end.row >= r.start.row))
+    })
+}
+
 fn insert_table(s: &mut Session, p: &Json) -> Result<Json> {
     let r = block(s, p)?;
     let sheet = target_sheet(s, p)?;
@@ -274,6 +288,13 @@ fn insert_table(s: &mut Session, p: &Json) -> Result<Json> {
     };
     if !header && d.wb.sheet(sheet).is_some_and(moves_a_table) {
         return Err(EngineError::Other("This operation isn't allowed: it would shift cells in a table on your worksheet.".into()));
+    }
+    // The header row is an Insert Cells > Shift down over the table's columns. That shift is refused
+    // when it would cut a merged area in two (the same guard `insert.cells` uses), because the two
+    // halves would otherwise stay put and leave two merges overlapping -- found by the
+    // command-sequence fuzzer (seed 79: a merge straddling the table's columns).
+    if !header && d.wb.sheet(sheet).is_some_and(|sh| cut_by_header_row(sh, r)) {
+        return Err(EngineError::Other("Cannot change part of a merged cell.".into()));
     }
     let style = str_param(p, "style").unwrap_or("TableStyleMedium2").to_string();
     let id = d.wb.next_object_id();

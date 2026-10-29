@@ -5820,6 +5820,30 @@ fn slicer_look_and_place_commands_stay_inside_the_workbook() {
 }
 
 #[test]
+fn a_table_without_headers_is_refused_when_its_header_row_would_cut_a_merge() {
+    // The header row is an Insert Cells > Shift down over the table's columns; a merge that
+    // straddles those columns cannot move with it, so both halves would stay put and overlap.
+    // Found by the command-sequence fuzzer (seed 79, `insert.table {header:false}`).
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["a", "b", "c"], [1, 2, 3]]})).unwrap();
+    // D:F straddles the table's E:G: part of the merge would move, part would not.
+    s.execute("home.mergeCenter", json!({"range": "D19:F19"})).unwrap();
+    let err = s.execute("insert.table", json!({"header": false, "range": "E8:G8"})).unwrap_err().to_string();
+    assert!(err.contains("merged cell"), "{err}");
+    // The sheet is untouched: no table, no second merge, the original merge intact.
+    let sh = s.doc().unwrap().wb.active().unwrap().clone();
+    assert!(sh.tables.is_empty());
+    assert_eq!(sh.merges.len(), 1, "{:?}", sh.merges);
+    // A merge clear of the table's columns does not block it.
+    let mut second = crate::Session::new();
+    second.new_workbook();
+    second.execute("range.setValues", json!({"range": "A1", "values": [["a", "b", "c"], [1, 2, 3]]})).unwrap();
+    second.execute("home.mergeCenter", json!({"range": "K19:M19"})).unwrap();
+    second.execute("insert.table", json!({"header": false, "range": "E8:G8"})).unwrap();
+    assert_eq!(second.doc().unwrap().wb.active().unwrap().tables.len(), 1);
+}
+
+#[test]
 fn insert_timeline_lands_and_goes_with_its_report() {
     let mut s = pivot_session();
     // A field that holds no dates is refused: a timeline is a date axis.
