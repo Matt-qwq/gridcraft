@@ -38,6 +38,7 @@ fn workbook(categories: &str, values: &str) -> Workbook {
             smooth: false,
             trendlines: Vec::new(),
             quartiles: Default::default(),
+            ..Series::default()
         }],
         legend: LegendPos::Bottom,
         data_labels: false,
@@ -48,6 +49,7 @@ fn workbook(categories: &str, values: &str) -> Workbook {
         source: None,
         by_rows: false,
         pivot: None,
+        ..Chart::default()
     });
     Workbook { sheets: vec![Arc::new(s)], ..Workbook::default() }
 }

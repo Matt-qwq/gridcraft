@@ -438,6 +438,213 @@ impl ChartKind {
     }
 }
 
+/// Where the other axis crosses this one (Format Axis ▸ Axis value).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum AxisCrossing {
+    /// Automatic: zero on a value axis, the first category on a category axis.
+    #[default]
+    AutoZero,
+    /// At the minimum: the lowest value, or before the first category.
+    Min,
+    /// At the maximum: the highest value, or after the last category.
+    Max,
+    /// A fixed value: a number on a value axis, a 1-based category number on a category axis.
+    At(f64),
+}
+
+/// A built-in display unit (Format Axis ▸ Display units).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayUnits {
+    Hundreds,
+    Thousands,
+    TenThousands,
+    HundredThousands,
+    Millions,
+    TenMillions,
+    HundredMillions,
+    Billions,
+    Trillions,
+}
+
+impl DisplayUnits {
+    /// The divisor an axis label is shown in (Thousands → 1_000).
+    pub fn factor(self) -> f64 {
+        match self {
+            Self::Hundreds => 1e2,
+            Self::Thousands => 1e3,
+            Self::TenThousands => 1e4,
+            Self::HundredThousands => 1e5,
+            Self::Millions => 1e6,
+            Self::TenMillions => 1e7,
+            Self::HundredMillions => 1e8,
+            Self::Billions => 1e9,
+            Self::Trillions => 1e12,
+        }
+    }
+
+    /// The name shown beside the axis, as Excel labels it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hundreds => "Hundreds",
+            Self::Thousands => "Thousands",
+            Self::TenThousands => "Ten Thousands",
+            Self::HundredThousands => "Hundred Thousands",
+            Self::Millions => "Millions",
+            Self::TenMillions => "Ten Millions",
+            Self::HundredMillions => "Hundred Millions",
+            Self::Billions => "Billions",
+            Self::Trillions => "Trillions",
+        }
+    }
+}
+
+/// A value or category axis's scaling (Format Axis ▸ Axis Options).
+///
+/// Bounds are data values, except on a category axis, where `min`/`max` are 1-based category
+/// numbers and `major_unit` is the number of categories between labels. All of them are
+/// automatic when `None`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AxisOptions {
+    /// Fixed lower bound of the axis.
+    pub min: Option<f64>,
+    /// Fixed upper bound of the axis.
+    pub max: Option<f64>,
+    /// Distance between major gridlines and labels.
+    pub major_unit: Option<f64>,
+    /// Logarithmic scale base (2..=1000); `None` is a linear axis.
+    pub log_base: Option<f64>,
+    /// Values (or categories) run from high to low: `orientation maxMin`.
+    pub reversed: bool,
+    /// Where the other axis crosses this one.
+    pub crosses: AxisCrossing,
+    /// Labels are shown in these units, with the unit named beside the axis.
+    pub display_units: Option<DisplayUnits>,
+    /// Number format code of the axis labels; `None` follows the plotted values.
+    pub number_format: Option<String>,
+}
+
+/// Where a data label sits relative to its point (`c:dLblPos`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LabelPosition {
+    /// Excel's choice for the chart type (outside the end of a bar, best fit in a pie slice).
+    #[default]
+    Auto,
+    /// Centre of the point (pie slices, stacked bars).
+    Center,
+    InsideEnd,
+    InsideBase,
+    OutsideEnd,
+    /// Excel picks a free spot (pie, doughnut, bar of pie).
+    BestFit,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// What a data label shows and where (Add Chart Element ▸ Data Labels, Format Data Labels).
+///
+/// A chart's labels are on when [`Chart::data_labels`] is set; this says which parts of the label
+/// are shown. A label with every part off falls back to the value, as the on/off flag alone meant.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LabelOptions {
+    pub show_value: bool,
+    pub show_percentage: bool,
+    pub show_series: bool,
+    pub show_category: bool,
+    /// The legend key (a colour square) is drawn beside the label.
+    pub show_legend_key: bool,
+    pub position: LabelPosition,
+    /// Separator between the parts (`, ` when absent).
+    pub separator: Option<String>,
+    /// Number format of the label text; `None` follows the plotted values.
+    pub number_format: Option<String>,
+    /// No labels at all for this series (`c:dLbls/c:delete`): Excel hides one series' labels
+    /// while the others keep theirs.
+    pub hidden: bool,
+}
+
+impl LabelOptions {
+    /// Whether any part of a label is shown.
+    pub fn shows_anything(&self) -> bool {
+        self.show_value || self.show_percentage || self.show_series || self.show_category || self.show_legend_key
+    }
+
+    /// The value-only label the single on/off flag used to mean.
+    pub fn values() -> Self {
+        Self { show_value: true, ..Self::default() }
+    }
+}
+
+/// Which ends of an error bar are drawn (`c:errBarType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ErrorBarDirection {
+    #[default]
+    Both,
+    Plus,
+    Minus,
+}
+
+/// How long an error bar is (`c:errValType`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum ErrorBarKind {
+    /// The standard error of the plotted values.
+    #[default]
+    StdErr,
+    /// A fixed amount above and below each point.
+    Fixed(f64),
+    /// A percentage of each point's value.
+    Percentage(f64),
+    /// A multiple of the standard deviation of the plotted values.
+    StdDev(f64),
+    /// Custom amounts per point: references or array constants (`Sheet1!$C$2:$C$5`, `{1,2,3}`).
+    Custom { plus: Option<String>, minus: Option<String> },
+}
+
+/// A series' error bars (Add Chart Element ▸ Error Bars).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ErrorBars {
+    pub direction: ErrorBarDirection,
+    pub kind: ErrorBarKind,
+    /// No cap across the end of the bar (`noEndCap`); Excel draws caps by default.
+    pub no_end_cap: bool,
+}
+
+/// Formatting that applies to one point of a series (`c:dPt`): a pie slice, a bar, a marker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PointFormat {
+    /// 0-based point index within the series.
+    pub index: u32,
+    /// The point's fill colour.
+    pub fill: Option<Color>,
+    /// The point's outline colour.
+    pub line: Option<Color>,
+    /// The point's marker colour (line and scatter series).
+    pub marker: Option<Color>,
+    /// The point's data label is deleted (`c:dLbl` with `delete`).
+    pub no_label: bool,
+}
+
+/// The chart part a chart was read from, kept so that everything GridCraft does not model in it
+/// survives an open → save. Opaque to the model (not part of the JSON format); the xlsx crate
+/// writes it back byte for byte while the chart still matches what was read.
+#[derive(Clone, PartialEq)]
+pub struct ChartPart {
+    pub xml: std::sync::Arc<str>,
+    /// The model as read, without this field: an edit makes the part stale.
+    as_read: Box<Chart>,
+}
+
+impl std::fmt::Debug for ChartPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChartPart").field("bytes", &self.xml.len()).finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LegendPos {
     None,
@@ -477,6 +684,32 @@ pub struct Series {
     /// Trendlines fitted to this series (Excel allows several per series).
     #[serde(default)]
     pub trendlines: Vec<Trendline>,
+    /// Data labels for this series only (Excel's Format Data Labels on a selected series).
+    #[serde(default)]
+    pub labels: Option<LabelOptions>,
+    /// Error bars drawn on this series.
+    #[serde(default)]
+    pub error_bars: Option<ErrorBars>,
+    /// Per-point formatting overrides (a slice, a bar, a marker), sorted by index.
+    #[serde(default)]
+    pub points: Vec<PointFormat>,
+}
+
+impl Series {
+    /// The formatting override for point `j`, if the file carried one.
+    pub fn point(&self, j: usize) -> Option<&PointFormat> {
+        let j = u32::try_from(j).ok()?;
+        self.points.iter().find(|p| p.index == j)
+    }
+
+    /// Stores an override, replacing an entry for the same point.
+    pub fn set_point(&mut self, p: PointFormat) {
+        match self.points.iter_mut().find(|x| x.index == p.index) {
+            Some(slot) => *slot = p,
+            None => self.points.push(p),
+        }
+        self.points.sort_by_key(|x| x.index);
+    }
 }
 
 /// Regression a trendline fits (`c:trendlineType`).
@@ -547,7 +780,7 @@ impl Trendline {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Chart {
     pub id: u32,
     pub kind: ChartKind,
@@ -567,6 +800,44 @@ pub struct Chart {
     /// whenever the PivotTable is refreshed or its layout changes.
     #[serde(default)]
     pub pivot: Option<String>,
+    /// Category axis scaling and labels.
+    #[serde(default)]
+    pub x_axis: AxisOptions,
+    /// Value axis scaling and labels (the primary axis of a combo chart).
+    #[serde(default)]
+    pub y_axis: AxisOptions,
+    /// What data labels show; `data_labels` turns them on and off.
+    #[serde(default)]
+    pub labels: LabelOptions,
+    /// The chart part as read from a file, for options GridCraft does not model. Not serialized.
+    #[serde(skip)]
+    pub part: Option<Box<ChartPart>>,
+}
+
+impl Chart {
+    /// Keeps the chart part `xml`, read into `self`, for a later save. Classic DrawingML charts
+    /// only: a chartex part refers to hidden defined names, which the model does not keep.
+    pub fn keep_part(&mut self, xml: std::sync::Arc<str>) {
+        let mut as_read = self.clone();
+        as_read.part = None;
+        self.part = Some(Box::new(ChartPart { xml, as_read: Box::new(as_read) }));
+    }
+
+    /// The chart part to write back unchanged: only while nothing in the model changed since it was
+    /// read. An edit writes the model out (and with it every option GridCraft models).
+    pub fn unchanged_part(&self) -> Option<&str> {
+        let part = self.part.as_deref()?;
+        let mut now = self.clone();
+        let mut then = (*part.as_read).clone();
+        now.part = None;
+        then.part = None;
+        // The anchor and the object id live in the drawing part, not in the chart part.
+        now.anchor = Anchor::default();
+        then.anchor = Anchor::default();
+        now.id = 0;
+        then.id = 0;
+        (now == then).then_some(part.xml.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

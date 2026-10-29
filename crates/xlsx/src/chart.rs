@@ -5,10 +5,13 @@ use std::fmt::Write as _;
 
 use gridcraft_core::{RangeRef, Value, category_levels};
 use gridcraft_formula::{Expr, SheetSel};
-use gridcraft_model::{Chart, ChartKind, Color, DefinedName, LegendPos, LineDash, Series, Trendline, TrendlineKind, Workbook};
+use gridcraft_model::{
+    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DefinedName, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions,
+    LabelPosition, LegendPos, LineDash, PointFormat, Series, Trendline, TrendlineKind, Workbook,
+};
 
 use crate::drawing::{dml_color, srgb};
-use crate::xml::{El, esc, num};
+use crate::xml::{El, esc, esc_attr, num};
 
 // ---------------------------------------------------------------- reading
 
@@ -130,6 +133,19 @@ fn read_series(s: &El) -> Series {
         .and_then(dml_color)
         .or_else(|| sp.and_then(|p| p.path(&["ln", "solidFill"])).and_then(dml_color))
         .or_else(|| s.path(&["marker", "spPr", "solidFill"]).and_then(dml_color));
+    let mut points: Vec<PointFormat> = s.kids("dPt").filter_map(read_point).collect();
+    // A per-point data label that is deleted: Excel keeps these in the series' `<c:dLbls>`.
+    for dl in s.path(&["dLbls"]).into_iter().flat_map(|d| d.kids("dLbl")) {
+        let Some(idx) = dl.child_val("idx").and_then(|v| v.trim().parse::<u32>().ok()) else { continue };
+        if !bool_val(dl, "delete") {
+            continue;
+        }
+        match points.iter_mut().find(|p| p.index == idx) {
+            Some(p) => p.no_label = true,
+            None => points.push(PointFormat { index: idx, no_label: true, ..PointFormat::default() }),
+        }
+    }
+    points.sort_by_key(|p| p.index);
     Series {
         name,
         categories: data_ref(s.child("cat")).or_else(|| data_ref(s.child("xVal"))),
@@ -141,7 +157,89 @@ fn read_series(s: &El) -> Series {
         quartiles: Default::default(),
         smooth: bool_val(s, "smooth"),
         trendlines: s.kids("trendline").filter_map(read_trendline).collect(),
+        // A `dLbls` that only deletes points carries no options; keep `None` so an empty record
+        // does not appear out of nowhere on the next save.
+        labels: s.child("dLbls").map(read_labels).filter(|l| {
+            l.hidden || l.shows_anything() || l.position != gridcraft_model::LabelPosition::Auto || l.separator.is_some() || l.number_format.is_some()
+        }),
+        error_bars: s.child("errBars").and_then(read_error_bars),
+        points,
     }
+}
+
+/// `c:dLblPos` → [`LabelPosition`].
+fn label_position(v: &str) -> Option<LabelPosition> {
+    Some(match v {
+        "ctr" => LabelPosition::Center,
+        "inEnd" => LabelPosition::InsideEnd,
+        "inBase" => LabelPosition::InsideBase,
+        "outEnd" => LabelPosition::OutsideEnd,
+        "bestFit" => LabelPosition::BestFit,
+        "l" => LabelPosition::Left,
+        "r" => LabelPosition::Right,
+        "t" => LabelPosition::Top,
+        "b" => LabelPosition::Bottom,
+        _ => return None,
+    })
+}
+
+fn label_position_file(p: LabelPosition) -> &'static str {
+    match p {
+        LabelPosition::Auto | LabelPosition::Center => "ctr",
+        LabelPosition::InsideEnd => "inEnd",
+        LabelPosition::InsideBase => "inBase",
+        LabelPosition::OutsideEnd => "outEnd",
+        LabelPosition::BestFit => "bestFit",
+        LabelPosition::Left => "l",
+        LabelPosition::Right => "r",
+        LabelPosition::Top => "t",
+        LabelPosition::Bottom => "b",
+    }
+}
+
+/// A `CT_DLbls`: what the labels show, where and with which separator.
+fn read_labels(d: &El) -> LabelOptions {
+    LabelOptions {
+        show_value: bool_val(d, "showVal"),
+        show_percentage: bool_val(d, "showPercent"),
+        show_series: bool_val(d, "showSerName"),
+        show_category: bool_val(d, "showCatName"),
+        show_legend_key: bool_val(d, "showLegendKey"),
+        position: d.child_val("dLblPos").and_then(label_position).unwrap_or_default(),
+        separator: d.child("separator").map(|s| s.text.clone()).filter(|s| !s.is_empty()),
+        number_format: d.child("numFmt").and_then(|n| n.attr("formatCode")).map(str::to_string).filter(|c| !c.is_empty()),
+        hidden: bool_val(d, "delete"),
+    }
+}
+
+/// A `CT_ErrBars`. Unknown error types are read as the standard error rather than dropped.
+fn read_error_bars(e: &El) -> Option<ErrorBars> {
+    let direction = match e.child_val("errBarType") {
+        Some("plus") => ErrorBarDirection::Plus,
+        Some("minus") => ErrorBarDirection::Minus,
+        _ => ErrorBarDirection::Both,
+    };
+    let kind = match e.child_val("errValType") {
+        Some("fixedVal") => ErrorBarKind::Fixed(f64_val(e, "val").unwrap_or(0.0)),
+        Some("percentage") => ErrorBarKind::Percentage(f64_val(e, "val").unwrap_or(0.0)),
+        Some("stdDev") => ErrorBarKind::StdDev(f64_val(e, "val").unwrap_or(1.0)),
+        Some("cust") => ErrorBarKind::Custom { plus: data_ref(e.child("plus")), minus: data_ref(e.child("minus")) },
+        _ => ErrorBarKind::StdErr,
+    };
+    Some(ErrorBars { direction, kind, no_end_cap: bool_val(e, "noEndCap") })
+}
+
+/// A `CT_DPt`: the fill, line and marker colour of one point.
+fn read_point(e: &El) -> Option<PointFormat> {
+    let index = e.child_val("idx")?.trim().parse::<u32>().ok()?;
+    let sp = e.child("spPr");
+    Some(PointFormat {
+        index,
+        fill: sp.and_then(|p| p.child("solidFill")).and_then(dml_color),
+        line: sp.and_then(|p| p.path(&["ln", "solidFill"])).and_then(dml_color),
+        marker: e.path(&["marker", "spPr", "solidFill"]).and_then(dml_color),
+        no_label: e.child("dLbl").is_some_and(|d| bool_val(d, "delete")),
+    })
 }
 
 const DASHES: [(LineDash, &str); 11] = [
@@ -216,6 +314,60 @@ fn axis_ids(g: &El) -> Vec<String> {
     g.kids("axId").filter_map(|a| a.attr("val")).map(str::to_string).collect()
 }
 
+/// The `<c:valAx>`, `<c:catAx>` or `<c:dateAx>` with relationship id `id`.
+fn axis_by_id<'a>(plot: &'a El, id: &str) -> Option<&'a El> {
+    plot.children.iter().find(|e| matches!(e.name.as_str(), "valAx" | "catAx" | "dateAx") && e.child_val("axId") == Some(id))
+}
+
+fn display_units(v: &str) -> Option<DisplayUnits> {
+    Some(match v {
+        "hundreds" => DisplayUnits::Hundreds,
+        "thousands" => DisplayUnits::Thousands,
+        "tenThousands" => DisplayUnits::TenThousands,
+        "hundredThousands" => DisplayUnits::HundredThousands,
+        "millions" => DisplayUnits::Millions,
+        "tenMillions" => DisplayUnits::TenMillions,
+        "hundredMillions" => DisplayUnits::HundredMillions,
+        "billions" => DisplayUnits::Billions,
+        "trillions" => DisplayUnits::Trillions,
+        _ => return None,
+    })
+}
+
+/// Axis scaling, crossing and labels from a `<c:valAx>`, `<c:catAx>` or `<c:dateAx>`.
+fn read_axis(a: &El) -> AxisOptions {
+    let scaling = a.child("scaling");
+    let bound = |tag: &str| scaling.and_then(|s| s.child(tag)).and_then(|e| e.attr_f64("val"));
+    let crosses = match a.child_val("crosses") {
+        Some("min") => AxisCrossing::Min,
+        Some("max") => AxisCrossing::Max,
+        _ => match a.child("crossesAt").and_then(|e| e.attr_f64("val")) {
+            Some(v) => AxisCrossing::At(v),
+            None => AxisCrossing::AutoZero,
+        },
+    };
+    // A category axis carries the interval between labels as `tickLblSkip`.
+    let cat = matches!(a.name.as_str(), "catAx" | "dateAx");
+    let skip = a.child_val("tickLblSkip").and_then(|v| v.trim().parse::<f64>().ok());
+    AxisOptions {
+        min: bound("min"),
+        max: bound("max"),
+        major_unit: a.child("majorUnit").and_then(|e| e.attr_f64("val")).or(if cat { skip } else { None }),
+        log_base: scaling.and_then(|s| s.child("logBase")).and_then(|e| e.attr_f64("val")).filter(|b| (2.0..=1000.0).contains(b)),
+        reversed: scaling.and_then(|s| s.child("orientation")).and_then(|o| o.attr("val")) == Some("maxMin"),
+        crosses,
+        display_units: a.path(&["dispUnits", "builtInUnit"]).and_then(|e| e.attr("val")).and_then(display_units),
+        // `sourceLinked` means "linked to source": the format follows the cells, which the model
+        // spells as no explicit format.
+        number_format: a
+            .child("numFmt")
+            .filter(|n| !n.flag("sourceLinked", false))
+            .and_then(|n| n.attr("formatCode"))
+            .map(str::to_string)
+            .filter(|c| !c.is_empty()),
+    }
+}
+
 pub fn read_chart(root: &El) -> Option<Chart> {
     let chart = root.child("chart")?;
     let plot = chart.child("plotArea")?;
@@ -237,17 +389,44 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         }
     }
     let kind = if groups.len() > 1 { ChartKind::Combo } else { first_kind };
-    let show_val = |e: &El| e.child("dLbls").is_some_and(|d| bool_val(d, "showVal"));
-    let data_labels = groups.iter().any(|(g, _)| show_val(g) || g.kids("ser").any(show_val));
-    let val_axes: Vec<&El> = plot.kids("valAx").collect();
-    let cat_ax = plot.child("catAx").or_else(|| plot.child("dateAx"));
+    let group_labels = groups.iter().find_map(|(g, _)| g.child("dLbls")).map(read_labels);
+    // Labels are on when any group or series shows any part of them.
+    let shows = |d: &El| read_labels(d).shows_anything();
+    let data_labels = groups.iter().any(|(g, _)| g.child("dLbls").is_some_and(shows) || g.kids("ser").any(|s| s.child("dLbls").is_some_and(shows)));
+    // Labels only on some series: the chart-level record says "no group labels" so the next save
+    // writes that back (with every unlabelled series hidden), instead of turning on value labels.
+    let labels = match &group_labels {
+        Some(l) => l.clone(),
+        None if data_labels => LabelOptions { hidden: true, ..LabelOptions::default() },
+        None => LabelOptions::default(),
+    };
+    // Series without a record of their own show no labels when the group shows none: Excel writes
+    // their `<c:dLbls><c:delete val="1"/></c:dLbls>`, and the writer below does the same.
+    if data_labels && !group_labels.as_ref().is_some_and(|l| l.shows_anything()) {
+        for se in &mut series {
+            if se.labels.is_none() {
+                se.labels = Some(LabelOptions { hidden: true, ..LabelOptions::default() });
+            }
+        }
+    }
     let scatter = matches!(first_kind, ChartKind::Scatter | ChartKind::ScatterLines | ChartKind::Bubble);
-    let (x_ax, y_ax) = if scatter {
-        let x = val_axes.iter().find(|a| matches!(a.child_val("axPos"), Some("b") | Some("t"))).copied();
-        let y = val_axes.iter().find(|a| matches!(a.child_val("axPos"), Some("l") | Some("r"))).copied();
-        (x, y)
-    } else {
-        (cat_ax, val_axes.first().copied())
+    let (x_ax, y_ax) = {
+        let x = first_axes.first().and_then(|id| axis_by_id(plot, id));
+        let y = first_axes.get(1).and_then(|id| axis_by_id(plot, id));
+        if x.is_some() || y.is_some() {
+            (x, y)
+        } else {
+            // Few files leave out the group's axis ids: fall back to the axes by position.
+            let val_axes: Vec<&El> = plot.kids("valAx").collect();
+            let cat_ax = plot.child("catAx").or_else(|| plot.child("dateAx"));
+            if scatter {
+                let x = val_axes.iter().find(|a| matches!(a.child_val("axPos"), Some("b") | Some("t"))).copied();
+                let y = val_axes.iter().find(|a| matches!(a.child_val("axPos"), Some("l") | Some("r"))).copied();
+                (x, y)
+            } else {
+                (cat_ax, val_axes.first().copied())
+            }
+        }
     };
     let legend = match chart.child("legend") {
         None => LegendPos::None,
@@ -266,13 +445,17 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         series,
         legend,
         data_labels,
-        gridlines: val_axes.iter().any(|a| a.child("majorGridlines").is_some()),
+        gridlines: plot.kids("valAx").any(|a| a.child("majorGridlines").is_some()),
         style: root.child_val("style").and_then(|v| v.parse().ok()).unwrap_or(2),
         x_title: x_ax.and_then(|a| a.child("title")).and_then(rich_title),
         y_title: y_ax.and_then(|a| a.child("title")).and_then(rich_title),
         source: None,
         by_rows: false,
         pivot: root.path(&["pivotSource", "name"]).map(|n| strip_book(n.text.trim()).to_string()).filter(|n| !n.is_empty()),
+        x_axis: x_ax.map(read_axis).unwrap_or_default(),
+        y_axis: y_ax.map(read_axis).unwrap_or_default(),
+        labels,
+        part: None,
     })
 }
 
@@ -316,6 +499,10 @@ fn group_for(k: ChartKind) -> G {
 }
 
 const MAX_CACHE: u64 = 100_000;
+
+/// Most per-point formatting records written for one series (a file or a command may carry more
+/// than the model caps; the rest are dropped rather than growing the part without bound).
+const MAX_POINTS: usize = 4096;
 
 /// The sheet and range a same-workbook reference (`Sheet1!$B$2:$B$9`) names.
 fn ref_target(wb: &Workbook, sheet_idx: usize, f: &str) -> Option<(usize, RangeRef)> {
@@ -519,7 +706,7 @@ fn multi_level_cat(f: &str, values: &str, wb: &Workbook, si: usize) -> Option<St
     Some(s)
 }
 
-fn series_xml(s: &Series, idx: usize, g: G, wb: &Workbook, si: usize) -> String {
+fn series_xml(s: &Series, idx: usize, g: G, labels_on: bool, wb: &Workbook, si: usize) -> String {
     let mut x = format!("<c:ser><c:idx val=\"{idx}\"/><c:order val=\"{idx}\"/>");
     if let Some(n) = &s.name {
         if is_ref(n) || is_defined_name(wb, si, n) {
@@ -553,12 +740,26 @@ fn series_xml(s: &Series, idx: usize, g: G, wb: &Workbook, si: usize) -> String 
         G::Bubble => x.push_str("<c:invertIfNegative val=\"0\"/>"),
         _ => {}
     }
-    // Trendlines sit between dLbls and the data in CT_LineSer, CT_BarSer, CT_AreaSer,
-    // CT_ScatterSer and CT_BubbleSer; pie and radar series have none.
+    // CT_*Ser order after spPr and marker: dPt*, dLbls?, trendline*, errBars?, then the data.
+    let marker_points = matches!(g, G::Line { .. } | G::Scatter { .. } | G::Bubble | G::Radar);
+    for p in s.points.iter().take(MAX_POINTS) {
+        x.push_str(&point_xml(p, marker_points, wb));
+    }
+    let no_label: Vec<u32> = s.points.iter().filter(|p| p.no_label).map(|p| p.index).collect();
+    // Labels are a chart-wide switch: a series' own options are written only while they are on.
+    let labels = s.labels.as_ref().filter(|_| labels_on);
+    if labels.is_some() || !no_label.is_empty() {
+        x.push_str(&dlbls_xml(labels, &no_label));
+    }
     if !matches!(g, G::Pie | G::Doughnut | G::Radar) {
         for t in &s.trendlines {
             x.push_str(&trendline_xml(t, wb));
         }
+    }
+    if let Some(e) = &s.error_bars
+        && !matches!(g, G::Pie | G::Doughnut | G::Radar | G::Stock)
+    {
+        x.push_str(&err_bars_xml(e, wb, si));
     }
     match g {
         G::Scatter { .. } | G::Bubble => {
@@ -644,16 +845,110 @@ fn trendline_xml(t: &Trendline, wb: &Workbook) -> String {
     x
 }
 
-fn dlbls(show: bool) -> String {
-    format!(
-        "<c:dLbls><c:showLegendKey val=\"0\"/><c:showVal val=\"{}\"/><c:showCatName val=\"0\"/><c:showSerName val=\"0\"/><c:showPercent val=\"0\"/><c:showBubbleSize val=\"0\"/></c:dLbls>",
-        show as u8
-    )
+/// `<c:dLbls>` in CT_DLbls order: deleted points, number format, position, the show flags, the
+/// separator. `labels` absent writes the deleted points only (a series with no options of its own).
+fn dlbls_xml(labels: Option<&LabelOptions>, deleted: &[u32]) -> String {
+    let mut x = String::from("<c:dLbls>");
+    for idx in deleted.iter().take(MAX_POINTS) {
+        let _ = write!(x, "<c:dLbl><c:idx val=\"{idx}\"/><c:delete val=\"1\"/></c:dLbl>");
+    }
+    let Some(l) = labels else {
+        x.push_str("</c:dLbls>");
+        return x;
+    };
+    if l.hidden {
+        x.push_str("<c:delete val=\"1\"/></c:dLbls>");
+        return x;
+    }
+    if let Some(code) = l.number_format.as_deref().filter(|c| !c.is_empty()) {
+        let _ = write!(x, "<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>", esc_attr(code));
+    }
+    if l.position != LabelPosition::Auto {
+        let _ = write!(x, "<c:dLblPos val=\"{}\"/>", label_position_file(l.position));
+    }
+    let _ = write!(
+        x,
+        "<c:showLegendKey val=\"{}\"/><c:showVal val=\"{}\"/><c:showCatName val=\"{}\"/><c:showSerName val=\"{}\"/><c:showPercent val=\"{}\"/><c:showBubbleSize val=\"0\"/>",
+        l.show_legend_key as u8, l.show_value as u8, l.show_category as u8, l.show_series as u8, l.show_percentage as u8
+    );
+    if let Some(sep) = l.separator.as_deref().filter(|s| !s.is_empty()) {
+        let _ = write!(x, "<c:separator>{}</c:separator>", esc(sep));
+    }
+    x.push_str("</c:dLbls>");
+    // A chart label with no part shown would show nothing; the flag alone always meant values.
+    if !l.shows_anything() {
+        x = x.replacen("<c:showVal val=\"0\"/>", "<c:showVal val=\"1\"/>", 1);
+    }
+    x
+}
+
+/// `<c:dPt>` in CT_DPt order: idx, marker?, spPr?.
+fn point_xml(p: &PointFormat, marker: bool, wb: &Workbook) -> String {
+    let mut x = format!("<c:dPt><c:idx val=\"{}\"/>", p.index.min(MAX_POINTS as u32));
+    if marker && let Some(c) = p.marker.as_ref().and_then(|c: &Color| srgb(c, &wb.theme)) {
+        let _ = write!(x, "<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/><c:spPr><a:solidFill>{c}</a:solidFill></c:spPr></c:marker>");
+    }
+    let fill = p.fill.as_ref().and_then(|c: &Color| srgb(c, &wb.theme));
+    let line = p.line.as_ref().and_then(|c: &Color| srgb(c, &wb.theme));
+    if fill.is_some() || line.is_some() {
+        x.push_str("<c:spPr>");
+        if let Some(c) = &fill {
+            let _ = write!(x, "<a:solidFill>{c}</a:solidFill>");
+        }
+        if let Some(c) = &line {
+            let _ = write!(x, "<a:ln w=\"12700\"><a:solidFill>{c}</a:solidFill></a:ln>");
+        }
+        x.push_str("</c:spPr>");
+    }
+    x.push_str("</c:dPt>");
+    x
+}
+
+/// `<c:errBars>` in CT_ErrBars order: errBarType, errValType, noEndCap?, plus/minus?, val?.
+fn err_bars_xml(e: &ErrorBars, wb: &Workbook, si: usize) -> String {
+    let direction = match e.direction {
+        ErrorBarDirection::Both => "both",
+        ErrorBarDirection::Plus => "plus",
+        ErrorBarDirection::Minus => "minus",
+    };
+    let kind = match e.kind {
+        ErrorBarKind::Fixed(_) => "fixedVal",
+        ErrorBarKind::Percentage(_) => "percentage",
+        ErrorBarKind::StdDev(_) => "stdDev",
+        ErrorBarKind::Custom { .. } => "cust",
+        ErrorBarKind::StdErr => "stdErr",
+    };
+    let mut x = format!("<c:errBars><c:errBarType val=\"{direction}\"/><c:errValType val=\"{kind}\"/>");
+    if e.no_end_cap {
+        x.push_str("<c:noEndCap val=\"1\"/>");
+    }
+    match &e.kind {
+        ErrorBarKind::Custom { plus, minus } => {
+            if let Some(f) = plus {
+                x.push_str(&num_data("plus", Some(f), wb, si));
+            }
+            if let Some(f) = minus {
+                x.push_str(&num_data("minus", Some(f), wb, si));
+            }
+        }
+        ErrorBarKind::Fixed(v) | ErrorBarKind::Percentage(v) => {
+            let _ = write!(x, "<c:val val=\"{}\"/>", num(*v));
+        }
+        ErrorBarKind::StdDev(v) => {
+            let _ = write!(x, "<c:val val=\"{}\"/>", num(v.max(0.0)));
+        }
+        ErrorBarKind::StdErr => {}
+    }
+    x.push_str("</c:errBars>");
+    x
 }
 
 fn group_xml(g: G, series: &[(usize, &Series)], ch: &Chart, axes: (u32, u32), wb: &Workbook, si: usize) -> String {
-    let sers: String = series.iter().map(|(i, s)| series_xml(s, *i, g, wb, si)).collect();
-    let dl = dlbls(ch.data_labels);
+    let sers: String = series.iter().map(|(i, s)| series_xml(s, *i, g, ch.data_labels, wb, si)).collect();
+    // Group-level labels: the chart's options when they show something, else the plain value label.
+    // `labels.hidden` means the file had no group-level labels (only some series had them):
+    // writing no group record keeps it that way.
+    let dl = if ch.data_labels && !ch.labels.hidden { dlbls_xml(Some(&ch.labels), &[]) } else { String::new() };
     let ax = format!("<c:axId val=\"{}\"/><c:axId val=\"{}\"/>", axes.0, axes.1);
     match g {
         G::Bar { bar, grouping } => {
@@ -701,35 +996,94 @@ struct Ax<'a> {
     delete: bool,
     grid: bool,
     title: Option<&'a str>,
-    crosses_max: bool,
+    options: &'a AxisOptions,
+    /// A category axis that plots numbers (a scatter chart's X axis) is written `valAx`.
+    numeric_cat: bool,
+}
+
+/// CT_Scaling child order: logBase, orientation, max, min.
+fn scaling_xml(o: &AxisOptions) -> String {
+    let mut s = String::from("<c:scaling>");
+    if let Some(b) = o.log_base.filter(|b| (2.0..=1000.0).contains(b)) {
+        let _ = write!(s, "<c:logBase val=\"{}\"/>", num(b));
+    }
+    let _ = write!(s, "<c:orientation val=\"{}\"/>", if o.reversed { "maxMin" } else { "minMax" });
+    for (tag, v) in [("max", o.max), ("min", o.min)] {
+        if let Some(v) = v.filter(|v| v.is_finite()) {
+            let _ = write!(s, "<c:{tag} val=\"{}\"/>", num(v));
+        }
+    }
+    s.push_str("</c:scaling>");
+    s
 }
 
 fn axis_xml(a: &Ax<'_>) -> String {
-    let mut s = format!(
-        "<c:{0}><c:axId val=\"{1}\"/><c:scaling><c:orientation val=\"minMax\"/></c:scaling><c:delete val=\"{2}\"/><c:axPos val=\"{3}\"/>",
-        if a.cat { "catAx" } else { "valAx" },
-        a.id,
-        a.delete as u8,
-        a.pos
-    );
+    let o = a.options;
+    let tag = if a.cat && !a.numeric_cat { "catAx" } else { "valAx" };
+    let mut s = format!("<c:{tag}><c:axId val=\"{}\"/>{}<c:delete val=\"{}\"/><c:axPos val=\"{}\"/>", a.id, scaling_xml(o), a.delete as u8, a.pos);
     if a.grid {
         s.push_str("<c:majorGridlines/>");
     }
     if let Some(t) = a.title {
         s.push_str(&title_xml(t));
     }
-    let _ = write!(
-        s,
-        "<c:numFmt formatCode=\"General\" sourceLinked=\"1\"/><c:majorTickMark val=\"out\"/><c:minorTickMark val=\"none\"/><c:tickLblPos val=\"nextTo\"/><c:crossAx val=\"{}\"/><c:crosses val=\"{}\"/>",
-        a.cross,
-        if a.crosses_max { "max" } else { "autoZero" }
-    );
-    if a.cat {
-        s.push_str("<c:auto val=\"1\"/><c:lblAlgn val=\"ctr\"/><c:lblOffset val=\"100\"/><c:noMultiLvlLbl val=\"0\"/></c:catAx>");
-    } else {
-        s.push_str("<c:crossBetween val=\"between\"/></c:valAx>");
+    match o.number_format.as_deref().filter(|c| !c.is_empty()) {
+        Some(code) => {
+            let _ = write!(s, "<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>", esc_attr(code));
+        }
+        None => s.push_str("<c:numFmt formatCode=\"General\" sourceLinked=\"1\"/>"),
     }
+    s.push_str("<c:majorTickMark val=\"out\"/><c:minorTickMark val=\"none\"/><c:tickLblPos val=\"nextTo\"/>");
+    let _ = write!(s, "<c:crossAx val=\"{}\"/>", a.cross);
+    match o.crosses {
+        AxisCrossing::Min => s.push_str("<c:crosses val=\"min\"/>"),
+        AxisCrossing::Max => s.push_str("<c:crosses val=\"max\"/>"),
+        AxisCrossing::At(v) if v.is_finite() => {
+            let _ = write!(s, "<c:crossesAt val=\"{}\"/>", num(v));
+        }
+        _ => s.push_str("<c:crosses val=\"autoZero\"/>"),
+    }
+    if a.cat && !a.numeric_cat {
+        s.push_str("<c:auto val=\"1\"/><c:lblAlgn val=\"ctr\"/><c:lblOffset val=\"100\"/>");
+        if let Some(u) = o.major_unit.filter(|u| u.is_finite() && *u >= 1.0) {
+            let _ = write!(s, "<c:tickLblSkip val=\"{}\"/>", u.round().clamp(1.0, 31_999.0) as u32);
+        }
+        s.push_str("<c:noMultiLvlLbl val=\"0\"/>");
+    } else {
+        s.push_str("<c:crossBetween val=\"between\"/>");
+        if let Some(u) = o.major_unit.filter(|u| u.is_finite() && *u > 0.0) {
+            let _ = write!(s, "<c:majorUnit val=\"{}\"/>", num(u));
+        }
+        if let Some(unit) = o.display_units {
+            let name = match unit {
+                DisplayUnits::Hundreds => "hundreds",
+                DisplayUnits::Thousands => "thousands",
+                DisplayUnits::TenThousands => "tenThousands",
+                DisplayUnits::HundredThousands => "hundredThousands",
+                DisplayUnits::Millions => "millions",
+                DisplayUnits::TenMillions => "tenMillions",
+                DisplayUnits::HundredMillions => "hundredMillions",
+                DisplayUnits::Billions => "billions",
+                DisplayUnits::Trillions => "trillions",
+            };
+            let _ = write!(s, "<c:dispUnits><c:builtInUnit val=\"{name}\"/></c:dispUnits>");
+        }
+    }
+    let _ = write!(s, "</c:{tag}>");
     s
+}
+
+/// The sheets a kept chart part's formulas (`<c:f>Data!$A$2:$A$5</c:f>`) name.
+fn part_sheet_names(xml: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<c:f>") {
+        let after = rest.get(start + 5..).unwrap_or("");
+        let Some(end) = after.find("</c:f>") else { break };
+        names.extend(crate::passthrough::sheet_names_in(after.get(..end).unwrap_or("")));
+        rest = after.get(end + 6..).unwrap_or("");
+    }
+    names
 }
 
 /// A PivotChart link without the workbook in brackets: `[Book.xlsx]Sheet2!PT` → `Sheet2!PT`.
@@ -739,6 +1093,14 @@ fn strip_book(link: &str) -> &str {
 
 /// Chart part XML for a model chart on sheet `si`.
 pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> String {
+    // Nothing in the model changed since the file was read: write the part back byte for byte, so
+    // every option GridCraft does not model survives (the pass-through contract). A sheet the part
+    // names that the workbook no longer has (renamed or deleted) makes it stale: write it again.
+    if let Some(part) = ch.unchanged_part()
+        && part_sheet_names(part).iter().all(|n| wb.sheet_index(n).is_some())
+    {
+        return part.to_string();
+    }
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><c:roundedCorners val=\"0\"/>",
     );
@@ -793,6 +1155,8 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
         };
         s.push_str(&group_xml(primary_g, &all, ch, (1, 2), wb, si));
     }
+    let no_options = AxisOptions::default();
+    let secondary_y = AxisOptions { crosses: AxisCrossing::Max, ..AxisOptions::default() };
     match primary_g {
         G::Pie | G::Doughnut => {}
         G::Scatter { .. } | G::Bubble => {
@@ -804,7 +1168,8 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
                 delete: false,
                 grid: false,
                 title: ch.x_title.as_deref(),
-                crosses_max: false,
+                options: &ch.x_axis,
+                numeric_cat: true,
             }));
             s.push_str(&axis_xml(&Ax {
                 cat: false,
@@ -814,7 +1179,8 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
                 delete: false,
                 grid: ch.gridlines,
                 title: ch.y_title.as_deref(),
-                crosses_max: false,
+                options: &ch.y_axis,
+                numeric_cat: true,
             }));
         }
         G::Bar { bar: true, .. } => {
@@ -826,7 +1192,8 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
                 delete: false,
                 grid: false,
                 title: ch.x_title.as_deref(),
-                crosses_max: false,
+                options: &ch.x_axis,
+                numeric_cat: false,
             }));
             s.push_str(&axis_xml(&Ax {
                 cat: false,
@@ -836,7 +1203,8 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
                 delete: false,
                 grid: ch.gridlines,
                 title: ch.y_title.as_deref(),
-                crosses_max: false,
+                options: &ch.y_axis,
+                numeric_cat: true,
             }));
         }
         _ => {
@@ -848,7 +1216,8 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
                 delete: false,
                 grid: false,
                 title: ch.x_title.as_deref(),
-                crosses_max: false,
+                options: &ch.x_axis,
+                numeric_cat: false,
             }));
             s.push_str(&axis_xml(&Ax {
                 cat: false,
@@ -858,13 +1227,34 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
                 delete: false,
                 grid: ch.gridlines,
                 title: ch.y_title.as_deref(),
-                crosses_max: false,
+                options: &ch.y_axis,
+                numeric_cat: true,
             }));
         }
     }
     if secondary.is_some() {
-        s.push_str(&axis_xml(&Ax { cat: true, id: 3, cross: 4, pos: "b", delete: true, grid: false, title: None, crosses_max: false }));
-        s.push_str(&axis_xml(&Ax { cat: false, id: 4, cross: 3, pos: "r", delete: false, grid: false, title: None, crosses_max: true }));
+        s.push_str(&axis_xml(&Ax {
+            cat: true,
+            id: 3,
+            cross: 4,
+            pos: "b",
+            delete: true,
+            grid: false,
+            title: None,
+            options: &no_options,
+            numeric_cat: false,
+        }));
+        s.push_str(&axis_xml(&Ax {
+            cat: false,
+            id: 4,
+            cross: 3,
+            pos: "r",
+            delete: false,
+            grid: false,
+            title: None,
+            options: &secondary_y,
+            numeric_cat: true,
+        }));
     }
     s.push_str("</c:plotArea>");
     let pos = match ch.legend {

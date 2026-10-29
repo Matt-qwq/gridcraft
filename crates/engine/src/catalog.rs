@@ -298,6 +298,10 @@ pub const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("chart.changeType", "Chart Design", "Type", "Change Chart Type"),
     ("chart.move", "Chart Design", "Location", "Move Chart"),
     ("chart.formatSelection", "Format", "Current Selection", "Format Selection"),
+    ("chart.setAxis", "Format", "Current Selection", "Format Axis"),
+    ("chart.formatPoint", "Format", "Current Selection", "Format Data Point"),
+    ("chart.setDataLabels", "Chart Design", "Chart Layouts", "Data Labels"),
+    ("chart.setErrorBars", "Chart Design", "Chart Layouts", "Error Bars"),
     ("chart.shapeFill", "Format", "Shape Styles", "Shape Fill"),
     ("chart.shapeOutline", "Format", "Shape Styles", "Shape Outline"),
     // PivotTable Analyze / Design

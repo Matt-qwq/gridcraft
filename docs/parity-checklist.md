@@ -4,7 +4,7 @@
 
 Each entry is an Excel ribbon or menu command (feature names only). It counts as implemented when GridCraft registers a command with the same id. This measures breadth only; the overall assessment (depth, fidelity, effort) is in [target-app-parity.md](target-app-parity.md).
 
-**Overall: 275 / 291 commands implemented (94.5%).**
+**Overall: 279 / 295 commands implemented (94.6%).**
 
 | Tab | Implemented | Total | Parity |
 |---|---|---|---|
@@ -19,8 +19,8 @@ Each entry is an Excel ribbon or menu command (feature names only). It counts as
 | View | 20 | 20 | 100% |
 | Automate | 4 | 4 | 100% |
 | Table Design | 13 | 13 | 100% |
-| Chart Design | 8 | 8 | 100% |
-| Format | 3 | 3 | 100% |
+| Chart Design | 10 | 10 | 100% |
+| Format | 5 | 5 | 100% |
 | PivotTable Analyze | 13 | 13 | 100% |
 | PivotTable Design | 4 | 4 | 100% |
 
@@ -351,7 +351,7 @@ Implemented:
 - `table.bandedColumns` Banded Columns (Table Style Options)
 - `table.style` Table Styles (Table Styles)
 
-## Chart Design (8 / 8, 100%)
+## Chart Design (10 / 10, 100%)
 
 Implemented:
 
@@ -363,12 +363,16 @@ Implemented:
 - `chart.selectData` Select Data (Data)
 - `chart.changeType` Change Chart Type (Type)
 - `chart.move` Move Chart (Location)
+- `chart.setDataLabels` Data Labels (Chart Layouts)
+- `chart.setErrorBars` Error Bars (Chart Layouts)
 
-## Format (3 / 3, 100%)
+## Format (5 / 5, 100%)
 
 Implemented:
 
 - `chart.formatSelection` Format Selection (Current Selection)
+- `chart.setAxis` Format Axis (Current Selection)
+- `chart.formatPoint` Format Data Point (Current Selection)
 - `chart.shapeFill` Shape Fill (Shape Styles)
 - `chart.shapeOutline` Shape Outline (Shape Styles)
 

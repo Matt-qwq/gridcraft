@@ -50,6 +50,7 @@ fn chart(id: u32, kind: ChartKind, trendlines: Vec<Trendline>) -> Chart {
             quartiles: Default::default(),
             smooth: false,
             trendlines,
+            ..Series::default()
         }],
         legend: LegendPos::Bottom,
         data_labels: false,
@@ -60,6 +61,7 @@ fn chart(id: u32, kind: ChartKind, trendlines: Vec<Trendline>) -> Chart {
         source: None,
         by_rows: false,
         pivot: None,
+        ..Chart::default()
     }
 }
 

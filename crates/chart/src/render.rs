@@ -3,12 +3,15 @@
 use std::collections::HashSet;
 use std::f32::consts::{PI, TAU};
 
-use gridcraft_model::{Chart, ChartKind, LegendPos, LineDash, QuartileMethod, Theme, TrendlineKind};
+use gridcraft_model::{
+    AxisCrossing, AxisOptions, Chart, ChartKind, DisplayUnits, ErrorBarDirection, ErrorBarKind, LabelOptions, LabelPosition, LegendPos, LineDash,
+    QuartileMethod, Theme, TrendlineKind,
+};
 
-use crate::axis::{Fmt, Scale, clean, fixed_scale, nice_scale};
+use crate::axis::{Fmt, Scale, axis_scale, clean, fixed_scale, format_number};
 use crate::resolve::{MAX_POINTS, MAX_SERIES, MAX_TRENDLINES, series_color};
 use crate::trend::{auto_name, fit_trendline, moving_average};
-use crate::{ChartData, HAlign, Measure, Prim, Rgba, SeriesData, VAlign};
+use crate::{ChartData, ErrorBarsData, HAlign, Measure, PointStyle, Prim, Rgba, SeriesData, VAlign};
 
 pub(crate) const TEXT: Rgba = [0x59, 0x59, 0x59, 0xFF];
 const DARK_TEXT: Rgba = [0x26, 0x26, 0x26, 0xFF];
@@ -125,8 +128,12 @@ fn plot_kind(chart: &Chart, s: &SeriesData) -> ChartKind {
     if chart.kind == ChartKind::Combo { if s.kind == ChartKind::Combo { ChartKind::Line } else { s.kind } } else { chart.kind }
 }
 
-/// Colour of point `j` for charts that colour by point (pie, doughnut, treemap, sunburst).
+/// Colour of point `j` for charts that colour by point (pie, doughnut, treemap, sunburst): a
+/// per-point fill override wins, then the series colour for the first point, then the palette.
 fn point_color(data: &ChartData, j: usize) -> Rgba {
+    if let Some(c) = data.series.first().and_then(|s| point_style(s, j)).and_then(|p| p.fill) {
+        return c;
+    }
     match (j, data.series.first()) {
         (0, Some(s)) => s.color,
         _ => j.checked_rem(data.palette.len()).and_then(|k| data.palette.get(k)).copied().unwrap_or_else(|| series_color(&Theme::default(), j)),
@@ -139,6 +146,179 @@ fn first_len(data: &ChartData) -> usize {
 
 fn cat_label(data: &ChartData, j: usize) -> String {
     data.categories.get(j).cloned().unwrap_or_else(|| (j + 1).to_string())
+}
+
+/// The label options in force for series `s`: its own, else the chart's.
+fn series_labels<'a>(chart: &'a Chart, s: &'a SeriesData) -> &'a LabelOptions {
+    s.labels.as_ref().unwrap_or(&chart.labels)
+}
+
+/// The position a label is drawn at: `Auto` picks the chart type's usual place.
+fn resolved_position(chart: &Chart, o: &LabelOptions) -> LabelPosition {
+    if o.position != LabelPosition::Auto {
+        return o.position;
+    }
+    match chart.kind {
+        ChartKind::Pie | ChartKind::Doughnut | ChartKind::Sunburst | ChartKind::Funnel => LabelPosition::BestFit,
+        ChartKind::Line | ChartKind::LineMarkers | ChartKind::LineStacked | ChartKind::Area | ChartKind::AreaStacked => LabelPosition::Top,
+        ChartKind::Scatter | ChartKind::ScatterLines | ChartKind::Bubble => LabelPosition::Top,
+        _ => LabelPosition::OutsideEnd,
+    }
+}
+
+/// Text of point `j`'s data label: the parts the options ask for, joined by the separator.
+/// `None` when labels are off, when the point's label is deleted, or when there is nothing to say.
+/// `total` is the whole a percentage refers to (the pie's sum); otherwise the series' own total.
+fn label_text(chart: &Chart, data: &ChartData, s: &SeriesData, j: usize, total: Option<f64>) -> Option<String> {
+    if !chart.data_labels || s.points.iter().any(|p| p.index == j && p.no_label) {
+        return None;
+    }
+    let o = series_labels(chart, s);
+    if o.hidden {
+        return None;
+    }
+    let sep = o.separator.as_deref().filter(|s| !s.is_empty()).unwrap_or(", ");
+    let fmt = o.number_format.as_deref().unwrap_or(&s.number_format);
+    let v = s.values.get(j).copied().flatten();
+    let mut parts: Vec<String> = Vec::new();
+    if o.show_series && !s.name.is_empty() {
+        parts.push(s.name.clone());
+    }
+    if o.show_category {
+        parts.push(cat_label(data, j));
+    }
+    if (o.show_value || !o.shows_anything())
+        && let Some(v) = v
+    {
+        parts.push(format_number(v, fmt, None));
+    }
+    if o.show_percentage
+        && let Some(v) = v
+    {
+        let sum = total.unwrap_or_else(|| s.values.iter().flatten().map(|v| v.abs()).sum::<f64>());
+        if sum.is_finite() && sum > 0.0 {
+            parts.push(format!("{}%", format_number(v.abs() / sum * 100.0, "General", None)));
+        }
+    }
+    if parts.is_empty() {
+        parts.extend(v.map(|v| format_number(v, fmt, None)));
+    }
+    if parts.is_empty() { None } else { Some(parts.join(sep)) }
+}
+
+/// Draws a data label, with a small legend-key square before it when the options ask for one.
+fn draw_label(ctx: &mut Ctx, o: &LabelOptions, x: f32, y: f32, text: &str, key: Rgba, align: HAlign, valign: VAlign) {
+    draw_label_colored(ctx, o, x, y, text, key, TEXT, align, valign);
+}
+
+/// [`draw_label`] in a given text colour (labels inside a bar are painted in the readable colour).
+fn draw_label_colored(ctx: &mut Ctx, o: &LabelOptions, x: f32, y: f32, text: &str, key: Rgba, color: Rgba, align: HAlign, valign: VAlign) {
+    if text.is_empty() {
+        return;
+    }
+    if !o.show_legend_key {
+        ctx.text(x, y, text, LABEL_SIZE, color, align, valign);
+        return;
+    }
+    let s = LABEL_SIZE * 0.65;
+    let tw = ctx.tw(text, LABEL_SIZE);
+    let (kx, tx) = match align {
+        HAlign::Left => (x, x + s + 2.0),
+        HAlign::Right => (x - tw - s - 2.0, x),
+        HAlign::Center => (x - (tw + s + 2.0) / 2.0, x + (s + 2.0) / 2.0),
+    };
+    ctx.rect(kx, y - s / 2.0, s, s, key, None);
+    ctx.text(tx, y, text, LABEL_SIZE, color, align, valign);
+}
+
+/// The formatting override of point `j`, if any. The list is sorted by index (resolve sorts it).
+fn point_style(s: &SeriesData, j: usize) -> Option<&PointStyle> {
+    s.points.binary_search_by_key(&j, |p| p.index).ok().and_then(|i| s.points.get(i))
+}
+
+fn point_fill(s: &SeriesData, j: usize) -> Rgba {
+    point_style(s, j).and_then(|p| p.fill).unwrap_or(s.color)
+}
+
+fn point_marker(s: &SeriesData, j: usize) -> Rgba {
+    point_style(s, j).and_then(|p| p.marker.or(p.line).or(p.fill)).unwrap_or(s.color)
+}
+
+fn point_line(s: &SeriesData, j: usize) -> Option<Rgba> {
+    point_style(s, j).and_then(|p| p.line)
+}
+
+/// Sample standard deviation of the plotted values, or `None` with fewer than two finite values.
+fn stddev(values: &[f64]) -> Option<f64> {
+    let n = values.len();
+    if n < 2 {
+        return None;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let var = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n as f64 - 1.0);
+    (var.is_finite() && var >= 0.0).then(|| var.sqrt())
+}
+
+/// The (minus, plus) lengths of series `s`'s error bar at point `j`, in data units. `sd` is the
+/// series' sample standard deviation and `n` its finite value count, computed once per series.
+fn error_span(s: &SeriesData, j: usize, sd: Option<f64>, n: usize) -> Option<(f64, f64)> {
+    let e = s.error_bars.as_ref()?;
+    let v = s.values.get(j).copied().flatten()?;
+    let (minus, plus) = match &e.spec.kind {
+        ErrorBarKind::Fixed(amount) => (amount.abs(), amount.abs()),
+        ErrorBarKind::Percentage(p) => {
+            let a = v.abs() * p.abs() / 100.0;
+            (a, a)
+        }
+        ErrorBarKind::StdDev(k) => {
+            let a = sd.unwrap_or(0.0) * k.abs();
+            (a, a)
+        }
+        ErrorBarKind::StdErr => {
+            let a = sd.unwrap_or(0.0) / (n.max(1) as f64).sqrt();
+            (a, a)
+        }
+        ErrorBarKind::Custom { .. } => {
+            (e.minus.get(j).copied().flatten().unwrap_or(0.0).abs(), e.plus.get(j).copied().flatten().unwrap_or(0.0).abs())
+        }
+    };
+    let span = match e.spec.direction {
+        ErrorBarDirection::Both => (minus, plus),
+        ErrorBarDirection::Plus => (0.0, plus),
+        ErrorBarDirection::Minus => (minus, 0.0),
+    };
+    (span.0.is_finite() && span.1.is_finite()).then_some(span)
+}
+
+/// Draws one error bar: `p` is the point, the bar runs along the value axis by `minus`/`plus`.
+fn error_bar(ctx: &mut Ctx, p: [f32; 2], v: f64, minus: f64, plus: f64, sc: &Scale, plot: Bx, horizontal: bool, color: Rgba, cap: bool) {
+    if !(v.is_finite() && minus.is_finite() && plus.is_finite() && minus >= 0.0 && plus >= 0.0) {
+        return;
+    }
+    let at = |val: f64| -> [f32; 2] {
+        let f = sc.frac(clean(val));
+        if horizontal {
+            [(plot.x + f * plot.w).clamp(plot.x, plot.right()), p[1].clamp(plot.y, plot.bottom())]
+        } else {
+            [p[0].clamp(plot.x, plot.right()), (plot.bottom() - f * plot.h).clamp(plot.y, plot.bottom())]
+        }
+    };
+    let (lo, hi) = (at(clean(v - minus)), at(clean(v + plus)));
+    let len = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt();
+    if !(len.is_finite() && len >= 0.5) {
+        return;
+    }
+    ctx.line(vec![lo, hi], color, 1.0);
+    if cap {
+        let d = 3.0;
+        for q in [lo, hi] {
+            if horizontal {
+                ctx.vline(q[0], q[1] - d, q[1] + d, color, 1.0);
+            } else {
+                ctx.hline(q[0] - d, q[0] + d, q[1], color, 1.0);
+            }
+        }
+    }
 }
 
 /// Legend entries (text, colour, swatch) `render` draws for this chart; empty when hidden.
@@ -208,6 +388,13 @@ fn sanitize(d: &ChartData) -> ChartData {
                 smooth: s.smooth,
                 trendlines: s.trendlines.iter().take(MAX_TRENDLINES).cloned().collect(),
                 number_format: s.number_format.clone(),
+                labels: s.labels.clone(),
+                error_bars: s.error_bars.as_ref().map(|e| ErrorBarsData {
+                    spec: e.spec.clone(),
+                    plus: e.plus.iter().take(MAX_POINTS).copied().collect(),
+                    minus: e.minus.iter().take(MAX_POINTS).copied().collect(),
+                }),
+                points: s.points.iter().take(MAX_POINTS).copied().collect(),
             })
             .collect(),
     }
@@ -395,7 +582,9 @@ enum CatAxis<'a> {
     /// Category labels and, for a multi-level axis, the outer levels (nearest the labels first;
     /// one entry per category, non-empty where a group starts).
     Labels(&'a [String], &'a [Vec<String>]),
-    Numeric(Scale, &'a Fmt),
+    /// A numeric category axis (a scatter chart's X): scale, format, where the value axis crosses
+    /// it and the display units its labels are divided by.
+    Numeric(Scale, &'a Fmt, AxisCrossing, Option<DisplayUnits>),
 }
 
 /// Groups of an outer category level: `(first, end)` index pairs, a group starting at every
@@ -409,11 +598,31 @@ fn level_groups(level: &[String], n: usize) -> Vec<(usize, usize)> {
 struct ValAxis<'a> {
     scale: Scale,
     fmt: &'a Fmt,
+    /// Display units the labels are divided by, with the unit named beside the axis.
+    units: Option<DisplayUnits>,
+    /// Where the category axis crosses this value axis.
+    crosses: AxisCrossing,
 }
 
 impl ValAxis<'_> {
     fn labels(&self) -> Vec<(f64, String)> {
-        self.scale.ticks().into_iter().map(|v| (v, self.fmt.format(v, Some(self.scale.step)))).collect()
+        let divisor = self.units.map(DisplayUnits::factor).unwrap_or(1.0);
+        // A log axis names its ticks in their own scale: General makes 0.001 read as 0.001.
+        let step = if self.scale.log.is_some() { None } else { Some(self.scale.step) };
+        self.scale.ticks().into_iter().map(|v| (v, self.fmt.format(v / divisor, step))).collect()
+    }
+
+    /// Where the category axis line sits along this axis, as a value.
+    fn crossing(&self) -> f64 {
+        match self.crosses {
+            AxisCrossing::Min => self.scale.min,
+            AxisCrossing::Max => self.scale.max,
+            AxisCrossing::At(v) if v.is_finite() && v >= self.scale.min && v <= self.scale.max => v,
+            _ => {
+                let (min, max) = (self.scale.min, self.scale.max);
+                if min <= 0.0 && max >= 0.0 { 0.0 } else { min }
+            }
+        }
     }
 }
 
@@ -428,7 +637,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         let y2labels = y2.map(|a| a.labels());
         let right = match (&y2labels, &cat) {
             (Some(l), _) => (maxw(ctx, l) + 6.0).min(area.w * 0.3),
-            (None, CatAxis::Numeric(s, f)) => (ctx.tw(&f.format(s.max, Some(s.step)), ls) / 2.0).min(area.w * 0.2),
+            (None, CatAxis::Numeric(s, f, _, _)) => (ctx.tw(&f.format(s.max, Some(s.step)), ls) / 2.0).min(area.w * 0.2),
             _ => 4.0,
         };
         let levels = match &cat {
@@ -452,9 +661,11 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                 ctx.text(plot.right() + 4.0, yy, t, ls, TEXT, HAlign::Left, VAlign::Middle);
             }
         }
-        let zero = if y.scale.min <= 0.0 && y.scale.max >= 0.0 { 0.0 } else { y.scale.min };
-        let y0 = plot.bottom() - y.scale.frac(zero) * plot.h;
+        let y0 = plot.bottom() - y.scale.frac(y.crossing()) * plot.h;
         ctx.hline(plot.x, plot.right(), y0, AXIS, 0.75);
+        if let Some(u) = y.units {
+            ctx.text(plot.x - 4.0, plot.y, u.label(), ls * 0.9, TEXT, HAlign::Right, VAlign::Bottom);
+        }
         match cat {
             CatAxis::Labels(l, outer) => {
                 let n = l.len().max(1);
@@ -482,9 +693,10 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                     ctx.vline(plot.right(), plot.bottom(), top + lh - 2.0, AXIS, 0.75);
                 }
             }
-            CatAxis::Numeric(s, f) => {
+            CatAxis::Numeric(s, f, crosses, units) => {
                 let ticks = s.ticks();
-                let labels: Vec<String> = ticks.iter().map(|v| f.format(*v, Some(s.step))).collect();
+                let divisor = units.map(DisplayUnits::factor).unwrap_or(1.0);
+                let labels: Vec<String> = ticks.iter().map(|v| f.format(v / divisor, Some(s.step))).collect();
                 let lw = labels.iter().map(|t| ctx.tw(t, ls)).fold(0.0f32, f32::max);
                 let slot = plot.w / ticks.len().max(1) as f32;
                 let k = (((lw + 6.0) / slot.max(1e-3)).ceil() as usize).max(1);
@@ -492,10 +704,20 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                     let xx = plot.x + s.frac(*v) * plot.w;
                     ctx.text(xx, plot.bottom() + 3.0, t, ls, TEXT, HAlign::Center, VAlign::Top);
                 }
-                if s.min <= 0.0 && s.max >= 0.0 {
-                    let xx = plot.x + s.frac(0.0) * plot.w;
-                    ctx.vline(xx, plot.y, plot.bottom(), AXIS, 0.75);
-                }
+                let at = match crosses {
+                    AxisCrossing::Min => s.min,
+                    AxisCrossing::Max => s.max,
+                    AxisCrossing::At(v) if v.is_finite() && v >= s.min && v <= s.max => v,
+                    _ => {
+                        if s.min <= 0.0 && s.max >= 0.0 {
+                            0.0
+                        } else {
+                            s.min
+                        }
+                    }
+                };
+                let xx = plot.x + s.frac(at) * plot.w;
+                ctx.vline(xx, plot.y, plot.bottom(), AXIS, 0.75);
             }
         }
         plot
@@ -526,9 +748,11 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                 ctx.text(xx, plot.bottom() + 3.0, t, ls, TEXT, HAlign::Center, VAlign::Top);
             }
         }
-        let zero = if y.scale.min <= 0.0 && y.scale.max >= 0.0 { 0.0 } else { y.scale.min };
-        let x0 = plot.x + y.scale.frac(zero) * plot.w;
+        let x0 = plot.x + y.scale.frac(y.crossing()) * plot.w;
         ctx.vline(x0, plot.y, plot.bottom(), AXIS, 0.75);
+        if let Some(u) = y.units {
+            ctx.text(plot.right(), plot.bottom() + lh, u.label(), ls * 0.9, TEXT, HAlign::Right, VAlign::Top);
+        }
         let n = labels.len().max(1);
         let ch = plot.h / n as f32;
         let k = ((lh / ch.max(1e-3)).ceil() as usize).clamp(1, n);
@@ -675,9 +899,10 @@ fn catmull(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f
     o
 }
 
-fn draw_markers(ctx: &mut Ctx, pts: impl Iterator<Item = [f32; 2]>, r: f32, color: Rgba) {
+/// Markers with a colour each (per-point formatting overrides).
+fn draw_markers_colored(ctx: &mut Ctx, pts: impl Iterator<Item = ([f32; 2], Rgba)>, r: f32) {
     let mut seen = HashSet::new();
-    for p in pts {
+    for (p, color) in pts {
         if seen.len() >= MAX_MARKERS {
             break;
         }
@@ -976,11 +1201,19 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
             spans.get(*i).into_iter().flatten().flatten().flat_map(move |(b, t)| if line { vec![*t] } else { vec![*b, *t] })
         }));
         let (lo, hi) = range.unwrap_or((0.0, 0.0));
+        let options = if axis { &AxisOptions::default() } else { &chart.y_axis };
         let (scale, fmt) = if all100 {
-            (fixed_scale(if lo < -1e-9 { -1.0 } else { 0.0 }, if hi > 1e-9 || lo >= -1e-9 { 1.0 } else { 0.0 }, 0.2), Fmt::new("0%"))
+            let mut s = fixed_scale(if lo < -1e-9 { -1.0 } else { 0.0 }, if hi > 1e-9 || lo >= -1e-9 { 1.0 } else { 0.0 }, 0.2);
+            s.reversed = options.reversed;
+            (s, Fmt::new("0%"))
         } else {
-            let code = members.first().and_then(|i| data.series.get(*i)).map(|s| s.number_format.as_str()).unwrap_or("General");
-            (nice_scale(lo, hi, force_zero), Fmt::new(code))
+            let code = options
+                .number_format
+                .as_deref()
+                .filter(|c| !c.is_empty())
+                .or_else(|| members.first().and_then(|i| data.series.get(*i)).map(|s| s.number_format.as_str()))
+                .unwrap_or("General");
+            (axis_scale(lo, hi, force_zero, options), Fmt::new(code))
         };
         axes.push((scale, fmt));
         if !axis && sec.iter().all(|s| !s) {
@@ -988,8 +1221,8 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
         }
     }
     let Some((s1, f1)) = axes.first() else { return };
-    let y1 = ValAxis { scale: *s1, fmt: f1 };
-    let y2 = axes.get(1).map(|(s, f)| ValAxis { scale: *s, fmt: f });
+    let y1 = ValAxis { scale: *s1, fmt: f1, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses };
+    let y2 = axes.get(1).map(|(s, f)| ValAxis { scale: *s, fmt: f, units: None, crosses: AxisCrossing::AutoZero });
     // A forward forecast on a category axis adds empty category slots after the data.
     let fwd = data
         .series
@@ -999,10 +1232,18 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
         .map(|(_, s)| max_forward(s))
         .fold(0.0, f64::max);
     let ncat_slots = ncat.saturating_add(fwd.min(max_forward_slots(ncat)).ceil() as usize).min(MAX_CATS.max(ncat));
-    let labels: Vec<String> = (0..ncat_slots).map(|j| if j < ncat { cat_label(data, j) } else { String::new() }).collect();
+    // A reversed category axis mirrors the slots; the labels follow their mirrored slot.
+    let reversed = chart.x_axis.reversed;
+    let slot = |j: usize| if reversed { ncat_slots.saturating_sub(1).saturating_sub(j) } else { j };
+    let labels: Vec<String> = (0..ncat_slots)
+        .map(|p| {
+            let cat = slot(p);
+            if cat < ncat { cat_label(data, cat) } else { String::new() }
+        })
+        .collect();
     // Outer levels padded to the slots (forecast slots stay in the last group).
     let outer: Vec<Vec<String>> =
-        data.category_levels.iter().map(|l| (0..ncat_slots).map(|j| l.get(j).cloned().unwrap_or_default()).collect()).collect();
+        data.category_levels.iter().map(|l| (0..ncat_slots).map(|j| l.get(slot(j)).cloned().unwrap_or_default()).collect()).collect();
     let plot = frame(ctx, area, CatAxis::Labels(&labels, &outer), &y1, y2.as_ref(), horizontal, chart.gridlines);
     if !plot.ok() {
         return;
@@ -1010,7 +1251,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
     let scale_of = |i: usize| -> Scale { if sec.get(i).copied().unwrap_or(false) { y2.as_ref().map(|a| a.scale).unwrap_or(*s1) } else { *s1 } };
     let cat_len = if horizontal { plot.h } else { plot.w };
     let cw = cat_len / ncat_slots as f32;
-    let center = |j: usize| if horizontal { plot.bottom() - (j as f32 + 0.5) * cw } else { plot.x + (j as f32 + 0.5) * cw };
+    let center = |j: usize| if horizontal { plot.bottom() - (slot(j) as f32 + 0.5) * cw } else { plot.x + (slot(j) as f32 + 0.5) * cw };
     let vpos = |v: f64, sc: &Scale| if horizontal { plot.x + sc.frac(v) * plot.w } else { plot.bottom() - sc.frac(v) * plot.h };
 
     // Column slots: each clustered series gets one, each stack group shares one.
@@ -1052,7 +1293,6 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                 continue;
             }
             let sc = scale_of(i);
-            let fmt = Fmt::new(&s.number_format);
             let row = match spans.get(i) {
                 Some(r) => r,
                 None => continue,
@@ -1069,9 +1309,12 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                         // Source values (not stack totals), just above the top edge like the line labels.
                         if labels_on
                             && sp.is_some()
-                            && let Some(v) = s.values.get(j).copied().flatten()
+                            && let Some(text) = label_text(chart, data, s, j, None)
                         {
-                            area_labels.push((c, vpos(t, &sc) - 5.0, fmt.format(v, None)));
+                            let o = series_labels(chart, s);
+                            let below = resolved_position(chart, o) == LabelPosition::Bottom;
+                            let (y, va) = if below { (vpos(t, &sc) + 5.0, VAlign::Top) } else { (vpos(t, &sc) - 5.0, VAlign::Bottom) };
+                            area_labels.push((c, y, text, point_fill(s, j), va));
                         }
                     }
                     if top.len() == 1 {
@@ -1091,41 +1334,70 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                 }
                 1 => {
                     let k = slot_of.get(i).copied().unwrap_or(0) as f32;
+                    let o = series_labels(chart, s);
+                    let pos = resolved_position(chart, o);
+                    let inside = matches!(pos, LabelPosition::Center | LabelPosition::InsideEnd | LabelPosition::InsideBase);
                     for (j, sp) in row.iter().enumerate() {
                         let Some((b, t)) = sp else { continue };
                         let (pb, pt) = (vpos(*b, &sc), vpos(*t, &sc));
                         let c = center(j);
                         let lo = pb.min(pt);
                         let len = (pb - pt).abs();
+                        let mid = (pb + pt) / 2.0;
+                        let fill = point_fill(s, j);
+                        let edge = point_line(s, j).map(|c| (c, 1.0));
+                        let v = s.values.get(j).copied().flatten().unwrap_or(t - b);
                         if horizontal {
                             let y = c + nslots * bw / 2.0 - (k + 1.0) * bw;
-                            ctx.rect(lo, y, len, bw, s.color, None);
+                            ctx.rect(lo, y, len, bw, fill, edge);
+                            if labels_on && let Some(text) = label_text(chart, data, s, j, None) {
+                                let yc = c + nslots * bw / 2.0 - (k + 0.5) * bw;
+                                let (x, ha) = match pos {
+                                    LabelPosition::Center => (mid, HAlign::Center),
+                                    LabelPosition::InsideEnd | LabelPosition::InsideBase => {
+                                        (if v >= 0.0 { pb.max(pt) - 3.0 } else { lo + 3.0 }, if v >= 0.0 { HAlign::Right } else { HAlign::Left })
+                                    }
+                                    LabelPosition::Left => (lo - 3.0, HAlign::Right),
+                                    LabelPosition::Right => (pb.max(pt) + 3.0, HAlign::Left),
+                                    _ => (if v >= 0.0 { pb.max(pt) + 3.0 } else { lo - 3.0 }, if v >= 0.0 { HAlign::Left } else { HAlign::Right }),
+                                };
+                                let color = if inside { on(fill) } else { TEXT };
+                                draw_label_colored(ctx, o, x, yc, &text, fill, color, ha, VAlign::Middle);
+                            }
                         } else {
                             let x = c - nslots * bw / 2.0 + k * bw;
-                            ctx.rect(x, lo, bw, len, s.color, None);
-                        }
-                        if labels_on && let Some(v) = s.values.get(j).copied().flatten() {
-                            let t = fmt.format(v, None);
-                            let stacked = fam != Fam::Col;
-                            let mid = (pb + pt) / 2.0;
-                            if horizontal {
-                                let y = c + nslots * bw / 2.0 - (k + 0.5) * bw;
-                                if stacked {
-                                    ctx.text(mid, y, &t, LABEL_SIZE, on(s.color), HAlign::Center, VAlign::Middle);
-                                } else if v >= 0.0 {
-                                    ctx.text(pb.max(pt) + 3.0, y, &t, LABEL_SIZE, TEXT, HAlign::Left, VAlign::Middle);
-                                } else {
-                                    ctx.text(lo - 3.0, y, &t, LABEL_SIZE, TEXT, HAlign::Right, VAlign::Middle);
-                                }
-                            } else {
-                                let x = c - nslots * bw / 2.0 + (k + 0.5) * bw;
-                                if stacked {
-                                    ctx.text(x, mid, &t, LABEL_SIZE, on(s.color), HAlign::Center, VAlign::Middle);
-                                } else if v >= 0.0 {
-                                    ctx.text(x, lo - 2.0, &t, LABEL_SIZE, TEXT, HAlign::Center, VAlign::Bottom);
-                                } else {
-                                    ctx.text(x, lo + len + 2.0, &t, LABEL_SIZE, TEXT, HAlign::Center, VAlign::Top);
-                                }
+                            ctx.rect(x, lo, bw, len, fill, edge);
+                            if labels_on && let Some(text) = label_text(chart, data, s, j, None) {
+                                let xc = c - nslots * bw / 2.0 + (k + 0.5) * bw;
+                                let (y, va, ha) = match pos {
+                                    LabelPosition::Center => (mid, VAlign::Middle, HAlign::Center),
+                                    LabelPosition::InsideEnd => {
+                                        if v >= 0.0 {
+                                            (lo + 2.0, VAlign::Top, HAlign::Center)
+                                        } else {
+                                            (lo + len - 2.0, VAlign::Bottom, HAlign::Center)
+                                        }
+                                    }
+                                    LabelPosition::InsideBase => {
+                                        if v >= 0.0 {
+                                            (lo + len - 2.0, VAlign::Bottom, HAlign::Center)
+                                        } else {
+                                            (lo + 2.0, VAlign::Top, HAlign::Center)
+                                        }
+                                    }
+                                    LabelPosition::Bottom => (lo + len + 2.0, VAlign::Top, HAlign::Center),
+                                    LabelPosition::Left => (xc - bw / 2.0 - 2.0, VAlign::Middle, HAlign::Right),
+                                    LabelPosition::Right => (xc + bw / 2.0 + 2.0, VAlign::Middle, HAlign::Left),
+                                    _ => {
+                                        if v >= 0.0 {
+                                            (lo - 2.0, VAlign::Bottom, HAlign::Center)
+                                        } else {
+                                            (lo + len + 2.0, VAlign::Top, HAlign::Center)
+                                        }
+                                    }
+                                };
+                                let color = if inside { on(fill) } else { TEXT };
+                                draw_label_colored(ctx, o, xc, y, &text, fill, color, ha, va);
                             }
                         }
                     }
@@ -1135,20 +1407,53 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                     draw_runs(ctx, &pts, s.color, 2.25, s.smooth.then_some(plot));
                     let k = kinds.get(i).copied().unwrap_or(ChartKind::Line);
                     if k == ChartKind::LineMarkers && cw >= 3.0 {
-                        draw_markers(ctx, pts.iter().flatten().copied(), 3.5, s.color);
+                        draw_markers_colored(ctx, pts.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j)))), 3.5);
                     }
                     if labels_on {
+                        let o = series_labels(chart, s);
+                        let pos = resolved_position(chart, o);
                         for (j, p) in pts.iter().enumerate() {
-                            if let (Some(p), Some(v)) = (p, s.values.get(j).copied().flatten()) {
-                                ctx.text(p[0], p[1] - 5.0, &fmt.format(v, None), LABEL_SIZE, TEXT, HAlign::Center, VAlign::Bottom);
-                            }
+                            let (Some(p), Some(text)) = (p, label_text(chart, data, s, j, None)) else { continue };
+                            let (x, y, ha, va) = match pos {
+                                LabelPosition::Bottom => (p[0], p[1] + 3.0, HAlign::Center, VAlign::Top),
+                                LabelPosition::Left => (p[0] - 3.0, p[1], HAlign::Right, VAlign::Middle),
+                                LabelPosition::Right => (p[0] + 3.0, p[1], HAlign::Left, VAlign::Middle),
+                                LabelPosition::Center => (p[0], p[1], HAlign::Center, VAlign::Middle),
+                                _ => (p[0], p[1] - 5.0, HAlign::Center, VAlign::Bottom),
+                            };
+                            draw_label(ctx, o, x, y, &text, point_marker(s, j), ha, va);
                         }
                     }
                 }
             }
         }
-        for (x, y, t) in area_labels.drain(..) {
-            ctx.text(x, y, &t, LABEL_SIZE, TEXT, HAlign::Center, VAlign::Bottom);
+        for (x, y, t, key, va) in area_labels.drain(..) {
+            draw_label_colored(ctx, &chart.labels, x, y, &t, key, TEXT, HAlign::Center, va);
+        }
+    }
+    // Error bars over the marks: in the series' colour, with Excel's end caps.
+    for (i, s) in data.series.iter().enumerate() {
+        let Some(e) = s.error_bars.as_ref() else { continue };
+        let fam = fams.get(i).copied().unwrap_or(Fam::Col);
+        let Some(row) = spans.get(i) else { continue };
+        let sc = scale_of(i);
+        let k = slot_of.get(i).copied().unwrap_or(0) as f32;
+        let stats: Vec<f64> = s.values.iter().flatten().copied().collect();
+        let sd = stddev(&stats);
+        let n = stats.len();
+        for (j, sp) in row.iter().enumerate() {
+            let Some((_, t)) = sp else { continue };
+            let Some((minus, plus)) = error_span(s, j, sd, n) else { continue };
+            let (x, y) = if is_col(fam) {
+                if horizontal {
+                    (vpos(*t, &sc), center(j) + nslots * bw / 2.0 - (k + 0.5) * bw)
+                } else {
+                    (center(j) - nslots * bw / 2.0 + (k + 0.5) * bw, vpos(*t, &sc))
+                }
+            } else {
+                (center(j), vpos(*t, &sc))
+            };
+            error_bar(ctx, [x, y], *t, minus, plus, &sc, plot, horizontal, s.color, !e.spec.no_end_cap);
         }
     }
     // Trendlines on top: x is the category number 1..n.
@@ -1159,7 +1464,9 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
         }
         let sc = scale_of(i);
         let pts: Vec<(f64, f64)> = s.values.iter().take(ncat).enumerate().filter_map(|(j, v)| v.map(|v| ((j + 1) as f64, v))).collect();
-        let frac = |x: f64, y: f64| ((x - 0.5) / ncat_slots as f64, (y - sc.min) / (sc.max - sc.min));
+        // A reversed category axis mirrors the slot a category number sits in.
+        let cat_frac = |x: f64| if reversed { (ncat_slots as f64 - x) / ncat_slots as f64 } else { (x - 0.5) / ncat_slots as f64 };
+        let frac = |x: f64, y: f64| (cat_frac(x), (y - sc.min) / (sc.max - sc.min));
         let px = |(fx, fy): (f64, f64)| {
             if horizontal {
                 [plot.x + fy as f32 * plot.w, plot.bottom() - fx as f32 * plot.h]
@@ -1201,11 +1508,12 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         }
     }
     let Some((ylo, yhi)) = value_range(all.iter().flatten().flatten().map(|p| p.1)) else { return };
-    let xs = nice_scale(xlo, xhi, false);
-    let ys = nice_scale(ylo, yhi, false);
-    let fx = Fmt::new("General");
-    let fy = Fmt::new(data.series.first().map(|s| s.number_format.as_str()).unwrap_or("General"));
-    let plot = frame(ctx, area, CatAxis::Numeric(xs, &fx), &ValAxis { scale: ys, fmt: &fy }, None, false, chart.gridlines);
+    let xs = axis_scale(xlo, xhi, false, &chart.x_axis);
+    let ys = axis_scale(ylo, yhi, false, &chart.y_axis);
+    let fx = Fmt::new(chart.x_axis.number_format.as_deref().unwrap_or("General"));
+    let fy = Fmt::new(chart.y_axis.number_format.as_deref().or_else(|| data.series.first().map(|s| s.number_format.as_str())).unwrap_or("General"));
+    let y_axis = ValAxis { scale: ys, fmt: &fy, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses };
+    let plot = frame(ctx, area, CatAxis::Numeric(xs, &fx, chart.x_axis.crosses, chart.x_axis.display_units), &y_axis, None, false, chart.gridlines);
     if !plot.ok() {
         return;
     }
@@ -1217,22 +1525,23 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         if bubble {
             let sizes = s.sizes.as_deref().unwrap_or(&[]);
             let smax = sizes.iter().flatten().fold(0.0f64, |a, b| a.max(*b));
-            let mut bubbles: Vec<([f32; 2], f64)> = px
+            let mut bubbles: Vec<(usize, [f32; 2], f64)> = px
                 .iter()
                 .enumerate()
                 .filter_map(|(j, p)| {
                     let sz = if sizes.is_empty() { Some(1.0) } else { sizes.get(j).copied().flatten() };
                     match (p, sz) {
-                        (Some(p), Some(sz)) if sz > 0.0 => Some((*p, sz)),
+                        (Some(p), Some(sz)) if sz > 0.0 => Some((j, *p, sz)),
                         _ => None,
                     }
                 })
                 .take(MAX_MARKERS)
                 .collect();
-            bubbles.sort_by(|a, b| b.1.total_cmp(&a.1));
+            bubbles.sort_by(|a, b| b.2.total_cmp(&a.2));
             let smax = if sizes.is_empty() { 1.0 } else { smax };
-            let fill = [s.color[0], s.color[1], s.color[2], 0xC0];
-            for (p, sz) in bubbles {
+            for (j, p, sz) in bubbles {
+                let base = point_fill(s, j);
+                let fill = [base[0], base[1], base[2], 0xC0];
                 let r = ((sz / smax).sqrt() as f32 * rmax).max(1.0);
                 ctx.out.push(Prim::Circle { cx: p[0], cy: p[1], r, fill: Some(fill), stroke: Some((WHITE, 0.75)) });
             }
@@ -1242,14 +1551,34 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                 draw_runs(ctx, &px, s.color, 2.0, s.smooth.then_some(plot));
             }
             if !lines || px.len() <= 500 {
-                draw_markers(ctx, px.iter().flatten().copied(), 3.5, s.color);
+                draw_markers_colored(ctx, px.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j)))), 3.5);
             }
         }
         if chart.data_labels && pts.len() <= MAX_LABELS {
-            for (p, raw) in px.iter().zip(pts) {
-                if let (Some(p), Some((_, y))) = (p, raw) {
-                    ctx.text(p[0], p[1] - 6.0, &fy.format(*y, None), LABEL_SIZE, TEXT, HAlign::Center, VAlign::Bottom);
-                }
+            let o = series_labels(chart, s);
+            let pos = resolved_position(chart, o);
+            for (j, (p, raw)) in px.iter().zip(pts).enumerate() {
+                let (Some(p), Some(_)) = (p, raw) else { continue };
+                let Some(text) = label_text(chart, data, s, j, None) else { continue };
+                let (x, y, ha, va) = match pos {
+                    LabelPosition::Bottom => (p[0], p[1] + 6.0, HAlign::Center, VAlign::Top),
+                    LabelPosition::Left => (p[0] - 4.0, p[1], HAlign::Right, VAlign::Middle),
+                    LabelPosition::Right => (p[0] + 4.0, p[1], HAlign::Left, VAlign::Middle),
+                    LabelPosition::Center => (p[0], p[1], HAlign::Center, VAlign::Middle),
+                    _ => (p[0], p[1] - 6.0, HAlign::Center, VAlign::Bottom),
+                };
+                draw_label(ctx, o, x, y, &text, point_marker(s, j), ha, va);
+            }
+        }
+        // Error bars run along the value (vertical) axis.
+        if let Some(e) = s.error_bars.as_ref() {
+            let stats: Vec<f64> = s.values.iter().flatten().copied().collect();
+            let sd = stddev(&stats);
+            let n = stats.len();
+            for (j, (p, raw)) in px.iter().zip(pts).enumerate() {
+                let (Some(p), Some((_, v))) = (p, raw) else { continue };
+                let Some((minus, plus)) = error_span(s, j, sd, n) else { continue };
+                error_bar(ctx, *p, *v, minus, plus, &ys, plot, false, s.color, !e.spec.no_end_cap);
             }
         }
     }
@@ -1299,9 +1628,17 @@ fn histogram(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         })
         .collect();
     let maxc = counts.iter().copied().max().unwrap_or(0) as f64;
-    let ys = nice_scale(0.0, maxc, true);
-    let fc = Fmt::new("General");
-    let plot = frame(ctx, area, CatAxis::Labels(&labels, &[]), &ValAxis { scale: ys, fmt: &fc }, None, false, chart.gridlines);
+    let ys = axis_scale(0.0, maxc, true, &chart.y_axis);
+    let fc = Fmt::new(chart.y_axis.number_format.as_deref().unwrap_or("General"));
+    let plot = frame(
+        ctx,
+        area,
+        CatAxis::Labels(&labels, &[]),
+        &ValAxis { scale: ys, fmt: &fc, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
+        None,
+        false,
+        chart.gridlines,
+    );
     if !plot.ok() {
         return;
     }
@@ -1351,9 +1688,17 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         }
     }
     let (lo, hi) = value_range(bars.iter().flat_map(|(b, t, _)| [*b, *t])).unwrap_or((0.0, 0.0));
-    let ys = nice_scale(lo, hi, true);
-    let f = Fmt::new(&s.number_format);
-    let plot = frame(ctx, area, CatAxis::Labels(&labels, &[]), &ValAxis { scale: ys, fmt: &f }, None, false, chart.gridlines);
+    let ys = axis_scale(lo, hi, true, &chart.y_axis);
+    let f = Fmt::new(chart.y_axis.number_format.as_deref().unwrap_or(&s.number_format));
+    let plot = frame(
+        ctx,
+        area,
+        CatAxis::Labels(&labels, &[]),
+        &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
+        None,
+        false,
+        chart.gridlines,
+    );
     if !plot.ok() {
         return;
     }
@@ -1372,9 +1717,11 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         if j + 1 < bars.len() && ncat <= 500 {
             ctx.out.push(Prim::Line { pts: vec![[x + bw, yt], [x + cw, yt]], color: AXIS, width: 0.75, dash: true });
         }
-        if chart.data_labels && ncat <= MAX_LABELS {
-            let v = if *kind == 0 { *t } else { t - b };
-            ctx.text(x + bw / 2.0, yb.min(yt) - 2.0, &f.format(v, None), LABEL_SIZE, TEXT, HAlign::Center, VAlign::Bottom);
+        if ncat <= MAX_LABELS {
+            let o = series_labels(chart, s);
+            if let Some(text) = label_text(chart, data, s, j, None) {
+                draw_label_colored(ctx, o, x + bw / 2.0, yb.min(yt) - 2.0, &text, s.color, TEXT, HAlign::Center, VAlign::Bottom);
+            }
         }
     }
 }
@@ -1393,6 +1740,7 @@ fn funnel(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         return;
     }
     let labels: Vec<String> = (0..n).map(|j| cat_label(data, j)).collect();
+    let total: f64 = vals.iter().sum();
     let lw = (labels.iter().take(2000).map(|t| ctx.tw(t, LABEL_SIZE)).fold(0.0f32, f32::max) + 8.0).min(area.w * 0.35);
     let plot = Bx { x: area.x + lw, w: area.w - lw, ..area };
     if !plot.ok() {
@@ -1400,7 +1748,6 @@ fn funnel(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     }
     let slot = plot.h / n as f32;
     let bh = slot * 0.85;
-    let f = Fmt::new(&s.number_format);
     let show = slot >= LABEL_SIZE * 0.9;
     for (j, v) in vals.iter().enumerate() {
         let bw = (*v / max) as f32 * plot.w;
@@ -1411,10 +1758,10 @@ fn funnel(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         }
         if show {
             let yc = y + bh / 2.0;
-            if chart.data_labels {
-                let t = f.format(s.values.get(j).copied().flatten().unwrap_or(0.0), None);
+            let o = series_labels(chart, s);
+            if let Some(t) = label_text(chart, data, s, j, Some(total)) {
                 let color = if ctx.tw(&t, LABEL_SIZE) + 4.0 <= bw { on(s.color) } else { TEXT };
-                ctx.text(plot.cx(), yc, &t, LABEL_SIZE, color, HAlign::Center, VAlign::Middle);
+                draw_label_colored(ctx, o, plot.cx(), yc, &t, s.color, color, HAlign::Center, VAlign::Middle);
             }
             let l = ctx.fit(labels.get(j).map(String::as_str).unwrap_or(""), LABEL_SIZE, lw - 8.0);
             ctx.text(plot.x - 6.0, yc, &l, LABEL_SIZE, TEXT, HAlign::Right, VAlign::Middle);
@@ -1437,28 +1784,50 @@ fn pie(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, inner: f32, nam
         return;
     }
     let ri = r * inner;
-    let f = Fmt::new(&s.number_format);
     let mut a = 0.0f32;
-    let mut labels = Vec::new();
     for (j, v) in vals.iter().enumerate() {
         let sweep = (*v / total) as f32 * TAU;
         if sweep > 1e-4 {
             let fill = point_color(data, j);
             ctx.out.push(Prim::Wedge { cx, cy, r_outer: r, r_inner: ri, a0: a, a1: (a + sweep).min(TAU), fill, stroke: Some((WHITE, 1.5)) });
-            if (chart.data_labels || names) && vals.len() <= MAX_LABELS {
-                let t = if names { cat_label(data, j) } else { f.format(s.values.get(j).copied().flatten().unwrap_or(0.0), None) };
-                let mid = a + sweep / 2.0;
-                let rr = if ri > 0.0 { (r + ri) / 2.0 } else { r * 0.65 };
-                let room = sweep * rr;
-                if ctx.tw(&t, LABEL_SIZE) <= room.max(r - ri) && room >= LABEL_SIZE {
-                    labels.push((cx + rr * mid.sin(), cy - rr * mid.cos(), t, on(fill)));
+            let deleted = s.points.iter().any(|p| p.index == j && p.no_label);
+            if !deleted && vals.len() <= MAX_LABELS {
+                let o = series_labels(chart, s);
+                let pos = resolved_position(chart, o);
+                let text = if names { Some(cat_label(data, j)) } else { label_text(chart, data, s, j, Some(total)) };
+                if let Some(t) = text {
+                    let mid = a + sweep / 2.0;
+                    let outside = matches!(
+                        pos,
+                        LabelPosition::OutsideEnd | LabelPosition::Left | LabelPosition::Right | LabelPosition::Top | LabelPosition::Bottom
+                    );
+                    let rr = if outside {
+                        r + 4.0
+                    } else if ri > 0.0 {
+                        (r + ri) / 2.0
+                    } else {
+                        r * 0.65
+                    };
+                    let room = sweep * rr;
+                    if outside || ctx.tw(&t, LABEL_SIZE) <= room.max(r - ri) && room >= LABEL_SIZE {
+                        let (ha, va) = if outside {
+                            if mid.sin().abs() < 0.15 {
+                                (HAlign::Center, if mid.cos() > 0.0 { VAlign::Bottom } else { VAlign::Top })
+                            } else if mid.sin() > 0.0 {
+                                (HAlign::Left, VAlign::Middle)
+                            } else {
+                                (HAlign::Right, VAlign::Middle)
+                            }
+                        } else {
+                            (HAlign::Center, VAlign::Middle)
+                        };
+                        let color = if outside { TEXT } else { on(fill) };
+                        draw_label_colored(ctx, o, cx + rr * mid.sin(), cy - rr * mid.cos(), &t, fill, color, ha, va);
+                    }
                 }
             }
         }
         a += sweep;
-    }
-    for (x, y, t, c) in labels {
-        ctx.text(x, y, &t, LABEL_SIZE, c, HAlign::Center, VAlign::Middle);
     }
 }
 
@@ -1546,7 +1915,7 @@ fn treemap(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         if b.w > 24.0 && b.h > LABEL_SIZE * 1.6 {
             let name = ctx.fit(&cat_label(data, j), LABEL_SIZE, b.w - 8.0);
             ctx.text(b.x + 4.0, b.y + 4.0, &name, LABEL_SIZE, on(fill), HAlign::Left, VAlign::Top);
-            if chart.data_labels && b.h > LABEL_SIZE * 3.2 {
+            if chart.data_labels && b.h > LABEL_SIZE * 3.2 && !s.points.iter().any(|p| p.index == j && p.no_label) {
                 let v = items.iter().find(|x| x.0 == j).map(|x| x.1).unwrap_or(0.0);
                 let t = ctx.fit(&f.format(v, None), LABEL_SIZE, b.w - 8.0);
                 ctx.text(b.x + 4.0, b.y + 4.0 + LABEL_SIZE * 1.4, &t, LABEL_SIZE, on(fill), HAlign::Left, VAlign::Top);
@@ -1570,11 +1939,12 @@ fn radar(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     }
     let (cx, cy) = (area.cx(), area.cy());
     let (lo, hi) = value_range(data.series.iter().flat_map(|s| s.values.iter().flatten().copied())).unwrap_or((0.0, 0.0));
-    let sc = nice_scale(lo, hi, true);
-    let f = Fmt::new(data.series.first().map(|s| s.number_format.as_str()).unwrap_or("General"));
+    let sc = axis_scale(lo, hi, true, &chart.y_axis);
+    let f = Fmt::new(chart.y_axis.number_format.as_deref().or_else(|| data.series.first().map(|s| s.number_format.as_str())).unwrap_or("General"));
     let ang = |j: usize| j as f32 / ncat as f32 * TAU;
     let pt = |a: f32, rr: f32| [cx + rr * a.sin(), cy - rr * a.cos()];
     let ticks = sc.ticks();
+    let divisor = chart.y_axis.display_units.map(DisplayUnits::factor).unwrap_or(1.0);
     let spacing = r / ticks.len().saturating_sub(1).max(1) as f32;
     let every = ((LABEL_SIZE * 1.3 / spacing.max(1e-3)).ceil() as usize).max(1);
     for (ti, t) in ticks.into_iter().enumerate() {
@@ -1589,8 +1959,11 @@ fn radar(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
             ctx.line(ring, GRID, 0.75);
         }
         if ti % every == 0 {
-            ctx.text(cx - 3.0, cy - rr, &f.format(t, Some(sc.step)), LABEL_SIZE * 0.9, TEXT, HAlign::Right, VAlign::Middle);
+            ctx.text(cx - 3.0, cy - rr, &f.format(t / divisor, Some(sc.step)), LABEL_SIZE * 0.9, TEXT, HAlign::Right, VAlign::Middle);
         }
+    }
+    if let Some(u) = chart.y_axis.display_units {
+        ctx.text(cx, cy + r + 10.0, u.label(), LABEL_SIZE * 0.9, TEXT, HAlign::Center, VAlign::Top);
     }
     let step = ncat.div_ceil(72).max(1);
     for j in (0..ncat).step_by(step) {
@@ -1646,9 +2019,17 @@ fn quantile(sorted: &[f64], q: f64, method: QuartileMethod) -> f64 {
 fn box_whisker(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let labels: Vec<String> = data.series.iter().map(|s| s.name.clone()).collect();
     let Some((lo, hi)) = value_range(data.series.iter().flat_map(|s| s.values.iter().flatten().copied())) else { return };
-    let ys = nice_scale(lo, hi, false);
-    let f = Fmt::new(data.series.first().map(|s| s.number_format.as_str()).unwrap_or("General"));
-    let plot = frame(ctx, area, CatAxis::Labels(&labels, &[]), &ValAxis { scale: ys, fmt: &f }, None, false, chart.gridlines);
+    let ys = axis_scale(lo, hi, false, &chart.y_axis);
+    let f = Fmt::new(chart.y_axis.number_format.as_deref().or_else(|| data.series.first().map(|s| s.number_format.as_str())).unwrap_or("General"));
+    let plot = frame(
+        ctx,
+        area,
+        CatAxis::Labels(&labels, &[]),
+        &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
+        None,
+        false,
+        chart.gridlines,
+    );
     if !plot.ok() {
         return;
     }
@@ -1695,9 +2076,17 @@ fn stock(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     }
     let labels: Vec<String> = (0..ncat).map(|j| cat_label(data, j)).collect();
     let Some((lo, hi)) = value_range(data.series.iter().flat_map(|s| s.values.iter().flatten().copied())) else { return };
-    let ys = nice_scale(lo, hi, false);
-    let f = Fmt::new(data.series.first().map(|s| s.number_format.as_str()).unwrap_or("General"));
-    let plot = frame(ctx, area, CatAxis::Labels(&labels, &[]), &ValAxis { scale: ys, fmt: &f }, None, false, chart.gridlines);
+    let ys = axis_scale(lo, hi, false, &chart.y_axis);
+    let f = Fmt::new(chart.y_axis.number_format.as_deref().or_else(|| data.series.first().map(|s| s.number_format.as_str())).unwrap_or("General"));
+    let plot = frame(
+        ctx,
+        area,
+        CatAxis::Labels(&labels, &[]),
+        &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
+        None,
+        false,
+        chart.gridlines,
+    );
     if !plot.ok() {
         return;
     }

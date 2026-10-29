@@ -414,6 +414,7 @@ fn forecast_sheet(s: &mut Session, p: &Json) -> Result<Json> {
                 quartiles: Default::default(),
                 smooth: false,
                 trendlines: Vec::new(),
+                ..Series::default()
             })
             .collect();
         sheet.charts.push(Chart {
@@ -431,6 +432,7 @@ fn forecast_sheet(s: &mut Session, p: &Json) -> Result<Json> {
             source: None,
             by_rows: false,
             pivot: None,
+            ..Chart::default()
         });
         cx.wb.sheets.insert(at, Arc::new(sheet));
         for nm in cx.wb.names.iter_mut() {
