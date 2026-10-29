@@ -361,8 +361,14 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   `dx`/`dy`, so it no longer has to snap to a cell, and it reaches timelines too), Delete removes it,
   a right-click menu carries delete/select-all/clear and a Slicer Styles submenu, and Tab/Enter move
   between tiles without the grid stealing the keys.
-- **Missing:** timeline **date-range** selection (the model has no state for it, so the track means
-  "full range" and its handles are deliberately not draggable); a filter on a field outside Rows/Columns is drawn as an extra page-filter row
+- **Landed 10-30 (timeline ranges):** `PivotTimeline` carries a `TimelineRange`, written as
+  `<state><selection startDate endDate>` with `filterType="dateBetween"` and read back exactly, and
+  `slicer.setRange` filters the report through the slicer path in one undo step (clamping a range past
+  the field's own bounds and saying so). The UI's timeline handles are still not draggable — the model
+  can hold the range now, wiring the drag is UI work in the next round. Fidelity note: the pivot
+  filters by item labels, so a range covering part of a month shows the whole month; a real
+  Excel-authored timeline with non-zero refresh versions stays on the kept path.
+- **Missing:** the timeline handles' drag in the UI; a filter on a field outside Rows/Columns is drawn as an extra page-filter row
   (`PivotFilter` has no flag to distinguish it); timeline date ranges are kept but not editable;
   calculated items, PivotCharts, value/label filters, number grouping, GETPIVOTDATA and data-model
   pivots; a table slicer is still not written to XLSX; `pivot.filter` does not sync a slicer's tiles.
@@ -371,7 +377,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
   never been opened in Excel — gate #1.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 8–14 h for beta (22–35 h full).
+- **Estimate:** 6–11 h for beta (22–35 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group

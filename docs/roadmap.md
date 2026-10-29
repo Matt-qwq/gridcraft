@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (text is shaped on both paths — the grid/editor and PDF — so gate #5 is met with a font-coverage caveat; slicers and timelines are placed and table slicers written; encryption hardened with OS CSPRNG and a verified integrity HMAC; a 595-example documented formula oracle suite with gate #6 met; gates #4 1–3 h and #8 8–14 h; beta total ~81–142) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (text is shaped on both paths — the grid/editor and PDF — so gate #5 is met with a font-coverage caveat; slicers and timelines are placed and table slicers written; encryption hardened with OS CSPRNG and a verified integrity HMAC; a 595-example documented formula oracle suite with gate #6 met; gates #4 1–3 h and #8 6–11 h; beta total ~79–139) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -30,7 +30,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi | #5 | 0–3 | **Shaping engine landed 10-30** (`core::text`: unicode-bidi levels + rustybuzz, visual-order runs, logical clusters, 26 tests). What remains is wiring it into the grid and the PDF writer — two tasks in flight. |
 | **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
 | **3** | `.xls` import and password-protected workbooks | #7 | 9–19 | **Encryption (write + verified integrity + CSPRNG) and `.xls` styles, comments, validation, conditional formats, hyperlinks and frozen panes landed 10-29/30**; CF12 rules, charts/pictures, BIFF5 (not in [MS-XLS]) and Standard/RC4 writing remain. |
-| **3b** | PivotTables: PivotCharts, calculated items, timeline ranges, Excel verification | #8 | 8–14 | **Slicers and timelines landed 10-30** (model, XLSX, six commands, a selection filters the pivot); the widgets are not drawn yet. Excel verification waits for #1. |
+| **3b** | PivotTables: PivotCharts, calculated items, Excel verification | #8 | 6–11 | **Slicers and timelines landed 10-30** (model, XLSX, six commands, a selection filters the pivot); the widgets are not drawn yet. Excel verification waits for #1. |
 | **4** | **Beta exit**: stability soak, all gates green, full `cargo xtask ci`, docs, release, corpus re-run | all | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read half and linked tables (20–30 h) · M17 zone maps (8–12 h) · localization, twelve languages (100–165 h) · Get & Transform/data model (60–100 h) · full chart depth, collaboration, mobile, AI · M22 only if a measured trigger fires | M17/M21/M22 | — | Not beta blockers. Keep the 100M/paging base stable; no native format before a trigger. |
 
@@ -76,7 +76,7 @@ and edge features. Each gate links its gap.
 | PivotTables: slicers, calculated items, PivotCharts, verified in Excel | #8 | **partial 10-30**: slicers and timelines are modelled, written from the model, placed on the sheet, **drawn and driven by real input** (tiles through `slicer.toggle`, filter button, drag/nudge through `slicer.move` with sub-cell `dx`/`dy`, Delete, context menu, style submenu) and a selection filters the pivot through its own refresh path, undoably and across save/reopen. Missing: timeline date ranges, calculated items, PivotCharts, value/label filters, number grouping, GETPIVOTDATA, data-model pivots, and the whole gate's Excel check | 8–14 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **met 10-29** (417 sequences, keyboard context menus, six shortcuts; the Menu key itself is blocked upstream) | 0–6 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #4, #8, #10 open or partial (pass-through #3, keyboard #9, calc #6, all-script text #5 met; charts #4, `.xls`/encryption #7, PivotTables #8 partly, and #1 is the owner's) | **~61–112 + 20–30 base = ~81–142** |
+| **Total** | | gates #1, #4, #8, #10 open or partial (pass-through #3, keyboard #9, calc #6, all-script text #5 met; charts #4, `.xls`/encryption #7, PivotTables #8 partly, and #1 is the owner's) | **~59–109 + 20–30 base = ~79–139** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
@@ -818,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | Timeline date ranges modelled, written (`dateBetween`/`<selection>`) and filtering through the slicer path via `slicer.setRange`, with clamping; unmodellable states still kept raw; #8 → 6–11 h, beta ~79–139 h |
 | 2026-10-30 | minor | Slicer/timeline widgets drawn and driven through commands (tiles, filter button, drag with `dx`/`dy`, arrow nudge, Delete, context menu, style submenu); #8 → 8–14 h, beta ~81–142 h |
 | 2026-10-30 | minor | Chartex parts patched instead of regenerated, per-point data labels modelled/read/written/drawn/settable; #4 → 1–3 h, beta ~85–147 h |
 | 2026-10-30 | minor | `.xls` validation, conditional formats, hyperlinks and frozen panes read from [MS-XLS], matched to the `.xlsx` reader; CF12 and BIFF5 refused with reasons; #7 → 9–19 h, beta ~86–150 h |
