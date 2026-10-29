@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** major (a documentation-derived formula oracle suite lands and §6 closes; encryption hardening — OS CSPRNG, integrity HMAC verified on read, web refuses a password save — leaves §7 at 10–21 h; the chart Format pane and drag-resize landed, §4 2–6 h; slicers and timelines modelled, §8 14–22 h) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** major (a shaping + bidi engine lands in `core::text`, so §5 has one wiring task left; a documentation-derived formula oracle suite lands and §6 closes; encryption hardening — OS CSPRNG, integrity HMAC verified on read, web refuses a password save — leaves §7 at 10–21 h; the chart Format pane and drag-resize landed, §4 2–6 h; slicers and timelines modelled, §8 14–22 h) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -219,9 +219,16 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   instead of vanishing. One face per document, chosen by coverage; ASCII/WinAnsi documents keep
   their **previous bytes** (proven by a byte-for-byte test and by the untouched golden) because the
   engine only resolves a font when a character falls outside WinAnsi. Verified with `pdftotext`.
-- **Still missing:** **shaping** (Arabic joining, Devanagari reordering/conjuncts, Thai mark
-  positioning) and **bidi** — glyphs are correct but unjoined and stored-order, so RTL sheets print
-  LTR; CJK and Arabic cannot both be embedded in one document (no single face covers both, stated in
+- **Landed 10-30 (shaping engine):** `gridcraft-core::text` resolves paragraph levels and
+  reordering (`unicode-bidi`) and shapes each run (`rustybuzz`), returning positioned glyphs in
+  **visual order** with logical UTF-8 byte clusters, mark offsets, ascent/descent and a bounded cache
+  (16 faces FIFO, 512 shapings, 512 KiB of text, 4 MiB input ceiling). Arabic joins and ligates,
+  Devanagari reorders and merges conjuncts, Thai marks take zero advance, `fi` ligates and RTL
+  mirrors brackets; 26 tests cover levels, visual chunk order, cluster tiling and hostile input
+  (lone combining mark, cut cluster, astral characters, 100k characters in 19 ms). Nothing draws
+  through it yet, so the grid and the PDF writer still emit stored order until they are wired.
+- **Still missing:** the **wiring** of that engine into the grid renderer and the PDF writer, CJK and
+  Arabic in one document (no single face covers both), and the fonts shipped per platform; CJK and Arabic cannot both be embedded in one document (no single face covers both, stated in
   the matrix); CFF/OTF (`CIDFontType0`) and TTC faces past index 0 are not embedded; the grid's own
   rendering is a separate task in `crates/ui-egui`.
 - **Evidence:** the matrix in [localization-parity.md](localization-parity.md); #142, #54.
