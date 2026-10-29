@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (PDF export embeds subset TrueType fonts: gate #5 partial; beta total ~130–211 including slicers in flight) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (Agile encryption write + `.xls` styles/comments: gate #7 partial; beta total ~114–193) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -29,7 +29,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 8–18 | Longest gate. **A1 landed 10-29** (model, round-trip, render, four commands, catalog 279/295); field-level pass-through, secondary axes, unmodelled kinds and the Format pane + resize remain. |
 | **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi (PDF half landed 10-29: subset TrueType embedding) | #5 | 6–12 | Parallel with 2; needs the ui-egui text path. |
 | **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
-| **3** | `.xls` import and password-protected workbooks | #7 | 28–42 | Independent and long; start in parallel with 1–2 once the base is stable. |
+| **3** | `.xls` import and password-protected workbooks | #7 | 12–24 | **Encryption write and `.xls` styles/comments landed 10-29**; DV/CF records, BIFF5 and hardening remain. |
 | **3b** | PivotTables: slicers, PivotCharts, Excel verification | #8 | 20–30 | After #1's Excel loop exists; needs #7's Excel-side practice less than it seems. |
 | **4** | **Beta exit**: stability soak, all gates green, full `cargo xtask ci`, docs, release, corpus re-run | all | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read half and linked tables (20–30 h) · M17 zone maps (8–12 h) · localization, twelve languages (100–165 h) · Get & Transform/data model (60–100 h) · full chart depth, collaboration, mobile, AI · M22 only if a measured trigger fires | M17/M21/M22 | — | Not beta blockers. Keep the 100M/paging base stable; no native format before a trigger. |
@@ -72,11 +72,11 @@ and edge features. Each gate links its gap.
 | Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **partial 10-29**: axis scaling, data labels, error bars and per-point formatting modelled, round-tripped, drawn and command-driven (catalog 279/295); field-level pass-through, secondary axes and the UI Format pane + resize (#190) remain | 8–18 |
 | Text in every script renders and exports | #5 | **partial 10-29**: PDF export embeds subset TrueType, so Latin Ext/Greek/Cyrillic/Hebrew/Arabic/Devanagari/Thai/CJK/Hangul print (ASCII bytes unchanged, `pdftotext` verified); shaping, bidi and the on-screen path remain | 6–12 |
 | Calculation correctness bugs closed; iterative calculation | #6 | **open** | 10–15 |
-| `.xls` import, password-protected workbooks | #7 | **open** | 28–42 |
+| `.xls` import, password-protected workbooks | #7 | **partial 10-29**: Agile encryption is written and a remembered password survives a save; `.xls` styles/comments read (DV, CF and BIFF5 still refused) | 12–24 |
 | PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **met 10-29** (417 sequences, keyboard context menus, six shortcuts; the Menu key itself is blocked upstream) | 0–6 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #4, #6–#8, #10 (pass-through #3 and keyboard #9 met; charts #4 and text #5 partly) | **~110–181 + 20–30 base = ~130–211** |
+| **Total** | | gates #1, #4, #6, #8, #10 (pass-through #3, keyboard #9 met; charts #4, text #5, `.xls`/encryption #7 partly) | **~94–163 + 20–30 base = ~114–193** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).

@@ -1,6 +1,6 @@
 # GridCraft roadmap
 
-**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~125–205 h away
+**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~115–195 h away
 
 > **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (charts depth: axis scaling, data labels, error bars, per-point formatting; catalog 279/295; beta ~120–200 h) · **Target:** Microsoft Excel (Microsoft 365)
 
@@ -26,7 +26,7 @@ This page is the summary. The detail is in:
 | **Ready for real work** | **~50%** | estimated from written weights (51.6); [target-app-parity.md](docs/target-app-parity.md) |
 | **Mainstream practitioner** | **~50%** | estimated: typical analyst/finance user, weekly features, × 0.90 interaction × 0.92 stability × 0.88 file exchange; [method](docs/target-app-parity.md#mainstream-practitioner) |
 | **Essentials user** | **~63%** | estimated: core features only, × 0.92 launch/stability × 0.95 clarity × 0.90 opening sent files; [method](docs/target-app-parity.md#essentials-user) |
-| Remaining to **beta** | **~125–205 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met; pass-through (#3), keyboard (#9), the chart model half of #4 and the PDF half of #5 landed 10-29 |
+| Remaining to **beta** | **~115–195 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met; pass-through (#3), keyboard (#9), the chart model half of #4 and the PDF half of #5 landed 10-29 |
 | Remaining to **full parity** | **~700–1,100 Opus 5.5 agent-hours** | estimated; sum of the dimension rows below |
 
 | Audience | Ready % | Opus 5.5 agent wall-clock hours to ~95% | Work that dominates |
@@ -134,7 +134,7 @@ The detailed queue with dependencies and the parallel plan is in
 | **2** | Charts depth (#4) | 8–18 | **Model half landed 10-29** (axis scaling, labels, error bars, per-point, four commands, catalog 279/295); field-level pass-through, secondary axes and the Format pane + resize remain. |
 | **2b** | All-script text (#5) | 6–12 | **PDF half landed 10-29** (subset TrueType embedding, `pdftotext`-verified); shaping and bidi remain. |
 | **2c** | Keyboard/key tips (#9) | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects. |
-| **3** | `.xls` + password-protected books (#7) | 28–42 | Independent; start in parallel once base is stable. |
+| **3** | `.xls` + password-protected books (#7) | 12–24 | **Encryption write and `.xls` styles/comments landed 10-29**; DV/CF records, BIFF5 and crypto hardening remain. |
 | **3b** | Pivot slicers/PivotCharts, Excel verification (#8) | 20–30 | After #1's Excel loop. |
 | **4** | **Beta exit**: gates green, full `cargo xtask ci`, corpus re-run, release | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read/linked tables (20–30) · M17 zone maps (8–12) · localization (100–165) · Get & Transform/data model (60–100) · full charts/collaboration/mobile/AI · M22 only on a measured trigger | — | Not beta blockers. |
@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | Password-protected workbooks can be **saved**: `file.save`/`saveAs`/`saveBytes` write Agile encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, version-3 compound file), and a document opened with a password re-encrypts with it on a plain save — the silent removal of a file's protection is fixed. An empty password removes protection; a password on a format that cannot carry one is **refused, never dropped**. `.xls` gained a real style table (`FONT`/`FORMAT`/`PALETTE`/`XF`/`STYLE` → family, size, bold/italic/strike/underline, palette colour, number format, fill, four borders, alignment, protection, named styles) with cells picking up their XF, and `NOTE`/`TXO` comments with author and text; the record layouts were calibrated against an independent BSD-licensed BIFF8 reader over 70 Excel-authored files (metadata only, nothing copied in). Standard/RC4 encryption, `.xls` DV and conditional formats, BIFF5, hyperlinks and freeze panes remain (#7) |
 | 2026-10-29 | Gate hygiene: `cargo xtask keytips --check` and `parity --check` compared **CRLF checkout bytes against LF generated text**, so both were red on every Windows checkout with nothing to fix — the comparison now folds line endings and regeneration keeps the file's own endings, with unit tests over LF/CRLF/differing content (assets, layers, wasm and fmt were audited and are not affected). The one failing `ui-egui` test on main was a **test** bug, not a product bug: header AutoFit measures with the grid's real font (#1316) while the test measured with the headless fallback, so at 50 % it compared ~4 phantom screen-pixels against the filter slot and failed by 0.09 px. The test now uses the same metric the product draws with, covers 50/75/100/150/200 %, asserts the column reserves text + 6 pt + the dropdown slot, and pins the observed 12.5 pt constant; a fault injection (making `filter_button_space` zoom-blind) makes it fail, so the guard bites. `ui-egui` 951 green, `xtask` 27 |
 | 2026-10-29 | Non-Latin text reaches the PDF: `gridcraft-core::fonts` discovers a font file (`CRAFT_FONTS_DIR`, then the platform's own directories) and answers per-character `cmap` coverage, and `gridcraft-pdf` reads TrueType, subsets it with composite closure and rebuilt tables, and embeds a `CIDFontType2` with `FontFile2`, `Identity-H`, `/W` and a `ToUnicode` CMap. Latin Extended, Greek, Cyrillic, Hebrew, Arabic, Devanagari, Thai, CJK and Hangul now print; `pdftotext` extracts Cyrillic and Greek correctly. The font is resolved only when a character falls outside WinAnsi, so an ASCII document keeps its previous bytes (byte-for-byte test plus the untouched golden). Shaping (Arabic joining, Devanagari reordering, Thai marks) and bidi are **not** done: glyphs are right, joins are not (#5) |
 | 2026-10-29 | Charts depth, model half: the model now carries axis scaling (min, max, major unit, log base, reversed, crossing, display units, number format), data labels (value, percentage, series and category names, legend key, position, separator, number format, per-series visibility, per-point deletion), error bars (fixed, percentage, sample standard deviation, standard error, custom ranges, both directions, caps) and per-point fill/line/marker colour — read from the file, written back and drawn, with `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars` and `chart.formatPoint` as commands that refuse what a chart kind cannot store instead of holding a dead option. An unmodelled chart part is kept byte-identically while untouched; catalog 274 → 279 / 290 → 295 (#4) |
@@ -259,6 +260,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | major | Agile encryption write (remembered password survives a save, empty password removes it, non-package formats refuse it) and `.xls` styles + comments; gate #7 partial, beta ~115–195 h |
 | 2026-10-29 | trivial | Gate hygiene: `--check` gates fold line endings (they were red on every Windows checkout); the header-autofit failure was a test measuring with the headless font, now zoom-parameterised 50–200 % |
 | 2026-10-29 | minor | PDF export embeds subset TrueType fonts (core::fonts discovery + cmap coverage, CIDFontType2 with ToUnicode, one face per document, ASCII bytes unchanged); gate #5 partial, shaping/bidi remain |
 | 2026-10-29 | minor | Charts depth: axis scaling, data labels, error bars and per-point formatting round-trip, draw and are commands; catalog 279/295; gate #4 partial, beta ~120–200 h |

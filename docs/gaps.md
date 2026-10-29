@@ -220,6 +220,24 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** — [function-parity.md](function-parity.md#formula-language)
 
 ### 7. Legacy `.xls` only partly read; encrypted workbooks can't be saved with a password (FF)
+- **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
+  encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
+  version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
+  `file.save` — the silent loss of a file's protection is fixed. `password: ""` removes protection;
+  a password on a format that cannot carry one is refused, never dropped. Standard (RC4/AES-128) and
+  certificate encryption are not written; the integrity HMAC is written but not yet verified on
+  read, and key material still comes from a non-cryptographic source (both in flight).
+- **Landed 10-29 (`.xls` styles):** `FONT`, `FORMAT`, `PALETTE`, `XF`, `STYLE` build a real style
+  table (family, size, bold/italic/strike/underline, palette colour, number format, fill pattern and
+  colours, four borders, alignment/wrap/rotation/indent, protection, named styles), cells pick up
+  their XF, and `NOTE` + `TXO`/`CONTINUE` give comments with author and text. Layouts were calibrated
+  against an independent BSD-licensed BIFF8 reader over 70 Excel-authored files on the dev machine
+  (metadata only; no file or data copied into the repo, per the clean-room rule).
+- **Still missing:** `.xls` conditional formats (`CONDFMT`/`CF`/`CFEX`) and data validation (`DV`/
+  `DVAL`) — decoded but with two unexplained byte ranges next to attacker-controlled formula blobs,
+  so they are refused rather than guessed; BIFF5 is refused with a clear message; hyperlinks and
+  freeze panes; charts, pictures, OLE objects and PivotTables are dropped with a warning; `.xls` is
+  never written.
 - **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
   formats, merges, sizes, names); fonts, fills, borders, charts, pictures, comments, conditional
   formats, validation and BIFF5 files are not read, and `.xls` is never written. Password-encrypted
