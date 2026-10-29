@@ -136,8 +136,24 @@ fn watch(app: &mut SheetApp, ui: &mut Ui) {
 fn selection(app: &mut SheetApp, ui: &mut Ui) {
     let list = app.session.run("arrange.selectionPane", json!({})).unwrap_or(Json::Null);
     let items = list.as_array().cloned().unwrap_or_default();
-    if items.is_empty() {
-        ui.label(egui::RichText::new("There are no shapes, pictures or charts on this sheet.").italics());
+    // PivotTable slicers and timelines live in their own sheet lists, which `arrange.selectionPane`
+    // does not carry (the arrange commands stack charts, pictures and shapes only). They are read
+    // from the sheet here so they can be selected and deleted from the same pane; bring forward /
+    // send backward has no meaning for a widget outside that stacking order.
+    let widgets: Vec<(String, u32)> = app
+        .session
+        .active()
+        .and_then(|d| d.wb.active())
+        .map(|sh| {
+            sh.pivot_slicers
+                .iter()
+                .map(|s| (format!("Slicer {}", s.name), s.id))
+                .chain(sh.pivot_timelines.iter().map(|t| (format!("Timeline {}", t.name), t.id)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() && widgets.is_empty() {
+        ui.label(egui::RichText::new("There are no shapes, pictures, charts or slicers on this sheet.").italics());
     }
     for it in items.iter().rev() {
         let kind = it["kind"].as_str().unwrap_or("").to_string();
@@ -155,6 +171,19 @@ fn selection(app: &mut SheetApp, ui: &mut Ui) {
             }
             if ui.small_button("✕").on_hover_text("Delete").clicked() {
                 app.run_or_alert("object.delete", json!({"kind": kind, "id": id}));
+            }
+        });
+    }
+    for (name, id) in widgets {
+        ui.horizontal(|ui| {
+            if ui.selectable_label(app.selected_chart == Some(id), name).clicked() {
+                app.selected_chart = Some(id);
+            }
+            if ui.small_button("✕").on_hover_text("Delete").clicked() {
+                app.run_or_alert("slicer.delete", json!({"slicer": id}));
+                if app.selected_chart == Some(id) {
+                    app.selected_chart = None;
+                }
             }
         });
     }

@@ -30,6 +30,7 @@ pub mod paper_view;
 pub mod pivot_pane;
 pub mod printing;
 pub mod ribbon;
+pub mod slicer_view;
 pub mod tabs;
 pub mod text;
 pub mod text_box;
