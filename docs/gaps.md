@@ -190,12 +190,24 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 25–35 h for beta (40–60 h full). [chart-parity.md](chart-parity.md)
 
 ### 5. Text in non-Latin scripts doesn't render or export (L)
-- **Missing:** CJK font fallback, complex shaping (Arabic, Devanagari, Thai), bidi, non-Latin PDF.
-- **Evidence:** system-font fallback for CJK, Thai and Hebrew landed in #38 (closed #32); #142
-  (Chinese text) awaits confirmation; #54 (symbols as boxes on Fedora); no shaping for Arabic or
-  Devanagari; PDF writer uses 14 standard fonts only.
-- **Impact:** blocks most of the world's users even with an English UI.
-- **Estimate:** 12–20 h. [localization-parity.md](localization-parity.md)
+- **Landed 10-29 (PDF half):** `gridcraft-core::fonts` finds a font file (`CRAFT_FONTS_DIR`, then the
+  platform's font directories, plain `read_dir`, no fontconfig) and answers per-character coverage
+  from `cmap`; `gridcraft-pdf` reads TrueType, subsets it (composite closure, rebuilt tables) and
+  embeds a `CIDFontType2` with `FontFile2`, `Identity-H`, `/W` and a `ToUnicode` CMap, so Latin
+  Extended, Greek, Cyrillic, Hebrew, Arabic, Devanagari, Thai, CJK and Hangul text reaches the page
+  instead of vanishing. One face per document, chosen by coverage; ASCII/WinAnsi documents keep
+  their **previous bytes** (proven by a byte-for-byte test and by the untouched golden) because the
+  engine only resolves a font when a character falls outside WinAnsi. Verified with `pdftotext`.
+- **Still missing:** **shaping** (Arabic joining, Devanagari reordering/conjuncts, Thai mark
+  positioning) and **bidi** — glyphs are correct but unjoined and stored-order, so RTL sheets print
+  LTR; CJK and Arabic cannot both be embedded in one document (no single face covers both, stated in
+  the matrix); CFF/OTF (`CIDFontType0`) and TTC faces past index 0 are not embedded; the grid's own
+  rendering is a separate task in `crates/ui-egui`.
+- **Evidence:** the matrix in [localization-parity.md](localization-parity.md); #142, #54.
+- **Impact:** PDF export and printing no longer drops most of the world's scripts; on-screen shaping
+  and right-to-left layout are still English-centric.
+- **Estimate:** 6–12 h left of the 12–20 (shaping + bidi in the UI text path).
+  [localization-parity.md](localization-parity.md)
 
 ### 6. Calculation correctness bugs (F)
 - **Missing:** nothing known. The four this entry tracked have landed: 15-significant-digit

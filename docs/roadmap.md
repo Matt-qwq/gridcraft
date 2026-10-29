@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (charts depth: axis scaling, data labels, error bars, per-point formatting; catalog 279/295; gate #4 partial, beta total ~121–197) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (PDF export embeds subset TrueType fonts: gate #5 partial; beta total ~130–211 including slicers in flight) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -27,7 +27,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair | #1 | 15–25 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. #3's pass-through half landed 10-29. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
 | **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 8–18 | Longest gate. **A1 landed 10-29** (model, round-trip, render, four commands, catalog 279/295); field-level pass-through, secondary axes, unmodelled kinds and the Format pane + resize remain. |
-| **2b** | All-script text: CJK fallback confirmation, Arabic/Devanagari/Thai shaping, bidi, non-Latin PDF | #5 | 12–20 | Parallel with 2. |
+| **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi (PDF half landed 10-29: subset TrueType embedding) | #5 | 6–12 | Parallel with 2; needs the ui-egui text path. |
 | **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
 | **3** | `.xls` import and password-protected workbooks | #7 | 28–42 | Independent and long; start in parallel with 1–2 once the base is stable. |
 | **3b** | PivotTables: slicers, PivotCharts, Excel verification | #8 | 20–30 | After #1's Excel loop exists; needs #7's Excel-side practice less than it seems. |
@@ -70,13 +70,13 @@ and edge features. Each gate links its gap.
 | Unmodelled XLSX parts preserved on save | #3 | **met 10-29** (slicers, timelines, table query tables, unknown `extLst`, strict package validator); data model and chart `extLst` remain, Excel check folded into #1 | 0–4 |
 | 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | **met 10-28** (M19/M20); M20/M19 polish in wave 0 | 0 for the gate; 20–30 polish |
 | Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **partial 10-29**: axis scaling, data labels, error bars and per-point formatting modelled, round-tripped, drawn and command-driven (catalog 279/295); field-level pass-through, secondary axes and the UI Format pane + resize (#190) remain | 8–18 |
-| Text in every script renders and exports | #5 | **open** | 12–20 |
+| Text in every script renders and exports | #5 | **partial 10-29**: PDF export embeds subset TrueType, so Latin Ext/Greek/Cyrillic/Hebrew/Arabic/Devanagari/Thai/CJK/Hangul print (ASCII bytes unchanged, `pdftotext` verified); shaping, bidi and the on-screen path remain | 6–12 |
 | Calculation correctness bugs closed; iterative calculation | #6 | **open** | 10–15 |
 | `.xls` import, password-protected workbooks | #7 | **open** | 28–42 |
 | PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **met 10-29** (417 sequences, keyboard context menus, six shortcuts; the Menu key itself is blocked upstream) | 0–6 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #4–#8, #10 (pass-through #3 and keyboard #9 met; charts #4 partly) | **~101–167 + 20–30 base = ~121–197** |
+| **Total** | | gates #1, #4, #6–#8, #10 (pass-through #3 and keyboard #9 met; charts #4 and text #5 partly) | **~110–181 + 20–30 base = ~130–211** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
