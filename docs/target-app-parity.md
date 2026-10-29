@@ -12,11 +12,11 @@ generated ribbon checklist is [`parity-checklist.md`](parity-checklist.md).
 
 | Number | Value | Kind |
 |---|---|---|
-| Feature breadth (weighted by use) | **~77%** | estimated from the area table below; anchored on two measurements |
+| Feature breadth (weighted by use) | **~78%** | estimated from the area table below; anchored on two measurements |
 | Ribbon and menu catalog | **280 / 295 (94.9%)** | measured: `cargo xtask parity` (`crates/engine/src/catalog.rs` ∩ registered command ids) |
 | Worksheet functions, by name | **513 / 523 (98.1%)** | measured: registered functions vs Microsoft's published function list (method below) |
 | Worksheet functions that do real work | **504 / 523 (96.4%)** | measured: excludes 9 stubs (7 CUBE functions, WEBSERVICE, FILTERXML) |
-| **Ready for real work** | **~55%** | estimated; written weights below (54.6 computed, re-measured 2026-10-30) |
+| **Ready for real work** | **~55%** | estimated; written weights below (54.8 computed, re-measured 2026-10-30) |
 | **Mainstream practitioner** | **~56%** | estimated; [method](#mainstream-practitioner) (73.6 depth × 0.92 × 0.92 × 0.88 = 50.6) |
 | **Essentials user** | **~67%** | estimated; [method](#essentials-user) (82.0 depth × 0.92 × 0.96 × 0.92 = 66.7) |
 | Stage | **alpha** | see [Stage](#stage) |
@@ -86,29 +86,29 @@ performance 8, stability 8, localization 4, hardware 2, platforms 2, ecosystem 2
 | Sort, filter, tables, validation, outline | 8 | ~82% | ~70% | 10–16 | Multi-level sort, AutoFilter, Advanced Filter, tables with totals, validation, outline, subtotals, consolidate. Advanced Filter copy-to preserves cells outside its result and rejects worksheet overflow (#1031). Bugs: subtotal header (#131), validation edits (#129), table style panic caught (#130); no slicers on tables |
 | PivotTables | 7 | ~70% | ~56% | 20–32 | Insert/Recommended, field list, three layouts, values on rows or columns, date grouping, show-values-as, refresh, calculated fields, XLSX round-trip.**Slicers and timelines landed 10-30:** read into the model (cache field, filtered PivotTables, item values with their selected tiles, caption, style, column count, timeline unit, anchor), written once from the model and driven by `insert.slicer`, `insert.timeline`, `slicer.setSelection/setStyle/move/delete`, and a selection filters the pivot through its own refresh path in one undo step. A written widget is **placed**: an anchored drawing frame naming the view, one slicers/timelines part per sheet listed in the worksheet, the caches in the workbook, and table slicers written with `x15:tableSlicerCache`. Missing: the widget UI, calculated items, PivotCharts, value/label filters, number grouping, GETPIVOTDATA, data-model pivots. The written slicer has never been opened in Excel |
 | Charts and sparklines | 8 | ~52% | ~55% | 28–42 | 25 chart kinds are created and edited; seven more (3-D bar/line/area/pie, surface, pie of pie/bar of pie, Pareto, filled map) are **kept but not drawn** rather than dropped. Options round-trip, draw and are commands (axis scaling, display units, data labels, error bars, per-point fill/line/marker, trendlines) and an **edit patches the kept part**, so unmodelled chart XML survives instead of being regenerated away; the secondary axis is modelled, written and drawn. The **Format pane** drives those options per element (chart area, either axis, each series; per-field Auto) and charts, pictures, shapes and slicers **resize from eight handles** (Shift keeps the ratio, Esc cancels, one undo step, the size survives save/reopen). Missing: creating the unmodelled kinds, chartex options on modelled chartex charts, per-point label text, custom error-bar references in the pane, clicking a chart element to select it, chart sheets. [chart-parity.md](chart-parity.md) |
-| Page layout, print, PDF | 5 | ~82% | ~58% | 11–18 | Page setup, print titles, breaks, Page Break Preview, headers/footers, PDF export and printing. Paper sizes match Japanese Excel: B4/B5/B6 are the JIS sizes, ISO B4/B5/B6 stay reachable by name, and Japanese Postcard (はがき), Japanese Double Postcard (往復はがき), the chou/kaku envelopes and A6 are available. PDF export embeds a subset TrueType face, so Latin Ext, Greek, Cyrillic, Hebrew, Arabic, Devanagari, Thai, CJK and Hangul print (shaping and bidi are still missing). No true Page Layout view; pictures in headers/footers and Different First Page/Odd & Even remain; web print only exports (#141, #143) |
+| Page layout, print, PDF | 5 | ~86% | ~62% | 10–17 | Page setup, print titles, breaks, Page Break Preview, headers/footers, PDF export and printing. Paper sizes match Japanese Excel: B4/B5/B6 are the JIS sizes, ISO B4/B5/B6 stay reachable by name, and Japanese Postcard (はがき), Japanese Double Postcard (往復はがき), the chou/kaku envelopes and A6 are available. PDF export embeds a subset TrueType face, so Latin Ext, Greek, Cyrillic, Hebrew, Arabic, Devanagari, Thai, CJK and Hangul print (shaping and bidi are still missing). No true Page Layout view; pictures in headers/footers and Different First Page/Odd & Even remain; web print only exports (#141, #143) |
 | What-if and analysis | 4 | ~50% | ~40% | 22–35 | Goal Seek, Scenario Manager, data tables, Analysis ToolPak (13 of 19 tools, no charts), Solver (Simplex LP, a local nonlinear method and Evolutionary; Answer and Limits reports; no Sensitivity report or options dialog). Missing: Forecast Sheet, Analyze Data |
 | Get & Transform, external data, data model | 5 | ~15% | ~10% | 60–100 | Import of CSV/TSV, JSON, HTML. No Power Query editor, no From Web, database or folder sources, no connections or refresh, no relationships or data model, no external workbook links (dropped with a warning) |
 | Insert objects | 3 | ~55% | ~45% | 25–40 | Pictures, 8 shape kinds (Excel has ~170), text boxes, own icon set, ink with Ink to Shape, hyperlinks, checkboxes. Missing: SmartArt, WordArt, equations, signature line, objects, 3-D models, screenshot, pictures in cells (PR #105) |
 | Review, comments, protection, collaboration | 4 | ~55% | ~44% | 32–50 | Threaded comments, notes, spelling (system dictionary), thesaurus, sheet and workbook protection, Allow Edit Ranges with Excel-compatible password hashes (#307). Missing: comment navigation, Show Changes, notes-to-comments conversion, accessibility checker, co-authoring. Password-encrypted workbooks **open** (Agile and Standard are read) and Agile is **written** back (#11, #7) |
 | Automation | 4 | ~30% | ~20% | 12–20 | Recorded, editable GridCraft scripts (Automate tab). VBA is out of scope by owner decision and is **dropped** when an `.xlsm` is opened (warning shown). No Office Scripts compatibility |
-| **Weighted** | 100 | **~77%** | **~64.0%** | **270–434** | |
+| **Weighted** | 100 | **~78%** | **~64.2%** | **269–433** | |
 
 ## Dimensions
 
 | Dimension | Weight | Ready | Hours | Evidence |
 |---|---|---|---|---|
-| Features | 45 | ~64.0% | 270–434 | Table above |
+| Features | 45 | ~64.2% | 269–433 | Table above |
 | File formats | 15 | ~52% | 70–105 | XLSX read/write is broad and large files now open (100M cells with cold paging) but output is unproven on a real corpus and in Excel; XLSB and ODS are values-only import; no XLS, XML Spreadsheet 2003, SYLK, DIF, PRN; VBA dropped. [file-format-parity.md](file-format-parity.md) |
 | UI/UX fidelity | 12 | ~58% | 45–72 | Excel-style ribbon, galleries, dialogs, formula bar, status bar; 59 commands with shortcuts vs Excel's 200+; key tips on part of the Home tab only; short context menu; single window. [ui-parity.md](ui-parity.md) |
 | Performance | 8 | ~35% (conservative; large-workbook gate met 10-28, re-scored at beta exit) | 20–35 | [Performance](#performance) |
 | Stability | 8 | ~62% | 13–22 | Never-crash rules enforced by lint, every command fuzzed with hostile params, random command sequences fuzzed against undo/redo, XLSX round-trip and full-recalc invariants, last-resort guard in `Session::execute`. Field reports: Windows Intel GPU crash (#120), error on close (#117), freeze opening from Finder (#166), screen flashing (#76) |
-| Localization | 4 | ~10% | 100–165 | Ribbon-only catalog in five languages (ja, zh, ko, pt-BR, ru; ~12% of strings each), CJK/Thai/Hebrew font fallback, no shaping or RTL. [localization-parity.md](localization-parity.md) |
+| Localization | 4 | ~15% | 100–165 | Ribbon-only catalog in five languages (ja, zh, ko, pt-BR, ru; ~12% of strings each), CJK/Thai/Hebrew font fallback, no shaping or RTL. [localization-parity.md](localization-parity.md) |
 | Hardware | 2 | ~40% | 25–40 | GPU UI via wgpu; recalc uses up to 8 threads for independent formulas; no pen pressure; one window. [hardware-parity.md](hardware-parity.md) |
 | Platforms | 2 | ~80% | 30–60 | [Platforms](#platforms) |
 | Ecosystem / add-ins | 2 | ~10% | 25–40 | [Ecosystem and AI](#ecosystem-and-ai) |
 | AI features | 2 | ~15% | 30–50 | [Ecosystem and AI](#ecosystem-and-ai) |
-| **Ready for real work** | 100 | **~55%** (54.6 computed: 0.45 × 64.0 features + the other rows × their weights) | **~628–1,023** | |
+| **Ready for real work** | 100 | **~55%** (54.8 computed: 0.45 × 64.2 features + the other rows × their weights) | **~627–1,020** | |
 
 How the full number is built: features ready is the weighted mean of the area table (64.0 now);
 ready for real work is the weighted mean of this table with the weights written under
@@ -348,6 +348,7 @@ The inventory carried over from the 2026-10-07 ROADMAP.md, updated for what land
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | Text is shaped on **both** paths: the grid and in-cell editor draw bidi runs in visual order with a visual caret, and PDF export shapes with cluster-exact `ToUnicode`. Page/print/PDF ready 58% → 62%, localization 10% → 15%, feature breadth 77% → 78%, ready for real work 54.6% → 54.8%; arithmetic recomputed from the tables |
 | 2026-10-30 | major | Consolidated re-score after the 10-29/30 wave: ready for real work 51.6 → 54.6 (charts 30 → 55, PivotTables 45 → 56, formula 72 → 78, functions 82 → 86, editing 70 → 73, PDF 55 → 58, review 40 → 44; file formats, UI/UX and stability +2 each), mainstream practitioner 50.6 → 56.1, essentials 63.1 → 66.7, feature breadth 75 → 77, catalog 280/295. Arithmetics recomputed from the tables, not adjusted by hand |
 | 2026-10-29 | minor | Large-workbook beta gate met: 100M cells 16.7 MiB live / 183 MiB peak with cold paging, 100k edit 20–25 ms, 1M rows, row and column structural maps; the performance readiness score is left conservative until M20/M19 polish closes and beta re-scores |
 | 2026-10-28 | minor | Whole-sheet operations: bulk edits scan blocked arrays once for the union of changed cells; Remove Duplicates on 1M×10 is 12 s (was 91), Sort 3.2 s, Fill Down 1M rows 1.45 s, and sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) |
