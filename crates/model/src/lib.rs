@@ -12,6 +12,7 @@ pub mod line;
 pub mod password;
 pub mod preserved;
 pub mod sheet;
+mod slicer;
 pub mod store;
 pub mod style;
 pub mod workbook;
@@ -22,6 +23,7 @@ pub use line::{LineAxis, LineMap};
 pub use password::PasswordHash;
 pub use preserved::{Preserved, PreservedPart, PreservedRel, PreservedSheet, PreservedXml};
 pub use sheet::{DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, LineIndex, Sheet, SheetViewMode, Visibility, points_to_chars};
+pub use slicer::{PivotSlicer, PivotTimeline, SlicerItem, SlicerSort, SlicerValue, TimeUnit};
 pub use store::{BandBatch, CellStore, Compacted, Packed, PageCacheStats, SpillOptions};
 pub use style::{
     Alignment, BorderLine, BorderStyle, Borders, Color, Fill, Font, HAlign, NumFmt, PatternType, Style, StyleId, StyleTable, Theme, Underline,

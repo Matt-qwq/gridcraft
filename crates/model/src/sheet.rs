@@ -96,6 +96,12 @@ pub struct Sheet {
     /// On-sheet slicer widgets (filter a table column by clicking value tiles).
     #[serde(default)]
     pub slicers: Vec<Slicer>,
+    /// Slicers bound to a PivotTable's cache (Excel's Insert ▸ Slicer); saved in `.xlsx`.
+    #[serde(default)]
+    pub pivot_slicers: Vec<crate::slicer::PivotSlicer>,
+    /// Timelines bound to a PivotTable's cache (Excel's Insert ▸ Timeline).
+    #[serde(default)]
+    pub pivot_timelines: Vec<crate::slicer::PivotTimeline>,
     /// PivotTables whose output lives on this sheet.
     #[serde(default)]
     pub pivots: Vec<PivotTable>,
@@ -159,6 +165,8 @@ impl Sheet {
             shapes: vec![],
             sparklines: vec![],
             slicers: vec![],
+            pivot_slicers: vec![],
+            pivot_timelines: vec![],
             pivots: vec![],
             protection: None,
             edit_ranges: vec![],

@@ -375,6 +375,12 @@ impl Workbook {
             for c in &s.slicers {
                 m = m.max(c.id);
             }
+            for c in &s.pivot_slicers {
+                m = m.max(c.id);
+            }
+            for c in &s.pivot_timelines {
+                m = m.max(c.id);
+            }
         }
         m + 1
     }
