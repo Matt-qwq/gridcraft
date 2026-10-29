@@ -175,11 +175,13 @@ fn names_and_tables_survive_hostile_values() {
     // A glyph id past the end has no data and does not panic.
     assert!(face.glyph_data(9999).is_none());
     assert_eq!(face.components(&[]), return_bad());
-    // A cmap with a huge record count does not walk past the table.
+    // A cmap with a huge record count and no subtable bytes behind the records does not walk
+    // past the table.
     let b = testfont::basic();
     let mut tables = b.tables();
     if let Some((_, cmap)) = tables.iter_mut().find(|(t, _)| *t == b"cmap") {
         cmap[2..4].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        cmap.truncate(20);
     }
     let face = Face::parse(testfont::assemble(&tables)).expect("parse");
     assert_eq!(face.glyph('A'), 0, "a broken cmap maps nothing");

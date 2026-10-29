@@ -210,16 +210,21 @@ impl Builder {
         for _ in &segs {
             f4.extend_from_slice(&0u16.to_be_bytes());
         }
-        let astral: Vec<(u32, u16)> = self.cmap.iter().filter(|(c, _)| (*c as u32) >= 0xFFFF).map(|(c, g)| (*c as u32, *g)).collect();
-        let f12 = astral.last().map(|_| {
-            let cnt = astral.len() as u32;
+        // A face with a (3, 10) format 12 subtable must list *every* character there: a shaper
+        // picks the best subtable by platform/encoding and does not fall back to format 4 (real
+        // fonts write both complete). The format 4 table below stays the BMP-only twin.
+        let has_astral = self.cmap.iter().any(|(c, _)| (*c as u32) >= 0xFFFF);
+        let f12 = has_astral.then(|| {
+            let mut all: Vec<(u32, u16)> = self.cmap.iter().map(|(c, g)| (*c as u32, *g)).collect();
+            all.sort_unstable();
+            let cnt = all.len() as u32;
             let mut f = Vec::new();
             f.extend_from_slice(&12u16.to_be_bytes());
             f.extend_from_slice(&0u16.to_be_bytes());
             f.extend_from_slice(&(16 + cnt * 12).to_be_bytes());
             f.extend_from_slice(&0u32.to_be_bytes());
             f.extend_from_slice(&cnt.to_be_bytes());
-            for (c, g) in &astral {
+            for (c, g) in &all {
                 f.extend_from_slice(&c.to_be_bytes());
                 f.extend_from_slice(&c.to_be_bytes());
                 f.extend_from_slice(&(*g as u32).to_be_bytes());
