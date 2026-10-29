@@ -125,7 +125,7 @@ impl Palette {
     }
 
     /// A colour from a BIFF colour index.
-    fn color(&self, index: u16) -> Color {
+    pub(super) fn color(&self, index: u16) -> Color {
         match index {
             ICV_AUTOMATIC | ICV_AUTO => Color::Auto,
             _ => self.colors.get(usize::from(index)).map_or(Color::Auto, |rgb| Color::Rgb(*rgb)),
@@ -133,7 +133,7 @@ impl Palette {
     }
 
     /// A fill or border colour: 64 is automatic, 65 is the system background.
-    fn fill_color(&self, index: u16) -> Color {
+    pub(super) fn fill_color(&self, index: u16) -> Color {
         if index >= ICV_AUTO {
             return Color::Auto;
         }

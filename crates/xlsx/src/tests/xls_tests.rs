@@ -133,36 +133,36 @@ pub(crate) fn compound(name: &str, data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rec(id: u16, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn rec(id: u16, payload: &[u8]) -> Vec<u8> {
     let mut v = id.to_le_bytes().to_vec();
     v.extend_from_slice(&(payload.len() as u16).to_le_bytes());
     v.extend_from_slice(payload);
     v
 }
 
-fn cat(parts: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn cat(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
 }
 
-fn u16s(v: &[u16]) -> Vec<u8> {
+pub(crate) fn u16s(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
 /// Cell header: row, column, XF index.
-fn cell(r: u16, c: u16, xf: u16) -> Vec<u8> {
+pub(crate) fn cell(r: u16, c: u16, xf: u16) -> Vec<u8> {
     u16s(&[r, c, xf])
 }
 
-fn bof(dt: u16) -> Vec<u8> {
+pub(crate) fn bof(dt: u16) -> Vec<u8> {
     rec(0x0809, &cat(&[&u16s(&[0x0600, dt, 0x0DBB, 0x07CC]), &[0; 8]]))
 }
 
-fn eof() -> Vec<u8> {
+pub(crate) fn eof() -> Vec<u8> {
     rec(0x000A, &[])
 }
 
 /// XLUnicodeString with compressed characters.
-fn xlstr(s: &str) -> Vec<u8> {
+pub(crate) fn xlstr(s: &str) -> Vec<u8> {
     cat(&[&(s.len() as u16).to_le_bytes(), &[0], s.as_bytes()])
 }
 
@@ -697,7 +697,7 @@ fn xf(x: &Xf) -> Vec<u8> {
 }
 
 /// A `PALETTE` record: colours for indices 8 onward.
-fn palette(colors: &[(u8, u8, u8)]) -> Vec<u8> {
+pub(crate) fn palette(colors: &[(u8, u8, u8)]) -> Vec<u8> {
     let mut p = (colors.len() as u16).to_le_bytes().to_vec();
     for (r, g, b) in colors {
         p.extend_from_slice(&[*r, *g, *b, 0]);
