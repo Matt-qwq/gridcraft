@@ -80,7 +80,7 @@ struct Dir {
 /// handle to the same font.
 #[derive(Clone)]
 pub struct Face {
-    data: Arc<Vec<u8>>,
+    data: Arc<[u8]>,
     dir: Arc<Vec<Dir>>,
     units_per_em: u16,
     num_glyphs: u16,
@@ -108,7 +108,7 @@ impl fmt::Debug for Face {
 impl Face {
     /// Reads the tables a PDF embedding needs. `data` is the whole font file.
     pub fn parse(data: Vec<u8>) -> Result<Face, Error> {
-        let data = Arc::new(data);
+        let data = Arc::<[u8]>::from(data);
         let dir = Arc::new(read_directory(&data)?);
         let table = |tag: &[u8; 4]| -> Option<&[u8]> {
             let d = dir.iter().find(|d| &d.tag == tag)?;
@@ -166,6 +166,12 @@ impl Face {
     fn table(&self, tag: &[u8; 4]) -> Option<&[u8]> {
         let d = self.dir.iter().find(|d| &d.tag == tag)?;
         self.data.get(d.off..d.off.checked_add(d.len)?)
+    }
+
+    /// The font file this face was parsed from, shared (no copy) so the text engine can register
+    /// the same bytes for shaping that this subsetter embeds.
+    pub fn bytes(&self) -> Arc<[u8]> {
+        Arc::clone(&self.data)
     }
 
     /// Em size in font units.
