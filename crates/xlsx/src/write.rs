@@ -400,6 +400,7 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
         kept: Default::default(),
     };
     out.kept.reserve_vml_blocks(wb);
+    out.kept.set_workbook_facts(wb);
     out.default_type("rels", "application/vnd.openxmlformats-package.relationships+xml");
     out.default_type("xml", "application/xml");
 
@@ -555,9 +556,10 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
     }
     w.push_str("/>");
     w.push_str(&pivots.workbook_xml(&mut wb_rels));
-    let exts = crate::passthrough::workbook_elements(wb, "ext");
-    if !exts.is_empty() {
-        let _ = write!(w, "<extLst>{exts}</extLst>");
+    let exts = crate::passthrough::workbook_elements(wb, crate::passthrough::CALC_SLOT);
+    let kept_exts = &kept.ext;
+    if !exts.is_empty() || !kept_exts.is_empty() {
+        let _ = write!(w, "<extLst>{exts}{kept_exts}</extLst>");
     }
     w.push_str("</workbook>");
 
@@ -679,7 +681,16 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
     for (name, part) in parts {
         zip.add_part(&name, part);
     }
-    zip.finish()
+    let bytes = zip.finish()?;
+    // Every package the test suite saves is held to the strict check (`testing::check_package`):
+    // a relationship to a missing part, a part without a content type, an orphan part or a stale
+    // content-type override fails the test that saved it. Packages over 8 MiB are skipped (the
+    // check unpacks and parses everything again); the pass-through tests check those themselves.
+    #[cfg(test)]
+    if precompress_sheets && bytes.len() <= 8 * 1024 * 1024 {
+        crate::testing::check_package(&bytes).map_err(|e| IoError::Format(format!("the written package is not valid: {e}")))?;
+    }
+    Ok(bytes)
 }
 
 /// Cell metadata declaring dynamic-array formulas (MS-XLSX `XLDAPR`).

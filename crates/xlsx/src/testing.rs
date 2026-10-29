@@ -260,3 +260,151 @@ pub(crate) fn encrypt_standard(plain: &[u8], password: &str) -> (Vec<u8>, Vec<u8
     info.extend(encrypt_ecb(&key, &Hash::Sha1.digest(&[&VERIFIER])));
     (info, package(plain.len(), encrypt_ecb(&key, plain)))
 }
+
+// ---------------------------------------------------------------- package validator
+
+/// A strict check of an `.xlsx` package, for tests: every relationship target exists, every part
+/// has a content type, no part is orphaned, and `[Content_Types].xml` has no override for a part
+/// the package doesn't have. These are the four ways a package makes Excel show a repair prompt.
+///
+/// The writer runs it on every package the test suite saves ([`crate::write::checked`]), so a
+/// future change that writes a part without a relationship (or a relationship to a part it forgot
+/// to write) fails every test that saves, not one.
+pub fn check_package(bytes: &[u8]) -> Result<(), String> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("not a zip: {e}"))?;
+    let mut parts: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).map_err(|e| format!("entry {i}: {e}"))?;
+        if f.is_dir() {
+            continue;
+        }
+        let mut v = vec![];
+        std::io::Read::read_to_end(&mut f, &mut v).map_err(|e| format!("{}: {e}", f.name()))?;
+        parts.insert(f.name().to_string(), v);
+    }
+    check_unpacked(&parts)
+}
+
+/// [`check_package`] for a package that is already unpacked (part name → bytes).
+pub fn check_unpacked(parts: &std::collections::HashMap<String, Vec<u8>>) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    use crate::package::{normalize, resolve, split_dir};
+    use crate::xml;
+
+    let ct = parts.get("[Content_Types].xml").ok_or("[Content_Types].xml is missing")?;
+    let types = xml::parse(ct).map_err(|e| format!("[Content_Types].xml is not XML: {e}"))?;
+    let mut defaults: HashMap<String, String> = HashMap::new();
+    for d in types.kids("Default") {
+        let (Some(ext), Some(_)) = (d.attr("Extension"), d.attr("ContentType")) else {
+            return Err("[Content_Types].xml has a <Default> without Extension or ContentType".into());
+        };
+        if defaults.insert(ext.to_ascii_lowercase(), d.attr("ContentType").unwrap_or("").to_string()).is_some() {
+            return Err(format!("[Content_Types].xml declares the extension .{ext} twice"));
+        }
+    }
+    let mut overrides: HashSet<String> = HashSet::new();
+    for o in types.kids("Override") {
+        let (Some(p), Some(_)) = (o.attr("PartName"), o.attr("ContentType")) else {
+            return Err("[Content_Types].xml has an <Override> without PartName or ContentType".into());
+        };
+        let key = normalize(p);
+        if !overrides.insert(key.clone()) {
+            return Err(format!("[Content_Types].xml has two overrides for /{key}"));
+        }
+        if !parts.keys().any(|n| normalize(n) == key) {
+            return Err(format!("[Content_Types].xml has a stale override for /{key}: the package has no such part"));
+        }
+    }
+
+    // Content types, part-name uniqueness and the relationship graph.
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    let mut lower: HashMap<String, String> = HashMap::new();
+    for name in parts.keys() {
+        if let Some(other) = lower.insert(name.to_ascii_lowercase(), name.clone()) {
+            return Err(format!("part names differ only in case: {other} and {name}"));
+        }
+        if name != "[Content_Types].xml" {
+            let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+            let covered = overrides.contains(&normalize(name)) || ext.is_some_and(|e| defaults.contains_key(&e));
+            if !covered {
+                return Err(format!("{name} has no content type"));
+            }
+        }
+        if !name.ends_with(".rels") {
+            continue;
+        }
+        let source = rels_source(name)?;
+        if let Some(src) = &source
+            && !parts.keys().any(|n| normalize(n) == normalize(src))
+        {
+            return Err(format!("{name} is the relationships of {src}, which the package doesn't have"));
+        }
+        let root = xml::parse(parts.get(name).map(Vec::as_slice).unwrap_or_default()).map_err(|e| format!("{name}: {e}"))?;
+        let dir = source.as_deref().map(|s| split_dir(s).0).unwrap_or("");
+        let mut ids: HashSet<&str> = HashSet::new();
+        let mut targets = vec![];
+        for r in root.kids("Relationship") {
+            let (Some(id), Some(target)) = (r.attr("Id"), r.attr("Target")) else {
+                return Err(format!("{name}: a <Relationship> has no Id or no Target"));
+            };
+            if !ids.insert(id) {
+                return Err(format!("{name}: the relationship id {id} is used twice"));
+            }
+            if r.attr("TargetMode").is_some_and(|m| m.eq_ignore_ascii_case("External")) {
+                continue;
+            }
+            let t = resolve(dir, target);
+            if !parts.keys().any(|n| normalize(n) == normalize(&t)) {
+                return Err(format!("{name}: {id} points at {target} (={t}), which the package doesn't have"));
+            }
+            targets.push(t);
+        }
+        edges.insert(source.clone().unwrap_or_default(), targets);
+    }
+
+    // No part is orphaned: every one is reachable from the package root through relationships.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = edges.get("").cloned().unwrap_or_default().into();
+    while let Some(n) = queue.pop_front() {
+        if !seen.insert(n.clone()) {
+            continue;
+        }
+        if let Some(next) = edges.get(&n) {
+            queue.extend(next.iter().cloned());
+        }
+    }
+    for name in parts.keys() {
+        if name == "[Content_Types].xml" {
+            continue;
+        }
+        if !name.ends_with(".rels") {
+            if !seen.iter().any(|n| normalize(n) == normalize(name)) {
+                return Err(format!("{name} is orphaned: no relationship points at it"));
+            }
+            continue;
+        }
+        match rels_source(name)? {
+            Some(src) if !seen.iter().any(|n| normalize(n) == normalize(&src)) => {
+                return Err(format!("{name} is orphaned: its part {src} is not reachable from the package root"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The part a `.rels` part describes: `xl/_rels/sheet1.xml.rels` → `xl/worksheets/sheet1.xml`… seen
+/// relative to its own folder; `_rels/.rels` → the package root (`None`).
+fn rels_source(name: &str) -> Result<Option<String>, String> {
+    use crate::package::split_dir;
+    let (dir, file) = split_dir(name);
+    let stem = file.strip_suffix(".rels").ok_or_else(|| format!("{name} is not a .rels part"))?;
+    if stem.is_empty() {
+        return Ok(None);
+    }
+    let Some(parent) = dir.strip_suffix("_rels").map(|p| p.strip_suffix('/').unwrap_or(p)) else {
+        return Err(format!("{name} is not in a _rels folder"));
+    };
+    Ok(Some(if parent.is_empty() { stem.to_string() } else { format!("{parent}/{stem}") }))
+}
