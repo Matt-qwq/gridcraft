@@ -1893,10 +1893,22 @@ impl Calc {
             // the other cells and ignores the error). Excel shows 0 with a warning; we keep it
             // explicit. Without this the loop's cells hold values that depend on the order the
             // pass happened to compute them in (found by the command-sequence fuzzer).
+            //
+            // An array this pass laid out but then dropped (the anchor turned out to be circular)
+            // leaves the cells it would have spilled over empty. Formulas that read that area —
+            // a whole-column `COUNTIF` is one — read its values during the pass, so they are
+            // evaluated again after the write-back.
+            let mut discarded: Vec<(usize, RangeRef)> = Vec::new();
             if !wb.calc.iterative && !cycles.is_empty() {
                 for k in &cycles {
                     results.insert(*k, Slot { value: Some(Value::Error(CellError::Circ)) });
-                    spills.remove(k);
+                    if let Some(arr) = spills.remove(k) {
+                        let end = CellRef::new(
+                            k.1.row.saturating_add((arr.rows as u32).saturating_sub(1)),
+                            k.1.col.saturating_add((arr.cols as u32).saturating_sub(1)),
+                        );
+                        discarded.push((k.0, RangeRef::new(k.1, end)));
+                    }
                 }
             }
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
@@ -1907,6 +1919,9 @@ impl Calc {
             found_cycles.extend(cycles.iter().copied());
             // Write back.
             let mut spill_changes: Vec<Key> = Vec::new();
+            for (si, range) in discarded {
+                self.graph.dependents_of_range(si, range, &mut spill_changes);
+            }
             let mut freed: Vec<(usize, RangeRef)> = Vec::new();
             let twr = prof_now();
             // Row-major order: the results come out of a hash map, and walking bands in row order
@@ -2012,6 +2027,13 @@ impl Calc {
                         (None, Some(_)) => false,
                     };
                     spill_changes.extend(deps.into_iter().filter(|d| d != k || freed));
+                    // The spill moved the sheet's used range, and a formula that reads a whole
+                    // column or row (trimmed to it) reads different cells now even when the
+                    // spill lies nowhere near it.
+                    spill_changes.extend(self.graph.trim.iter().filter(|t| t.0 == k.0).copied());
+                    // A dynamic reference (INDIRECT, OFFSET, a defined name) can hide a read of
+                    // the cells the spill just gave back; the graph does not name them.
+                    spill_changes.extend(self.graph.dynamic.iter().filter(|d| d.0 == k.0).copied());
                 }
                 if let Some(o) = old
                     && !sheet.spill_ranges.get(&k.1).is_some_and(|n| n.contains(o.start) && n.contains(o.end))
