@@ -883,7 +883,7 @@ fn paint_panes(
             continue;
         }
         let p = painter.with_clip_rect(*clip);
-        paint_quadrant(&p, geo, wb, si, sh, *rows, *cols, cf, t);
+        paint_quadrant(&p, geo, wb, si, sh, *rows, *cols, cf, t, &app.text);
         paint_selection(&p, geo, sh, sel, t, app, *rows, *cols);
     }
     // Freeze lines.
@@ -1111,6 +1111,7 @@ pub(crate) fn paint_quadrant(
     cols: (u32, u32),
     cf: &mut CfCache,
     t: &Tokens,
+    engine: &crate::text::GridText,
 ) {
     let z = geo.z;
     let (r0, r1) = rows;
@@ -1267,7 +1268,7 @@ pub(crate) fn paint_quadrant(
             continue;
         }
         let color = ncolor.unwrap_or(lk.text_color);
-        let halign = match st.align.h {
+        let mut halign = match st.align.h {
             HAlign::General => match v {
                 Value::Number(_) => HAlign::Right,
                 Value::Bool(_) | Value::Error(_) => HAlign::Center,
@@ -1302,20 +1303,40 @@ pub(crate) fn paint_quadrant(
         let first_line: String = text.chars().filter(|&ch| ch != '\n' && ch != '\r').collect();
         // The fill position indexes `text`; move it back by the breaks removed before it.
         let fill_char = fill_char.map(|(ch, pos)| (ch, pos.saturating_sub(text.get(..pos).map_or(0, |s| s.matches(['\n', '\r']).count()))));
+        // One line of shaped text: bidi runs in visual order, Arabic joined, Indic reordered. The
+        // measure it carries is the width the line is drawn at, so the #### test, Shrink to fit
+        // and overflow all agree with the drawing (and with AutoFit, which asks the same engine).
+        let direction = crate::text::base_direction(&first_line, sh.right_to_left);
+        let mut line = engine.line(p.ctx(), &font, &first_line, direction, color);
+        // General-aligned text follows its own reading direction: right-to-left text aligns
+        // right, as in Excel. Numbers and dates keep the alignment their format asks for, and a
+        // right-to-left *sheet* already puts general text on the right once the grid is mirrored.
+        if !geo.rtl
+            && st.align.h == HAlign::General
+            && !numeric
+            && halign == HAlign::Left
+            && line.shaped.as_ref().is_some_and(|s| s.base_direction.is_rtl())
+        {
+            halign = HAlign::Right;
+        }
+        let mut w = line.width;
         // Shrink to fit: too-wide content is drawn in a smaller font so it fits the cell (or the
         // merged area): it neither spills, nor is clipped, nor turns into ####.
         let small = (st.align.shrink && !rotated && st.align.h != HAlign::Fill && fill_char.is_none())
-            .then(|| shrink_font(p, &first_line, &font, avail_w - 2.0 * pad - indent))
+            .then(|| shrink_font(p, engine, &first_line, &font, avail_w - 2.0 * pad - indent, direction))
             .flatten();
         let shrunk = small.is_some();
         let font = small.unwrap_or(font);
-        let mut galley = p.layout_no_wrap(first_line.clone(), font.clone(), color);
-        let mut w = galley.size().x;
+        if shrunk {
+            line = engine.line(p.ctx(), &font, &first_line, direction, color);
+            w = line.width;
+        }
         // Numbers and dates never overflow: they show #### when too narrow.
         if !shrunk && (numeric || matches!(v, Value::Number(_))) && w > avail_w - 2.0 * pad && st.align.h != HAlign::Fill {
             let n = ((avail_w - 2.0 * pad) / char_w).floor().max(1.0) as usize;
-            galley = p.layout_no_wrap("#".repeat(n), font.clone(), color);
-            w = galley.size().x;
+            let hashes = "#".repeat(n);
+            w = engine.measure(p.ctx(), &font, &hashes, direction);
+            line = engine.line(p.ctx(), &font, &hashes, direction, color);
         }
         // Repeat fill (`*` in number formats) / Fill alignment.
         if let Some((ch, pos)) = fill_char
@@ -1328,8 +1349,8 @@ pub(crate) fn paint_quadrant(
             if first_line.is_char_boundary(pos) {
                 s.insert_str(pos, &ch.to_string().repeat(n));
             }
-            galley = p.layout_no_wrap(s, font.clone(), color);
-            w = galley.size().x;
+            line = engine.line(p.ctx(), &font, &s, direction, color);
+            w = line.width;
         }
         // Center Across Selection: the text is centred over this cell and the empty cells to its right that also use it.
         let across_end = if halign == HAlign::CenterAcross && !rotated && in_merge(c).is_none() {
@@ -1383,7 +1404,7 @@ pub(crate) fn paint_quadrant(
             HAlign::Right => rect.right() - pad - w - indent,
             _ => text_left + pad + indent,
         };
-        let gh = galley.size().y;
+        let gh = line.height();
         let y = cell_text_y(st.align.v, *rect, gh, z);
         let cp = p.with_clip_rect(clip.intersect(p.clip_rect()));
         if rotated {
@@ -1393,14 +1414,14 @@ pub(crate) fn paint_quadrant(
                 let job = egui::text::LayoutJob::simple(text.clone(), font.clone(), color, (rect.height() - 2.0 * pad).max(4.0));
                 p.layout_job(job)
             } else {
-                galley.clone()
+                line.galley.clone()
             };
             let pos = rotated_text_pos(*rect, galley.size(), angle, painted_halign(st.align.h, geo.rtl), st.align.v, pad, indent);
             let mut shape = egui::epaint::TextShape::new(pos, galley, color);
             shape.angle = angle;
             cp.add(shape);
         } else {
-            cp.galley(pos2(x, y), galley.clone(), color);
+            line.paint(&cp, pos2(x, y), color);
         }
         let baseline = y + gh * 0.82;
         match st.font.underline {
@@ -1615,8 +1636,15 @@ fn merged_edges(
 
 /// The smaller font that makes `text` fit in `room` points of width (Shrink to fit), or `None`
 /// when it already fits at its own size.
-fn shrink_font(p: &Painter, text: &str, font: &FontId, room: f32) -> Option<FontId> {
-    let natural = p.layout_no_wrap(text.to_string(), font.clone(), Color32::PLACEHOLDER).size().x;
+fn shrink_font(
+    p: &Painter,
+    engine: &crate::text::GridText,
+    text: &str,
+    font: &FontId,
+    room: f32,
+    direction: gridcraft_engine::core::text::Direction,
+) -> Option<FontId> {
+    let natural = engine.measure(p.ctx(), font, text, direction);
     let room = room.max(1.0);
     if natural.is_nan() || natural <= room {
         return None;
@@ -3223,7 +3251,7 @@ fn in_cell_editor(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, sh: &Sheet, 
         let wrapped = ui.painter().layout(ed.text.clone(), font.clone(), Color32::BLACK, (rect.width() - 4.0).max(1.0));
         (rect.width(), (wrapped.size().y.max(size * 1.3 * lines) + 4.0).max(rect.height()))
     } else {
-        let text_w = ui.painter().layout_no_wrap(ed.text.clone(), font.clone(), Color32::BLACK).size().x;
+        let text_w = app.text.measure(ui.ctx(), &font, &ed.text, crate::text::base_direction(&ed.text, sh.right_to_left));
         // Excel keeps the cell's height for one line and only grows for extra lines.
         let h = if lines > 1.0 { (size * 1.3 * lines + 4.0).max(rect.height()) } else { rect.height() };
         ((text_w + 14.0).max(rect.width()).min(geo.cells.right() - rect.left()), h)
