@@ -211,8 +211,8 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Line metadata, 1M custom heights | `Sheet::clone` **0.13 ms**, insert/delete **0.013/0.007 ms**, 10k inherited lines 0.1 ms; `LineIndex` build 6.6 ms (cached per revision) | immediate | measured 2026-10-29, `_gridcraft-bench/linebench` |
 | Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
-Work: M20/M19 polish (compaction wiring, mapped value writes, spill placement and byte budget,
-flat-memory save), then M17 zone maps and the M21 Parquet read half after beta. The
+Work: M20/M19 polish (mapped value writes, spill placement and byte budget, flat-memory save),
+then M17 zone maps and the M21 Parquet read half after beta. The
 old streaming/threading/whole-column items are landed; keep the measured workbooks and
 `cargo xtask bench` as the regression net.
 

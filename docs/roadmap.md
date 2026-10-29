@@ -22,7 +22,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 
 | Order | Work | Gap | Hours | Depends / notes |
 |---|---|---|---|---|
-| **0** | **Close the base**: M20 compaction (model half landed 10-29; page-aware pass and a caller remain); mapped `set_values`, logical `diff`, physical-column `visit_packed`; M19 spill-beside-document, byte-budget LRU, flat-memory save/scan | M20/M19 follow-up | **20–30** | Start now; no owner. This is the last large-workbook debt before beta evidence. |
+| **0** | **Close the base**: M20 mapped `set_values`, logical `diff`, physical-column `visit_packed`; M19 spill-beside-document, byte-budget LRU, flat-memory save/scan | M20/M19 follow-up | **20–30** | Compaction (page-aware pass and its `document.compact`/save caller) landed 10-29. This is the last large-workbook debt before beta evidence. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair; pass-through/unmodelled parts in the same pass | #1 + #3 | 21–35 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
@@ -105,7 +105,7 @@ to check our files (gate #1/#8), and Windows machines with the reported GPU driv
 | M17 | Block statistics (zone maps) for skips and whole-column bounds | planned |
 | M18 | Vectorized aggregation kernels | landed (10-24/27): whole-column folds and recalc kernels; remaining work in gaps |
 | M19 | Cold paging: bands leave memory when unused | **landed (10-28)**: compressed pages + 4,096-band LRU; spill-beside-document, byte budget and save/scan remain |
-| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **rows, columns and line metadata landed (10-29)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20, chunked line metadata; compaction landed at model level (page-aware pass and caller remain); wave 0 closes mapped value writes and M19 |
+| M20 | Append-style structural edits (segments, no whole-sheet shifts) | **rows, columns, line metadata and compaction landed (10-29)**: logical→physical maps, 3.7 ms row / 9.8 ms column on 1M×20, chunked line metadata, page-aware `compact` with `document.compact` and a save caller; wave 0 closes mapped value writes and M19 |
 | M21 | Parquet / Arrow interchange and linked tables | export half done (10-24); reading/linked tables are post-beta (not a beta gate) |
 | M22 | A native working format | deferred with four measured triggers (10-26) |
 
@@ -597,13 +597,18 @@ The 1M×10 case is 3.9 / 4.0 ms and 36.8 / 35.7 ms commit. A save/reopen test ke
 shifted formula, and the model test checks the map, insertion into a gap, delete, iteration and JSON
 round trip. Full 414 engine tests, 52 model, 265 xlsx, 86 calc and release fuzz 100×200 stay green.
 
-**Compaction (10-29).** `CellStore::compact()` walks only live bands, drops cells whose physical
-row or column has no logical inverse, removes emptied bands and exacts `len`; `RowMap::normalize`
-and `ColMap::normalize` merge runs, bound the column free list and return a contiguous map to the
-identity fast path. It is idempotent and leaves mapped cells unchanged; the new tests cover orphan
-rows/columns, fragmentation, free-list bounds, serialization and a paged store. It does not decode
-or rewrite pages yet: paged orphans stay counted and unreadable, and no engine/UI caller invokes
-`compact` yet. Model tests are now 52 (33 store tests), up from 46.
+**Compaction (10-29).** `CellStore::compact()` returns `Compacted` and is **O(1)** when both maps
+are identity, covering every clean and freshly opened store. Otherwise it drops live orphan
+rows/columns, then visits only the pages a gap can leave an orphan in: row gaps map to band keys,
+column gaps test the page's bounds. Each candidate is decoded without priming the page cache;
+only a page that actually held an orphan is cloned, re-encoded, appended and replaced by a **new**
+`Arc<Page>`, so undo snapshots keep reading their old offsets and cells. Bounds and formula/array
+flags are recomputed, `len` is exacted once, and the maps return to identity only when every
+candidate was handled. `document.compact` (`noundo`, no menu) and the `file.save` hook (after a
+successful Xlsx/Json write, before the saved baseline) call it; other formats and exports do not.
+A clean 100M paged store pays the early-out; a decode counter proves a no-op pass visits zero
+pages. Model tests are **71** (42 store), engine **422**, xlsx 265. A page-file rewrite, byte budget
+and spill placement remain M19.
 
 **Line metadata (10-29).** `Sheet.rows`/`cols` are a `LineMap`: the cell store's logical→physical
 runs, with the entries themselves in 128-line `Arc` chunks. An insert or delete moves runs and
@@ -623,11 +628,11 @@ per `(document uid, revision, sheet)`; `Geo::new_with_lines`/`Geo::paged_with_li
 Scrolling, selection and zoom keep the cache; edits, undo/redo and sheet switches rebuild it. A
 sheet with a custom height on every row no longer walks a million lines once or twice a frame.
 
-**Remaining.** Compaction is model-only: a page-aware pass and a caller on save or idle are still
-missing. `set_values` on a mapped sheet takes the value-at-a-time path because logical and physical
-rows are no longer ordered together; `CellStore::diff` still compares physical cells (the engine
-skips array checks on structural commits); and `visit_packed` falls back to the logical walk on a
-column-mapped sheet. Those complete wave 0's M20 work beside the M19 polish.
+**Remaining.** `set_values` on a mapped sheet takes the value-at-a-time path because logical and
+physical rows are no longer ordered together; `CellStore::diff` still compares physical cells (the
+engine skips array checks on structural commits); and `visit_packed` falls back to the logical walk
+on a column-mapped sheet. Those complete wave 0's M20 work, then M19: spill beside the document, a
+byte-budget LRU and a flat-memory save/scan.
 
 **Acceptance (rows and columns).**
 - Insert one row above a 1M-row, 20-column sheet: **3.7 ms command / 35.8 ms commit**, below 50 ms;
@@ -753,6 +758,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 page-aware compaction: O(1) identity early-out, page candidates from map gaps (never a full sweep), snapshot-safe page replacement, `document.compact` (noundo) and a `file.save` hook; 71 model / 422 engine tests; page-file rewrite/byte budget stay in M19 |
 | 2026-10-29 | minor | M20 UI line geometry is cached per (document, revision, sheet): scrolling/selection/zoom reuse the `LineIndex` and outline axes, an edit or sheet switch rebuilds them; 26 targeted grid tests. 1M custom heights: clone 0.13 ms, insert/delete 0.013/0.007 ms (`linebench`) |
 | 2026-10-29 | minor | M20 line metadata maps through physical ids: chunked `LineMap`, logical JSON/XLSX, inserts inherit and deletes drop entries, undo charges unshared chunks; 62 model / 419 engine / 265 xlsx tests; wave 0 and beta estimate narrow to 20–30 base / ~155–240 |
 | 2026-10-29 | minor | M20 compaction at model level: `CellStore::compact` reclaims live orphan rows/columns and normalizes maps; 6 new model tests (52 total); page orphans and a save/idle caller remain |

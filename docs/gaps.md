@@ -99,7 +99,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   file is a temporary beside the system temp directory (not the document), the cache budget is a
   page count (not a byte count), and a save decodes the whole model transiently; the per-band value
   dictionaries still cost full price when values do not repeat;
-  model-level compaction landed 10-29 but paged orphans and a save/idle caller remain;
+  page-aware compaction landed 10-29 (O(1) identity early-out, gap-scoped page candidates,
+  snapshot-safe replacement, `document.compact` and a save hook); a page-file rewrite and
+  byte budget remain;
   `set_values` on a mapped sheet is value-at-a-time and `diff` is still physical;
   whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
   a ten-row used range in 0.0 ms). The 159 cells that still differ from the cached values of the
