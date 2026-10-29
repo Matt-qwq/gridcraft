@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-29 · **Change:** minor (XLSX pass-through keeps slicers, timelines, table query tables and unknown `extLst`, with a strict package validator; gaps §3 moves to 0–2 h left) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-29 · **Change:** minor (chart edits patch the kept part field by field, unmodelled chart kinds kept whole, secondary axis modelled/drawn; §4 → 4–9 h left) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -173,21 +173,30 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   error, custom `numRef`/`numLit`, both directions, `noEndCap`) and per-point fill/line/marker
   colour. Four commands: `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars`,
   `chart.formatPoint` — a chart kind that cannot store an option refuses it rather than holding a
-  dead value. An unmodelled chart part is kept byte-identically while the chart is untouched, and
-  `chart_options_roundtrip` pins build → save → reopen → second save byte equality. Catalog
-  274 → 279 / 290 → 295.
-- **Missing (in flight):** field-level pass-through (the first edit still drops unmodelled XML),
-  secondary and date axes, category-axis bounds drawn, charts of unmodelled kinds (3-D, surface,
-  pie-of-pie, Pareto) whose frame lives in the drawing part, chartex options, per-point label text.
-  The UI side — the Format pane driving the four commands and chart **resize** (#190) — has not
-  started.
-- **Evidence:** `Chart` holds only title, legend position, two flags and axis titles
-  (`crates/model/src/features.rs`); PRs #158, #161 open; charts can't be resized (#190). Smooth lines (#62), Switch Row/Column (#116) and trendlines (read, written, drawn) landed. Multi-level category axes (year beside month) are read, drawn and written back.
-  (`crates/model/src/features.rs`); all 2-D kinds survive XLSX round trip (#158, #161); charts
-  can't be resized (#190). Smooth lines (#62), Switch Row/Column (#116) and trendlines (read,
-  written, drawn) landed.
+  dead value. Catalog 274 → 279 / 290 → 295.
+- **Landed (10-29, second round):** an edit **patches** the chart part instead of regenerating it
+  (`crates/xlsx/src/chart_patch.rs`): only the changed element is rewritten, so everything we do not
+  model survives an edit — manual plot-area and label layout, label callouts and leader lines,
+  `dTable`, `serLines`, `overlap`, date-axis units, minor units and gridlines with their formatting,
+  axis `spPr`/`txPr`, legend entry and title-run formatting, series `extLst`, `printSettings` — with
+  the test asserting `part.replace(<patched element>, "")` equals the original bytes. Charts of
+  unmodelled kinds (3-D, surface, pie of pie, bar of pie, Pareto, filled map) are kept whole
+  (`Sheet::kept_charts`, `Obj::RawChart`) instead of being dropped or flattened. The secondary axis
+  is modelled (`Chart::y2_axis`), written, patched, drawn and addressable as `chart.setAxis axis:
+  "y2"`; category-axis bounds crop the drawn window.
+- **Missing:** the Format pane driving the four commands and chart **resize** (#190) — in flight as
+  the UI half; chartex (`chartExN.xml`) options on modelled chartex kinds are regenerated, not
+  patched; per-point label text/position/prefix and per-point marker size are not modelled; date-axis
+  units are kept but not editable; no command moves a series onto the secondary axis (so it applies
+  to charts read from files, and `insert.chart "combo"` puts every series on the primary axis);
+  from-cells labels, callouts added through the UI and chart templates are not there.
+- **Evidence:** `Chart` (`crates/model/src/features.rs`) now holds the option families above;
+  `chart_options_roundtrip` and `chart_unmodelled_kinds` pin build → save → reopen → second save
+  byte equality; the patch path is pinned per chart kind. Smooth lines (#62), Switch Row/Column
+  (#116) and trendlines (read, written, drawn) landed; multi-level category axes (year beside month)
+  are read, drawn and written back. Charts can't be resized yet (#190).
 - **Impact:** charts are in most business workbooks.
-- **Estimate:** 25–35 h for beta (40–60 h full). [chart-parity.md](chart-parity.md)
+- **Estimate:** 4–9 h for beta (40–60 h full). [chart-parity.md](chart-parity.md)
 
 ### 5. Text in non-Latin scripts doesn't render or export (L)
 - **Landed 10-29 (PDF half):** `gridcraft-core::fonts` finds a font file (`CRAFT_FONTS_DIR`, then the

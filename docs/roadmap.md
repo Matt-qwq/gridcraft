@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (Agile encryption write + `.xls` styles/comments: gate #7 partial; beta total ~114–193) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (chart edits patch the kept part, unmodelled kinds kept whole, secondary axis; gate #4 down to 4–9 h; beta total ~110–184) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -26,7 +26,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
 | **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair | #1 | 15–25 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. #3's pass-through half landed 10-29. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 10–15 | Parallel with 1; no owner. |
-| **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 8–18 | Longest gate. **A1 landed 10-29** (model, round-trip, render, four commands, catalog 279/295); field-level pass-through, secondary axes, unmodelled kinds and the Format pane + resize remain. |
+| **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 4–9 | **A1 landed 10-29** (model, round-trip, render, four commands, catalog 279/295) and **A7 landed 10-29** (an edit patches the kept part, so unmodelled chart XML survives; unmodelled kinds kept whole; secondary axis modelled, written, drawn). What remains: the Format pane + resize (#190, in flight as the UI half) and chartex/per-point-label fidelity. |
 | **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi (PDF half landed 10-29: subset TrueType embedding) | #5 | 6–12 | Parallel with 2; needs the ui-egui text path. |
 | **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
 | **3** | `.xls` import and password-protected workbooks | #7 | 12–24 | **Encryption write and `.xls` styles/comments landed 10-29**; DV/CF records, BIFF5 and hardening remain. |
@@ -69,14 +69,14 @@ and edge features. Each gate links its gap.
 | XLSX proven on a real-world corpus; Excel opens our output without repair | #1 | **open**; owner needed | 15–25 |
 | Unmodelled XLSX parts preserved on save | #3 | **met 10-29** (slicers, timelines, table query tables, unknown `extLst`, strict package validator); data model and chart `extLst` remain, Excel check folded into #1 | 0–4 |
 | 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | **met 10-28** (M19/M20); M20/M19 polish in wave 0 | 0 for the gate; 20–30 polish |
-| Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **partial 10-29**: axis scaling, data labels, error bars and per-point formatting modelled, round-tripped, drawn and command-driven (catalog 279/295); field-level pass-through, secondary axes and the UI Format pane + resize (#190) remain | 8–18 |
+| Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **partial 10-29**: axis scaling, data labels, error bars and per-point formatting modelled, round-tripped, drawn and command-driven, and an edit now patches the kept chart part so unmodelled XML (manual layout, callouts, `dTable`, date-axis units, `extLst`) survives; unmodelled kinds are kept whole instead of dropped; secondary axis modelled, written, drawn. Remaining: the UI Format pane + resize (#190), chartex options, per-point label text | 4–9 |
 | Text in every script renders and exports | #5 | **partial 10-29**: PDF export embeds subset TrueType, so Latin Ext/Greek/Cyrillic/Hebrew/Arabic/Devanagari/Thai/CJK/Hangul print (ASCII bytes unchanged, `pdftotext` verified); shaping, bidi and the on-screen path remain | 6–12 |
 | Calculation correctness bugs closed; iterative calculation | #6 | **open** | 10–15 |
 | `.xls` import, password-protected workbooks | #7 | **partial 10-29**: Agile encryption is written and a remembered password survives a save; `.xls` styles/comments read (DV, CF and BIFF5 still refused) | 12–24 |
 | PivotTables: slicers, calculated fields, PivotCharts, verified in Excel | #8 | **open**; verify with #1 | 20–30 |
 | Keyboard: key tips, shortcut audit, context menus | #9 | **met 10-29** (417 sequences, keyboard context menus, six shortcuts; the Menu key itself is blocked upstream) | 0–6 |
 | Field crashes and freezes closed; autosave/recovery soak | #10 | **open** | 8–12 |
-| **Total** | | gates #1, #4, #6, #8, #10 (pass-through #3, keyboard #9 met; charts #4, text #5, `.xls`/encryption #7 partly) | **~94–163 + 20–30 base = ~114–193** |
+| **Total** | | gates #1, #4, #6, #8, #10 (pass-through #3, keyboard #9 met; charts #4, text #5, `.xls`/encryption #7 partly) | **~90–154 + 20–30 base = ~110–184** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
 to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
@@ -818,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | Chart edits patch the kept chart part field by field (`chart_patch.rs`): only the changed element is rewritten, so unmodelled chart XML survives an edit; unmodelled kinds kept whole instead of dropped; secondary axis modelled, written, patched, drawn. Gate #4 down to 4–9 h, beta total ~110–184 |
 | 2026-10-29 | minor | M19 per-sheet save: worksheet XML deflates on a background worker as it is written, `write_zip` mixes raw/pre-deflated parts in order, wasm uses inline/sequential paths; 100M save **28.42 s / 1,814.3 MiB** (was 26.37 s / 6,049.8), 31.7M **3.48 s / 1,283.9 MiB**, byte-identical output; 273 xlsx / 423 engine tests |
 | 2026-10-29 | minor | Measured save peak after S4a: 31.7M cells saves in **3.92 s / 1,655.8 MiB peak**, 100M cells in **26.37 s / 6,049.8 MiB peak** (`session_breakdown`, release, counting allocator). The remaining peak is every sheet's XML in `Out.parts` plus the archive; S4b (per-sheet release) is next |
 | 2026-10-29 | minor | M19 writer ownership: `ZipOut::add` takes `Vec` parts, each moves into its deflate worker and is dropped there, zip64 is decided from a whole-archive bound before compression; output unchanged (37,153 bytes / `sha256 ae15eeb1…` pinned); 271 xlsx / 423 engine tests. Per-sheet release remains, after a measured save peak |
