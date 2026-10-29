@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M20 UI line geometry is cached per (document, revision, sheet): `Geo` takes the row/column `LineIndex` and outline axes from `GridState`, so a sheet with a custom height on every row no longer rebuilds 1M-entry prefix sums once or twice a frame; scrolling, selection and zoom reuse it, edits and sheet switches rebuild it. Targeted grid test only; the UI suite is unchanged |
 | 2026-10-29 | M20 line metadata maps through physical ids: `Sheet.rows`/`cols` are a `LineMap` with a logical→physical axis map and 128-line `Arc` chunks, so a row/column insert or delete moves runs instead of reindexing every custom line and an undo snapshot shares untouched chunks; JSON and XLSX still store logical lines, inheritance and delete semantics unchanged. Model 62 tests, engine 419, xlsx 265; undo accounting charges unshared chunks |
 | 2026-10-29 | M20 compaction at model level: `CellStore::compact()` reclaims live orphan rows/columns and normalizes row/column maps, with 6 new model tests (52 total); paged orphans and a save/idle caller remain |
 | 2026-10-29 | Roadmap re-planned: wave 0 closes the M20/M19 base (30–45 h), wave 1 proves XLSX in Excel/corpus with the owner (21–35 h), then calc/text/keyboard/charts, `.xls`/encryption and Pivot slicers; beta exit is wave 4. Post-beta puts M21 read/linked tables, zone maps, localization and Get & Transform. M22 stays deferred. The old PR-queue wave is folded into the gap it addresses |
@@ -244,6 +245,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 UI line geometry cached per (uid, revision, sheet); 1M-custom-height sheets stop rebuilding `LineIndex`/outline axes every frame; targeted `grid::` tests only |
 | 2026-10-29 | minor | M20 line metadata maps through physical ids (chunked `LineMap`, logical JSON/XLSX, O(1) clone; 62 model / 419 engine / 265 xlsx tests); wave 0 narrows to compaction wiring, mapped value writes and M19, beta ~150–240 h |
 | 2026-10-29 | minor | M20 compaction at model level (live orphan rows/columns, map normalization, 6 new tests; 52 model total); page-aware pass and caller remain |
 | 2026-10-29 | major | Roadmap re-planned after M19/M20: large-workbook beta gate met; wave 0 base (30–45 h), wave 1 XLSX/Excel (21–35 h, owner), waves 2–3 fidelity/formats, wave 4 beta exit; M21 post-beta, M22 deferred |

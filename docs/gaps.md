@@ -92,7 +92,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   column insert/delete moves runs instead of reindexing every custom height, hidden line or
   outline entry, an undo snapshot shares untouched chunks, and JSON/XLSX still store logical lines.
   Insert inheritance, delete, undo and a mapped-sheet XLSX round trip are covered (model 62,
-  engine 419, xlsx 265 tests).
+  engine 419, xlsx 265 tests). The UI also caches the derived `LineIndex`/outline axes per
+  `(document, revision, sheet)`, so a 1M-custom-height sheet no longer rebuilds them every frame.
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the spill
   file is a temporary beside the system temp directory (not the document), the cache budget is a

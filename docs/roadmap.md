@@ -615,6 +615,11 @@ geometry, sort/filter, clipboard and the file reader/writer all take the logical
 accounting charges only chunks a snapshot does not share. Model tests are 62, engine 419, xlsx 265;
 `cargo check --workspace --all-targets` compiles (the UI test suite was not run).
 
+**UI geometry (10-29).** `GridState` caches the derived `LineIndex` prefix sums and outline axes
+per `(document uid, revision, sheet)`; `Geo::new_with_lines`/`Geo::paged_with_lines` consume them.
+Scrolling, selection and zoom keep the cache; edits, undo/redo and sheet switches rebuild it. A
+sheet with a custom height on every row no longer walks a million lines once or twice a frame.
+
 **Remaining.** Compaction is model-only: a page-aware pass and a caller on save or idle are still
 missing. `set_values` on a mapped sheet takes the value-at-a-time path because logical and physical
 rows are no longer ordered together; `CellStore::diff` still compares physical cells (the engine
@@ -745,6 +750,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | M20 UI line geometry is cached per (document, revision, sheet): scrolling/selection/zoom reuse the `LineIndex` and outline axes, an edit or sheet switch rebuilds them; 26 targeted grid tests |
 | 2026-10-29 | minor | M20 line metadata maps through physical ids: chunked `LineMap`, logical JSON/XLSX, inserts inherit and deletes drop entries, undo charges unshared chunks; 62 model / 419 engine / 265 xlsx tests; wave 0 and beta estimate narrow to 20–30 base / ~155–240 |
 | 2026-10-29 | minor | M20 compaction at model level: `CellStore::compact` reclaims live orphan rows/columns and normalizes maps; 6 new model tests (52 total); page orphans and a save/idle caller remain |
 | 2026-10-29 | major | Roadmap re-planned after M19/M20: current focus, execution queue, parallel plan, beta gate status and post-beta order set; large-workbook gate marked met and the old PR-queue wave folded into the gaps |
