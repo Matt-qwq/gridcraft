@@ -99,7 +99,7 @@ performance 8, stability 8, localization 4, hardware 2, platforms 2, ecosystem 2
 | Dimension | Weight | Ready | Hours | Evidence |
 |---|---|---|---|---|
 | Features | 45 | ~64.2% | 269–433 | Table above |
-| File formats | 15 | ~52% | 70–105 | XLSX read/write is broad and large files now open (100M cells with cold paging) but output is unproven on a real corpus and in Excel; XLSB and ODS are values-only import; no XLS, XML Spreadsheet 2003, SYLK, DIF, PRN; VBA dropped. [file-format-parity.md](file-format-parity.md) |
+| File formats | 15 | ~54% | 68–102 | XLSX read/write is broad and large files now open (100M cells with cold paging) but output is unproven on a real corpus and in Excel; XLSB and ODS are values-only import; no XLS, XML Spreadsheet 2003, SYLK, DIF, PRN; VBA dropped. [file-format-parity.md](file-format-parity.md) |
 | UI/UX fidelity | 12 | ~58% | 45–72 | Excel-style ribbon, galleries, dialogs, formula bar, status bar; 59 commands with shortcuts vs Excel's 200+; key tips on part of the Home tab only; short context menu; single window. [ui-parity.md](ui-parity.md) |
 | Performance | 8 | ~35% (conservative; large-workbook gate met 10-28, re-scored at beta exit) | 20–35 | [Performance](#performance) |
 | Stability | 8 | ~62% | 13–22 | Never-crash rules enforced by lint, every command fuzzed with hostile params, random command sequences fuzzed against undo/redo, XLSX round-trip and full-recalc invariants, last-resort guard in `Session::execute`. Field reports: Windows Intel GPU crash (#120), error on close (#117), freeze opening from Finder (#166), screen flashing (#76) |
@@ -348,6 +348,7 @@ The inventory carried over from the 2026-10-07 ROADMAP.md, updated for what land
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | `.xls` gained validation, conditional formats, hyperlinks and frozen panes (matched to the `.xlsx` reader, spec-derived only); file formats 52% → 54%, hours 70–105 → 68–102 |
 | 2026-10-30 | minor | Text is shaped on **both** paths: the grid and in-cell editor draw bidi runs in visual order with a visual caret, and PDF export shapes with cluster-exact `ToUnicode`. Page/print/PDF ready 58% → 62%, localization 10% → 15%, feature breadth 77% → 78%, ready for real work 54.6% → 54.8%; arithmetic recomputed from the tables |
 | 2026-10-30 | major | Consolidated re-score after the 10-29/30 wave: ready for real work 51.6 → 54.6 (charts 30 → 55, PivotTables 45 → 56, formula 72 → 78, functions 82 → 86, editing 70 → 73, PDF 55 → 58, review 40 → 44; file formats, UI/UX and stability +2 each), mainstream practitioner 50.6 → 56.1, essentials 63.1 → 66.7, feature breadth 75 → 77, catalog 280/295. Arithmetics recomputed from the tables, not adjusted by hand |
 | 2026-10-29 | minor | Large-workbook beta gate met: 100M cells 16.7 MiB live / 183 MiB peak with cold paging, 100k edit 20–25 ms, 1M rows, row and column structural maps; the performance readiness score is left conservative until M20/M19 polish closes and beta re-scores |

@@ -264,7 +264,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus once Excel is
   available. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls` only partly read; Standard/RC4 encryption cannot be written (FF)
+### 7. Legacy `.xls` reads everything but CF12; Standard/RC4 encryption cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
@@ -292,9 +292,21 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   their XF, and `NOTE` + `TXO`/`CONTINUE` give comments with author and text. Layouts were calibrated
   against an independent BSD-licensed BIFF8 reader over 70 Excel-authored files on the dev machine
   (metadata only; no file or data copied into the repo, per the clean-room rule).
-- **Still missing:** `.xls` conditional formats (`CONDFMT`/`CF`/`CFEX`) and data validation (`DV`/
-  `DVAL`) — decoded but with two unexplained byte ranges next to attacker-controlled formula blobs,
-  so they are refused rather than guessed; BIFF5 is refused with a clear message; hyperlinks and
+- **Landed 10-30 (`.xls` records):** data validation (`Dv`/`DVal` — seven kinds, eight
+  operators, literal and range lists, prompt and error text, the three error styles, dropdown and
+  allow-blank flags), conditional formats (`CondFmt`/`CF`/`CFEx` with a full `DXFN`/`DXFN12`
+  differential style: number format, font, alignment, borders, pattern, protection), hyperlinks
+  (`HLINK`/`HLINKTOOLTIP` through [MS-OSHARED] URL, file and composite monikers with the tooltip) and
+  freeze panes (`Pane` + `Window2`, plus the scrolled top-left cell and the active sheet from
+  `Window1`). Each is asserted equal to what the `.xlsx` reader produces for the same model, and every
+  fixture is a byte array built in code. **Spec-derived and fixture-tested only — no `.xls` corpus and
+  no Excel on this machine.** Still refused, with the reason recorded: **CF12** colour
+  scales/data bars/icon sets (the specification's diagram and its field text disagree on
+  `rgbTemplateParms`' length, so the tail's offset is undetermined — a guessed offset would be
+  invention), and BIFF5, whose record layouts are simply **not in [MS-XLS]** (§1.6 specifies BIFF8
+  only), so a second reader would be ~1,000–1,500 lines from a source we do not have.
+- **Still missing:** `.xls` conditional formats of the **CF12** kinds (colour scales, data bars, icon
+  sets) — everything older is read now; BIFF5 is refused with a clear message; hyperlinks and
   freeze panes; charts, pictures, OLE objects and PivotTables are dropped with a warning; `.xls` is
   never written.
 - **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
@@ -305,8 +317,8 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   RC4-encrypted files are still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 10–21 h (`.xls` objects 8–15, Standard/RC4 encryption write 2–3, an Excel run over an
-  encrypted file 0–3). [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 9–19 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, Standard/RC4
+  encryption write 2–3, an Excel run over a `.xls` 2–7). [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: no slicer UI, calculated items, PivotCharts; unverified in Excel (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
