@@ -1,6 +1,6 @@
 # Function parity: worksheet functions and formulas
 
-> **Last reviewed:** 2026-10-15 · **Last updated:** 2026-10-21 · **Change:** minor (SUBTOTAL and AGGREGATE cap the cells they visit, #2175) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (documentation-derived formula oracle suite) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Excel's worksheet functions, category by category, against GridCraft's function library. Part of
 [target-app-parity.md](target-app-parity.md); gaps feed [gaps.md](gaps.md).
@@ -103,6 +103,16 @@ reports keep finding edge cases: MIN() with no arguments (#138), COUNTBLANK past
 10-09). Statistical distributions and financial functions with iterative solvers (RATE, IRR,
 XIRR, YIELD) are the highest-risk for last-digit differences.
 
+**Documentation-derived oracle suite (2026-10-30).** `crates/calc/tests/formula_oracle.rs`
+transcribes 595 worked examples for 275 distinct functions from Microsoft's published function
+reference and runs each through `gridcraft_calc::evaluate`, so the parser, names, references,
+special forms, array results and spills are exercised, not just the function body. It includes
+regression rows for #57, #133, #139, #140 and #134. This is a **documentation-derived, not
+Excel-computed** oracle: expected values are the numbers the pages print, compared at their printed
+precision (half a unit in the last printed digit) or at 1e-9 relative where the page prints more
+digits. It is a weaker oracle than a workbook calculated by Excel, so the Excel-computed corpus
+below is still the deeper gate.
+
 TEXT() and cell display share `crates/numfmt`; checked against Excel-cached results in
 number- and text-format test workbooks (352 TEXT cells), all match:
 fraction sections with literal text (`#\:#=/=#`, `#_#/#`), zero fractions, zero-padded
@@ -122,6 +132,7 @@ workbooks; results checked in as data, not Excel files) and fixing what it finds
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | Documentation-derived formula oracle suite: 595 worked examples for 275 functions through the evaluator, with #57/#133/#139/#140/#134 regressions (not an Excel-computed corpus) |
 | 2026-10-21 | minor | SUBTOTAL and AGGREGATE charge every argument against the evaluator's 16-million-cell limit before scanning; a value in XFD1048576 no longer makes `SUBTOTAL(9,A:XFD)` read the whole sheet (#2175) |
 | 2026-10-19 | minor | LET and LAMBDA names compare case-insensitively in any script, as in Excel: `=LET(dług,100,DŁUG*2)` is 200 (was #NAME?); also LET-bound lambdas called or passed by name (`żar(2)`, `MAP(…,Λ)`), `ISOMITTED`, and formula-bar alias translation (one shared `gridcraft_formula::same_name`, which matches `ß` with `ẞ` and keeps dotless `ı` apart from `i`) |
 | 2026-10-19 | minor | Long flat operator chains (#916): 4,096 operands (Excel's 8,192-character limit) no longer overflow the stack when entered, filled, adjusted or saved; chains past 64 operands are no longer saved as dynamic-array formulas; Spanish entry no longer refuses chains past 256 operands |
