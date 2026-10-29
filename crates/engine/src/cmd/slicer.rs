@@ -66,7 +66,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Slicer Styles",
             [],
             None,
-            "{slicer?: id | name, style: \"SlicerStyleLight1\"} (a PivotTable slicer style the format defines)",
+            "{slicer?: id | name, style: \"SlicerStyleLight1\"} (a PivotTable slicer or timeline style the format defines)",
             has_doc,
             set_style
         ),
@@ -75,7 +75,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Move Slicer",
             [],
             None,
-            "{slicer?: id | name, at?: cell, width?, height?} → {slicer, at, width, height}",
+            "{slicer?: id | name, at?: cell, dx?, dy?, width?, height?} (a PivotTable slicer, a table slicer or a timeline; `dx`/`dy` are offsets inside the anchor cell, so a drag does not have to snap to a cell) → {slicer, at, dx, dy, width, height}",
             has_doc,
             move_slicer
         ),
@@ -760,11 +760,21 @@ fn slicer_select_all(s: &mut Session, p: &Json) -> Result<Json> {
 fn set_style(s: &mut Session, p: &Json) -> Result<Json> {
     const C: &str = "slicer.setStyle";
     let style = known_style(C, str_param(p, "style").ok_or_else(|| bad(C, "missing `style`"))?)?;
-    let (si, wi) = find_pivot_slicer(s, p).ok_or_else(|| bad(C, "no PivotTable slicer on this sheet"))?;
-    let name = s.doc()?.wb.sheet(si).and_then(|sh| sh.pivot_slicers.get(wi)).map(|sl| sl.name.clone()).ok_or_else(|| bad(C, "no slicer"))?;
+    // A PivotTable slicer or a timeline: both carry a style in the model.
+    if let Some((si, wi)) = find_pivot_slicer(s, p) {
+        let name = s.doc()?.wb.sheet(si).and_then(|sh| sh.pivot_slicers.get(wi)).map(|sl| sl.name.clone()).ok_or_else(|| bad(C, "no slicer"))?;
+        return edit(s, |cx| {
+            if let Some(sl) = cx.sheet_mut(si)?.pivot_slicers.get_mut(wi) {
+                sl.style = style.clone();
+            }
+            Ok(json!({"slicer": name, "style": style}))
+        });
+    }
+    let (si, wi) = find_timeline(s, p).ok_or_else(|| bad(C, "no PivotTable slicer or timeline on this sheet"))?;
+    let name = s.doc()?.wb.sheet(si).and_then(|sh| sh.pivot_timelines.get(wi)).map(|tl| tl.name.clone()).ok_or_else(|| bad(C, "no timeline"))?;
     edit(s, |cx| {
-        if let Some(sl) = cx.sheet_mut(si)?.pivot_slicers.get_mut(wi) {
-            sl.style = style.clone();
+        if let Some(tl) = cx.sheet_mut(si)?.pivot_timelines.get_mut(wi) {
+            tl.style = style.clone();
         }
         Ok(json!({"slicer": name, "style": style}))
     })
@@ -773,14 +783,19 @@ fn set_style(s: &mut Session, p: &Json) -> Result<Json> {
 fn move_slicer(s: &mut Session, p: &Json) -> Result<Json> {
     const C: &str = "slicer.move";
     let sheet = target_sheet(s, p)?;
+    // Offsets inside the anchor cell, so a drag does not have to snap to a cell edge; bounded like
+    // every other host of hostile numbers.
+    let offset = |name: &str| f64_param(p, name).map(|v| v.clamp(0.0, 10000.0) as f32);
     let at = cell_param_on(s, p, "at", sheet)?;
+    let dx = offset("dx");
+    let dy = offset("dy");
     let width = f64_param(p, "width").map(|w| w.clamp(60.0, 10000.0) as f32);
     let height = f64_param(p, "height").map(|h| h.clamp(40.0, 10000.0) as f32);
-    if at.is_none() && width.is_none() && height.is_none() {
-        return Err(bad(C, "nothing to move: pass `at`, `width` or `height`"));
+    if at.is_none() && dx.is_none() && dy.is_none() && width.is_none() && height.is_none() {
+        return Err(bad(C, "nothing to move: pass `at`, `dx`, `dy`, `width` or `height`"));
     }
-    // A PivotTable slicer or a table slicer with this id/name on the sheet.
-    let (pivot_at, table_at) = {
+    // A PivotTable slicer, a table slicer or a timeline with this id/name on the sheet.
+    let (pivot_at, table_at, timeline_at) = {
         let d = s.doc()?;
         let Some(sh) = d.wb.sheet(sheet) else { return Err(EngineError::NoDocument) };
         let pivot = match p.get("slicer").filter(|v| !v.is_null()) {
@@ -795,28 +810,43 @@ fn move_slicer(s: &mut Session, p: &Json) -> Result<Json> {
             None if sh.pivot_slicers.is_empty() => sh.slicers.len().checked_sub(1),
             None => None,
         };
-        (pivot, table)
+        let timeline = match p.get("slicer").or_else(|| p.get("timeline")).filter(|v| !v.is_null()) {
+            Some(Json::Number(n)) => sh.pivot_timelines.iter().position(|x| n.as_u64() == Some(x.id as u64)),
+            Some(Json::String(name)) => sh.pivot_timelines.iter().position(|x| x.name.eq_ignore_ascii_case(name)),
+            Some(_) => None,
+            None if pivot.is_none() && table.is_none() => sh.pivot_timelines.len().checked_sub(1),
+            None => None,
+        };
+        (pivot, table, timeline)
     };
     let id = {
         let d = s.doc()?;
         let sh = d.wb.sheet(sheet).ok_or(EngineError::NoDocument)?;
-        match (pivot_at, table_at) {
-            (Some(i), _) => sh.pivot_slicers.get(i).map(|x| x.id),
-            (None, Some(i)) => sh.slicers.get(i).map(|x| x.id),
+        match (pivot_at, table_at, timeline_at) {
+            (Some(i), ..) => sh.pivot_slicers.get(i).map(|x| x.id),
+            (None, Some(i), _) => sh.slicers.get(i).map(|x| x.id),
+            (None, None, Some(i)) => sh.pivot_timelines.get(i).map(|x| x.id),
             _ => None,
         }
-        .ok_or_else(|| bad(C, "no slicer on this sheet"))?
+        .ok_or_else(|| bad(C, "no slicer or timeline on this sheet"))?
     };
     edit(s, |cx| {
         let sh = cx.sheet_mut(sheet)?;
-        let anchor = match (pivot_at, table_at) {
-            (Some(i), _) => sh.pivot_slicers.get_mut(i).map(|x| &mut x.anchor),
-            (None, Some(i)) => sh.slicers.get_mut(i).map(|x| &mut x.anchor),
+        let anchor = match (pivot_at, table_at, timeline_at) {
+            (Some(i), ..) => sh.pivot_slicers.get_mut(i).map(|x| &mut x.anchor),
+            (None, Some(i), _) => sh.slicers.get_mut(i).map(|x| &mut x.anchor),
+            (None, None, Some(i)) => sh.pivot_timelines.get_mut(i).map(|x| &mut x.anchor),
             _ => None,
         }
-        .ok_or_else(|| bad(C, "no slicer on this sheet"))?;
+        .ok_or_else(|| bad(C, "no slicer or timeline on this sheet"))?;
         if let Some(at) = at {
             anchor.cell = at;
+        }
+        if let Some(v) = dx {
+            anchor.dx = v;
+        }
+        if let Some(v) = dy {
+            anchor.dy = v;
         }
         if let Some(w) = width {
             anchor.width = w;
@@ -824,7 +854,7 @@ fn move_slicer(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(h) = height {
             anchor.height = h;
         }
-        let out = json!({"slicer": id, "at": anchor.cell.a1(), "width": anchor.width, "height": anchor.height});
+        let out = json!({"slicer": id, "at": anchor.cell.a1(), "dx": anchor.dx, "dy": anchor.dy, "width": anchor.width, "height": anchor.height});
         Ok(out)
     })
 }

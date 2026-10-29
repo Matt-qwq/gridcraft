@@ -5845,6 +5845,24 @@ fn insert_timeline_lands_and_goes_with_its_report() {
         let tl = &sh.pivot_timelines[0];
         assert_eq!((tl.name.as_str(), tl.unit), ("ByDate", gridcraft_model::TimeUnit::Quarters));
     }
+    // A timeline moves and takes a style like a slicer does, and `dx`/`dy` give a sub-cell nudge
+    // (the UI drags in points, not cells).
+    let r = s.execute("slicer.move", json!({"slicer": id, "at": "J4", "dx": 6.0, "dy": 3.0, "width": 300.0})).unwrap();
+    assert_eq!((r["at"].as_str(), r["dx"].as_f64(), r["dy"].as_f64()), (Some("J4"), Some(6.0), Some(3.0)), "{r}");
+    {
+        let d = s.doc().unwrap();
+        let tl = &d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap().pivot_timelines[0];
+        assert_eq!((tl.anchor.cell, tl.anchor.dx, tl.anchor.dy, tl.anchor.width), (CellRef::parse("J4").unwrap(), 6.0, 3.0, 300.0));
+    }
+    // Hostile offsets are clamped, not trusted.
+    let r = s.execute("slicer.move", json!({"slicer": id, "dx": -50.0, "dy": 1e12})).unwrap();
+    assert_eq!((r["dx"].as_f64(), r["dy"].as_f64()), (Some(0.0), Some(10000.0)), "{r}");
+    // A timeline style is stored on the model; an unknown one is refused by name.
+    s.execute("slicer.setStyle", json!({"slicer": id, "style": "SlicerStyleLight3"})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.sheet(s.doc().unwrap().wb.sheet_index("Report").unwrap()).unwrap().pivot_timelines[0].style, "SlicerStyleLight3");
+    assert!(s.execute("slicer.setStyle", json!({"slicer": id, "style": "NoSuchStyle"})).is_err());
+    // A move with no target parameter is an error, not an empty undo entry.
+    assert!(s.execute("slicer.move", json!({"slicer": id})).is_err());
     // Deleting it by id leaves the report alone.
     s.execute("slicer.delete", json!({"slicer": id})).unwrap();
     let d = s.doc().unwrap();
