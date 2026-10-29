@@ -3,26 +3,45 @@
 //! On read, the raw bytes of unmodelled parts are kept with their content type and their
 //! relationship graph, per owner: the package root (custom document properties, ribbon
 //! customisation, add-in task panes), the workbook (custom XML, links to external workbooks with
-//! their `<externalReferences>`, data connections, XML maps) and each sheet (query tables, cells
+//! their `<externalReferences>`, data connections, XML maps, its unmodelled `<extLst>` children and
+//! the slicer and timeline caches they or a relationship name), each sheet (query tables, cells
 //! mapped to XML elements, form controls, ActiveX controls, OLE objects, the sheet background and
 //! printer settings, with the sheet's `<picture>`, `<oleObjects>` and `<controls>` XML, the `r:id`
 //! of `<pageSetup>`, the legacy VML shapes those controls need and the pictures of the headers and
-//! footers, `&G`, with their `<legacyDrawingHF>`). The workbook also keeps its
-//! `<fileVersion>` and the calcFeatures extension, which Excel needs to trust the saved values.
+//! footers, `&G`, with their `<legacyDrawingHF>`; and the sheet's unmodelled `<extLst>` children,
+//! such as a timeline) and the parts GridCraft rewrites (a table's `<extLst>` and the query table
+//! attached to it, a PivotTable's `<extLst>` — the slicer cache reference among them — and the
+//! `<extLst>` of its cache definition). The workbook also keeps its `<fileVersion>` and the
+//! calcFeatures extension, which Excel needs to trust the saved values.
 //!
 //! On write, kept parts get fresh part names where needed and new relationship ids; the `r:id`s in
 //! kept XML are rewritten to match. Kept content is conservative:
 //! - Anything whose relationship graph reaches a part GridCraft reads and rewrites (worksheets,
-//!   drawings, charts, tables, PivotTables, comments, slicers…) is not kept: it would point at
-//!   content that no longer exists in the same form.
+//!   drawings, charts, tables, PivotTables, comments…) is not kept: it would point at content that
+//!   no longer exists in the same form. Slicers, slicer caches, timelines and timeline caches are
+//!   not rewritten, so their graphs are kept whole — they are never edited (gap #8).
+//! - Extensions GridCraft writes itself are never kept from the source: the calc-features
+//!   extension, the worksheet's data bars, sparklines and x14 validations, and the PivotTable's own
+//!   x14 extensions are written from the model, once.
+//! - Content a part GridCraft rewrites owns hangs off that owner's name (`table:<name>`,
+//!   `pivot:<name>`, `pivotcache:<name>`), stored in the owning sheet's or workbook's kept content;
+//!   its relationships carry the key in their id (see `KS`). A table or PivotTable that is
+//!   deleted, renamed or replaced therefore takes its extensions and the parts only they reach
+//!   with it, instead of having them attached to another one. An extension whose relationship ids
+//!   can't all be resolved is dropped whole.
+//! - A slicer or timeline cache that names a PivotTable the workbook no longer has is dropped, with
+//!   the slicers and timelines behind it: a filter for a report that is gone is a repair prompt, and
+//!   a part nothing relates to is one too.
 //! - External relationship targets (the path of a linked workbook) are kept as text and never
 //!   opened, followed or refreshed. A relative path to a linked workbook is rewritten when the
 //!   workbook is saved into another folder ([`rebase_links`]), so it still names the same file.
 //! - Sheet content lives on the sheet: deleting the sheet drops it, Copy Sheet doesn't copy it.
-//!   Cell references inside kept parts (a control's linked cell, a query table's range, a cell
-//!   mapped to an XML element) are kept as they were, not adjusted to inserted or deleted rows.
-//! - Strict Open XML files are not passed through (their namespaces differ from what we write).
-//! - Sizes are bounded: per part and per workbook.
+//!   Cell and sheet references inside kept parts (a control's linked cell, a query table's range, a
+//!   cell mapped to an XML element, a slicer cache's `pivotCacheId`) are kept as they were, not
+//!   adjusted to inserted or deleted rows or reordered sheets.
+//! - Not kept: the data model (Power Pivot parts), chart `<extLst>` children and chart details, and
+//!   Strict Open XML files (their namespaces differ from what we write).
+//! - Sizes are bounded: per part, per owner and per workbook.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -58,6 +77,17 @@ const MAX_CHAIN: usize = 16;
 const MAX_FRAGMENT: usize = 4 * 1024 * 1024;
 /// Deepest element nesting accepted in a kept fragment.
 const MAX_FRAGMENT_DEPTH: usize = 256;
+/// Most `extLst` children kept for one owner.
+const MAX_EXTS: usize = 256;
+/// Most bytes of `extLst` children kept for one owner.
+const MAX_EXTS_BYTES: usize = 8 * 1024 * 1024;
+/// Separator between an owner key and the source relationship id in [`PreservedRel::id`]. XML 1.0
+/// forbids it in a part, so it can't come out of a file and can't be confused with a real id.
+const KS: char = '\u{1}';
+/// The slot of an `extLst` child of the workbook or a worksheet that GridCraft does not model.
+const EXT_SLOT: &str = "ext";
+/// The slot of the workbook's calc-features extension (written by [`workbook_elements`]).
+pub(crate) const CALC_SLOT: &str = "calcFeatures";
 
 #[cfg(test)]
 thread_local! {
@@ -78,11 +108,21 @@ fn kept_total() -> usize {
 
 const NS_REL_STRICT: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
 const CT_VML: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
+const CT_SLICER_CACHE: &str = "application/vnd.ms-excel.slicerCache+xml";
+const CT_TIMELINE_CACHE: &str = "application/vnd.ms-excel.timelineCache+xml";
+const CT_SLICER: &str = "application/vnd.ms-excel.slicer+xml";
+const CT_TIMELINE: &str = "application/vnd.ms-excel.timeline+xml";
 
 /// Relationship kinds (last segment of the type) kept from the package root.
 const PACKAGE_ROOTS: &[&str] = &["custom-properties", "extensibility", "webextensiontaskpanes"];
-/// Relationship kinds kept from the workbook without a workbook element.
+/// Relationship kinds kept from the workbook without a workbook element. Slicer and timeline
+/// caches are related to the workbook; the extensions naming them are kept as well when the file
+/// has them.
 const WORKBOOK_ROOTS: &[&str] = &["customXml", "connections", "xmlMaps"];
+/// Workbook relationship kinds whose parts are kept even when no XML element names them.
+const WORKBOOK_CACHES: &[&str] = &["slicerCache", "timelineCache"];
+/// Relationship kinds a table part owns that GridCraft doesn't write (its query table).
+const TABLE_OWNED: &[&str] = &["queryTable"];
 /// Relationship kinds kept from a sheet without a sheet element.
 const SHEET_ROOTS: &[&str] = &["queryTable", "tableSingleCells"];
 /// Sheet relationship kinds that mean the sheet XML may hold elements worth keeping.
@@ -92,6 +132,26 @@ const FILE_VERSION_ATTRS: &[&str] = &["appName", "lastEdited", "lowestEdited", "
 /// The workbook extension listing the calculation features the saved values were computed with.
 const CALC_FEATURES_URI: &str = "{B58B0392-4F1F-4190-BB64-5DF3571DCE5F}";
 const NS_CALC_FEATURES: &str = "http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures";
+/// Worksheet extensions GridCraft models and writes itself (solid data bars, sparklines, the
+/// validations of Excel 2010, and the id that links a data bar to its rule): keeping the source
+/// ones too would duplicate them or contradict the model.
+const MODELED_SHEET_EXTS: &[&str] =
+    &["{78C0D931-6437-407d-A8A1-0F90B4350D7D}", "{05C60535-1F16-4fd2-B633-F4F36F0B64E0}", "{B025F937-C7B1-47D3-B67F-A62EFF666E3E}"];
+const MODELED_SHEET_EXT_ELEMENTS: &[&str] = &["conditionalFormattings", "sparklineGroups", "dataValidations"];
+/// The PivotTable extensions GridCraft writes itself (the show-values-as rank, `hideValuesRow`).
+const MODELED_PIVOT_EXTS: &[&str] = &[crate::pivot::EXT_X14_DATA_FIELD, crate::pivot::EXT_X14_PIVOT_TABLE];
+
+/// Whether a worksheet `<ext>` holds something the model has no room for. Read with the sheet, so
+/// the pass-through only reads the part again (it is the biggest part of the file) when there is
+/// something to keep there. The list is the one `keep_exts` uses: the same extensions GridCraft
+/// writes itself are skipped on the way back.
+pub(crate) fn sheet_ext_unknown(ext: &xml::El) -> bool {
+    let uri = ext.attr("uri").unwrap_or("");
+    if MODELED_SHEET_EXTS.iter().any(|m| m.eq_ignore_ascii_case(uri)) {
+        return false;
+    }
+    ext.children.iter().any(|c| !MODELED_SHEET_EXT_ELEMENTS.contains(&c.name.as_str()))
+}
 /// Kept sheet elements, in schema order (all after `<legacyDrawing>`, before `<tableParts>`).
 const SHEET_SLOTS: &[&str] = &["legacyDrawingHF", "picture", "oleObjects", "controls"];
 
@@ -133,10 +193,6 @@ const REWRITTEN: &[&str] = &[
     "rdsupportingpropertybag",
     "rdsupportingpropertybagstructure",
     "richvaluerel",
-    "slicer",
-    "slicercache",
-    "timeline",
-    "timelinecache",
     "powerpivotdata",
 ];
 
@@ -148,6 +204,10 @@ const CHART_SHEET_GRAPH: &[&str] = &["chartsheet", "drawing", "chart", "chartex"
 /// original names. Anything else is renamed so it can't collide with written parts.
 const OWN_DIRS: &[&str] = &[
     "customxml/",
+    "xl/slicers/",
+    "xl/slicercaches/",
+    "xl/timelines/",
+    "xl/timelinecaches/",
     "docprops/custom.xml",
     "customui/",
     "xl/externallinks/",
@@ -177,6 +237,41 @@ fn rewritten(r: &PreservedRel) -> bool {
 fn rels_part_name(part: &str) -> String {
     let (dir, file) = package::split_dir(part);
     if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") }
+}
+
+/// The key of a part GridCraft rewrites whose kept extras hang off its name (a table, PivotTable
+/// or pivot cache), or `None` when the name can't be used as one.
+fn owner_key(kind: &str, name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name.contains(KS) {
+        return None;
+    }
+    Some(format!("{kind}:{}", name.to_lowercase()))
+}
+
+/// The key of a table's kept content: its name, which Excel keeps unique in a workbook.
+pub fn table_key(name: &str) -> Option<String> {
+    owner_key("table", name)
+}
+
+/// The key of a PivotTable's kept content (its slicer cache, its extensions).
+pub fn pivot_key(name: &str) -> Option<String> {
+    owner_key("pivot", name)
+}
+
+/// The key of the kept extensions of a PivotTable's cache definition.
+pub fn pivot_cache_key(name: &str) -> Option<String> {
+    owner_key("pivotcache", name)
+}
+
+/// The owner key of a kept relationship of a rewritten part, if it has one.
+fn split_owner(id: &str) -> Option<(&str, &str)> {
+    id.split_once(KS)
+}
+
+/// A kept relationship id of a rewritten part, prefixed with its owner key.
+fn prefixed(key: &str, id: &str) -> String {
+    format!("{key}{KS}{id}")
 }
 
 /// A part's relationships with full type URIs. `Ok(vec![])` when it has none; an error when the
@@ -209,6 +304,113 @@ fn raw_rels(cx: &mut Ctx<'_>, part: &str) -> Result<Vec<PreservedRel>, String> {
 
 // ---------------------------------------------------------------- reading
 
+/// The root element's `name` attribute and the raw `<ext>` children of a part's `<extLst>`.
+struct ExtScan {
+    name: Option<String>,
+    exts: Vec<String>,
+}
+
+/// Reads the `extLst` children of a part that GridCraft rewrites (a table, PivotTable or pivot
+/// cache definition), with the root's namespace declarations added to each fragment. `None` when
+/// the part is not XML.
+fn scan_exts(bytes: &[u8]) -> Option<ExtScan> {
+    let data = xml::to_utf8(bytes);
+    let text = std::str::from_utf8(&data).ok()?;
+    let mut reader = Reader::from_str(text);
+    let mut decls: Vec<(String, String)> = vec![];
+    let mut out = ExtScan { name: None, exts: vec![] };
+    let mut in_root = false;
+    let mut total = 0usize;
+    loop {
+        match reader.read_event().ok()? {
+            Event::Eof => break,
+            Event::Start(e) if !in_root => {
+                in_root = true;
+                for a in e.attributes().with_checks(false).flatten() {
+                    if a.key.as_ref() == b"name" {
+                        out.name = String::from_utf8(a.value.to_vec()).ok();
+                    } else if let Some(p) = a.key.as_ref().strip_prefix(b"xmlns:")
+                        && let (Ok(p), Ok(v)) = (std::str::from_utf8(p), std::str::from_utf8(&a.value))
+                        && !v.contains('"')
+                    {
+                        decls.push((p.to_string(), v.to_string()));
+                    }
+                }
+            }
+            Event::Start(e) => {
+                let local = e.local_name().as_ref().to_vec();
+                if local == b"extLst" {
+                    read_ext_list(&mut reader, text, &decls, &mut out.exts, &mut total)?;
+                } else {
+                    reader.read_to_end(e.name()).ok()?;
+                }
+            }
+            Event::End(_) => break,
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// Reads the `<ext>` children of the `<extLst>` the reader is positioned in, appending their raw
+/// XML to `out`. Bounded: at most [`MAX_EXTS`] fragments of [`MAX_FRAGMENT`] bytes.
+fn read_ext_list(reader: &mut Reader<&[u8]>, text: &str, decls: &[(String, String)], out: &mut Vec<String>, total: &mut usize) -> Option<()> {
+    loop {
+        let start = usize::try_from(reader.buffer_position()).ok()?;
+        match reader.read_event().ok()? {
+            Event::Eof => return None,
+            Event::Start(e) => {
+                let is_ext = e.local_name().as_ref() == b"ext";
+                reader.read_to_end(e.name()).ok()?;
+                if is_ext {
+                    let end = usize::try_from(reader.buffer_position()).ok()?;
+                    push_ext(text, start, end, decls, out, total);
+                }
+            }
+            Event::Empty(e) => {
+                if e.local_name().as_ref() == b"ext" {
+                    let end = usize::try_from(reader.buffer_position()).ok()?;
+                    push_ext(text, start, end, decls, out, total);
+                }
+            }
+            Event::End(_) => return Some(()),
+            _ => {}
+        }
+    }
+}
+
+fn push_ext(text: &str, start: usize, end: usize, decls: &[(String, String)], out: &mut Vec<String>, total: &mut usize) {
+    if out.len() >= MAX_EXTS || end.saturating_sub(start) > MAX_FRAGMENT {
+        return;
+    }
+    let Some(frag) = text.get(start..end) else { return };
+    let frag = with_decls(frag, decls);
+    if total.saturating_add(frag.len()) > MAX_EXTS_BYTES {
+        return;
+    }
+    *total = total.saturating_add(frag.len());
+    out.push(frag);
+}
+
+/// Every relationship id a fragment names, in order; `None` when the fragment is damaged or a
+/// namespace prefix it uses is undeclared.
+fn rel_ids(x: &str) -> Option<Vec<String>> {
+    let mut ids = vec![];
+    map_rel_ids(x, &mut |id| {
+        ids.push(id.to_string());
+        Some(id.to_string())
+    })
+    .map(|_| ids)
+}
+
+/// A part GridCraft rewrites, as far as pass-through needs it: its root `name`, its `<extLst>`
+/// children and its relationships.
+fn read_owner_part(cx: &mut Ctx<'_>, part: &str) -> Option<(String, Vec<String>, Vec<PreservedRel>)> {
+    let bytes = cx.pkg.read_limited(part, MAX_META).ok().flatten()?;
+    let scan = scan_exts(&bytes)?;
+    let rels = raw_rels(cx, part).ok()?;
+    Some((scan.name.unwrap_or_default(), scan.exts, rels))
+}
 /// The `<sheet>` entries of the workbook that are chart sheets, each with the number of worksheets
 /// (model sheets) before it.
 fn chart_sheet_entries<'a>(wb_xml: &'a xml::El, wb_rels: &[PreservedRel], file_to_model: &[Option<usize>]) -> Vec<(usize, &'a xml::El)> {
@@ -351,11 +553,122 @@ impl KeptReader {
         *seen = scratch;
         p.parts.extend(new_parts);
         for r in roots {
-            if !p.rels.iter().any(|x| x.id == r.id) {
+            // The same part is often named twice: by an extension and by a root kind (a slicer
+            // cache is related to the workbook and listed in its `<extLst>`). One relationship is
+            // written, with the id the kept XML uses.
+            if !p.rels.iter().any(|x| x.id == r.id || (x.rel_type == r.rel_type && x.target == r.target && x.external == r.external)) {
                 p.rels.push(r.clone());
             }
         }
         Ok(())
+    }
+
+    /// Keeps a part GridCraft rewrites and what it owns that the model doesn't: the `<extLst>`
+    /// children it has (except `modeled`, which GridCraft writes itself), the relationships in
+    /// `owned` and everything behind them. Extras hang off the owner key (`owner_key`), so a
+    /// renamed or deleted owner drops them instead of attaching them elsewhere. `key_name`
+    /// overrides the part's root `name` attribute (a pivot cache definition has none).
+    #[allow(clippy::too_many_arguments)]
+    fn keep_owner(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        part: &str,
+        kind_name: &str,
+        key_name: Option<&str>,
+        modeled: &[&str],
+        owned: &[&str],
+        p: &mut Preserved,
+    ) -> Option<String> {
+        let (name, exts, rels) = match read_owner_part(cx, part) {
+            Some(x) => x,
+            None => {
+                cx.warn(format!("{part}: its unmodelled content could not be read and was dropped"));
+                return None;
+            }
+        };
+        let name = key_name.map(str::to_string).unwrap_or(name);
+        let Some(key) = owner_key(kind_name, &name) else {
+            cx.warn(format!("{part} has no usable name; its unmodelled content was dropped"));
+            return None;
+        };
+        // A fresh set: a slicer cache can hang off two PivotTables (or the workbook too), and
+        // each owner must get every part its own extensions name. The writer dedupes by part name.
+        let mut seen = HashSet::new();
+        self.keep_exts(cx, part, &rels, &exts, modeled, &key, owned, p, &mut seen);
+        Some(key)
+    }
+
+    /// Keeps the `extLst` children of an owner that GridCraft does not model, and the
+    /// relationships they name. `key` is empty for the package's own owners (the workbook and a
+    /// worksheet, whose relationships are written as they are) and the owner key for a rewritten
+    /// part. A fragment that names a relationship GridCraft can't keep is dropped whole: it would
+    /// point at a part the file no longer has.
+    #[allow(clippy::too_many_arguments)]
+    fn keep_exts(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        owner: &str,
+        rels: &[PreservedRel],
+        frags: &[String],
+        modeled: &[&str],
+        key: &str,
+        owned: &[&str],
+        p: &mut Preserved,
+        seen: &mut HashSet<String>,
+    ) {
+        let mut wanted: Vec<(&str, Vec<String>)> = vec![];
+        for frag in frags {
+            let Ok(el) = xml::parse(frag.as_bytes()) else {
+                cx.warn(format!("{owner}: an extension was dropped: its XML is damaged"));
+                continue;
+            };
+            let uri = el.attr("uri").unwrap_or("");
+            let modeled_uri = modeled.iter().any(|m| m.eq_ignore_ascii_case(uri));
+            let modeled_child = el.children.iter().any(|c| MODELED_SHEET_EXT_ELEMENTS.contains(&c.name.as_str()));
+            if modeled_uri || modeled_child {
+                continue;
+            }
+            let Some(ids) = rel_ids(frag) else {
+                cx.warn(format!("{owner}: an extension was dropped: its XML is damaged"));
+                continue;
+            };
+            let keepable = |id: &str| rels.iter().any(|r| r.id == id && !rewritten(r));
+            if let Some(bad) = ids.iter().find(|id| !keepable(id)) {
+                cx.warn(format!("{owner}: an extension was dropped: it names {bad}, which GridCraft cannot keep"));
+                continue;
+            }
+            wanted.push((frag, ids));
+        }
+        let mut keep_ids: HashSet<String> = rels.iter().filter(|r| !rewritten(r) && is_kind(r, owned)).map(|r| r.id.clone()).collect();
+        for (_, ids) in &wanted {
+            keep_ids.extend(ids.iter().cloned());
+        }
+        // An extension that names no part is kept on its own: it may hold anything.
+        if keep_ids.is_empty() && wanted.is_empty() {
+            return;
+        }
+        let mut kept: HashSet<String> = HashSet::new();
+        for r in rels.iter().filter(|r| keep_ids.contains(&r.id)) {
+            let mut q = Preserved::default();
+            match self.keep(cx, &mut q, std::slice::from_ref(r), seen) {
+                Ok(()) => {
+                    kept.insert(r.id.clone());
+                    p.parts.extend(q.parts);
+                    let id = if key.is_empty() { r.id.clone() } else { prefixed(key, &r.id) };
+                    if !p.rels.iter().any(|x| x.id == id) {
+                        p.rels.push(PreservedRel { id, ..r.clone() });
+                    }
+                }
+                Err(why) => cx.warn(format!("{owner}: {} was dropped: {why}", kind(&r.rel_type))),
+            }
+        }
+        for (frag, ids) in wanted {
+            if ids.iter().all(|id| kept.contains(id)) {
+                p.elements.push(PreservedXml { slot: if key.is_empty() { EXT_SLOT.into() } else { key.to_string() }, xml: frag.to_string() });
+            } else {
+                cx.warn(format!("{owner}: an extension was dropped: a part it names could not be kept"));
+            }
+        }
     }
 
     /// Package-root and workbook-level content.
@@ -391,6 +704,11 @@ impl KeptReader {
                 cx.warn(format!("{} part {} was dropped: {why}", kind(&r.rel_type), r.target));
             }
         }
+        // Workbook extensions GridCraft does not model (slicer caches, timeline cache references,
+        // defined names of extensions…), and the slicer and timeline caches they or a relationship
+        // name. Their part bytes, relationships and content types are kept as they are.
+        let wb_exts = cx.pkg.read_limited(wb_part, MAX_META).ok().flatten().and_then(|b| scan_exts(&b)).map(|s| s.exts).unwrap_or_default();
+        self.keep_exts(cx, wb_part, &wb_rels, &wb_exts, &[CALC_FEATURES_URI], "", WORKBOOK_CACHES, &mut p, &mut seen);
         // Chart sheets: the sheet entry (name, state, position) plus the chart sheet part and the
         // drawing, chart, style and colour parts behind it.
         for (worksheets, se) in chart_sheet_entries(wb_xml, &wb_rels, file_to_model) {
@@ -456,7 +774,7 @@ impl KeptReader {
                 let _ = write!(x, "<xcalcf:feature name=\"{}\"/>", esc_attr(name));
             }
             x.push_str("</xcalcf:calcFeatures></ext>");
-            p.elements.push(PreservedXml { slot: "ext".into(), xml: x });
+            p.elements.push(PreservedXml { slot: CALC_SLOT.into(), xml: x });
         }
         (!p.is_empty()).then(|| Arc::new(p))
     }
@@ -480,10 +798,26 @@ impl KeptReader {
                 cx.warn(format!("sheet \"{name}\": {} was dropped: {why}", kind(&r.rel_type)));
             }
         }
+        // Parts GridCraft rewrites keep what the model has no room for: a table's extensions and
+        // the query table attached to it, a PivotTable's slicer cache and the extensions of its
+        // cache definition. Each hangs off the owner's name; a renamed or deleted owner drops it.
+        for r in rels.iter().filter(|r| is_kind(r, &["table"]) && !r.external) {
+            self.keep_owner(cx, &r.target, "table", None, &[], TABLE_OWNED, &mut p);
+        }
+        for r in rels.iter().filter(|r| is_kind(r, &["pivotTable"]) && !r.external) {
+            let key = self.keep_owner(cx, &r.target, "pivot", None, MODELED_PIVOT_EXTS, &[], &mut p);
+            if let Some(key) = key
+                && let Some(cache) =
+                    raw_rels(cx, &r.target).unwrap_or_default().into_iter().find(|q| is_kind(q, &["pivotCacheDefinition"]) && !q.external)
+            {
+                let pivot_name = key.split_once(':').map(|(_, n)| n).unwrap_or("");
+                self.keep_owner(cx, &cache.target, "pivotcache", Some(pivot_name), &[], &[], &mut p);
+            }
+        }
         // Notes have one VML drawing per sheet; another one holds the header and footer pictures.
         let vml_drawings = rels.iter().filter(|r| is_kind(r, &["vmlDrawing"])).count();
         let notes = rels.iter().filter(|r| is_kind(r, &["comments"])).count();
-        if rels.iter().any(|r| is_kind(r, SHEET_ELEMENT_KINDS)) || vml_drawings > notes {
+        if rels.iter().any(|r| is_kind(r, SHEET_ELEMENT_KINDS)) || vml_drawings > notes || cx.sheet_ext {
             self.sheet_elements(cx, part, name, &rels, &mut p, &mut seen);
         }
         (!p.is_empty()).then(|| Arc::new(p))
@@ -498,6 +832,9 @@ impl KeptReader {
             cx.warn(format!("sheet \"{name}\": controls and embedded objects could not be read and were dropped"));
             return;
         };
+        // The sheet's unmodelled extensions (timelines, filters, anything else): kept with the
+        // parts their relationship ids name.
+        self.keep_exts(cx, part, rels, &scan.exts, MODELED_SHEET_EXTS, "", &[], p, seen);
         // Printer settings (a binary part per sheet) hang off <pageSetup r:id>.
         if let Some(id) = scan.page_setup.as_deref()
             && let Some(r) = rels.iter().find(|r| r.id == id && is_kind(r, &["printerSettings"]))
@@ -599,6 +936,9 @@ impl KeptReader {
 struct SheetScan {
     /// (slot, XML with the namespace declarations it needs).
     fragments: Vec<(String, String)>,
+    /// The raw `<ext>` children of the sheet's `<extLst>`.
+    exts: Vec<String>,
+    ext_bytes: usize,
     legacy_drawing: Option<String>,
     /// The relationship id on `<legacyDrawingHF>` (header and footer pictures).
     legacy_drawing_hf: Option<String>,
@@ -613,7 +953,7 @@ fn scan_sheet(bytes: &[u8]) -> Option<SheetScan> {
     let text = std::str::from_utf8(&data).ok()?;
     let mut reader = Reader::from_str(text);
     let mut decls: Vec<(String, String)> = vec![];
-    let mut out = SheetScan { fragments: vec![], legacy_drawing: None, legacy_drawing_hf: None, page_setup: None };
+    let mut out = SheetScan { fragments: vec![], exts: vec![], ext_bytes: 0, legacy_drawing: None, legacy_drawing_hf: None, page_setup: None };
     let mut in_root = false;
     loop {
         let start = usize::try_from(reader.buffer_position()).ok()?;
@@ -636,6 +976,10 @@ fn scan_sheet(bytes: &[u8]) -> Option<SheetScan> {
                     b"pageSetup" => out.page_setup = rel_id_attr(&e),
                     b"legacyDrawing" => out.legacy_drawing = rel_id_attr(&e),
                     b"legacyDrawingHF" => out.legacy_drawing_hf = rel_id_attr(&e),
+                    b"extLst" => {
+                        read_ext_list(&mut reader, text, &decls, &mut out.exts, &mut out.ext_bytes)?;
+                        continue;
+                    }
                     _ => {}
                 }
                 reader.read_to_end(e.name()).ok()?;
@@ -867,11 +1211,26 @@ fn map_start(e: &BytesStart<'_>, prefixes: &mut HashSet<Vec<u8>>, map: &mut dyn 
 
 // ---------------------------------------------------------------- writing
 
+/// What the workbook still has, for the check a kept part has to pass: a slicer cache names the
+/// PivotTables it filters, a slicer or timeline names its cache.
+#[derive(Default)]
+struct PartFacts {
+    pivots: HashSet<String>,
+    caches: HashSet<String>,
+}
+
 /// Names given to kept parts while a package is written.
 #[derive(Default)]
 pub struct KeptOut {
     used: HashSet<String>,
     n: u32,
+    /// Every part written by name (normalized original → written name), across all owners: a part
+    /// reached from two owners is written once and related twice.
+    names: NameMap,
+    /// Part names (normalized) already written, so a part two owners keep is one zip entry.
+    written: HashSet<String>,
+    /// The PivotTable and cache names the workbook still has (see [`part_usable`]).
+    facts: PartFacts,
     /// The highest VML shape block a kept header and footer drawing uses: notes go after it.
     vml_blocks: u32,
     /// Package-root relationships (type, target, external), added when `_rels/.rels` is written.
@@ -879,6 +1238,19 @@ pub struct KeptOut {
 }
 
 impl KeptOut {
+    /// Records the PivotTables and caches the kept content may refer to, so a part that names a
+    /// deleted or renamed owner is dropped instead of written pointing at something the workbook
+    /// no longer has.
+    pub fn set_workbook_facts(&mut self, wb: &Workbook) {
+        self.facts.pivots = wb.sheets.iter().flat_map(|s| s.pivots.iter()).map(|p| p.name.to_lowercase()).collect();
+        let caches = wb.preserved.iter().map(|p| &**p).chain(wb.sheets.iter().filter_map(|s| s.preserved.as_deref())).flat_map(|p| &p.parts);
+        let names: Vec<String> = caches
+            .filter(|q| is_cache_part(q) && pivot_names_ok(&self.facts.pivots, q))
+            .filter_map(|q| xml::parse(&q.data).ok().and_then(|x| x.attr("name").map(|n| n.to_lowercase())))
+            .collect();
+        self.facts.caches = names.into_iter().collect();
+    }
+
     /// Reserves the VML shape blocks the kept header and footer drawings of `wb` use, so that the
     /// notes drawings GridCraft writes don't reuse their shape ids.
     pub fn reserve_vml_blocks(&mut self, wb: &Workbook) {
@@ -944,14 +1316,25 @@ fn part_rels_xml(rels: &[PreservedRel], names: &NameMap) -> String {
 }
 
 fn write_parts(out: &mut Out, parts: &[PreservedPart]) -> NameMap {
+    let facts = std::mem::take(&mut out.kept.facts);
+    let usable: Vec<&PreservedPart> = parts.iter().filter(|q| part_usable(&facts, q)).collect();
     let mut names = NameMap::new();
-    for p in parts {
-        names.entry(normalize(&p.name)).or_insert_with(|| out.kept.claim(&p.name));
+    for p in &usable {
+        let key = normalize(&p.name);
+        let name = match out.kept.names.get(&key) {
+            Some(n) => n.clone(),
+            None => {
+                let n = out.kept.claim(&p.name);
+                out.kept.names.insert(key.clone(), n.clone());
+                n
+            }
+        };
+        names.insert(key, name);
     }
     let mut written = HashSet::new();
-    for p in parts {
+    for p in &usable {
         let Some(new) = names.get(&normalize(&p.name)).cloned() else { continue };
-        if !written.insert(new.clone()) {
+        if !written.insert(new.clone()) || !out.kept.written.insert(new.to_ascii_lowercase()) {
             continue;
         }
         out.part(&new, Some(&p.content_type), p.data.to_vec());
@@ -959,7 +1342,36 @@ fn write_parts(out: &mut Out, parts: &[PreservedPart]) -> NameMap {
             out.part(&rels_part_name(&new), None, part_rels_xml(&p.rels, &names).into_bytes());
         }
     }
+    out.kept.facts = facts;
     names
+}
+
+fn is_cache_part(p: &PreservedPart) -> bool {
+    p.content_type.eq_ignore_ascii_case(CT_SLICER_CACHE) || p.content_type.eq_ignore_ascii_case(CT_TIMELINE_CACHE)
+}
+
+/// Whether a slicer or timeline cache still names the PivotTables the workbook has.
+fn pivot_names_ok(pivots: &HashSet<String>, p: &PreservedPart) -> bool {
+    let Ok(x) = xml::parse(&p.data) else { return false };
+    let names: Vec<&str> = x.child("pivotTables").map(|l| l.kids("pivotTable").filter_map(|q| q.attr("name")).collect()).unwrap_or_default();
+    names.iter().all(|n| n.trim().is_empty() || pivots.contains(&n.to_lowercase()))
+}
+
+/// Whether a kept part can still be written. A slicer or timeline cache names the PivotTables it
+/// filters, and a slicer or timeline names its cache; an owner the workbook no longer has (deleted,
+/// renamed) would leave the part pointing at nothing. The part goes, and with it whatever only it
+/// reaches — no relationship to a part that isn't written is ever left behind.
+fn part_usable(facts: &PartFacts, p: &PreservedPart) -> bool {
+    if is_cache_part(p) {
+        return pivot_names_ok(&facts.pivots, p);
+    }
+    let slicer = p.content_type.eq_ignore_ascii_case(CT_SLICER) || p.content_type.eq_ignore_ascii_case(CT_TIMELINE);
+    if !slicer {
+        return true;
+    }
+    let Ok(x) = xml::parse(&p.data) else { return false };
+    let names: Vec<&str> = x.children.iter().filter(|c| c.name == "slicer" || c.name == "timeline").filter_map(|c| c.attr("cache")).collect();
+    names.iter().all(|n| n.trim().is_empty() || facts.caches.contains(&n.to_lowercase()))
 }
 
 /// Adds the owner's relationships; returns old id → new id.
@@ -991,6 +1403,8 @@ pub struct KeptSheet {
 pub struct WorkbookKept {
     /// Workbook XML elements that go right after `<sheets>` (`<externalReferences>`).
     pub elements: String,
+    /// The workbook `<ext>` children GridCraft does not model, relationship ids rewritten.
+    pub ext: String,
     sheets: Vec<KeptSheet>,
 }
 
@@ -1032,6 +1446,63 @@ fn reachable(p: &Preserved, root: &PreservedRel) -> HashSet<String> {
         }
     }
     seen
+}
+
+/// The kept parts of `p` that one of `roots` reaches. Parts that only a rewritten owner's
+/// relationships reach are written with that owner (`owner_extras`), so an owner that is gone
+/// takes them with it instead of leaving an orphan part behind.
+fn live_parts(p: &Preserved, roots: &[&PreservedRel], facts: &PartFacts) -> Vec<PreservedPart> {
+    // Only usable parts are walked, so a part reached only through one that is dropped with its
+    // owner (a slicer behind a dropped cache) is dropped too instead of being left orphaned.
+    let by_name: HashMap<String, &PreservedPart> = p.parts.iter().filter(|q| part_usable(facts, q)).map(|q| (normalize(&q.name), q)).collect();
+    let mut live: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = roots.iter().map(|r| normalize(&r.target)).collect();
+    while let Some(n) = queue.pop_front() {
+        if !live.insert(n.clone()) {
+            continue;
+        }
+        if let Some(q) = by_name.get(&n) {
+            queue.extend(q.rels.iter().filter(|r| !r.external).map(|r| normalize(&r.target)));
+        }
+    }
+    p.parts.iter().filter(|q| live.contains(&normalize(&q.name)) && part_usable(facts, q)).cloned().collect()
+}
+
+/// The kept parts of `p` an owner GridCraft writes reaches through its own relationships.
+fn owner_parts(p: &Preserved, key: &str, facts: &PartFacts) -> (Vec<PreservedPart>, Vec<PreservedRel>, Vec<String>) {
+    let prefix = format!("{key}{KS}");
+    let mut sources: Vec<PreservedRel> = vec![];
+    for r in p.rels.iter().filter(|r| r.id.starts_with(&prefix)) {
+        if let Some(id) = r.id.get(prefix.len()..) {
+            sources.push(PreservedRel { id: id.to_string(), ..r.clone() });
+        }
+    }
+    let frags: Vec<String> = p.elements.iter().filter(|e| e.slot == key).map(|e| e.xml.clone()).collect();
+    let roots: Vec<&PreservedRel> = sources.iter().collect();
+    (live_parts(p, &roots, facts), sources, frags)
+}
+
+/// What a part GridCraft rewrites keeps: its `<ext>` children and the relationships and parts
+/// only it owns. Writes the parts and adds the relationships to `rels` (the part's own), then
+/// returns the `<ext>` XML with fresh relationship ids; empty when `key` matches no kept owner
+/// (the table or PivotTable was deleted or renamed) or it had nothing.
+pub fn owner_extras(owner: Option<&Preserved>, key: Option<&str>, rels: &mut Rels, out: &mut Out) -> String {
+    let (Some(p), Some(key)) = (owner, key) else { return String::new() };
+    let facts = std::mem::take(&mut out.kept.facts);
+    let (parts, sources, frags) = owner_parts(p, key, &facts);
+    out.kept.facts = facts;
+    if sources.is_empty() && frags.is_empty() {
+        return String::new();
+    }
+    let names = write_parts(out, &parts);
+    let ids = attach(rels, &sources, &names);
+    let mut x = String::new();
+    for f in &frags {
+        if let Some(m) = remap(f, &ids) {
+            x.push_str(&m);
+        }
+    }
+    x
 }
 
 /// Every formula (`<c:f>`) of a chart part, depth first.
@@ -1121,9 +1592,15 @@ pub fn write_workbook(wb: &Workbook, wb_rels: &mut Rels, out: &mut Out) -> Workb
             gone.remove(&n);
         }
     }
-    let parts: Vec<PreservedPart> = p.parts.iter().filter(|q| !gone.contains(&normalize(&q.name))).cloned().collect();
-    let rels: Vec<PreservedRel> = p.rels.iter().filter(|r| !dropped_ids.contains(r.id.as_str())).cloned().collect();
-    let names = write_parts(out, &parts);
+    let rels: Vec<PreservedRel> = p.rels.iter().filter(|r| !dropped_ids.contains(r.id.as_str()) && split_owner(&r.id).is_none()).cloned().collect();
+    // A rewritten part's own parts (a PivotTable's slicer cache) are written with it.
+    let facts = std::mem::take(&mut out.kept.facts);
+    let mut roots: Vec<&PreservedRel> = rels.iter().collect();
+    roots.extend(p.package_rels.iter());
+    let mut kept_parts = live_parts(p, &roots, &facts);
+    out.kept.facts = facts;
+    kept_parts.retain(|q| !gone.contains(&normalize(&q.name)));
+    let names = write_parts(out, &kept_parts);
     let ids = attach(wb_rels, &rels, &names);
     for r in &p.package_rels {
         if let Some(target) = rel_target(r, &names) {
@@ -1132,6 +1609,7 @@ pub fn write_workbook(wb: &Workbook, wb_rels: &mut Rels, out: &mut Out) -> Workb
     }
     WorkbookKept {
         elements: p.elements.iter().filter(|e| e.slot == "externalReferences").filter_map(|e| remap(&e.xml, &ids)).collect(),
+        ext: p.elements.iter().filter(|e| e.slot == EXT_SLOT).filter_map(|e| remap(&e.xml, &ids)).collect(),
         sheets: live
             .iter()
             .filter_map(|s| Some(KeptSheet { before: s.before, name: s.name.clone(), visibility: s.visibility, rid: ids.get(&s.rel_id)?.clone() }))
@@ -1139,7 +1617,8 @@ pub fn write_workbook(wb: &Workbook, wb_rels: &mut Rels, out: &mut Out) -> Workb
     }
 }
 
-/// The workbook's kept elements of `slot` that refer to no part (`fileVersion`, `ext`).
+/// The workbook's kept elements of `slot` that refer to no part (`fileVersion`, the calc-features
+/// extension).
 pub fn workbook_elements(wb: &Workbook, slot: &str) -> String {
     let Some(p) = wb.preserved.as_deref() else { return String::new() };
     p.elements.iter().filter(|e| e.slot == slot).map(|e| e.xml.as_str()).collect()
@@ -1163,9 +1642,23 @@ impl<'a> SheetKept<'a> {
     /// Writes the sheet's kept parts and adds their relationships to the sheet's.
     pub fn write(sheet: &'a Sheet, rels: &mut Rels, out: &mut Out) -> SheetKept<'a> {
         let Some(p) = sheet.preserved.as_deref() else { return SheetKept { p: None, names: NameMap::new(), ids: HashMap::new() } };
-        let names = write_parts(out, &p.parts);
-        let ids = attach(rels, &p.rels, &names);
+        // Parts a rewritten owner (a table, a PivotTable) owns are written with that owner, so
+        // they leave with it when it is renamed or deleted.
+        let mut roots: Vec<&PreservedRel> = p.rels.iter().filter(|r| split_owner(&r.id).is_none()).collect();
+        roots.extend(p.vml.iter().flat_map(|v| v.rels.iter()));
+        let facts = std::mem::take(&mut out.kept.facts);
+        let parts = live_parts(p, &roots, &facts);
+        out.kept.facts = facts;
+        let names = write_parts(out, &parts);
+        let rels_kept: Vec<PreservedRel> = p.rels.iter().filter(|r| split_owner(&r.id).is_none()).cloned().collect();
+        let ids = attach(rels, &rels_kept, &names);
         SheetKept { p: Some(p), names, ids }
+    }
+
+    /// The sheet `<ext>` children GridCraft does not model, relationship ids rewritten.
+    pub fn ext_elements(&self) -> String {
+        let Some(p) = self.p else { return String::new() };
+        p.elements.iter().filter(|e| e.slot == EXT_SLOT).filter_map(|e| remap(&e.xml, &self.ids)).collect()
     }
 
     fn vml(&self) -> Option<&'a PreservedPart> {

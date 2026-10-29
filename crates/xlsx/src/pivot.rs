@@ -39,8 +39,8 @@ const MAX_ITEMS: usize = 1_048_576;
 /// Most cache fields read.
 const MAX_FIELDS: usize = 16_384;
 /// The `x14:dataField` extension (Excel 2010 show-values-as additions such as rank).
-const EXT_X14_DATA_FIELD: &str = "{E15A36E0-9728-4e99-A89B-3F7291B0FE68}";
-const EXT_X14_PIVOT_TABLE: &str = "{962EF5D1-5CA2-4c93-8EF4-DBF5C05439D2}";
+pub(crate) const EXT_X14_DATA_FIELD: &str = "{E15A36E0-9728-4e99-A89B-3F7291B0FE68}";
+pub(crate) const EXT_X14_PIVOT_TABLE: &str = "{962EF5D1-5CA2-4c93-8EF4-DBF5C05439D2}";
 const NS_X14: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
 
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -277,6 +277,8 @@ pub struct PivotWriter {
 
 struct Pending {
     part: String,
+    /// The PivotTable part's relationships, written with it (they hold its slicer cache).
+    rels_part: String,
     sheet: usize,
     idx: usize,
     cache_id: u32,
@@ -292,25 +294,34 @@ impl PivotWriter {
             let Some(cache) = build_cache(wb, pt, si) else { continue };
             let n = self.caches.len() as u32 + 1;
             let cache_part = format!("xl/pivotCache/pivotCacheDefinition{n}.xml");
+            let mut cr = Rels::default();
             let rec_rid = if let Some((count, xml)) = &cache.records {
-                let mut r = Rels::default();
-                let rid = r.add("pivotCacheRecords", &format!("pivotCacheRecords{n}.xml"));
-                out.part(&format!("xl/pivotCache/_rels/pivotCacheDefinition{n}.xml.rels"), None, r.xml().into_bytes());
+                let rid = cr.add("pivotCacheRecords", &format!("pivotCacheRecords{n}.xml"));
                 let s = format!("{XML_DECL}<pivotCacheRecords xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\" count=\"{count}\">{xml}</pivotCacheRecords>");
                 out.part(&format!("xl/pivotCache/pivotCacheRecords{n}.xml"), Some(CT_PIVOT_CACHE_REC), s.into_bytes());
                 Some(rid)
             } else {
                 None
             };
-            out.part(&cache_part, Some(CT_PIVOT_CACHE_DEF), cache_xml(&cache, rec_rid.as_deref(), wb.date_system).into_bytes());
+            // What the source cache definition kept that the model has no room for.
+            let key = crate::passthrough::pivot_cache_key(&pt.name);
+            let ext = crate::passthrough::owner_extras(sheet.preserved.as_deref(), key.as_deref(), &mut cr, out);
+            out.part(&cache_part, Some(CT_PIVOT_CACHE_DEF), cache_xml(&cache, rec_rid.as_deref(), wb.date_system, &ext).into_bytes());
+            if !cr.is_empty() {
+                out.part(&format!("xl/pivotCache/_rels/pivotCacheDefinition{n}.xml.rels"), None, cr.xml().into_bytes());
+            }
             self.caches.push((n, format!("pivotCache/pivotCacheDefinition{n}.xml")));
             self.tables += 1;
             let t = self.tables;
             rels.add("pivotTable", &format!("../pivotTables/pivotTable{t}.xml"));
-            let mut tr = Rels::default();
-            tr.add("pivotCacheDefinition", &format!("../pivotCache/pivotCacheDefinition{n}.xml"));
-            out.part(&format!("xl/pivotTables/_rels/pivotTable{t}.xml.rels"), None, tr.xml().into_bytes());
-            self.pending.push(Pending { part: format!("xl/pivotTables/pivotTable{t}.xml"), sheet: si, idx, cache_id: n, cache });
+            self.pending.push(Pending {
+                part: format!("xl/pivotTables/pivotTable{t}.xml"),
+                rels_part: format!("xl/pivotTables/_rels/pivotTable{t}.xml.rels"),
+                sheet: si,
+                idx,
+                cache_id: n,
+                cache,
+            });
         }
     }
 
@@ -350,8 +361,15 @@ impl PivotWriter {
     pub fn finish(self, wb: &Workbook, out: &mut Out, fmt_id: &dyn Fn(&str) -> Option<u32>) {
         for p in self.pending {
             let Some(pt) = wb.sheet(p.sheet).and_then(|s| s.pivots.get(p.idx)) else { continue };
-            let xml = table_xml(pt, p.idx, p.cache_id, &p.cache, fmt_id);
+            let mut tr = Rels::default();
+            tr.add("pivotCacheDefinition", &format!("../pivotCache/pivotCacheDefinition{}.xml", p.cache_id));
+            // The extensions the source PivotTable kept that the model has no room for (the slicer
+            // cache reference among them), and the parts they name.
+            let key = crate::passthrough::pivot_key(&pt.name);
+            let ext = crate::passthrough::owner_extras(wb.sheet(p.sheet).and_then(|s| s.preserved.as_deref()), key.as_deref(), &mut tr, out);
+            let xml = table_xml(pt, p.idx, p.cache_id, &p.cache, fmt_id, &ext);
             out.part(&p.part, Some(CT_PIVOT_TABLE), xml.into_bytes());
+            out.part(&p.rels_part, None, tr.xml().into_bytes());
         }
     }
 }
@@ -678,7 +696,7 @@ fn item_xml(v: &Value, sys: DateSystem, date: bool) -> String {
     }
 }
 
-fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem) -> String {
+fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -> String {
     let mut s = format!("{XML_DECL}<pivotCacheDefinition xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\"");
     match (records_rid, &c.records) {
         (Some(rid), Some((count, _))) => {
@@ -763,11 +781,15 @@ fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem) -> String {
         }
         s.push_str("</cacheField>");
     }
-    s.push_str("</cacheFields></pivotCacheDefinition>");
+    s.push_str("</cacheFields>");
+    if !ext.is_empty() {
+        let _ = write!(s, "<extLst>{ext}</extLst>");
+    }
+    s.push_str("</pivotCacheDefinition>");
     s
 }
 
-fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn Fn(&str) -> Option<u32>) -> String {
+fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn Fn(&str) -> Option<u32>, ext: &str) -> String {
     let nf = c.fields.len();
     let find_db = |name: &str| c.fields.iter().position(|f| f.col.is_some() && same(&f.name, name));
     let row_idx: Vec<usize> = c.axis_map.iter().take(pt.rows.len()).filter_map(|x| *x).collect();
@@ -1012,11 +1034,14 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
         let _ = write!(s, " name=\"{}\"", esc_attr(&pt.style));
     }
     s.push_str(" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/>");
+    // One `<extLst>`: the extension GridCraft writes for the model, then the source's own.
+    let mut exts = String::new();
     if hide_values_row {
-        let _ = write!(
-            s,
-            "<extLst><ext uri=\"{EXT_X14_PIVOT_TABLE}\" xmlns:x14=\"{NS_X14}\"><x14:pivotTableDefinition hideValuesRow=\"1\"/></ext></extLst>"
-        );
+        let _ = write!(exts, "<ext uri=\"{EXT_X14_PIVOT_TABLE}\" xmlns:x14=\"{NS_X14}\"><x14:pivotTableDefinition hideValuesRow=\"1\"/></ext>");
+    }
+    exts.push_str(ext);
+    if !exts.is_empty() {
+        let _ = write!(s, "<extLst>{exts}</extLst>");
     }
     s.push_str("</pivotTableDefinition>");
     s

@@ -623,14 +623,23 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
             out.table_id += 1;
             let n = out.tables;
             let name = table_name(&t.name, &mut used_names, out.table_id);
-            let xml = table_xml(t, cols, &name, out.table_id, out);
+            // What the table owned in the source file (its query table, its extensions) hangs off
+            // its name: a renamed or deleted table takes it with it.
+            let mut trels = Rels::default();
+            let key = crate::passthrough::table_key(&name);
+            let ext = crate::passthrough::owner_extras(sheet.preserved.as_deref(), key.as_deref(), &mut trels, out);
+            let xml = table_xml(t, cols, &name, out.table_id, out, &ext);
             out.part(&format!("xl/tables/table{n}.xml"), Some(CT_TABLE), xml.into_bytes());
+            if !trels.is_empty() {
+                out.part(&format!("xl/tables/_rels/table{n}.xml.rels"), None, trels.xml().into_bytes());
+            }
             let rid = rels.add("table", &format!("../tables/table{n}.xml"));
             let _ = write!(parts, "<tablePart r:id=\"{rid}\"/>");
         }
         let _ = write!(s, "<tableParts count=\"{}\">{parts}</tableParts>", tables.len());
     }
-    // Excel 2010 extensions: solid data bars, then sparklines.
+    // Excel 2010 extensions: solid data bars, then sparklines, then the ones GridCraft does not
+    // model (timelines, filters…) as they came.
     let solid_bars: Vec<(&CondFormat, u32)> = sheet
         .cond_formats
         .iter()
@@ -638,7 +647,8 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         .filter(|(_, cf)| !cf.ranges.is_empty() && matches!(cf.rule, CfRule::DataBar { gradient: false, .. }))
         .map(|(i, cf)| (cf, prio.get(i).copied().unwrap_or(1)))
         .collect();
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+    let kept_exts = kept.ext_elements();
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || !kept_exts.is_empty() {
         s.push_str("<extLst>");
     }
     if !solid_bars.is_empty() {
@@ -676,7 +686,8 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         }
         s.push_str("</x14:sparklineGroups></ext>");
     }
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || !kept_exts.is_empty() {
+        s.push_str(&kept_exts);
         s.push_str("</extLst>");
     }
     s.push_str("</worksheet>");
@@ -1195,7 +1206,7 @@ fn autofilter_xml(range: RangeRef, criteria: &[(u32, FilterCriterion)], out: &mu
     s
 }
 
-fn table_xml(t: &Table, cols: &[String], name: &str, id: u32, out: &mut Out) -> String {
+fn table_xml(t: &Table, cols: &[String], name: &str, id: u32, out: &mut Out, ext: &str) -> String {
     let mut s =
         format!("{XML_DECL}<table xmlns=\"{NS_MAIN}\" id=\"{id}\" name=\"{0}\" displayName=\"{0}\" ref=\"{1}\"", esc_attr(name), t.range.a1());
     if !t.header_row {
@@ -1273,13 +1284,18 @@ fn table_xml(t: &Table, cols: &[String], name: &str, id: u32, out: &mut Out) -> 
     let style = if t.style.is_empty() { "TableStyleMedium2" } else { &t.style };
     let _ = write!(
         s,
-        "<tableStyleInfo name=\"{}\" showFirstColumn=\"{}\" showLastColumn=\"{}\" showRowStripes=\"{}\" showColumnStripes=\"{}\"/></table>",
+        "<tableStyleInfo name=\"{}\" showFirstColumn=\"{}\" showLastColumn=\"{}\" showRowStripes=\"{}\" showColumnStripes=\"{}\"/>",
         esc_attr(style),
         t.first_col as u8,
         t.last_col as u8,
         t.banded_rows as u8,
         t.banded_cols as u8
     );
+    // CT_Table puts extLst last.
+    if !ext.is_empty() {
+        let _ = write!(s, "<extLst>{ext}</extLst>");
+    }
+    s.push_str("</table>");
     s
 }
 

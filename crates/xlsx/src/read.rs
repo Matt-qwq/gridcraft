@@ -34,6 +34,9 @@ pub struct Ctx<'a> {
     pub cell_pictures: Vec<Option<Arc<CellPicture>>>,
     /// x14 conditional-format ids of the current sheet's data bars, with the index of the rule in `cond_formats`.
     pub cf_ext_ids: Vec<(String, usize)>,
+    /// Whether the sheet part being read had an `<extLst>`: the pass-through scans the part again
+    /// only when it has one.
+    pub sheet_ext: bool,
 }
 
 impl Ctx<'_> {
@@ -159,6 +162,7 @@ fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadRepor
         num_fmts: Default::default(),
         cell_pictures: vec![],
         cf_ext_ids: vec![],
+        sheet_ext: false,
     };
     let root_rels = cx.pkg.rels("")?;
     let wb_part = find_rel(&root_rels, "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
@@ -318,6 +322,7 @@ fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadRepor
             continue;
         }
         let name = unique_name(&wb, &name, i);
+        cx.sheet_ext = false;
         let mut sheet = match crate::sheet_read::read_sheet_with(&mut cx, &rel.target, &name, &plan) {
             Ok(s) => s,
             Err(IoError::TooLarge(m)) => return Err(IoError::TooLarge(m)),

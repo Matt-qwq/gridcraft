@@ -1778,6 +1778,11 @@ fn read_threaded(cx: &Ctx<'_>, x: &El, sheet: &mut Sheet) {
 
 /// Worksheet extensions: x14 data validations and sparklines.
 fn read_ext(cx: &mut Ctx<'_>, e: &El, sheet: &mut Sheet) {
+    // The pass-through keeps the extensions this doesn't read, and has to know whether to look:
+    // the sheet part is the file's biggest, and is only read again when there is something to keep.
+    if e.kids("ext").any(crate::passthrough::sheet_ext_unknown) {
+        cx.sheet_ext = true;
+    }
     for ext in e.kids("ext") {
         for c in &ext.children {
             match c.name.as_str() {
