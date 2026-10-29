@@ -27,8 +27,8 @@
 //! A band that overflows the index (more than 65,535 distinct numbers in 64 rows) falls back to
 //! `NUMBER_WIDE`, which keeps the bits in the row's side table.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use gridcraft_core::{CellError, CellRef, RangeRef, Value};
 use serde::{Deserialize, Serialize};
@@ -51,10 +51,16 @@ const PARALLEL_WRITE_MIN: usize = 16_384;
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_WRITE_MAX_CELLS: usize = 4_000_000;
 
-/// How many decoded bands the page cache keeps. A band is at most 64 rows; this is roughly 2.6M
-/// cells at the export's density (a few tens of MiB), enough for a viewport and a scrolling burst
-/// without letting a full-sheet scan grow the working set back to the live model.
-const PAGE_CACHE_PAGES: usize = 4_096;
+/// How many bytes of decoded bands the page cache keeps by default. Enough for a viewport and a
+/// scrolling burst at the export's density, without letting a full-sheet scan grow the working set
+/// back to the live model.
+const PAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// The bounds [`enable_paging`](CellStore::enable_paging) applies to `GRIDCRAFT_PAGE_CACHE_MB`.
+/// Only the non-wasm environment reader uses them; wasm keeps the default.
+#[cfg(not(target_arch = "wasm32"))]
+const PAGE_CACHE_MIN_MB: usize = 8;
+#[cfg(not(target_arch = "wasm32"))]
+const PAGE_CACHE_MAX_MB: usize = 512;
 
 /// How many rewritten pages a compaction pass keeps decoded. Genuine orphans are a handful per
 /// edit, and the read that follows a save is likely to want them; a bigger pass (or one that a
@@ -567,6 +573,56 @@ fn number_hash(bits: u64) -> usize {
 }
 
 impl Band {
+    /// Heap bytes of the band's header, its stripes and its number table: everything a band owns
+    /// before the rows' headers, their extras and the text contents.
+    fn stripe_bytes(&self) -> usize {
+        use std::mem::size_of;
+        size_of::<Band>()
+            + self.bits.capacity() * size_of::<u64>()
+            + self.kinds.capacity() * size_of::<(u16, u16)>()
+            + self.payloads.capacity() * size_of::<u16>()
+            + self.styles.capacity() * size_of::<(u16, u16)>()
+            + self.numbers.capacity() * size_of::<f64>()
+            + self.number_slots.capacity() * size_of::<u16>()
+    }
+
+    /// What one row's formulas and array values cost beyond the row header: the side table's run
+    /// of entries, and the parsed tree each formula keeps.
+    fn extras_bytes(row: &BandRow) -> usize {
+        row.formulas().len() * (4 + std::mem::size_of::<Formula>())
+            + row.arrays().len() * 8
+            + row.formulas().iter().map(|(_, f)| f.text.len().saturating_add(f.expr_bytes as usize)).sum::<usize>()
+    }
+
+    /// Heap bytes of one text: its characters plus the pointer that names them.
+    fn text_bytes(text: &Arc<str>) -> usize {
+        text.len().saturating_add(std::mem::size_of::<Arc<str>>())
+    }
+
+    /// Heap bytes this band owns, for the page cache's budget. A text or an extras table another
+    /// owner also holds is charged as its pointer, not as its contents: `decode_band` builds fresh
+    /// strings, while a band primed from a live one shares them, and that memory already belongs to
+    /// the model (or to an undo snapshot). O(rows + texts) and allocation-free, so one decode can
+    /// afford it.
+    fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let mut bytes = self.stripe_bytes();
+        bytes += self.rows.capacity() * size_of::<BandRow>();
+        bytes += self.style_ids.capacity() * size_of::<StyleId>();
+        for row in &self.rows {
+            match &row.extras {
+                None => {}
+                Some(extras) if Arc::strong_count(extras) > 1 => bytes = bytes.saturating_add(size_of::<Arc<RowExtras>>()),
+                // The band holds the only reference: the vecs and the formula trees are its cost.
+                Some(_) => bytes = bytes.saturating_add(size_of::<RowExtras>()).saturating_add(Self::extras_bytes(row)),
+            }
+        }
+        for text in &self.texts {
+            bytes = bytes.saturating_add(if Arc::strong_count(text) > 1 { size_of::<Arc<str>>() } else { Self::text_bytes(text) });
+        }
+        bytes
+    }
+
     fn row_index(&self, key: u32) -> Option<usize> {
         self.rows.binary_search_by_key(&key, |r| r.key).ok()
     }
@@ -1685,6 +1741,30 @@ pub struct Compacted {
     pub changed: bool,
 }
 
+/// What a [`CellStore::page_cache_stats`] report says about the decoded bands kept for a page file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageCacheStats {
+    /// The cache's byte budget, fixed when the page file was created.
+    pub budget: usize,
+    /// Decoded-band bytes the cache has charged now.
+    pub bytes: usize,
+    /// Entries in the cache's recency queue.
+    pub entries: usize,
+    /// Reads that found the band already decoded.
+    pub hits: u64,
+    /// Decodes that installed a band (and charged it to the budget).
+    pub misses: u64,
+    /// Entries dropped to stay within the budget.
+    pub evictions: u64,
+    /// Reads that found a page the file could not read or decode.
+    pub corrupt: u64,
+    /// Page writes the file refused or that failed; the band stays live when this happens.
+    pub spill_failures: u64,
+    /// The largest single band charged. When this is above `budget` the cache kept one oversize
+    /// band rather than evicting it only to decode it again on the next read.
+    pub max_entry_bytes: usize,
+}
+
 /// A `CellStore`'s packed bands, plus the count of stored cells.
 #[derive(Debug, Default)]
 pub struct CellStore {
@@ -1692,16 +1772,14 @@ pub struct CellStore {
     /// Bands that were spilled to a page file. A paged band is still in the store's logical range
     /// and `len`; it is decoded on the first read and then cached in its `Page`.
     pages: BTreeMap<u32, Arc<page::Page>>,
-    /// The temporary file the pages live in. One per store (and shared by its clones); dropping
-    /// the last store removes it.
+    /// The temporary file the pages live in, and the byte-budget cache of decoded bands that
+    /// belongs to it. One per store (and shared by its clones and undo snapshots); dropping the
+    /// last store removes the file.
     page_file: Option<Arc<page::PageFile>>,
     /// Logical→physical rows. Identity until a row insert or delete.
     row_map: RowMap,
     /// Logical→physical columns. Identity until a column insert or delete.
     col_map: ColMap,
-    /// The recency queue for decoded pages; shared by clones, like the file. It holds keys whose
-    /// page is (or was) decoded; a key whose page was evicted is a no-op when it reaches the front.
-    page_order: Option<Arc<Mutex<VecDeque<u32>>>>,
     len: usize,
     /// The band cells were last added to. Cells arrive band by band as a file is read, so the band
     /// before it is complete and can stop carrying its number index. Not part of what a store is:
@@ -1717,7 +1795,6 @@ impl Clone for CellStore {
             bands: self.bands.clone(),
             pages: self.pages.clone(),
             page_file: self.page_file.clone(),
-            page_order: self.page_order.clone(),
             row_map: self.row_map.clone(),
             col_map: self.col_map.clone(),
             len: self.len,
@@ -1907,9 +1984,23 @@ impl CellStore {
             return Some(band.clone());
         }
         let page = self.pages.get(&key)?;
-        let (band, first) = page.load(self.page_file.as_deref()?);
-        if first && band.is_some() {
-            self.touch_page(key);
+        self.load_page(key, page)
+    }
+
+    /// Decodes a paged band through the page cache: a fresh decode pays its heap bytes into the
+    /// budget, a cached band is a hit, and a page that cannot be read is counted as corrupt. Only
+    /// the call that installed the band gets a byte count back from [`page::Page::load`], so a band
+    /// that several stores read at once is charged once.
+    fn load_page(&self, key: u32, page: &Arc<page::Page>) -> Option<Arc<Band>> {
+        let file = self.page_file.as_deref()?;
+        let (band, decoded) = page.load(file);
+        match (&band, decoded) {
+            (Some(_), Some(bytes)) => {
+                file.cache().miss();
+                file.cache().note(key, page, bytes);
+            }
+            (Some(_), None) => file.cache().hit(),
+            (None, _) => file.cache().corrupt(),
         }
         band
     }
@@ -2003,39 +2094,45 @@ impl CellStore {
         (lo != u32::MAX).then_some((lo, hi))
     }
 
-    /// Records a decoded page and evicts the oldest when the cache is full. The queue is shared by
-    /// undo snapshots, so an eviction here helps every store holding the same file.
-    fn touch_page(&self, key: u32) {
-        let Some(order) = &self.page_order else { return };
-        let Ok(mut order) = order.lock() else { return };
-        order.push_back(key);
-        while order.len() > PAGE_CACHE_PAGES {
-            let Some(old) = order.pop_front() else { break };
-            if old != key
-                && let Some(page) = self.pages.get(&old)
-            {
-                page.clear();
-            }
-        }
-    }
-
     /// Bands held in memory, and bands on the page file.
     pub fn paged_band_count(&self) -> usize {
         self.pages.len()
+    }
+
+    /// What the page cache of this store's page file has done: its byte budget, the bytes it holds,
+    /// and its counters. `None` when the store does not page.
+    ///
+    /// `bytes` is what is charged to decoded bands the cache installed; a band can outlive its
+    /// charge (a caller, or an undo snapshot, holding the `Arc`), so the figure is the budget's
+    /// measure, not a heap census of the process. `entries` counts the queue's entries, including
+    /// the ones whose page has been dropped and whose bytes are subtracted the next time the queue
+    /// is trimmed to the budget.
+    pub fn page_cache_stats(&self) -> Option<PageCacheStats> {
+        self.page_file.as_ref().map(|file| file.cache().stats())
     }
 
     /// Turns paging on for this store: every completed band already in it is written to a fresh
     /// temporary page file, and later `insert_batch` calls spill the bands they add. Called by the
     /// reader before it fills a sheet, so a large open keeps pages instead of every band.
     ///
+    /// The decoded-band cache is created with the file and takes its budget from
+    /// `GRIDCRAFT_PAGE_CACHE_MB` (clamped to 8..=512 MiB, default 64 MiB). The budget belongs to
+    /// the file, so clones and undo snapshots share it and a later `enable_paging` keeps it.
+    ///
     /// Returns false when a temporary file cannot be created; the store stays ordinary.
     pub fn enable_paging(&mut self) -> bool {
+        self.enable_paging_with_cache(page::default_cache_bytes())
+    }
+
+    /// [`enable_paging`](Self::enable_paging) with an explicit cache budget in bytes. Tests pin the
+    /// budget this way: the environment is process-global and the model tests run in parallel. A
+    /// store that already pages keeps the budget it was created with.
+    pub fn enable_paging_with_cache(&mut self, cache_bytes: usize) -> bool {
         if self.page_file.is_some() {
             return true;
         }
-        let Some(file) = page::PageFile::new() else { return false };
+        let Some(file) = page::PageFile::new(cache_bytes) else { return false };
         self.page_file = Some(Arc::new(file));
-        self.page_order = Some(Arc::new(Mutex::new(VecDeque::new())));
         self.spill_pages();
         true
     }
@@ -2068,14 +2165,15 @@ impl CellStore {
             return Some(band.clone());
         }
         let page = self.pages.get(&key)?.clone();
-        let band = page.load(self.page_file.as_deref()?).0?;
+        let band = self.load_page(key, &page)?;
         self.pages.remove(&key);
         self.bands.insert(key, band.clone());
         Some(band)
     }
 
-    /// Bytes the page file holds, for the memory diagnostics. Pages are encoded, not compressed
-    /// yet; this is the live cost of the decoded bands that have been touched, plus the file.
+    /// Compressed bytes the page file holds: the sum of the deflated page lengths, i.e. what the
+    /// spill costs on disk. The decoded bands cost memory instead, and that is what
+    /// [`page_cache_stats`](Self::page_cache_stats) reports.
     pub fn paged_bytes(&self) -> usize {
         self.pages.values().map(|p| p.page_len()).sum()
     }
@@ -3030,11 +3128,7 @@ impl CellStore {
             if next.is_some_and(|b| Arc::ptr_eq(b, band)) {
                 continue;
             }
-            bytes += std::mem::size_of::<Band>();
-            bytes += band.bits.capacity() * 8;
-            bytes += band.kinds.capacity() * 4;
-            bytes += band.payloads.capacity() * 2;
-            bytes += band.styles.capacity() * 4;
+            bytes += band.stripe_bytes();
             for row in &band.rows {
                 bytes += std::mem::size_of::<BandRow>();
                 // A value edit copies the band but shares each row's extras with the newer store;
@@ -3047,16 +3141,10 @@ impl CellStore {
                 if shared {
                     continue;
                 }
-                bytes += row.formulas().len() * (4 + std::mem::size_of::<Formula>()) + row.arrays().len() * 8;
-                for f in row.formulas().iter().map(|(_, f)| f) {
-                    // The parsed tree's size is counted when the formula is parsed: walking every
-                    // formula of every band an edit touched was most of what an undo entry cost.
-                    bytes += f.text.len() + f.expr_bytes as usize;
-                }
+                bytes += Band::extras_bytes(row);
             }
-            bytes += band.numbers.capacity() * 8 + band.number_slots.capacity() * 2;
-            for t in &band.texts {
-                bytes += t.len() + std::mem::size_of::<Arc<str>>();
+            for text in &band.texts {
+                bytes += Band::text_bytes(text);
             }
         }
         bytes
@@ -3241,14 +3329,18 @@ impl CellStore {
                 continue;
             };
             rewritten = rewritten.saturating_add(1);
-            let page = page::Page::from_band(at, Arc::new(band));
+            let page = Arc::new(page::Page::from_band(at, Arc::new(band)));
             // A few rewritten pages are worth keeping decoded for the read that follows a save. A
             // column-gap pass can over-select and a big pass would pin a band per page, so those
             // are left for the page cache to decode once.
             if !(self.col_map.is_identity() && rewritten <= PAGE_PRIME_LIMIT) {
                 page.clear();
+            } else {
+                // A primed band is cache content like a decoded one: it must be charged to the
+                // budget and be evictable, or a compaction pass would leak bands past the budget.
+                file.cache().note(key, &page, page.cached_bytes());
             }
-            self.pages.insert(key, Arc::new(page));
+            self.pages.insert(key, page);
             compacted.cells = compacted.cells.saturating_add(gone);
             compacted.pages = compacted.pages.saturating_add(1);
         }
@@ -3645,6 +3737,7 @@ mod packed_tests {
 /// temp directory, removed when the last store that owns it drops, and never referenced by a
 /// document on disk.
 mod page {
+    use std::collections::VecDeque;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -3652,12 +3745,12 @@ mod page {
     use flate2::read::ZlibDecoder;
     use flate2::write::ZlibEncoder;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
     use gridcraft_core::{CellError, CellRef, RangeRef, Value};
 
-    use super::{Band, BandRow, ERRORS, Formula, RowExtras, StyleId, error_code};
+    use super::{Band, BandRow, ERRORS, Formula, PageCacheStats, RowExtras, StyleId, error_code};
 
     const MAGIC: u32 = 0x4750_4231; // "GPB1"
     const VERSION: u8 = 1;
@@ -3684,6 +3777,131 @@ mod page {
         Band(Arc<Band>),
     }
 
+    /// One decoded band's claim on the budget: the page that installed it, under which generation,
+    /// and the bytes it was charged.
+    #[derive(Debug)]
+    struct Entry {
+        key: u32,
+        generation: u64,
+        page: Weak<Page>,
+        bytes: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct CacheState {
+        /// Oldest first. An entry whose page has been dropped stays here until the budget sends it
+        /// to the front, so only trimming costs a `Weak` upgrade.
+        queue: VecDeque<Entry>,
+        bytes: usize,
+    }
+
+    /// The decoded-band cache of one page file: a byte budget, a queue of installs, and the
+    /// counters a memory report needs. There is one decoded copy per page and the pages belong to
+    /// one file, so the budget belongs to the file: clones and undo snapshots share it. The budget
+    /// is fixed when the file is created; a clone with a different budget is not offered.
+    #[derive(Debug)]
+    pub(super) struct PageCache {
+        budget: usize,
+        state: Mutex<CacheState>,
+        hits: AtomicU64,
+        misses: AtomicU64,
+        evictions: AtomicU64,
+        corrupt: AtomicU64,
+        spill_failures: AtomicU64,
+        max_entry_bytes: AtomicUsize,
+    }
+
+    impl PageCache {
+        fn new(budget: usize) -> PageCache {
+            PageCache {
+                budget,
+                state: Mutex::new(CacheState::default()),
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                evictions: AtomicU64::new(0),
+                corrupt: AtomicU64::new(0),
+                spill_failures: AtomicU64::new(0),
+                max_entry_bytes: AtomicUsize::new(0),
+            }
+        }
+
+        fn state(&self) -> MutexGuard<'_, CacheState> {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        pub(super) fn hit(&self) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(super) fn miss(&self) {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(super) fn corrupt(&self) {
+            self.corrupt.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn spill_failure(&self) {
+            self.spill_failures.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Charges a band a decode just installed, then trims the queue back to the budget, oldest
+        /// first. The entry just added is last, so the trim always leaves at least one band: a band
+        /// larger than the whole budget stays (evicting it would only decode it again) and
+        /// `max_entry_bytes` makes that visible.
+        pub(super) fn note(&self, key: u32, page: &Arc<Page>, bytes: usize) {
+            self.max_entry_bytes.fetch_max(bytes, Ordering::Relaxed);
+            let generation = page.generation();
+            let mut state = self.state();
+            // A second note for the same install of the same page would charge the band twice.
+            // `Page::load` hands the byte count to exactly one caller, so this cannot happen
+            // today; the check is O(1) and also keeps two pages at the same key apart, since a
+            // rewritten page starts its generations over.
+            if state
+                .queue
+                .back()
+                .is_some_and(|last| last.key == key && last.generation == generation && std::ptr::eq(last.page.as_ptr(), Arc::as_ptr(page)))
+            {
+                return;
+            }
+            state.bytes = state.bytes.saturating_add(bytes);
+            state.queue.push_back(Entry { key, generation, page: Arc::downgrade(page), bytes });
+            while state.bytes > self.budget && state.queue.len() > 1 {
+                if !self.evict_oldest(&mut state) {
+                    break;
+                }
+            }
+        }
+
+        /// Drops the oldest entry's band (when its page still exists and has not decoded again) and
+        /// takes the recorded bytes off the total. A dead `Weak` means the page, and the band it
+        /// held, are already gone: the bytes are still ours to subtract.
+        fn evict_oldest(&self, state: &mut CacheState) -> bool {
+            let Some(entry) = state.queue.pop_front() else { return false };
+            if let Some(page) = entry.page.upgrade() {
+                page.clear_if(entry.generation);
+            }
+            state.bytes = state.bytes.saturating_sub(entry.bytes);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+
+        pub(super) fn stats(&self) -> PageCacheStats {
+            let state = self.state();
+            PageCacheStats {
+                budget: self.budget,
+                bytes: state.bytes,
+                entries: state.queue.len(),
+                hits: self.hits.load(Ordering::Relaxed),
+                misses: self.misses.load(Ordering::Relaxed),
+                evictions: self.evictions.load(Ordering::Relaxed),
+                corrupt: self.corrupt.load(Ordering::Relaxed),
+                spill_failures: self.spill_failures.load(Ordering::Relaxed),
+                max_entry_bytes: self.max_entry_bytes.load(Ordering::Relaxed),
+            }
+        }
+    }
+
     #[derive(Debug)]
     pub(super) struct Page {
         at: PageRef,
@@ -3691,26 +3909,42 @@ mod page {
         formulas: bool,
         owned: bool,
         band: Mutex<Cached>,
+        /// Bumped whenever a decoded band is installed or dropped, so a cache entry can tell whether
+        /// the install its bytes were charged for is still the one in the page. Without it a key
+        /// decoded, evicted and decoded again would take its bytes off the budget twice.
+        generation: AtomicU64,
+        /// The [`Band::heap_bytes`] of the band in `band`; zero when nothing decoded is held.
+        cached_bytes: AtomicUsize,
     }
 
     impl Page {
         pub(super) fn new(at: PageRef, bounds: Option<(u32, u32, u32, u32)>, formulas: bool, owned: bool) -> Page {
-            Page { at, bounds, formulas, owned, band: Mutex::new(Cached::Miss) }
+            Page { at, bounds, formulas, owned, band: Mutex::new(Cached::Miss), generation: AtomicU64::new(0), cached_bytes: AtomicUsize::new(0) }
         }
 
         /// The page a rewritten band becomes: the bounds and flags are recomputed from the new
         /// band exactly as [`spill_band`](super::CellStore::spill_band) computes them, and the
-        /// decoded copy is installed so the read that follows does not decode it again.
+        /// decoded copy is installed and measured so the read that follows does not decode it
+        /// again, and so the cache can charge it.
         pub(super) fn from_band(at: PageRef, band: Arc<Band>) -> Page {
+            let bytes = band.heap_bytes();
             let bounds = band_bounds(&band);
             let formulas = band.rows.iter().any(|r| !r.formulas().is_empty());
             let owned = band.rows.iter().any(|r| !r.formulas().is_empty() || !r.arrays().is_empty());
-            Page { at, bounds, formulas, owned, band: Mutex::new(Cached::Band(band)) }
+            Page {
+                at,
+                bounds,
+                formulas,
+                owned,
+                band: Mutex::new(Cached::Band(band)),
+                generation: AtomicU64::new(1),
+                cached_bytes: AtomicUsize::new(bytes),
+            }
         }
 
-        /// Reads and decodes the page without touching the cached copy or the store's page-order
-        /// queue: a compaction pass looks at pages it may leave alone, and must not pin a decoded
-        /// band per page (the queue only evicts pages it was told about).
+        /// Reads and decodes the page without touching the cached copy or the cache's queue: a
+        /// compaction pass looks at pages it may leave alone, and must not pin a decoded band per
+        /// page (the queue only evicts pages it was told about).
         pub(super) fn decode(&self, file: &PageFile) -> Option<Arc<Band>> {
             file.decodes.fetch_add(1, Ordering::Relaxed);
             let bytes = file.read(self.at)?;
@@ -3733,45 +3967,82 @@ mod page {
             usize::try_from(self.at.len).unwrap_or(0)
         }
 
-        /// The decoded band, reading and validating the page on first use. The bool says this call
-        /// decoded it, which is what the store's page-cache queue needs to know.
-        pub(super) fn load(&self, file: &PageFile) -> (Option<Arc<Band>>, bool) {
-            if let Ok(guard) = self.band.lock() {
-                match &*guard {
-                    Cached::Band(band) => return (Some(band.clone()), false),
-                    Cached::Corrupt => return (None, false),
-                    Cached::Miss => {}
-                }
+        /// The current install's generation; the cache records it with the charge so an eviction
+        /// can tell whether the band it is looking at is the one it charged for.
+        pub(super) fn generation(&self) -> u64 {
+            self.generation.load(Ordering::Relaxed)
+        }
+
+        /// The bytes the installed band was charged, or 0 when nothing is decoded.
+        pub(super) fn cached_bytes(&self) -> usize {
+            self.cached_bytes.load(Ordering::Relaxed)
+        }
+
+        fn lock_band(&self) -> MutexGuard<'_, Cached> {
+            self.band.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// The decoded band, reading and validating the page on first use. `Some(bytes)` says this
+        /// call installed the band, and is the [`Band::heap_bytes`] the cache must charge; a cached
+        /// read and a corrupt page charge nothing. Exactly one caller sees the `Some`: the install
+        /// and the decision happen under the page's mutex.
+        pub(super) fn load(&self, file: &PageFile) -> (Option<Arc<Band>>, Option<usize>) {
+            match &*self.lock_band() {
+                Cached::Band(band) => return (Some(band.clone()), None),
+                Cached::Corrupt => return (None, None),
+                Cached::Miss => {}
             }
             let decoded = file.read(self.at).and_then(|bytes| decode_band(&bytes).map(Arc::new));
-            if let Ok(mut guard) = self.band.lock() {
-                match &*guard {
-                    Cached::Band(band) => return (Some(band.clone()), false),
-                    Cached::Corrupt => return (None, false),
-                    Cached::Miss => {
-                        *guard = match &decoded {
-                            Some(band) => Cached::Band(band.clone()),
-                            None => Cached::Corrupt,
-                        };
-                    }
+            let mut guard = self.lock_band();
+            match &*guard {
+                Cached::Band(band) => return (Some(band.clone()), None),
+                Cached::Corrupt => return (None, None),
+                Cached::Miss => {}
+            }
+            match decoded {
+                Some(band) => {
+                    let bytes = band.heap_bytes();
+                    *guard = Cached::Band(band.clone());
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                    self.cached_bytes.store(bytes, Ordering::Relaxed);
+                    (Some(band), Some(bytes))
+                }
+                None => {
+                    *guard = Cached::Corrupt;
+                    (None, None)
                 }
             }
-            (decoded, true)
         }
 
         /// Drops the decoded copy; a later read decodes the page again. A corrupt page stays
-        /// remembered as corrupt rather than being retried on every access.
+        /// remembered as corrupt rather than being retried on every access. The generation moves on
+        /// so a charge already queued for the dropped band cannot clear a later install.
         pub(super) fn clear(&self) {
-            if let Ok(mut guard) = self.band.lock()
-                && matches!(&*guard, Cached::Band(_))
-            {
+            let mut guard = self.lock_band();
+            if matches!(&*guard, Cached::Band(_)) {
                 *guard = Cached::Miss;
+                self.cached_bytes.store(0, Ordering::Relaxed);
+                self.generation.fetch_add(1, Ordering::Relaxed);
             }
+        }
+
+        /// Drops the decoded band only when `generation` is still the install the caller charged,
+        /// and returns the bytes that were charged for it. A page that decoded again (or was
+        /// cleared) keeps its band: the queue entry still goes away, since its bytes no longer
+        /// describe what the page holds.
+        pub(super) fn clear_if(&self, generation: u64) -> Option<usize> {
+            let mut guard = self.lock_band();
+            if self.generation.load(Ordering::Relaxed) != generation || !matches!(&*guard, Cached::Band(_)) {
+                return None;
+            }
+            *guard = Cached::Miss;
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            Some(self.cached_bytes.swap(0, Ordering::Relaxed))
         }
 
         #[cfg(test)]
         pub(super) fn is_cached(&self) -> bool {
-            self.band.lock().is_ok_and(|guard| matches!(&*guard, Cached::Band(_)))
+            matches!(&*self.lock_band(), Cached::Band(_))
         }
     }
 
@@ -3786,10 +4057,14 @@ mod page {
         /// nothing to reclaim must decode none, and a test can prove it because the count belongs
         /// to this file (not to the process, where parallel tests would see each other's reads).
         decodes: AtomicU64,
+        /// The decoded bands read through this file. It lives here because the budget has to: there
+        /// is one decoded copy per page, the pages belong to one file, and so the file's owner,
+        /// clones and undo snapshots all share one cache.
+        cache: PageCache,
     }
 
     impl PageFile {
-        pub(super) fn new() -> Option<PageFile> {
+        pub(super) fn new(cache_bytes: usize) -> Option<PageFile> {
             // A counter, not the clock: `SystemTime::now` traps on wasm. The pid separates
             // processes; `create_new` still refuses a stale collision, and the loop tries the next
             // name rather than trusting an existing file.
@@ -3798,15 +4073,20 @@ mod page {
             for attempt in 0..16u32 {
                 let path = std::env::temp_dir().join(format!("gridcraft-page-{}-{nonce}-{attempt}.bin", std::process::id()));
                 match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
-                    Ok(file) => return Some(PageFile { path, file: Mutex::new(Some(file)), decodes: AtomicU64::new(0) }),
+                    Ok(file) => {
+                        return Some(PageFile { path, file: Mutex::new(Some(file)), decodes: AtomicU64::new(0), cache: PageCache::new(cache_bytes) });
+                    }
                     Err(_) => continue,
                 }
             }
             None
         }
 
-        /// Appends `bytes` and returns where they landed. A page larger than the cap is refused
-        /// before it is written.
+        /// The decoded-band cache this file's pages are read through.
+        pub(super) fn cache(&self) -> &PageCache {
+            &self.cache
+        }
+
         #[cfg(test)]
         pub(super) fn path(&self) -> &std::path::Path {
             &self.path
@@ -3818,7 +4098,18 @@ mod page {
             self.decodes.load(Ordering::Relaxed)
         }
 
+        /// Appends `bytes` and returns where they landed. A page larger than the cap is refused
+        /// before it is written. A refusal or a failed write is counted as a spill failure; the
+        /// caller leaves the band live, so paging never loses cells.
         pub(super) fn write(&self, bytes: &[u8]) -> Option<PageRef> {
+            let at = self.append(bytes);
+            if at.is_none() {
+                self.cache.spill_failure();
+            }
+            at
+        }
+
+        fn append(&self, bytes: &[u8]) -> Option<PageRef> {
             if bytes.is_empty() || bytes.len() > MAX_PAGE {
                 return None;
             }
@@ -3863,6 +4154,36 @@ mod page {
             }
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+
+    /// The cache budget [`enable_paging`](super::CellStore::enable_paging) creates a page file
+    /// with. Read once: `GRIDCRAFT_PAGE_CACHE_MB`, clamped to 8..=512 MiB, default 64 MiB. Tests
+    /// pin a budget through [`enable_paging_with_cache`](super::CellStore::enable_paging_with_cache)
+    /// instead, because the environment is process-global and the model tests run in parallel.
+    pub(super) fn default_cache_bytes() -> usize {
+        static BUDGET: OnceLock<usize> = OnceLock::new();
+        *BUDGET.get_or_init(|| requested_cache_bytes().unwrap_or(super::PAGE_CACHE_BYTES))
+    }
+
+    /// `GRIDCRAFT_PAGE_CACHE_MB` in bytes, or `None` when it is unset or not a number.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn requested_cache_bytes() -> Option<usize> {
+        let mb = std::env::var("GRIDCRAFT_PAGE_CACHE_MB").ok()?.trim().parse::<usize>().ok()?;
+        Some(cache_bytes_for_mb(mb))
+    }
+
+    /// A `GRIDCRAFT_PAGE_CACHE_MB` value in bytes, clamped so a typo cannot ask for a gigabyte or
+    /// for a cache too small to hold one band. The clamp happens before the multiply, so an absurd
+    /// value cannot overflow the budget.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn cache_bytes_for_mb(mb: usize) -> usize {
+        mb.clamp(super::PAGE_CACHE_MIN_MB, super::PAGE_CACHE_MAX_MB).saturating_mul(1024 * 1024)
+    }
+
+    /// wasm has no environment to read; the default stands.
+    #[cfg(target_arch = "wasm32")]
+    fn requested_cache_bytes() -> Option<usize> {
+        None
     }
 
     fn put_u8(out: &mut Vec<u8>, v: u8) {
@@ -4427,21 +4748,154 @@ mod tests {
     }
 
     #[test]
-    fn the_page_cache_evicts_the_oldest_decoded_band() {
+    fn the_page_cache_evicts_to_a_byte_budget() {
         let mut s = CellStore::new();
-        for r in 0..(PAGE_CACHE_PAGES as u32 + 1) {
+        for r in 0..3u32 {
             s.set(c(r * 64, 0), Cell::value(Value::Number(f64::from(r))));
         }
-        assert!(s.enable_paging());
-        assert_eq!(s.pages.len(), PAGE_CACHE_PAGES + 1);
-        assert_eq!(s.iter().count(), PAGE_CACHE_PAGES + 1);
-        // The first band was decoded first and is past the cache window now.
-        assert!(s.pages.get(&0).is_some_and(|page| !page.is_cached()));
-        // The last one, and the rest of the window, are still decoded.
-        let last = PAGE_CACHE_PAGES as u32;
-        assert!(s.pages.get(&last).is_some_and(|page| page.is_cached()));
-        assert_eq!(s.get(c(0, 0)).map(|x| x.value), Some(Value::Number(0.0)));
+        assert!(s.enable_paging_with_cache(1), "one byte is a one-band budget");
+        assert_eq!(s.paged_band_count(), 3);
+        assert!(s.get(c(0, 0)).is_some());
+        let first = s.page_cache_stats().expect("the store pages");
+        assert_eq!((first.hits, first.misses, first.evictions), (0, 1, 0), "the first read decodes");
+        assert!(first.bytes > first.budget, "a band bigger than the budget is kept rather than re-decoded");
+        assert_eq!(first.max_entry_bytes, first.bytes, "the oversize band is reported");
         assert!(s.pages.get(&0).is_some_and(|page| page.is_cached()));
+        // A second band takes the total past the budget, so the first one is evicted.
+        assert!(s.get(c(64, 0)).is_some());
+        let second = s.page_cache_stats().expect("the store pages");
+        assert_eq!((second.hits, second.misses, second.evictions), (0, 2, 1));
+        assert!(!s.pages.get(&0).is_some_and(|page| page.is_cached()), "the oldest band was evicted");
+        assert!(s.pages.get(&1).is_some_and(|page| page.is_cached()));
+        assert_eq!(second.bytes, second.max_entry_bytes, "only the band just decoded is charged");
+        // Re-reading the evicted page decodes it again and restores the same charge.
+        assert!(s.get(c(0, 0)).is_some());
+        let third = s.page_cache_stats().expect("the store pages");
+        assert_eq!((third.hits, third.misses, third.evictions), (0, 3, 2));
+        assert_eq!(third.bytes, first.bytes, "the same band is charged the same bytes again");
+        assert!(!s.pages.get(&1).is_some_and(|page| page.is_cached()));
+        assert!(s.pages.get(&0).is_some_and(|page| page.is_cached()));
+        // A cached read is a hit and charges nothing.
+        assert!(s.get(c(0, 0)).is_some());
+        let fourth = s.page_cache_stats().expect("the store pages");
+        assert_eq!((fourth.hits, fourth.misses, fourth.evictions), (1, 3, 2));
+        assert_eq!(fourth.bytes, third.bytes);
+    }
+
+    #[test]
+    fn a_store_without_paging_has_no_page_cache() {
+        assert!(CellStore::new().page_cache_stats().is_none());
+    }
+
+    /// The `GRIDCRAFT_PAGE_CACHE_MB` value is clamped before it becomes bytes; the environment
+    /// itself is never touched by a test, since it is process-global and these run in parallel.
+    #[test]
+    fn the_cache_budget_knob_is_clamped_to_its_bounds() {
+        assert_eq!(page::cache_bytes_for_mb(0), 8 << 20, "a tiny budget is raised to the floor");
+        assert_eq!(page::cache_bytes_for_mb(64), 64 << 20);
+        assert_eq!(page::cache_bytes_for_mb(usize::MAX), 512 << 20, "an absurd value saturates the cap");
+    }
+
+    /// The budget belongs to the page file, so a clone reads into the same cache and its decode is
+    /// visible from the store it came from.
+    #[test]
+    fn a_clone_decodes_into_the_same_page_cache() {
+        let mut s = CellStore::new();
+        for r in 0..2u32 {
+            s.set(c(r * 64, 0), Cell::value(Value::Number(f64::from(r))));
+        }
+        assert!(s.enable_paging_with_cache(1));
+        let clone = s.clone();
+        assert!(clone.get(c(0, 0)).is_some());
+        let one = s.page_cache_stats().expect("the store pages");
+        assert_eq!(one.misses, 1);
+        assert_eq!(clone.page_cache_stats(), Some(one), "the clone reports the same cache");
+        // The clone's second band evicts the band the original decoded.
+        assert!(clone.get(c(64, 0)).is_some());
+        let two = s.page_cache_stats().expect("the store pages");
+        assert_eq!((two.misses, two.evictions), (2, 1));
+        assert!(!s.pages.get(&0).is_some_and(|page| page.is_cached()), "the eviction is shared");
+        assert_eq!(clone.page_cache_stats(), Some(two));
+    }
+
+    /// A snapshot that still holds a page the newer store replaced keeps the band charged: the
+    /// cache's `Weak` upgrades, so the memory is real and stays on the budget.
+    #[test]
+    fn a_snapshot_keeps_a_replaced_pages_bytes_charged() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging_with_cache(page::default_cache_bytes()));
+        let snapshot = s.clone();
+        assert!(s.get(c(0, 0)).is_some());
+        let old = s.page_cache_stats().expect("the store pages");
+        assert_eq!(old.entries, 1);
+        s.shift_rows(1, -1);
+        assert_eq!(s.compact().pages, 1);
+        let rewritten = s.pages.get(&0).cloned().expect("the rewritten page");
+        assert!(rewritten.is_cached(), "the rewrite is primed for the read that follows");
+        let now = s.page_cache_stats().expect("the store pages");
+        assert_eq!(now.entries, 2, "the old page's charge is still queued");
+        assert_eq!(now.bytes, old.bytes.saturating_add(rewritten.cached_bytes()));
+        assert!(snapshot.pages.get(&0).is_some_and(|page| page.is_cached()), "the snapshot still holds the old band");
+    }
+
+    /// A full-sheet scan cannot grow the cache past its budget: every decoded band is charged, and
+    /// the oldest ones are evicted until the total fits.
+    #[test]
+    fn a_full_scan_stays_within_the_byte_budget() {
+        fn scan_store(bands: u32) -> CellStore {
+            let mut s = CellStore::new();
+            for row in 0..bands * 64 {
+                s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+                s.set(c(row, 1), Cell::value(Value::Text(Arc::from("x"))));
+            }
+            s
+        }
+        // The decoded size of one band, measured through a cache that never evicts it.
+        let mut probe = scan_store(1);
+        assert!(probe.enable_paging_with_cache(usize::MAX));
+        assert!(probe.get(c(0, 0)).is_some());
+        let one = probe.page_cache_stats().expect("the probe pages").bytes;
+        assert!(one > 0);
+        let mut s = scan_store(8);
+        assert!(s.enable_paging_with_cache(one.saturating_mul(2)));
+        let bands = s.paged_band_count();
+        assert!(bands > 4);
+        assert_eq!(s.iter().count(), 8 * 64 * 2);
+        let stats = s.page_cache_stats().expect("the store pages");
+        assert!(stats.bytes <= stats.budget, "{} bytes over a {} byte budget", stats.bytes, stats.budget);
+        assert_eq!(stats.budget, one.saturating_mul(2));
+        assert_eq!(stats.misses, bands as u64, "every band was decoded once");
+        assert_eq!(stats.hits, 0);
+        assert!(stats.evictions > 0, "the scan decoded more than the budget holds");
+        assert!(stats.entries > 0);
+    }
+
+    /// A page compaction primes is cache content: charged when it is installed, and evictable when
+    /// the next decode pushes the budget past it. Under a page count it was never queued.
+    #[test]
+    fn compaction_charges_the_pages_it_primes_and_they_evict() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging_with_cache(1));
+        s.shift_rows(1, -1);
+        assert_eq!(s.compact().pages, 1);
+        let page = s.pages.get(&0).cloned().expect("the rewritten page");
+        assert!(page.is_cached(), "the rewrite is primed");
+        let primed = s.page_cache_stats().expect("the store pages");
+        assert_eq!((primed.entries, primed.misses, primed.evictions), (1, 0, 0), "priming is charged, not a read");
+        assert_eq!(primed.bytes, page.cached_bytes());
+        assert_eq!(primed.max_entry_bytes, page.cached_bytes());
+        // Decoding another band is over the one-byte budget, so the primed page is cleared.
+        assert!(s.get(c(64, 0)).is_some());
+        assert!(!page.is_cached(), "the primed band was evictable");
+        let after = s.page_cache_stats().expect("the store pages");
+        assert_eq!(after.evictions, 1);
+        assert!(after.bytes > 0);
     }
 
     #[test]
@@ -4463,7 +4917,7 @@ mod tests {
         s.insert_batch(batch);
         let band = s.bands.get(&0).expect("band");
         let bytes = page::encode_band(band).expect("encode");
-        let file = page::PageFile::new().expect("page file");
+        let file = page::PageFile::new(page::default_cache_bytes()).expect("page file");
         let at = file.write(&bytes).expect("write");
         let page = page::Page::new(at, page::band_bounds(band), true, true);
         let loaded = page.load(&file).0.expect("decode");
@@ -5532,9 +5986,12 @@ mod tests {
         let bytes = s.paged_bytes();
         let len = s.len();
         let decodes = s.page_file.as_ref().map(|file| file.decodes()).unwrap_or(0);
+        assert_eq!(s.page_cache_stats().expect("the store pages").bytes, 0, "spilling decodes nothing");
         let out = s.compact();
         assert_eq!(out, Compacted::default());
         assert_eq!(s.page_file.as_ref().map(|file| file.decodes()).unwrap_or(0), decodes, "a clean paged store decodes no page");
+        let stats = s.page_cache_stats().expect("the store pages");
+        assert_eq!((stats.entries, stats.bytes, stats.misses, stats.evictions), (0, 0, 0, 0), "a clean pass primes and charges nothing");
         assert_eq!(s.paged_bytes(), bytes);
         assert_eq!(s.len(), len);
         for (key, page) in pages {
