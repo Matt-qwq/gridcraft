@@ -166,7 +166,21 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   [file-format-parity.md](file-format-parity.md)
 
 ### 4. Charts lose options on round trip; shallow chart model (F, FF)
-- **Missing:** axis scaling, label options, error bars, per-point formatting.
+- **Landed (10-29):** the model carries, and reads/writes/draws, axis scaling (min, max, major unit,
+  log base, reversed, crossing, display units, number format), data labels (value, percentage,
+  series name, category name, legend key, position, separator, number format, per-series visibility,
+  per-point deletion), error bars per series (fixed, percentage, sample standard deviation, standard
+  error, custom `numRef`/`numLit`, both directions, `noEndCap`) and per-point fill/line/marker
+  colour. Four commands: `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars`,
+  `chart.formatPoint` — a chart kind that cannot store an option refuses it rather than holding a
+  dead value. An unmodelled chart part is kept byte-identically while the chart is untouched, and
+  `chart_options_roundtrip` pins build → save → reopen → second save byte equality. Catalog
+  274 → 279 / 290 → 295.
+- **Missing (in flight):** field-level pass-through (the first edit still drops unmodelled XML),
+  secondary and date axes, category-axis bounds drawn, charts of unmodelled kinds (3-D, surface,
+  pie-of-pie, Pareto) whose frame lives in the drawing part, chartex options, per-point label text.
+  The UI side — the Format pane driving the four commands and chart **resize** (#190) — has not
+  started.
 - **Evidence:** `Chart` holds only title, legend position, two flags and axis titles
   (`crates/model/src/features.rs`); PRs #158, #161 open; charts can't be resized (#190). Smooth lines (#62), Switch Row/Column (#116) and trendlines (read, written, drawn) landed. Multi-level category axes (year beside month) are read, drawn and written back.
   (`crates/model/src/features.rs`); all 2-D kinds survive XLSX round trip (#158, #161); charts

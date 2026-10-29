@@ -1,8 +1,8 @@
 # GridCraft roadmap
 
-**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~135–210 h away
+**Stage: alpha** · large-workbook beta gate met · next: beta, ~25 points of "ready for real work" and ~120–200 h away
 
-> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (key tips across the whole ribbon: 417 sequences, keyboard context menus, shortcut audit; gates #3 and #9 met) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-29 · **Last updated:** 2026-10-29 · **Change:** minor (charts depth: axis scaling, data labels, error bars, per-point formatting; catalog 279/295; beta ~120–200 h) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -22,11 +22,11 @@ This page is the summary. The detail is in:
 | Number | Value | Kind |
 |---|---|---|
 | 2026-10-14 | Editing a cell with text that would read back as a number, boolean, date or formula (entered with a leading apostrophe) shows the apostrophe in the editor and formula bar, so Enter unchanged keeps it text (#1362) |
-| **Feature breadth** (weighted) | **~75%** | estimated, anchored on two measurements: ribbon catalog 274 / 290 (94.5%), worksheet functions 513 / 523 (98.1%; 504 working, 96.4%) |
+| **Feature breadth** (weighted) | **~75%** | estimated, anchored on two measurements: ribbon catalog 279 / 295 (94.6%), worksheet functions 513 / 523 (98.1%; 504 working, 96.4%) |
 | **Ready for real work** | **~50%** | estimated from written weights (51.6); [target-app-parity.md](docs/target-app-parity.md) |
 | **Mainstream practitioner** | **~50%** | estimated: typical analyst/finance user, weekly features, × 0.90 interaction × 0.92 stability × 0.88 file exchange; [method](docs/target-app-parity.md#mainstream-practitioner) |
 | **Essentials user** | **~63%** | estimated: core features only, × 0.92 launch/stability × 0.95 clarity × 0.90 opening sent files; [method](docs/target-app-parity.md#essentials-user) |
-| Remaining to **beta** | **~135–210 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met; pass-through (#3) and keyboard (#9) landed 10-29 |
+| Remaining to **beta** | **~120–200 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met; pass-through (#3), keyboard (#9) and the chart model half of #4 landed 10-29 |
 | Remaining to **full parity** | **~700–1,100 Opus 5.5 agent-hours** | estimated; sum of the dimension rows below |
 
 | Audience | Ready % | Opus 5.5 agent wall-clock hours to ~95% | Work that dominates |
@@ -131,7 +131,7 @@ The detailed queue with dependencies and the parallel plan is in
 | **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
 | **1** | **XLSX corpus + Excel acceptance** (#1) | 15–25 | **Owner: half a day in Excel.** The only external gate; start early. #3's pass-through half landed 10-29, so this is the corpus run plus Excel acceptance. |
 | **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
-| **2** | Charts depth (#4) | 25–35 | Longest; start in parallel. |
+| **2** | Charts depth (#4) | 8–18 | **Model half landed 10-29** (axis scaling, labels, error bars, per-point, four commands, catalog 279/295); field-level pass-through, secondary axes and the Format pane + resize remain. |
 | **2b** | All-script text (#5) | 12–20 | Parallel. |
 | **2c** | Keyboard/key tips (#9) | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects. |
 | **3** | `.xls` + password-protected books (#7) | 28–42 | Independent; start in parallel once base is stable. |
@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | Charts depth, model half: the model now carries axis scaling (min, max, major unit, log base, reversed, crossing, display units, number format), data labels (value, percentage, series and category names, legend key, position, separator, number format, per-series visibility, per-point deletion), error bars (fixed, percentage, sample standard deviation, standard error, custom ranges, both directions, caps) and per-point fill/line/marker colour — read from the file, written back and drawn, with `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars` and `chart.formatPoint` as commands that refuse what a chart kind cannot store instead of holding a dead option. An unmodelled chart part is kept byte-identically while untouched; catalog 274 → 279 / 290 → 295 (#4) |
 | 2026-10-29 | Keyboard parity: **417 key-tip sequences** cover every ribbon tab, group and button (≤ 4 keys, badges drawn in code), with `Alt` activation, `Esc` at any depth and tests that enforce per-scope uniqueness, no shadowing (two-way prefix), tab reachability and one end-to-end test per sequence (419). `Shift+F10` now opens the context menu at the selection for cells and row/column headers, navigable with arrows/Home/End/Enter/Space/Esc while the grid keeps focus and selection (the Menu key itself cannot be delivered: egui-winit drops `KeyCode::ContextMenu`). Six Excel shortcuts added on commands we already had: `Alt+;` visible cells, `Ctrl+Shift+O` commented cells, `Ctrl+F2` and `Ctrl+Shift+F12` print, `Alt+F5` pivot refresh, `Ctrl+Alt+F5` refresh all; the full Excel → our-id → status audit is in `docs/ui-parity.md`, and what remains missing is features we lack (Quick Analysis, extend mode, pane cycling, sheet groups, Paste Name, Repeat, outline symbols) (#9) |
 | 2026-10-29 | XLSX pass-through keeps what it cannot model: slicers and their caches, timelines and their caches, table-attached query tables and unknown `extLst` children on the workbook, worksheet, table, PivotTable and pivot cache definition survive open → save with part bytes byte-identical and rels re-pointed. Every kept fragment is keyed to its owner, so a deleted, renamed or replaced table/pivot takes its extras, the parts only they reach and the rels with it instead of leaving a dangling reference. A strict package validator (every rel target exists, every part has a content type, no orphans, no case-only duplicates, no stale `Override`, no duplicate rel ids) now runs on every save in the crate's tests. The data model/Power Pivot and chart `extLst` remain dropped, and slicers are kept intact rather than editable (#3) |
 | 2026-10-29 | M19 per-sheet save: worksheet XML is deflated by a background worker as it is written, `write_zip` mixes raw and pre-deflated parts in the same order, and wasm uses inline/sequential paths (Node and native produce identical bytes). **100M save 28.42 s / 1,814.3 MiB peak** (was 26.37 s / 6,049.8), **31.7M 3.48 s / 1,283.9 MiB**; output byte-identical. 273 xlsx / 423 engine tests |
@@ -256,6 +257,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | Charts depth: axis scaling, data labels, error bars and per-point formatting round-trip, draw and are commands; catalog 279/295; gate #4 partial, beta ~120–200 h |
 | 2026-10-29 | minor | Keyboard parity: whole-ribbon key tips (417 sequences), keyboard context menus for cells and headers, six added shortcuts and a full Excel shortcut audit; gate #9 met, gaps §9 updated |
 | 2026-10-29 | minor | XLSX pass-through: slicers, timelines, table query tables and unknown `extLst` kept with owner-keyed extras and drop-with-owner rules; strict package validator on every save; gaps §3 → 0–2 h left, beta ~150–230 h |
 | 2026-10-29 | minor | M19 per-sheet save (background deflate as each sheet is written, mixed raw/packed archive, wasm inline); 100M peak 6.05→1.81 GiB at 28.42 s, 31.7M 1.66→1.28 GiB at 3.48 s, bytes identical; wave 0 base closed |
