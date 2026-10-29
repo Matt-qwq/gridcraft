@@ -448,3 +448,5 @@ fn every_embedded_glyph_is_mapped_once() {
     assert!(find(&pdf, b"<0002> Tj").is_none(), "the second page reused the glyph id");
     assert!(find(&pdf, b"/W [0 [600 650]]").is_some());
 }
+
+mod shaped;

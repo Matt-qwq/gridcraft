@@ -2,12 +2,24 @@
 //!
 //! - The 14 standard fonts with WinAnsiEncoding, plus approximate width tables ([`text_width`]) so
 //!   callers can measure, align and wrap text.
+//! - **Shaped text** ([`gridcraft_core::text`]): text the standard fonts cannot set is shaped with
+//!   the document's embedded face, so Arabic joins, Devanagari is reordered, Thai marks are
+//!   positioned and bidi runs come out in visual order. Glyph advances and marks are written as
+//!   `TJ` adjustments and `Ts` rises, so the pen follows the shaper without moving the text
+//!   matrix that `/W` widths and the `ToUnicode` CMap describe.
 //! - An optional **embedded TrueType subset** ([`PdfDoc::set_font`]) for characters
 //!   WinAnsiEncoding cannot set: the font is read and subset in [`truetype`], embedded as a
-//!   `CIDFontType2` with `FontFile2`, a `ToUnicode` CMap and a `/W` widths array taken from
-//!   `hmtx`, and text is drawn with two-byte glyph ids (`/Identity-H`). A document that sets no
-//!   font, or whose text stays inside WinAnsi, is byte-for-byte what it was: the embedded font is
-//!   only written when a page actually used it.
+//!   `CIDFontType2` with `FontFile2`, a `ToUnicode` CMap and a `/W` widths array that matches what
+//!   is drawn, and text is drawn with two-byte CIDs (`/Identity-H`). A CID extracts as the whole
+//!   source cluster (a ligature, a conjunct) rather than one character; when a glyph needs two
+//!   different extractions in one document, a `CIDToGIDMap` stream points both CIDs at the same
+//!   glyph. A document that sets no font, or whose text stays inside WinAnsi in stored order, is
+//!   byte-for-byte what it was: the embedded font is only written when a page actually used it.
+//! - Text is laid out in **visual order**, one `Tm` per text item with `TJ`/`Ts` placement, and
+//!   `ToUnicode` lines every CID up with the logical text of its source cluster, so a ligature or
+//!   conjunct never loses a character. Single-direction lines extract as their logical text (see
+//!   `examples/text_scripts.rs`); a line mixing right-to-left and left-to-right runs is reordered
+//!   by the extractor's own bidi pass.
 //! - Characters outside WinAnsiEncoding that the embedded font does not cover (and every such
 //!   character when no font is set) are set in a predefined, non-embedded Adobe-GB1 CID font with
 //!   the `UniGB-UTF16-H` CMap instead of being replaced by `?`.
@@ -15,8 +27,9 @@
 //! - RGBA images as RGB image XObjects with a soft mask for alpha (run-length encoded).
 //! - Coordinates are points with a **top-left origin** (y grows down); text `y` is the baseline.
 //!
-//! Streams are written uncompressed (images use the trivial RunLengthDecode filter) so the crate
-//! needs no dependencies.
+//! Streams are written uncompressed (images use the trivial RunLengthDecode filter). The crate's
+//! only dependencies are the shared L0 text engine ([`gridcraft_core`]) and `log`; it does not
+//! touch a UI toolkit, so the writer stays usable from the CLI, the web build and tests.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -27,10 +40,13 @@ pub mod truetype;
 mod testfont;
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
+use std::sync::Arc;
 
+pub use gridcraft_core::text::Direction;
+use gridcraft_core::text::{FaceId, FontSize, Glyph, ShapedText, TextEngine};
 pub use truetype::{Error as FontError, Face, Subset};
 
 /// RGB colour, 0–255 per channel.
@@ -237,6 +253,15 @@ const EMBED_FONT: usize = CID_FONT + 1;
 const FONT_SLOTS: usize = EMBED_FONT + 1;
 /// Most characters one embedded font maps (a `CIDFontType2` numbers glyphs with two bytes).
 const MAX_EMBEDDED_GLYPHS: usize = 65_534;
+/// Most glyphs one text item may shape to. The shaping engine accepts strings up to its own
+/// 4 MiB limit; a string that expands past this is written in stored order instead, so a hostile
+/// cell cannot make the writer allocate without bound.
+const MAX_SHAPED_GLYPHS: usize = 1 << 18;
+/// Longest extracted text one `ToUnicode` entry may hold, in characters. A CMap destination is a
+/// UTF-16BE string of at most 512 bytes; 128 characters is at most 512 bytes even when every one
+/// of them is astral. A real ligature or conjunct is a handful of characters; a longer "cluster"
+/// is a hostile string, and truncating it keeps the CMap bounded.
+const MAX_TO_UNICODE_CHARS: usize = 128;
 /// Base font of the CID font used for characters WinAnsiEncoding lacks.
 const CID_BASE_FONT: &str = "STSong-Light";
 /// Default glyph width of the CID font (full-width), in 1/1000 em.
@@ -247,90 +272,266 @@ fn needs_cid(c: char) -> bool {
     !c.is_control() && c != '?' && win_ansi(c) == b'?'
 }
 
-/// The font a document embeds for text WinAnsiEncoding cannot set, and the glyphs it has handed
-/// out so far.
+/// True when `text` can be written in stored order with a standard font, byte for byte as the
+/// writer always did.
 ///
-/// Glyph ids are assigned the first time a character is drawn, so the content stream written
-/// while drawing already carries the subset's glyph ids: subset glyph 1 is the first character
-/// the document set, and so on. Composite components are appended when the subset is built (they
-/// have no character of their own), which is why the ids of drawn glyphs never move.
+/// This is the one place that decides whether the shape-free path is taken: the text must not
+/// contain a character WinAnsiEncoding lacks (`needs_cid`, which also covers every combining mark
+/// and bidi control outside the encoding), and the base direction must not be right to left
+/// (which would mirror brackets and reverse neutral runs). Such text is drawn by a standard font,
+/// which has no OpenType layout at all, so shaping could not change a single glyph — the shaper is
+/// skipped to keep the document byte-identical. Anything the predicate is unsure about is shaped
+/// (and must then be drawn from the runs).
+pub fn plain_ltr(text: &str, direction: Direction) -> bool {
+    direction != Direction::Rtl && text.chars().all(|c| !needs_cid(c))
+}
+
+/// The font a document embeds for text WinAnsiEncoding cannot set, the shaping engine that lays
+/// its text out, and the glyphs (CIDs) it has handed out so far.
+///
+/// A **CID** is not necessarily a glyph id in the font program: one glyph can extract as different
+/// text in different places (a base letter inside a cluster with a mark, and the same letter on
+/// its own), and its written advance can differ with the cluster it extracts, so a CID is handed
+/// out per *(source glyph, extracted text, advance)* and a `CIDToGIDMap` stream points it at the
+/// program's glyph. When every CID is its own glyph id the map stays `/Identity` and the output is
+/// exactly what it was before shaping.
 struct FontUse {
     face: Face,
-    /// Character → subset glyph id (1-based; 0 is `.notdef`).
+    engine: TextEngine,
+    /// The face registered with the engine; `None` when the engine rejected the bytes (the
+    /// unshaped run path is then used).
+    shaped: Option<FaceId>,
+    /// Character → source glyph id, for the subset's own `cmap` (drawing uses the CID maps).
     chars: BTreeMap<char, u16>,
-    /// Subset glyph id - 1 → source glyph id.
-    order: Vec<u16>,
+    /// Source glyph id → the CID of a glyph that carries no extracted text (the second and later
+    /// glyphs of a multi-glyph cluster, such as a mark behind its base). Those CIDs have width 0:
+    /// the cluster's whole advance belongs to the glyph that extracts the text.
+    plain: BTreeMap<u16, u16>,
+    /// (source glyph id, cluster width) → (extracted text → the CID that carries it). The width is
+    /// part of the key because a glyph that extracts a cluster must advance the pen over the
+    /// cluster's whole visual span; extractors use that advance to place the following text, and a
+    /// narrower one would look like a word gap.
+    texted: BTreeMap<(u16, u16), BTreeMap<Box<str>, u16>>,
+    /// CID - 1 → source glyph id.
+    cid_src: Vec<u16>,
+    /// CID - 1 → advance width in 1/1000 em.
+    cid_width: Vec<u16>,
+    /// CID - 1 → the text the CID extracts as (`None` for a component glyph).
+    cid_text: Vec<Option<Box<str>>>,
 }
 
 impl FontUse {
     fn new(face: Face) -> FontUse {
-        FontUse { face, chars: BTreeMap::new(), order: Vec::new() }
+        let mut engine = TextEngine::new();
+        let shaped = match engine.add_face(face.bytes()) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                log::warn!("PDF export: the text engine cannot use this face ({e}); text is written in stored order");
+                None
+            }
+        };
+        FontUse {
+            face,
+            engine,
+            shaped,
+            chars: BTreeMap::new(),
+            plain: BTreeMap::new(),
+            texted: BTreeMap::new(),
+            cid_src: Vec::new(),
+            cid_width: Vec::new(),
+            cid_text: Vec::new(),
+        }
     }
 
-    /// The subset glyph id for `c`, assigning one on first use. `None` when the font has no glyph
-    /// for `c`, or when its outline data cannot be read (the caller then keeps the CID fallback,
-    /// so a broken font cannot produce a broken subset).
-    fn glyph_for(&mut self, c: char) -> Option<u16> {
-        if let Some(gid) = self.chars.get(&c) {
-            return Some(*gid);
+    /// Shape `text` for this face. `None` when the face cannot be shaped, the string is over the
+    /// engine's 4 MiB limit, or the result is larger than this writer handles: the caller then
+    /// writes the unshaped runs (a warning says why).
+    fn shape(&mut self, text: &str, direction: Direction, size: f32) -> Option<Arc<ShapedText>> {
+        let face = self.shaped?;
+        if text.len() > gridcraft_core::text::MAX_TEXT_BYTES {
+            log::warn!("PDF export: {} bytes of text is over the shape limit; writing it in stored order", text.len());
+            return None;
         }
+        if text.len() > MAX_SHAPED_GLYPHS {
+            // Every glyph needs at least one byte of source text, so a longer string would exceed
+            // the writer's glyph limit anyway; refusing before shaping bounds the engine's work too.
+            log::warn!("PDF export: {} bytes of text is over the writer's glyph limit; writing it in stored order", text.len());
+            return None;
+        }
+        match self.engine.shape(text, direction, face, FontSize::em(size)) {
+            Ok(shaped) if shaped.glyph_count() <= MAX_SHAPED_GLYPHS => Some(shaped),
+            Ok(shaped) => {
+                log::warn!("PDF export: {} glyphs is over the writer's limit; writing the text in stored order", shaped.glyph_count());
+                None
+            }
+            Err(e) => {
+                log::warn!("PDF export: text shaping failed ({e}); writing it in stored order");
+                None
+            }
+        }
+    }
+
+    /// Records `c` for the subset's `cmap` (a courtesy for tools that read the embedded program's
+    /// own character map; PDF text itself is addressed by CID).
+    fn note_char(&mut self, c: char) {
+        let src = self.face.glyph(c);
+        if src != 0 {
+            self.chars.insert(c, src);
+        }
+    }
+
+    fn note_chars(&mut self, text: &str) {
+        for c in text.chars() {
+            self.note_char(c);
+        }
+    }
+
+    /// True when `n` more CIDs fit in the two-byte CID space.
+    fn has_room(&self, n: usize) -> bool {
+        self.cid_src.len().saturating_add(n) <= MAX_EMBEDDED_GLYPHS
+    }
+
+    /// The width of `gid` in 1/1000 em, exactly as it is written to `/W`.
+    fn width_1000(&self, gid: u16) -> u16 {
+        let upem = i32::from(self.face.units_per_em().max(1));
+        let em = i32::from(self.face.advance(gid)).saturating_mul(1000) / upem;
+        em.clamp(0, 30_000) as u16
+    }
+
+    /// The CID for source glyph `src`, assigning one on first use. `text` is `Some((extracted
+    /// text, cluster width))` for the glyph that carries the cluster (the width is the whole
+    /// cluster's advance) and `None` for a component glyph, which advances the pen nowhere and
+    /// extracts as nothing. `None` when the glyph's outlines cannot be read or the CID space is
+    /// full, in which case the caller keeps the non-embedded fallback for that cluster.
+    fn cid(&mut self, src: u16, text: Option<(&str, u16)>) -> Option<u16> {
+        if src == 0 || !self.face.sound(src) {
+            return None;
+        }
+        let text = text.filter(|(t, _)| !t.is_empty()).map(|(t, width)| (mapping_text(t), width));
+        let existing = match &text {
+            Some((t, width)) => self.texted.get(&(src, *width)).and_then(|m| m.get(t.as_ref())).copied(),
+            None => self.plain.get(&src).copied(),
+        };
+        if let Some(cid) = existing {
+            return Some(cid);
+        }
+        if self.cid_src.len() >= MAX_EMBEDDED_GLYPHS {
+            return None;
+        }
+        let cid = self.cid_src.len() as u16 + 1;
+        self.cid_src.push(src);
+        match text {
+            Some((t, width)) => {
+                self.cid_width.push(width);
+                self.cid_text.push(Some(t.clone()));
+                self.texted.entry((src, width)).or_default().insert(t, cid);
+            }
+            None => {
+                self.cid_width.push(0);
+                self.cid_text.push(None);
+                self.plain.insert(src, cid);
+            }
+        }
+        Some(cid)
+    }
+
+    /// The CID for character `c` in the unshaped path, assigning one on first use. `None` when the
+    /// font has no (sound) glyph for `c`, so the caller keeps the CID fallback.
+    fn glyph_for(&mut self, c: char) -> Option<u16> {
         let src = self.face.glyph(c);
         if src == 0 || !self.face.sound(src) {
             return None;
         }
-        if self.order.len() >= MAX_EMBEDDED_GLYPHS {
-            return None;
-        }
-        let gid = self.order.len() as u16 + 1;
-        self.order.push(src);
-        self.chars.insert(c, gid);
-        Some(gid)
+        self.note_char(c);
+        let width = self.width_1000(src);
+        let mut utf8 = [0u8; 4];
+        self.cid(src, Some((c.encode_utf8(&mut utf8), width)))
     }
 
-    /// The font program, widths and mappings for the subset this document used. If the used
-    /// glyphs cannot be subset (a font that parsed but whose outlines are inconsistent), a
-    /// `.notdef`-only subset keeps the PDF valid instead of leaving the pages pointing at a font
-    /// that was never written.
+    /// The font program, widths and mappings for the CIDs this document used. If the used glyphs
+    /// cannot be subset (a font that parsed but whose outlines are inconsistent), a `.notdef`-only
+    /// subset keeps the PDF valid instead of leaving the pages pointing at a font that was never
+    /// written.
     fn build(&self) -> Result<BuiltFont, FontError> {
-        self.build_of(&self.order).or_else(|_| self.build_of(&[]))
+        let sources = self.sources();
+        self.build_of(&sources).or_else(|_| self.build_of(&[]))
+    }
+
+    /// Every distinct source glyph id, in first-use order (which is CID order, so an unused
+    /// duplication does not move the ids below it).
+    fn sources(&self) -> Vec<u16> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::with_capacity(self.cid_src.len());
+        for src in &self.cid_src {
+            if seen.insert(*src) {
+                out.push(*src);
+            }
+        }
+        out
     }
 
     fn build_of(&self, glyphs: &[u16]) -> Result<BuiltFont, FontError> {
-        let pairs: Vec<(char, u16)> = if glyphs.is_empty() {
-            Vec::new()
-        } else {
-            self.chars.iter().filter_map(|(c, gid)| glyphs.get((*gid as usize).checked_sub(1)?).map(|src| (*c, *src))).collect()
-        };
+        let present: BTreeSet<u16> = glyphs.iter().copied().collect();
+        let pairs: Vec<(char, u16)> = self.chars.iter().filter(|(_, src)| present.contains(src)).map(|(c, src)| (*c, *src)).collect();
         let subset = self.face.subset(glyphs, &pairs)?;
-        let upem = self.face.units_per_em().max(1);
-        let to_em = |v: i16| -> i32 { (i32::from(v).saturating_mul(1000)) / i32::from(upem) };
+        let mut source_gid = BTreeMap::new();
+        for (i, src) in subset.gids.iter().enumerate() {
+            source_gid.insert(*src, u16::try_from(i).unwrap_or(0));
+        }
+        let upem = i32::from(self.face.units_per_em().max(1));
+        let to_em = |v: i32| -> i32 { v.saturating_mul(1000) / upem };
+        // Index 0 is CID 0 (`.notdef`); the rest follow the CID order the pages used.
+        let mut widths = Vec::with_capacity(self.cid_src.len() + 1);
+        widths.push(self.width_1000(0));
+        widths.extend(self.cid_width.iter().copied());
+        let unicode: Vec<(Box<str>, u16)> =
+            self.cid_text.iter().enumerate().filter_map(|(i, text)| text.as_ref().map(|t| (t.clone(), u16::try_from(i + 1).unwrap_or(0)))).collect();
         Ok(BuiltFont {
             data: subset.data,
             // A PDF subset name is six uppercase letters and a `+` prefix.
             name: subset_name(self.face.postscript_name().or_else(|| self.face.family_name()).as_deref()),
-            widths: subset.gids.iter().map(|g| to_em(self.face.advance(*g) as i16).clamp(0, 30_000) as u16).collect(),
-            unicode: subset.chars,
-            bbox: self.face.bbox().map(to_em),
-            ascent: to_em(self.face.ascent_descent().0),
-            descent: to_em(self.face.ascent_descent().1),
+            widths,
+            unicode,
+            cid_to_gid: self.cid_src.iter().map(|src| source_gid.get(src).copied().unwrap_or(0)).collect(),
+            bbox: self.face.bbox().map(|v| to_em(i32::from(v))),
+            ascent: to_em(i32::from(self.face.ascent_descent().0)),
+            descent: to_em(i32::from(self.face.ascent_descent().1)),
             italic: self.face.italic_angle(),
         })
     }
+}
+
+/// `text` cut to the longest prefix of at most [`MAX_TO_UNICODE_CHARS`] characters.
+fn mapping_text(text: &str) -> Box<str> {
+    if text.len() <= MAX_TO_UNICODE_CHARS {
+        return text.into();
+    }
+    let cut = text.char_indices().nth(MAX_TO_UNICODE_CHARS).map_or(text.len(), |(i, _)| i);
+    text.get(..cut).unwrap_or(text).into()
 }
 
 /// Everything the PDF objects need from a used font.
 struct BuiltFont {
     data: Vec<u8>,
     name: String,
-    /// Advance width per subset glyph id, in 1/1000 em.
+    /// Advance width per CID, in 1/1000 em (index 0 is CID 0, `.notdef`).
     widths: Vec<u16>,
-    /// Subset glyph id → character, for the `ToUnicode` CMap.
-    unicode: Vec<(char, u16)>,
+    /// CID → the text it extracts as, for the `ToUnicode` CMap.
+    unicode: Vec<(Box<str>, u16)>,
+    /// CID - 1 → glyph id in the subset program.
+    cid_to_gid: Vec<u16>,
     /// `[xMin, yMin, xMax, yMax]` in 1/1000 em.
     bbox: [i32; 4],
     ascent: i32,
     descent: i32,
     italic: f32,
+}
+
+impl BuiltFont {
+    /// True when a CID is not its own glyph id, so `/CIDToGIDMap /Identity` cannot describe it.
+    fn needs_cid_map(&self) -> bool {
+        self.cid_to_gid.iter().enumerate().any(|(i, gid)| *gid != u16::try_from(i + 1).unwrap_or(u16::MAX))
+    }
 }
 
 /// `BASENAME+` as a PDF subset name: six uppercase letters (ASCII for the font's own name, so
@@ -408,10 +609,15 @@ fn pdf_uri_string(uri: &str) -> String {
     pdf_string(&ascii)
 }
 
+/// A number rounded to the 1/1000 the content stream carries, clamped to a finite range.
+fn round_number(v: f32) -> f32 {
+    let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
+    (v * 1000.0).round() / 1000.0
+}
+
 /// A number for a content stream: finite, short.
 fn n(v: f32) -> String {
-    let v = if v.is_finite() { v.clamp(-1.0e7, 1.0e7) } else { 0.0 };
-    let r = (v * 1000.0).round() / 1000.0;
+    let r = round_number(v);
     if r == r.trunc() {
         format!("{}", r as i64)
     } else {
@@ -702,23 +908,79 @@ impl Page {
 
     /// Text with its baseline starting at `(x, y)`.
     pub fn text(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str) {
-        self.text_rotated(x, y, size, font, color, text, 0.0);
+        self.text_rotated_dir(x, y, size, font, color, text, 0.0, Direction::Auto);
+    }
+
+    /// Text with an explicit base direction. A right-to-left sheet passes [`Direction::Rtl`], so
+    /// neutral text (brackets, punctuation, a bare number) is laid out for a right-to-left reader
+    /// and mirrored where the script calls for it; [`Direction::Auto`] takes the direction from
+    /// the first strong character.
+    pub fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, direction: Direction) {
+        self.text_rotated_dir(x, y, size, font, color, text, 0.0, direction);
     }
 
     /// Text rotated by `angle` radians (clockwise on the page, like the y-down coordinate
     /// system) about its baseline origin.
     pub fn text_rotated(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32) {
+        self.text_rotated_dir(x, y, size, font, color, text, angle, Direction::Auto);
+    }
+
+    /// [`Page::text_rotated`] with an explicit base direction.
+    pub fn text_rotated_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, direction: Direction) {
         if text.is_empty() || !extent(size) || !finite(&[x, y]) {
             return;
         }
-        let fi = font.index();
-        let size = n(size.min(10_000.0));
+        let size_pt = size.min(10_000.0);
+        let size_text = n(size_pt);
         let (sn, cs) = if angle.is_finite() { angle.sin_cos() } else { (0.0, 1.0) };
         // Clockwise in y-down = counter-clockwise negated in PDF's y-up space.
         let mut s = format!("BT\n{}\n{} {} {} {} {} {} Tm\n", rgb_op(color, false), n(cs), n(-sn), n(sn), n(cs), n(x), n(self.y(y)));
-        // Runs of WinAnsi text use `font`; runs it cannot encode use the embedded subset when the
-        // document set one that covers them, and the predefined CID font otherwise. Each `Tj`
-        // advances the text position, so the runs follow each other on the baseline.
+        let shared = Rc::clone(&self.font);
+        // Plain WinAnsi text is written in stored order (byte for byte as it always was): a
+        // standard font has no layout features, so shaping it could not change a glyph.
+        let shaped = if plain_ltr(text, direction) {
+            None
+        } else {
+            match shared.try_borrow_mut() {
+                Ok(mut bank) => bank.as_mut().and_then(|f| f.shape(text, direction, size_pt)),
+                Err(_) => None,
+            }
+        };
+        match shaped {
+            Some(shaped) => {
+                let mut used = [false; FONT_SLOTS];
+                let mut embedded = false;
+                let mut drew = false;
+                if let Ok(mut bank) = shared.try_borrow_mut()
+                    && let Some(font_use) = bank.as_mut()
+                {
+                    let mut enc = Encoder::new(size_pt);
+                    emit_shaped(&mut enc, &shaped, text, size_pt, font, font_use, &mut used, &mut embedded);
+                    s.push_str(&enc.finish());
+                    drew = true;
+                }
+                if !drew {
+                    // The face was already borrowed (a re-entrant call): keep the stored-order
+                    // fallback rather than dropping the text.
+                    self.emit_unshaped(&mut s, text, &size_text, font);
+                }
+                for (u, f) in self.fonts.iter_mut().zip(used) {
+                    *u |= f;
+                }
+                self.embedded_used |= embedded;
+            }
+            None => self.emit_unshaped(&mut s, text, &size_text, font),
+        }
+        s.push_str("ET");
+        self.op(&s);
+    }
+
+    /// Writes `text` in stored order: runs of WinAnsi text use `font`; runs it cannot encode use
+    /// the embedded subset when the document set one that covers them, and the predefined CID font
+    /// otherwise. This is the path every plain (WinAnsi, LTR) string takes, and the fallback when
+    /// shaping is unavailable.
+    fn emit_unshaped(&mut self, s: &mut String, text: &str, size: &str, font: Font) {
+        let fi = font.index();
         let mut rest = text;
         while !rest.is_empty() {
             let (class, end, glyphs) = self.next_run(rest);
@@ -739,8 +1001,6 @@ impl Page {
             let _ = writeln!(s, "/F{} {} Tf\n{} Tj", slot + 1, size, string);
             rest = tail;
         }
-        s.push_str("ET");
-        self.op(&s);
     }
 
     /// Splits the next text run off `rest`: `(class, byte length, glyph ids)` where class 0 is a
@@ -801,6 +1061,287 @@ impl Page {
         self.images.push(ImageData { width: pw, height: ph, rgb, alpha });
         let s = format!("q {} 0 0 {} {} {} cm /Im{} Do Q", n(w), n(h), n(x), n(self.y(y + h)), idx + 1);
         self.op(&s);
+    }
+}
+
+/// Writes the text-showing operators of one `BT`/`ET` block from shaped runs.
+///
+/// The runs arrive in visual order, left to right, and every glyph carries the advance the shaper
+/// gave it plus an optional mark offset. The pen is moved with `TJ` adjustments and `Ts` rises:
+/// a TJ number changes the text *position* only, so the text matrix stays the one `Tm` set and
+/// `/W` + the `ToUnicode` CMap keep describing the glyphs; a `Ts` rise lifts a mark without
+/// moving its baseline. A glyph whose advance already equals the `/W` width needs no number, so
+/// plain stretches stay one hex string and one `Tj`.
+fn emit_shaped(
+    enc: &mut Encoder,
+    shaped: &ShapedText,
+    text: &str,
+    size: f32,
+    font: Font,
+    font_use: &mut FontUse,
+    used: &mut [bool; FONT_SLOTS],
+    embedded: &mut bool,
+) {
+    let mut pen = 0.0f32; // the shaper's pen, in points from the text origin
+    let mut pdf_pen = 0.0f32; // where the content stream's pen actually is
+    for run in &shaped.runs {
+        let mut i = 0;
+        while i < run.glyphs.len() {
+            let first = run.glyphs[i];
+            let start = first.cluster_start;
+            // A cluster's glyphs are consecutive in a visual run: the base and its marks share
+            // the same logical byte range.
+            let mut j = i + 1;
+            while j < run.glyphs.len() && run.glyphs[j].cluster_start == start {
+                j += 1;
+            }
+            let cluster = &run.glyphs[i..j];
+            let cluster_text = text.get(first.cluster_start as usize..first.cluster_end as usize).unwrap_or("");
+            if plain_cluster(cluster_text, cluster, &font_use.face) {
+                // A standard font cannot ligate or reorder, so drawing the cluster's characters
+                // literally is exactly what the shaper did. Adjacent clusters merge into one
+                // literal (and one `Tj`) while no adjustment separates them, which keeps a mixed
+                // run's bytes identical to the unshaped path's.
+                enc.font(font.index());
+                used[font.index()] = true;
+                let width = text_width(font, size, cluster_text);
+                pdf_pen += enc.gap(position(pen) - pdf_pen);
+                enc.literal(cluster_text);
+                pdf_pen += width;
+                pen += width;
+            } else if let Some(cids) = embedded_cids(font_use, cluster, cluster_text, size) {
+                enc.font(EMBED_FONT);
+                used[EMBED_FONT] = true;
+                *embedded = true;
+                font_use.note_chars(cluster_text);
+                for (glyph, (cid, width_1000)) in cluster.iter().zip(cids) {
+                    let width = points(width_1000, size);
+                    let raised = glyph.y_offset != 0.0;
+                    if raised {
+                        enc.rise(glyph.y_offset);
+                    }
+                    let target = position(pen + glyph.x_offset);
+                    pdf_pen += enc.gap(target - pdf_pen);
+                    enc.glyph(cid);
+                    pdf_pen += width;
+                    pen += glyph.advance;
+                    if raised {
+                        enc.rise(0.0);
+                    }
+                }
+            } else {
+                // No sound outline for a glyph in this cluster: the predefined CID font carries
+                // the cluster's logical text (the existing fallback for characters no embedded
+                // face can set).
+                enc.font(CID_FONT);
+                used[CID_FONT] = true;
+                let width = cid_width(cluster_text, size);
+                pdf_pen += enc.gap(position(pen) - pdf_pen);
+                enc.utf16(cluster_text);
+                pdf_pen += width;
+                pen += width;
+            }
+            i = j;
+        }
+    }
+}
+
+/// The CIDs and `/W` widths for a cluster's glyphs, in visual order. The first (leftmost) glyph
+/// carries the cluster's logical text in `ToUnicode` and the cluster's *whole* advance; the rest
+/// extract as nothing and have width 0. That way the text occupies the cluster's full visual span
+/// whatever the reason for the multiple glyphs: a Devanagari pre-base matra drawn before its base,
+/// a Thai tone mark above it, or a mark that is positioned rather than advanced. Giving the text to
+/// a later, wider glyph instead would leave a hole an extractor reads as a word space.
+/// `None` when a glyph has no usable outline or the CID space is full (the caller then keeps the
+/// non-embedded CID font for the whole cluster).
+fn embedded_cids(font_use: &mut FontUse, cluster: &[Glyph], cluster_text: &str, size: f32) -> Option<Vec<(u16, u16)>> {
+    if !font_use.has_room(cluster.len()) || cluster.iter().any(|g| g.id == 0 || !font_use.face.sound(g.id)) {
+        return None;
+    }
+    let advance: f32 = cluster.iter().map(|g| g.advance).filter(|a| a.is_finite()).sum();
+    let width = round_number(advance * 1000.0 / size).clamp(0.0, 30_000.0) as u16;
+    let mut cids = Vec::with_capacity(cluster.len());
+    for (i, glyph) in cluster.iter().enumerate() {
+        // An empty range (a hostile cluster) maps to nothing rather than to an empty CMap
+        // destination.
+        let text = (i == 0).then_some((cluster_text, width));
+        let cid = font_use.cid(glyph.id, text)?;
+        cids.push((cid, if i == 0 { width } else { 0 }));
+    }
+    Some(cids)
+}
+
+/// True when a cluster can be drawn with a standard font: every character has a WinAnsi byte, the
+/// shaper left one glyph per character in logical order with no offsets, and each glyph is the
+/// face's own glyph for that character (or the face has none, which the standard font sets
+/// anyway). A ligature (fewer glyphs), a mark (an offset, or a character outside WinAnsi) or a
+/// mirrored or reordered glyph fails the test and is drawn with the embedded face.
+fn plain_cluster(text: &str, glyphs: &[Glyph], face: &Face) -> bool {
+    let chars = text.chars().count();
+    if chars == 0 || glyphs.len() != chars {
+        return false;
+    }
+    glyphs.iter().zip(text.chars()).all(|(glyph, c)| {
+        !needs_cid(c) && glyph.x_offset == 0.0 && glyph.y_offset == 0.0 && {
+            let nominal = face.glyph(c);
+            nominal == 0 || glyph.id == nominal
+        }
+    })
+}
+
+/// A pen position for a content stream: finite and inside the writer's coordinate range.
+fn position(points: f32) -> f32 {
+    if points.is_finite() {
+        points.clamp(-1.0e7, 1.0e7)
+    } else if points < 0.0 {
+        -1.0e7
+    } else {
+        1.0e7
+    }
+}
+
+/// A `/W` width, in points.
+fn points(width_1000: u16, size: f32) -> f32 {
+    f32::from(width_1000) * size / 1000.0
+}
+
+/// The advance of `text` in the predefined CID font: one full-width glyph per UTF-16 code unit.
+fn cid_width(text: &str, size: f32) -> f32 {
+    let units = text.encode_utf16().count() as f32;
+    units * f32::from(CID_WIDTH) * size / 1000.0
+}
+
+/// Accumulates the text-showing operators of one `BT`/`ET` block.
+struct Encoder {
+    out: String,
+    size: f32,
+    size_text: String,
+    /// The font slot the current array is drawn with (a `Tf` is written only on a change).
+    slot: Option<usize>,
+    /// The `TJ` array under construction.
+    arr: String,
+    strings: usize,
+    numbers: usize,
+    /// The string being built: adjacent glyphs or characters in the same font merge into one
+    /// string while nothing has to move the pen between them.
+    pending: Pending,
+}
+
+enum Pending {
+    None,
+    Literal(String),
+    Hex(String),
+}
+
+impl Encoder {
+    fn new(size: f32) -> Encoder {
+        Encoder { out: String::new(), size, size_text: n(size), slot: None, arr: String::new(), strings: 0, numbers: 0, pending: Pending::None }
+    }
+
+    fn font(&mut self, slot: usize) {
+        if self.slot == Some(slot) {
+            return;
+        }
+        self.flush();
+        let _ = writeln!(self.out, "/F{} {} Tf", slot + 1, self.size_text);
+        self.slot = Some(slot);
+    }
+
+    /// Appends WinAnsi text to the pending literal string.
+    fn literal(&mut self, text: &str) {
+        if !matches!(self.pending, Pending::Literal(_)) {
+            self.flush_pending();
+            self.pending = Pending::Literal(String::new());
+        }
+        if let Pending::Literal(buffer) = &mut self.pending {
+            buffer.push_str(text);
+        }
+    }
+
+    /// Appends a two-byte CID to the pending hex string.
+    fn glyph(&mut self, cid: u16) {
+        if !matches!(self.pending, Pending::Hex(_)) {
+            self.flush_pending();
+            self.pending = Pending::Hex(String::new());
+        }
+        if let Pending::Hex(buffer) = &mut self.pending {
+            let _ = write!(buffer, "{cid:04X}");
+        }
+    }
+
+    /// Appends UTF-16BE code units (the `UniGB-UTF16-H` fallback) to the pending hex string.
+    fn utf16(&mut self, text: &str) {
+        if !matches!(self.pending, Pending::Hex(_)) {
+            self.flush_pending();
+            self.pending = Pending::Hex(String::new());
+        }
+        if let Pending::Hex(buffer) = &mut self.pending {
+            for unit in text.encode_utf16() {
+                let _ = write!(buffer, "{unit:04X}");
+            }
+        }
+    }
+
+    /// Moves the pen by `points` (positive = right) with a `TJ` adjustment and returns the
+    /// distance actually written after rounding. Zero adjustments are not written, so text the
+    /// shaper did not reposition stays one contiguous string.
+    fn gap(&mut self, points: f32) -> f32 {
+        if !points.is_finite() || self.size <= 0.0 {
+            return 0.0;
+        }
+        let number = round_number(-points * 1000.0 / self.size);
+        if number == 0.0 {
+            return 0.0;
+        }
+        self.flush_pending();
+        let _ = write!(self.arr, "{} ", n(number));
+        self.numbers += 1;
+        -number * self.size / 1000.0
+    }
+
+    fn flush_pending(&mut self) {
+        match std::mem::replace(&mut self.pending, Pending::None) {
+            Pending::None => {}
+            Pending::Literal(text) => {
+                if !text.is_empty() {
+                    self.arr.push_str(&pdf_string(&text));
+                    self.arr.push(' ');
+                    self.strings += 1;
+                }
+            }
+            Pending::Hex(hex) => {
+                if !hex.is_empty() {
+                    let _ = write!(self.arr, "<{hex}> ");
+                    self.strings += 1;
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush_pending();
+        if self.strings > 0 {
+            let body = self.arr.trim_end();
+            if self.strings == 1 && self.numbers == 0 {
+                let _ = writeln!(self.out, "{body} Tj");
+            } else {
+                let _ = writeln!(self.out, "[{body}] TJ");
+            }
+        }
+        self.arr.clear();
+        self.strings = 0;
+        self.numbers = 0;
+    }
+
+    /// `Ts`: raises the following text by `points` (positive up) without moving its position.
+    fn rise(&mut self, points: f32) {
+        self.flush();
+        let _ = writeln!(self.out, "{} Ts", n(points));
+    }
+
+    fn finish(mut self) -> String {
+        self.flush();
+        self.out
     }
 }
 
@@ -877,11 +1418,13 @@ fn pdf_text_string(text: &str) -> String {
     s
 }
 
-/// Writes the five objects of an embedded `CIDFontType2`: the Type0 font, its descendant, the
-/// font descriptor, the font program and the `ToUnicode` CMap. `id` is the Type0 font's object
-/// number; the rest follow it.
+/// Writes the objects of an embedded `CIDFontType2`: the Type0 font, its descendant, the font
+/// descriptor, the font program and the `ToUnicode` CMap, plus a `CIDToGIDMap` stream when a CID is
+/// not its own glyph id. `id` is the Type0 font's object number; the rest follow it.
 fn push_embedded_font(objects: &mut Vec<(u32, Vec<u8>)>, id: u32, font: &BuiltFont) {
     let (cid_id, desc_id, file_id, unicode_id) = (id + 1, id + 2, id + 3, id + 4);
+    let needs_map = font.needs_cid_map();
+    let cid_map = if needs_map { format!("/CIDToGIDMap {} 0 R", id + 5) } else { "/CIDToGIDMap /Identity".to_string() };
     let name = &font.name;
     objects.push((
         id,
@@ -894,7 +1437,7 @@ fn push_embedded_font(objects: &mut Vec<(u32, Vec<u8>)>, id: u32, font: &BuiltFo
     objects.push((
         cid_id,
         format!(
-            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {desc_id} 0 R /CIDToGIDMap /Identity /DW 1000 /W [0 [{}]] >>",
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {desc_id} 0 R {cid_map} /DW 1000 /W [0 [{}]] >>",
             widths.join(" ")
         )
         .into_bytes(),
@@ -915,20 +1458,20 @@ fn push_embedded_font(objects: &mut Vec<(u32, Vec<u8>)>, id: u32, font: &BuiltFo
     program.extend_from_slice(&font.data);
     program.extend_from_slice(b"\nendstream");
     objects.push((file_id, program));
-    // `ToUnicode`: subset glyph id → the character it came from, so text can be copied and
-    // searched. At most 100 entries per `bfchar` block, as the CMap syntax requires.
-    let mut entries: Vec<(char, u16)> = font.unicode.clone();
-    entries.sort_unstable_by_key(|(c, gid)| (*gid, *c));
-    entries.dedup_by_key(|(_, gid)| *gid);
+    // `ToUnicode`: CID → the logical text the glyph came from (a whole ligature or conjunct, not
+    // one character), so text can be copied and searched. At most 100 entries per `bfchar` block,
+    // as the CMap syntax requires; component glyphs of a multi-glyph cluster have no entry and
+    // are ignored by extractors, so their text is not duplicated.
+    let mut entries: Vec<(Box<str>, u16)> = font.unicode.clone();
+    entries.sort_unstable_by_key(|(_, cid)| *cid);
     let mut cmap = String::from(
         "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
     );
     for chunk in entries.chunks(100) {
         let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
-        for (c, gid) in chunk {
-            let _ = write!(cmap, "<{gid:04X}> <");
-            let mut units = [0u16; 2];
-            for unit in c.encode_utf16(&mut units) {
+        for (text, cid) in chunk {
+            let _ = write!(cmap, "<{cid:04X}> <");
+            for unit in text.encode_utf16() {
                 let _ = write!(cmap, "{unit:04X}");
             }
             cmap.push_str(">\n");
@@ -940,6 +1483,18 @@ fn push_embedded_font(objects: &mut Vec<(u32, Vec<u8>)>, id: u32, font: &BuiltFo
     stream.extend_from_slice(cmap.as_bytes());
     stream.extend_from_slice(b"\nendstream");
     objects.push((unicode_id, stream));
+    if needs_map {
+        // CID 0 is `.notdef`; each following entry is the glyph id in the subset program.
+        let mut map = Vec::with_capacity((font.cid_to_gid.len() + 1) * 2);
+        map.extend_from_slice(&0u16.to_be_bytes());
+        for gid in &font.cid_to_gid {
+            map.extend_from_slice(&gid.to_be_bytes());
+        }
+        let mut stream = format!("<< /Length {} >>\nstream\n", map.len()).into_bytes();
+        stream.extend_from_slice(&map);
+        stream.extend_from_slice(b"\nendstream");
+        objects.push((id + 5, stream));
+    }
 }
 
 impl PdfDoc {
@@ -1018,7 +1573,7 @@ impl PdfDoc {
                 // the subset could not be built).
                 next += match i {
                     CID_FONT => 3,
-                    EMBED_FONT if embedded.is_some() => 5,
+                    EMBED_FONT if embedded.is_some() => 5 + u32::from(embedded.as_ref().is_some_and(BuiltFont::needs_cid_map)),
                     _ => 1,
                 };
             }

@@ -28,7 +28,9 @@ impl Class {
 pub const TABLE: &[(&str, Class)] = &[
     ("core", Class::Layer(0)),
     ("numfmt", Class::Layer(0)),
-    ("pdf", Class::Layer(0)),
+    // A format writer: it shares the L0 text engine (bidi + shaping) with the UI, exactly like
+    // `xlsx` shares `core`, so it sits on L0 rather than inside it.
+    ("pdf", Class::Layer(2)),
     ("formula", Class::Layer(1)),
     ("functions", Class::Layer(1)),
     ("model", Class::Layer(2)),

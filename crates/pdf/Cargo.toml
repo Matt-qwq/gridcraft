@@ -9,8 +9,15 @@ description = "GridCraft's tiny self-contained PDF 1.7 writer (standard 14 fonts
 workspace = true
 
 [dependencies]
+# The text engine: the Unicode bidi algorithm and OpenType shaping. `core` is L0, so the PDF
+# writer and the grid shape with the same code and produce the same text.
+gridcraft-core = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
+# Real font bytes, compiled into epaint: the shaping tests need a face with ligatures and
+# combining marks that every machine has, and no font binary may be committed to this repo.
+epaint_default_fonts = { workspace = true }
 # An independent font parser (the one epaint uses for system fonts) so the subsetter is checked
 # against a second implementation, not only against its own reader.
 skrifa = { workspace = true }
