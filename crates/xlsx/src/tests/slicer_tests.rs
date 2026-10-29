@@ -547,14 +547,17 @@ fn a_timeline_without_a_range_writes_no_selection_and_unknown() {
 #[test]
 fn a_timeline_state_a_save_could_not_spell_back_keeps_its_bytes() {
     // A reversed range, a date the calendar cannot hold, a fraction of a second GridCraft's dates
-    // do not carry, and a filter type that contradicts the children: none of these can be written
-    // back as they came, so the whole timeline set stays on the kept path, byte for byte.
+    // do not carry, a filter type that contradicts the children, a state attribute or child the
+    // model does not carry, and a refresh version: none of these can be written back as they came,
+    // so the whole timeline set stays on the kept path, byte for byte.
     let variants = [
         r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-02-12T00:00:00" endDate="2025-01-01T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
         r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="10000-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
         r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00.500" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
         r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="unknown" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
         r#"<state minimalRefreshVersion="3" lastRefreshVersion="3" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1" foo="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/></state>"#,
+        r#"<state minimalRefreshVersion="0" lastRefreshVersion="0" pivotCacheId="1" filterType="dateBetween" singleRangeFilterState="1"><selection startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><bounds startDate="2025-01-01T00:00:00" endDate="2025-02-12T00:00:00"/><foo/></state>"#,
     ];
     for state in variants {
         let (bytes, patched) = package_with_timeline_state(state);
