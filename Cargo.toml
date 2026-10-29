@@ -48,6 +48,12 @@ sha1 = { version = "0.11", default-features = false }
 # secure source it can reach — see `crypto::random_bytes`).
 getrandom = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Text: the Unicode bidirectional algorithm (`unicode-bidi`) and OpenType shaping — Arabic
+# joining, Indic reordering, Thai mark positioning, Latin ligatures (`rustybuzz`, a HarfBuzz
+# port). Pure Rust, no C, wasm-safe; both MIT/Apache-2.0. `core` is L0, so the engine lives here
+# and the grid and the PDF writer share it without either depending on the other.
+unicode-bidi = { version = "0.3", default-features = false, features = ["std", "hardcoded-data"] }
+rustybuzz = { version = "0.20", default-features = false, features = ["std"] }
 
 # ui
 egui = "0.36"
