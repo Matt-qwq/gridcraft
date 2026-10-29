@@ -8,6 +8,7 @@ use super::*;
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(query "document.inspect", "Inspect Workbook", [], None, "{} → sheets, selection, names, tables, charts, dirty, history", has_doc, inspect),
+        cmd!(noundo "document.compact", "Compact Workbook", [], None, "{} | {sheet?} → {cells, bands, pages, changed} reclaimed", has_doc, compact),
         cmd!(query "sheet.read", "Read Range", [], None, "{range?: \"A1:D10\" (default: used range), sheet?, formulas?: bool, formatted?: bool} → rows of values", has_doc, read),
         cmd!(query "cell.get", "Get Cell", [], None, "{cell?, sheet?} → value, formula, display text, style, comment, link", has_doc, cell_get),
         cmd!(query "selection.stats", "Selection Statistics", [], None, "{} → count, sum, average, min, max", has_doc, sel_stats),
@@ -74,6 +75,49 @@ fn inspect(s: &mut Session, _: &Json) -> Result<Json> {
         "theme": wb.theme.name,
         "mode": format!("{:?}", s.mode),
     }))
+}
+
+/// `document.compact`: reclaims cells that no logical row or column can reach. It is not an edit
+/// (what every reachable cell holds is unchanged), so it records no history entry, recalculates
+/// nothing and leaves the dirty bit as it was. `{}` compacts the whole workbook, `{sheet}` one
+/// sheet.
+fn compact(s: &mut Session, p: &Json) -> Result<Json> {
+    let only = if p.get("sheet").is_some() { Some(target_sheet(s, p)?) } else { None };
+    let out = compact_document(s.doc_mut()?, only);
+    Ok(json!({"cells": out.cells, "bands": out.bands, "pages": out.pages, "changed": out.changed}))
+}
+
+/// Compacts the sheets of `d` (`only`: one sheet, else all) with the view-state dirty idiom: a
+/// clean document stays clean and a dirty one stays dirty, because compaction never changes what a
+/// cell holds. Returns the totals so a caller can report them.
+pub(crate) fn compact_document(d: &mut DocState, only: Option<usize>) -> gridcraft_model::Compacted {
+    let targets: Vec<usize> = match only {
+        Some(i) => vec![i],
+        None => (0..d.wb.sheets.len()).collect(),
+    };
+    // A sheet whose maps are the identity has nothing to reclaim, and copying the workbook just to
+    // run that check would cost more than the compaction itself.
+    if !targets.iter().any(|i| d.wb.sheets.get(*i).is_some_and(|sh| sh.cells.needs_compaction())) {
+        return gridcraft_model::Compacted::default();
+    }
+    let dirty = d.is_dirty();
+    let mut total = gridcraft_model::Compacted::default();
+    let wb = std::sync::Arc::make_mut(&mut d.wb);
+    for i in targets {
+        let Some(sh) = wb.sheets.get_mut(i) else { continue };
+        if !sh.cells.needs_compaction() {
+            continue;
+        }
+        let out = std::sync::Arc::make_mut(sh).cells.compact();
+        total.cells = total.cells.saturating_add(out.cells);
+        total.bands = total.bands.saturating_add(out.bands);
+        total.pages = total.pages.saturating_add(out.pages);
+        total.changed = total.changed || out.changed;
+    }
+    if !dirty {
+        d.saved = d.wb.clone();
+    }
+    total
 }
 
 fn read(s: &mut Session, p: &Json) -> Result<Json> {

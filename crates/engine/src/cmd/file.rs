@@ -156,6 +156,10 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
         if d.wb.source_path != file {
             std::sync::Arc::make_mut(&mut d.wb).source_path = file;
         }
+        // Fold away cells no logical row or column can reach before this file becomes the
+        // document's baseline. Compaction never changes what a cell holds, so the bytes just
+        // written still describe the workbook; the baseline then starts out compacted.
+        super::inspect::compact_document(d, None);
         d.saved = d.wb.clone();
         d.path = Some(path.clone());
     }

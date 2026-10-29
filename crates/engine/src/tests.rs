@@ -5079,3 +5079,117 @@ fn a_mapped_sheet_saves_and_reopens_with_its_line_metadata() {
     assert_eq!(back_rows, rows, "row metadata after an XLSX round trip");
     assert_eq!(back_cols, cols, "column metadata after an XLSX round trip");
 }
+
+/// `document.compact` reclaims what no logical row or column reaches without changing content,
+/// adding a history entry or moving the dirty bit. A clean document stays clean, a dirty one stays
+/// dirty, and `document.inspect`'s `cells` count ends up equal to what `sheet.read` shows.
+#[test]
+fn document_compact_preserves_content() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=A1*2"})).unwrap();
+    // Save and reopen so the document starts clean, like a freshly opened file.
+    reopen(&mut s);
+    let read = |s: &mut Session| s.execute("sheet.read", json!({})).unwrap();
+    let inspect = |s: &mut Session| s.execute("document.inspect", json!({})).unwrap();
+    let history = |s: &mut Session| s.execute("history.list", json!({})).unwrap();
+    let (before_read, before_inspect, before_history) = (read(&mut s), inspect(&mut s), history(&mut s));
+    assert!(!s.doc().unwrap().is_dirty());
+    assert_eq!(s.execute("document.compact", json!({})).unwrap(), json!({"cells": 0, "bands": 0, "pages": 0, "changed": false}));
+    assert_eq!(s.execute("document.compact", json!({"sheet": 0})).unwrap(), json!({"cells": 0, "bands": 0, "pages": 0, "changed": false}));
+    assert!(s.execute("document.compact", json!({"sheet": 9})).is_err(), "a sheet that does not exist is refused");
+    assert_eq!(read(&mut s), before_read);
+    assert_eq!(inspect(&mut s), before_inspect);
+    assert_eq!(history(&mut s), before_history);
+    assert!(!s.doc().unwrap().is_dirty(), "a clean document stays clean");
+
+    // A direct model shift leaves cells no logical row can reach; the engine's own delete pairs
+    // every shift with a take, so only a direct shift can inject an orphan.
+    {
+        let d = s.doc_mut().unwrap();
+        let wb = std::sync::Arc::make_mut(&mut d.wb);
+        std::sync::Arc::make_mut(&mut wb.sheets[0]).cells.shift_rows(1, -1);
+    }
+    assert!(s.doc().unwrap().is_dirty(), "the injected shift changed the workbook");
+    let (dirty_read, dirty_inspect, dirty_history) = (read(&mut s), inspect(&mut s), history(&mut s));
+    let orphaned = dirty_inspect["sheets"][0]["cells"].as_u64().unwrap();
+    assert_eq!(orphaned, 4, "the two cells of the dropped row still count");
+    let out = s.execute("document.compact", json!({})).unwrap();
+    assert_eq!(out, json!({"cells": 2, "bands": 0, "pages": 0, "changed": true}));
+    assert_eq!(read(&mut s), dirty_read, "the reachable content is unchanged");
+    assert_eq!(history(&mut s), dirty_history, "compaction is not an edit");
+    assert!(s.doc().unwrap().is_dirty(), "a dirty document stays dirty");
+    let after = inspect(&mut s);
+    assert_eq!(after["sheets"][0]["usedRange"], dirty_inspect["sheets"][0]["usedRange"]);
+    assert_eq!(after["sheets"][0]["cells"], json!(orphaned - 2));
+    let rows = read(&mut s)["values"].as_array().unwrap().len();
+    assert_eq!(rows, 2, "sheet.read sees the two surviving rows");
+}
+
+/// Saving folds away an orphan before the file becomes the document's baseline, and the bytes do
+/// not change: a save, a reopen and a second save produce the same file.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn file_save_compacts_without_changing_the_bytes() {
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("gridcraft-compact-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let mut s = s();
+    let values: Vec<Vec<i32>> = (0..200).map(|i| vec![i]).collect();
+    s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+    // Page the sheet and leave the last row without an inverse: only compaction can reclaim it.
+    {
+        let d = s.doc_mut().unwrap();
+        let wb = std::sync::Arc::make_mut(&mut d.wb);
+        let sh = std::sync::Arc::make_mut(&mut wb.sheets[0]);
+        assert!(sh.cells.enable_paging());
+        sh.cells.shift_rows(200, -1);
+        assert_eq!(sh.cells.len(), 200);
+        assert_eq!(sh.cells.iter().count(), 199, "the shift left an orphan");
+    }
+    assert!(s.doc().unwrap().is_dirty());
+    let first = dir.join("first.xlsx");
+    s.execute("file.save", json!({"path": first})).unwrap();
+    assert!(!s.doc().unwrap().is_dirty());
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        assert_eq!(sh.cells.len(), 199, "save reclaimed the orphan");
+        assert_eq!(sh.cells.iter().count(), 199);
+        assert_eq!(sh.cells.paged_band_count(), 4, "the sheet stays paged");
+    }
+    let bytes = std::fs::read(&first).unwrap();
+    assert_eq!(bytes.len() as u64, std::fs::metadata(&first).unwrap().len());
+    // Reopen the bytes just written and save again: compaction changed no cell, so the file is
+    // byte-for-byte the same.
+    s.execute("file.open", json!({"name": "first.xlsx", "base64": crate::io::base64_encode(&bytes)})).unwrap();
+    assert!(!s.doc().unwrap().is_dirty());
+    let second = dir.join("second.xlsx");
+    s.execute("file.saveAs", json!({"path": second})).unwrap();
+    assert!(!s.doc().unwrap().is_dirty());
+    assert_eq!(std::fs::read(&second).unwrap(), bytes, "reopening and saving again writes the same bytes");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Compaction runs outside `commit`, so a protected sheet (whose locked cells `commit` would
+/// refuse to change) does not refuse it.
+#[test]
+fn document_compact_does_not_orphan_on_a_protected_sheet() {
+    let mut s = protected(json!({}));
+    {
+        let d = s.doc_mut().unwrap();
+        let wb = std::sync::Arc::make_mut(&mut d.wb);
+        std::sync::Arc::make_mut(&mut wb.sheets[0]).cells.shift_rows(1, -1);
+    }
+    let before = s.doc().unwrap().wb.active().unwrap().cells.len();
+    assert_eq!(before, 7);
+    let out = s.execute("document.compact", json!({})).unwrap();
+    assert_eq!(out, json!({"cells": 3, "bands": 0, "pages": 0, "changed": true}), "the locked orphans were reclaimed");
+    let cells = s.doc().unwrap().wb.active().unwrap().cells.clone();
+    assert_eq!(cells.len(), before - 3);
+    assert_eq!(cells.iter().count(), cells.len());
+    // The unlocked cells the user may edit are still readable; compaction refused nothing.
+    assert_eq!(v(&s, "D1"), Value::Number(20.0));
+    assert_eq!(v(&s, "D2"), Value::Number(30.0));
+}

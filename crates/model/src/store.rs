@@ -27,7 +27,7 @@
 //! A band that overflows the index (more than 65,535 distinct numbers in 64 rows) falls back to
 //! `NUMBER_WIDE`, which keeps the bits in the row's side table.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use gridcraft_core::{CellError, CellRef, RangeRef, Value};
@@ -50,6 +50,12 @@ const PARALLEL_WRITE_MAX_CELLS: usize = 4_000_000;
 /// cells at the export's density (a few tens of MiB), enough for a viewport and a scrolling burst
 /// without letting a full-sheet scan grow the working set back to the live model.
 const PAGE_CACHE_PAGES: usize = 4_096;
+
+/// How many rewritten pages a compaction pass keeps decoded. Genuine orphans are a handful per
+/// edit, and the read that follows a save is likely to want them; a bigger pass (or one that a
+/// conservative column-gap test over-selected) leaves the page undecoded for the cache to load
+/// once, so a rewrite cannot pin a band per page.
+const PAGE_PRIME_LIMIT: usize = 8;
 
 /// What a payload holds, one byte per stored cell, in column order within the row.
 const NUMBER: u8 = 0;
@@ -1660,6 +1666,20 @@ impl ColMap {
     }
 }
 
+/// What one [`CellStore::compact`] pass reclaimed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Compacted {
+    /// Cells dropped because no logical row or column could reach them.
+    pub cells: usize,
+    /// Live bands dropped because compaction emptied them.
+    pub bands: usize,
+    /// Paged bands rewritten (or dropped) to lose their orphans.
+    pub pages: usize,
+    /// Whether the store differs from before: a cell, band or page was reclaimed, or a map merged
+    /// or returned to the identity fast path.
+    pub changed: bool,
+}
+
 /// A `CellStore`'s packed bands, plus the count of stored cells.
 #[derive(Debug, Default)]
 pub struct CellStore {
@@ -2832,20 +2852,30 @@ impl CellStore {
     /// A structural edit changes the row/column map instead of moving cells, so a shift that is
     /// not paired with a delete can leave cells at physical rows or columns whose inverse is gone.
     /// Those cells are invisible to `get`, `iter` and `used_range` but still hold storage and
-    /// count in `len`. This walks the live bands only (never the sheet grid), drops each
-    /// unreachable cell and every band that empties, then merges the map runs, bounds the column
-    /// free list and returns a contiguous map to the identity fast path.
+    /// count in `len`. This walks the live bands and, when a gap in either map could hold one, the
+    /// pages that straddle it, drops each unreachable cell and every band that empties, then
+    /// merges the map runs, bounds the column free list and returns a contiguous map to the
+    /// identity fast path.
     ///
-    /// Paged bands are deliberately left untouched: a page can hold cells at physical positions
-    /// no run covers, and this slice does not decode or rewrite pages. Those cells stay counted
-    /// (and unreadable) until a later pass compacts pages too; every mapped paged cell still reads
-    /// exactly as before. The second call is a no-op.
-    pub fn compact(&mut self) {
+    /// With both maps identity every physical row and column has an inverse, so nothing can be an
+    /// orphan and the call returns at once: a clean store (and every freshly opened one) pays
+    /// O(1). Pages are found through the *gaps* of the maps — the physical runs no logical row or
+    /// column covers — so a row delete probes the band keys of the deleted rows instead of
+    /// decoding the sheet. A page is decoded without priming its cache and is only cloned,
+    /// rewritten (appended to the page file) and replaced when it actually held an orphan, so a
+    /// snapshot keeps reading its own `Arc<Page>` and its old offsets. A page that cannot be
+    /// decoded leaves the pass incomplete, which keeps the maps from resetting to identity.
+    pub fn compact(&mut self) -> Compacted {
+        if self.row_map.is_identity() && self.col_map.is_identity() {
+            return Compacted::default();
+        }
+        let shape = self.map_shape();
+        let mut compacted = Compacted::default();
         let keys: Vec<u32> = self.bands.keys().copied().collect();
-        let mut removed = 0usize;
         for key in keys {
             if self.bands.get(&key).is_some_and(|band| band.rows.is_empty()) {
                 self.bands.remove(&key);
+                compacted.bands = compacted.bands.saturating_add(1);
                 continue;
             }
             // Look before copying: a band with nothing to reclaim keeps sharing its `Arc` with the
@@ -2865,17 +2895,136 @@ impl CellStore {
             for (row_key, col) in drop_cells {
                 let _ = band.take(row_key, col);
             }
-            removed = removed.saturating_add(gone);
+            compacted.cells = compacted.cells.saturating_add(gone);
             if band.rows.is_empty() {
                 self.bands.remove(&key);
+                compacted.bands = compacted.bands.saturating_add(1);
             }
         }
-        self.len = self.len.saturating_sub(removed);
-        // A page can hold a cell at a position the shortened run no longer covers; with no pages,
-        // a single run from the origin is identity for every cell the store still holds.
-        let reset_prefix = self.pages.is_empty();
-        self.row_map.normalize(reset_prefix);
-        self.col_map.normalize(reset_prefix);
+        // A page can hold a cell at a position no logical row or column covers; once every page
+        // that could is checked, a single run from the origin is identity for every cell left.
+        let complete = self.compact_pages(&mut compacted);
+        self.len = self.len.saturating_sub(compacted.cells);
+        self.row_map.normalize(complete);
+        self.col_map.normalize(complete);
+        compacted.changed = compacted.cells > 0 || compacted.bands > 0 || compacted.pages > 0 || self.map_shape() != shape;
+        compacted
+    }
+
+    /// Whether [`compact`](Self::compact) could reclaim anything. `compact` returns at once when
+    /// both maps are the identity, and this is that same test, so a caller can use it to skip a
+    /// copy of the workbook.
+    pub fn needs_compaction(&self) -> bool {
+        !self.row_map.is_identity() || !self.col_map.is_identity()
+    }
+
+    /// The page half of [`compact`](Self::compact): visits the pages a gap in either map could
+    /// leave an orphan in, rewrites the ones that hold one and drops the ones that emptied.
+    /// Returns true when every candidate was read and handled (or there were none): only then is
+    /// the store free of orphans and a contiguous map may return to the identity fast path.
+    fn compact_pages(&mut self, compacted: &mut Compacted) -> bool {
+        let mut candidates: BTreeSet<u32> = BTreeSet::new();
+        for (lo, hi) in Self::unmapped_runs(self.row_map.is_identity(), &self.row_map.by_physical, self.row_map.next_physical) {
+            let (first, last) = (lo / BAND, hi.saturating_sub(1) / BAND);
+            candidates.extend(self.pages.range(first..=last).map(|(key, _)| *key));
+        }
+        if !self.col_map.is_identity() {
+            // Bounds are a span over physical columns, so this can over-select a page whose cells
+            // sit on both sides of a dropped column; the plan below then finds nothing and the
+            // page is left as it was. Only the bounds are read here, never the page.
+            let gaps = Self::unmapped_runs(false, &self.col_map.by_physical, self.col_map.next_physical);
+            if !gaps.is_empty() {
+                candidates.extend(
+                    self.pages
+                        .iter()
+                        .filter(|(_, page)| {
+                            page.bounds().is_some_and(|(_, _, first, last)| gaps.iter().any(|(lo, hi)| first <= hi.saturating_sub(1) && *lo <= last))
+                        })
+                        .map(|(key, _)| *key),
+                );
+            }
+        }
+        let mut complete = true;
+        let mut rewritten = 0usize;
+        for key in candidates {
+            let Some(page) = self.pages.get(&key).cloned() else { continue };
+            let Some(file) = self.page_file.clone() else {
+                // A page without its file cannot be read; keep it and report the pass incomplete.
+                complete = false;
+                continue;
+            };
+            // Decode without priming the page cache: a pass over many candidates must not pin a
+            // band per page in a queue that would never evict it.
+            let Some(band) = page.decode(&file) else {
+                complete = false;
+                continue;
+            };
+            let (gone, clear_rows, drop_cells) = Self::orphan_plan(&band, key, &self.row_map, &self.col_map);
+            if gone == 0 {
+                continue;
+            }
+            let mut band = Arc::unwrap_or_clone(band);
+            for row_key in clear_rows {
+                band.remove_row(row_key);
+            }
+            for (row_key, col) in drop_cells {
+                let _ = band.take(row_key, col);
+            }
+            if band.rows.is_empty() {
+                self.pages.remove(&key);
+                compacted.cells = compacted.cells.saturating_add(gone);
+                compacted.pages = compacted.pages.saturating_add(1);
+                continue;
+            }
+            let Some(bytes) = page::encode_band(&band) else {
+                complete = false;
+                continue;
+            };
+            let Some(at) = file.write(&bytes) else {
+                complete = false;
+                continue;
+            };
+            rewritten = rewritten.saturating_add(1);
+            let page = page::Page::from_band(at, Arc::new(band));
+            // A few rewritten pages are worth keeping decoded for the read that follows a save. A
+            // column-gap pass can over-select and a big pass would pin a band per page, so those
+            // are left for the page cache to decode once.
+            if !(self.col_map.is_identity() && rewritten <= PAGE_PRIME_LIMIT) {
+                page.clear();
+            }
+            self.pages.insert(key, Arc::new(page));
+            compacted.cells = compacted.cells.saturating_add(gone);
+            compacted.pages = compacted.pages.saturating_add(1);
+        }
+        complete
+    }
+
+    /// The physical runs `[lo, hi)` that no logical row or column covers: the holes between the
+    /// mapped runs, from the origin to the watermark of physical keys the map has handed out.
+    /// Nothing is stored past that watermark, so these runs bound every cell that could be an
+    /// orphan.
+    fn unmapped_runs(identity: bool, by_physical: &[RowSegment], next_physical: u32) -> Vec<(u32, u32)> {
+        if identity {
+            return Vec::new();
+        }
+        let mut runs = Vec::new();
+        let mut at = 0u32;
+        for segment in by_physical {
+            if segment.physical > at {
+                runs.push((at, segment.physical));
+            }
+            at = at.max(segment.physical.saturating_add(segment.len));
+        }
+        if next_physical > at {
+            runs.push((at, next_physical));
+        }
+        runs
+    }
+
+    /// A cheap fingerprint of the two maps: `Compacted::changed` needs to know whether
+    /// normalization merged runs, returned a map to identity or trimmed the column free list.
+    fn map_shape(&self) -> (bool, usize, bool, usize, usize) {
+        (self.row_map.is_identity(), self.row_map.segments.len(), self.col_map.is_identity(), self.col_map.segments.len(), self.col_map.free.len())
     }
 
     /// The rows to clear and the cells to drop of one live band whose physical row or column has
@@ -3195,6 +3344,25 @@ mod page {
             Page { at, bounds, formulas, owned, band: Mutex::new(Cached::Miss) }
         }
 
+        /// The page a rewritten band becomes: the bounds and flags are recomputed from the new
+        /// band exactly as [`spill_band`](super::CellStore::spill_band) computes them, and the
+        /// decoded copy is installed so the read that follows does not decode it again.
+        pub(super) fn from_band(at: PageRef, band: Arc<Band>) -> Page {
+            let bounds = band_bounds(&band);
+            let formulas = band.rows.iter().any(|r| !r.formulas().is_empty());
+            let owned = band.rows.iter().any(|r| !r.formulas().is_empty() || !r.arrays().is_empty());
+            Page { at, bounds, formulas, owned, band: Mutex::new(Cached::Band(band)) }
+        }
+
+        /// Reads and decodes the page without touching the cached copy or the store's page-order
+        /// queue: a compaction pass looks at pages it may leave alone, and must not pin a decoded
+        /// band per page (the queue only evicts pages it was told about).
+        pub(super) fn decode(&self, file: &PageFile) -> Option<Arc<Band>> {
+            file.decodes.fetch_add(1, Ordering::Relaxed);
+            let bytes = file.read(self.at)?;
+            decode_band(&bytes).map(Arc::new)
+        }
+
         pub(super) fn bounds(&self) -> Option<(u32, u32, u32, u32)> {
             self.bounds
         }
@@ -3260,6 +3428,10 @@ mod page {
     pub(super) struct PageFile {
         path: PathBuf,
         file: Mutex<Option<File>>,
+        /// How many pages [`Page::decode`] has read through this file. Compaction of a store with
+        /// nothing to reclaim must decode none, and a test can prove it because the count belongs
+        /// to this file (not to the process, where parallel tests would see each other's reads).
+        decodes: AtomicU64,
     }
 
     impl PageFile {
@@ -3272,7 +3444,7 @@ mod page {
             for attempt in 0..16u32 {
                 let path = std::env::temp_dir().join(format!("gridcraft-page-{}-{nonce}-{attempt}.bin", std::process::id()));
                 match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
-                    Ok(file) => return Some(PageFile { path, file: Mutex::new(Some(file)) }),
+                    Ok(file) => return Some(PageFile { path, file: Mutex::new(Some(file)), decodes: AtomicU64::new(0) }),
                     Err(_) => continue,
                 }
             }
@@ -3284,6 +3456,12 @@ mod page {
         #[cfg(test)]
         pub(super) fn path(&self) -> &std::path::Path {
             &self.path
+        }
+
+        /// Pages decoded through [`Page::decode`] so far (see the field's comment).
+        #[cfg(test)]
+        pub(super) fn decodes(&self) -> u64 {
+            self.decodes.load(Ordering::Relaxed)
         }
 
         pub(super) fn write(&self, bytes: &[u8]) -> Option<PageRef> {
@@ -4582,36 +4760,278 @@ mod tests {
         assert_eq!(back, s, "the saved cells are the logical cells");
     }
 
+    /// A paged store whose map lost a row: the page holding it is decoded, its orphan dropped and
+    /// the band written back at the same key, while every mapped cell reads as before.
     #[test]
-    fn compact_leaves_paged_bands_alone() {
+    fn compact_reclaims_paged_rows() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        s.set(c(3, 1), Cell { value: Value::Number(99.0), formula: None, style: StyleId(2) });
+        assert!(s.enable_paging());
+        assert_eq!(s.paged_band_count(), 4);
+        let pages: Vec<u32> = s.pages.keys().copied().collect();
+        // A direct model shift: unlike the engine's delete command, it does not clear the cells
+        // first, so physical row 0 stays in its page with no logical row to reach it.
+        s.shift_rows(1, -1);
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let used = s.used_range();
+        assert_eq!(visible.len(), 200);
+        assert_eq!(s.len(), 201, "the orphan is still counted before compaction");
+        let out = s.compact();
+        assert_eq!(out.cells, 1);
+        assert_eq!(out.pages, 1, "the page holding the dropped row is rewritten");
+        assert_eq!(out.bands, 0);
+        assert!(out.changed);
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible, "mapped cells keep their content");
+        assert_eq!(s.used_range(), used, "the used range is unchanged");
+        assert_eq!(s.len(), visible.len(), "len now counts exactly the reachable cells");
+        assert_eq!(s.pages.keys().copied().collect::<Vec<_>>(), pages, "the page keeps its band key");
+        for (at, cell) in &visible {
+            assert_eq!(s.get(*at).as_ref(), Some(cell), "{}", at.a1());
+        }
+        assert_eq!(visible.last().map(|(at, _)| *at), Some(c(198, 0)));
+    }
+
+    /// The rewrite installs a new `Arc<Page>`; the snapshot keeps the old one, its offsets and the
+    /// cell compaction dropped.
+    #[test]
+    fn compact_keeps_the_old_page_for_a_snapshot() {
         let mut s = CellStore::new();
         for row in 0..200u32 {
             s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
         }
         assert!(s.enable_paging());
-        assert!(s.paged_band_count() > 0);
-        let paged = s.paged_band_count();
-        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
-        let len = s.len();
-        s.compact();
-        assert_eq!(s.paged_band_count(), paged, "no page is decoded or dropped");
-        assert_eq!(s.len(), len);
-        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
-        for (at, cell) in &visible {
-            assert_eq!(s.get(*at).as_ref(), Some(cell));
-        }
-        // A shift leaves the page at physical row 0 unmapped. This slice does not reclaim paged
-        // cells, so it stays counted and unreadable; every mapped paged cell still reads.
+        let snapshot = s.clone();
+        let old_len = s.pages.get(&0).map(|page| page.page_len()).unwrap_or(0);
+        assert!(old_len > 0, "page 0 holds the first band");
         s.shift_rows(1, -1);
-        let still_visible: Vec<(CellRef, Cell)> = s.iter().collect();
-        assert_eq!(still_visible.len(), visible.len() - 1);
-        let len = s.len();
-        s.compact();
-        assert_eq!(s.paged_band_count(), paged);
-        assert_eq!(s.len(), len, "paged orphans are out of scope for this slice");
-        assert_eq!(s.iter().collect::<Vec<_>>(), still_visible);
-        for (at, cell) in &still_visible {
-            assert_eq!(s.get(*at).as_ref(), Some(cell));
+        assert_eq!(s.compact().pages, 1);
+        let new_page = s.pages.get(&0).expect("the rewritten page stays at its key");
+        let old_page = snapshot.pages.get(&0).expect("the snapshot keeps its page");
+        assert!(!Arc::ptr_eq(new_page, old_page), "the rewrite installs a new page");
+        assert_eq!(snapshot.get(c(0, 0)).map(|x| x.value), Some(Value::Number(0.0)), "the snapshot still reads the dropped row");
+        assert_eq!(s.get(c(0, 0)).map(|x| x.value), Some(Value::Number(1.0)), "the live store moved row 0 down");
+        assert_eq!(snapshot.len(), 200);
+        assert_eq!(snapshot.iter().count(), 200);
+        assert!(snapshot.retained_bytes_against(&s) >= old_len, "the snapshot is charged for the page it no longer shares");
+    }
+
+    /// A page whose only rows lost their inverse is dropped rather than rewritten empty.
+    #[test]
+    fn compact_drops_a_page_that_only_held_orphans() {
+        let mut s = CellStore::new();
+        for row in [0u32, 1, 2, 100, 101, 102] {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
         }
+        assert!(s.enable_paging());
+        assert_eq!(s.paged_band_count(), 2);
+        // Delete logical rows 0..63: page 0 held only those rows.
+        s.shift_rows(64, -64);
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let used = s.used_range();
+        assert_eq!(visible.len(), 3);
+        assert_eq!(s.len(), 6);
+        let out = s.compact();
+        assert_eq!(out.cells, 3);
+        assert_eq!(out.pages, 1, "the page that only held orphans is dropped");
+        assert_eq!(s.paged_band_count(), 1);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+        assert_eq!(s.used_range(), used);
+        assert_eq!(s.get(c(36, 0)).map(|x| x.value), Some(Value::Number(100.0)), "the remaining page still reads");
+    }
+
+    /// The early-out: a clean paged store (identity maps) decodes nothing, touches no page and
+    /// changes nothing. This is the regression test for the O(1) return.
+    #[test]
+    fn compact_is_free_when_nothing_is_orphaned() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging());
+        assert!(!s.needs_compaction());
+        let pages: Vec<(u32, Arc<page::Page>)> = s.pages.iter().map(|(key, page)| (*key, page.clone())).collect();
+        let bytes = s.paged_bytes();
+        let len = s.len();
+        let decodes = s.page_file.as_ref().map(|file| file.decodes()).unwrap_or(0);
+        let out = s.compact();
+        assert_eq!(out, Compacted::default());
+        assert_eq!(s.page_file.as_ref().map(|file| file.decodes()).unwrap_or(0), decodes, "a clean paged store decodes no page");
+        assert_eq!(s.paged_bytes(), bytes);
+        assert_eq!(s.len(), len);
+        for (key, page) in pages {
+            assert!(s.pages.get(&key).is_some_and(|now| Arc::ptr_eq(now, &page)), "page {key} is untouched");
+        }
+    }
+
+    /// A page can hold a cell at a physical column whose inverse is gone; the column gaps select
+    /// it, the rewrite drops the cell and recomputes the bounds.
+    #[test]
+    fn compact_reclaims_paged_columns() {
+        let mut s = CellStore::new();
+        for row in 0..100u32 {
+            for col in 0..4u32 {
+                s.set(c(row, col), Cell::value(Value::Number(f64::from(row * 10 + col))));
+            }
+        }
+        assert!(s.enable_paging());
+        let pages = s.paged_band_count();
+        assert_eq!(pages, 2);
+        s.shift_cols(1, -1);
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let used = s.used_range();
+        assert_eq!(visible.len(), 300);
+        assert_eq!(s.len(), 400);
+        let out = s.compact();
+        assert_eq!(out.cells, 100);
+        assert_eq!(out.pages, pages, "every page held a cell in the dropped column");
+        assert_eq!(s.len(), visible.len());
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+        assert_eq!(s.used_range(), used);
+        assert!(
+            s.pages.values().all(|page| page.bounds().is_some_and(|(_, _, first, _)| first >= 1)),
+            "the rewritten bounds no longer cross the dropped column"
+        );
+        assert_eq!(s.get(c(0, 0)).map(|x| x.value), Some(Value::Number(1.0)), "the rewritten page reads");
+        assert_eq!(s.get(c(99, 2)).map(|x| x.value), Some(Value::Number(993.0)));
+    }
+
+    /// With every page checked, a contiguous map returns to the identity fast path even though the
+    /// store is still paged — the `reset_prefix` change — and the next pass is O(1).
+    #[test]
+    fn compact_restores_identity_after_a_complete_page_sweep() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        // A cell in the last row of the grid: deleting that row leaves one contiguous run from the
+        // origin and puts the cell at physical `MAX_ROWS - 1` in a page of its own with no inverse.
+        s.set(c(gridcraft_core::MAX_ROWS - 1, 0), Cell::value(Value::Number(7.0)));
+        assert!(s.enable_paging());
+        let pages = s.paged_band_count();
+        assert_eq!(pages, 5);
+        s.shift_rows(gridcraft_core::MAX_ROWS, -1);
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        assert_eq!(visible.len(), 200);
+        assert_eq!(s.len(), 201);
+        assert!(!s.row_map.is_identity());
+        let out = s.compact();
+        assert_eq!(out.cells, 1);
+        assert_eq!(out.pages, 1, "the page that only held the dropped row is gone");
+        assert!(out.changed);
+        assert!(s.row_map.is_identity(), "a complete sweep returns a contiguous map to the fast path");
+        assert!(s.col_map.is_identity());
+        assert_eq!(s.paged_band_count(), pages - 1);
+        assert_eq!(s.len(), visible.len());
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+        let lens: Vec<usize> = s.pages.values().map(|page| page.page_len()).collect();
+        let again = s.compact();
+        assert_eq!(again, Compacted::default(), "the second pass is a no-op");
+        assert!(s.row_map.is_identity());
+        assert_eq!(s.pages.values().map(|page| page.page_len()).collect::<Vec<_>>(), lens);
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+    }
+
+    /// A second pass over a store whose map cannot return to identity decodes the pages a gap still
+    /// selects, finds nothing and changes nothing.
+    #[test]
+    fn compact_is_idempotent_across_pages() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging());
+        s.shift_rows(1, -1);
+        assert_eq!(s.compact().pages, 1);
+        let pages = s.paged_band_count();
+        let lens: Vec<usize> = s.pages.values().map(|page| page.page_len()).collect();
+        let bytes = s.paged_bytes();
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let used = s.used_range();
+        let len = s.len();
+        let again = s.compact();
+        assert_eq!(again, Compacted::default(), "nothing left to reclaim");
+        assert!(!again.changed);
+        assert_eq!((s.paged_band_count(), s.paged_bytes(), s.len()), (pages, bytes, len));
+        assert_eq!(s.pages.values().map(|page| page.page_len()).collect::<Vec<_>>(), lens);
+        assert_eq!(s.used_range(), used);
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+    }
+
+    /// A rewritten page recomputes its formula/array flags from the new band instead of dropping
+    /// them, so `formulas` and `has_owned_cells` still answer from the page.
+    #[test]
+    fn compact_keeps_formulas_on_a_rewritten_page() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        s.set(c(1, 1), Cell { value: Value::Number(2.0), formula: Some(Arc::new(Formula::new("=A1+1"))), style: StyleId(3) });
+        assert!(s.enable_paging());
+        s.shift_rows(1, -1);
+        let formulas: Vec<(CellRef, String, bool)> = s.formulas().map(|(at, f, has_value)| (at, f.text.clone(), has_value)).collect();
+        assert_eq!(formulas.len(), 1);
+        let block = RangeRef::new(c(0, 0), c(63, 10));
+        assert!(s.has_owned_cells(block));
+        assert_eq!(s.compact().pages, 1);
+        assert_eq!(s.formulas().map(|(at, f, has_value)| (at, f.text.clone(), has_value)).collect::<Vec<_>>(), formulas);
+        assert!(s.has_owned_cells(block));
+        let page = s.pages.get(&0).expect("the rewritten page");
+        assert!(page.has_formulas(), "the formula flag is recomputed");
+        assert!(page.has_owned(), "the owned flag is recomputed");
+        assert!(s.get(c(0, 1)).and_then(|cell| cell.formula).is_some(), "the formula reads back from the rewritten page");
+    }
+
+    /// A page that cannot be read leaves the pass incomplete: the store keeps its orphan and its
+    /// map, and reports no change.
+    #[test]
+    fn compact_keeps_the_maps_when_a_page_cannot_be_read() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging());
+        s.shift_rows(1, -1);
+        // The page file is gone (as a corrupt or missing page would be): the candidate cannot be
+        // decoded, so nothing is dropped and the shortened run must not become identity.
+        s.page_file = None;
+        let out = s.compact();
+        assert_eq!(out, Compacted::default(), "nothing was reclaimed");
+        assert_eq!(s.len(), 200, "the orphan stays counted");
+        assert_eq!(s.paged_band_count(), 4);
+        assert!(!s.row_map.is_identity(), "an incomplete pass does not reset the map");
+        assert!(s.needs_compaction(), "the map still has a gap to check");
+    }
+
+    /// A rewritten page serializes to the same logical cells: the wire format walks `iter`, and a
+    /// save after compaction must not lose or move anything.
+    #[test]
+    fn compact_keeps_the_logical_cells_of_a_rewritten_page_across_serialization() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell { value: Value::Number(f64::from(row)), formula: None, style: StyleId(row % 3) });
+            s.set(c(row, 1), Cell::value(Value::Text(Arc::from(format!("r{row}").as_str()))));
+        }
+        s.set(c(2, 2), Cell { value: Value::Number(9.0), formula: Some(Arc::new(Formula::new("=A1+1"))), style: StyleId(7) });
+        assert!(s.enable_paging());
+        s.shift_rows(1, -1);
+        s.shift_cols(1, -1);
+        let before = s.len();
+        let visible: Vec<(CellRef, Cell)> = s.iter().collect();
+        let out = s.compact();
+        assert_eq!(out.cells, before - visible.len());
+        assert_eq!(s.len(), visible.len());
+        assert_eq!(s.iter().collect::<Vec<_>>(), visible);
+        let positions: Vec<CellRef> = visible.iter().map(|(at, _)| *at).collect();
+        let values: Vec<Value> = visible.iter().map(|(_, cell)| cell.value.clone()).collect();
+        let bytes = serde_json::to_vec(&s).expect("serialize");
+        let back: CellStore = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(back.len(), visible.len());
+        assert_eq!(back.iter().map(|(at, _)| at).collect::<Vec<_>>(), positions);
+        assert_eq!(back.iter().map(|(_, cell)| cell.value).collect::<Vec<_>>(), values);
+        assert_eq!(back, s, "the saved cells are the logical cells");
     }
 }

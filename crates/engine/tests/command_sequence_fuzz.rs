@@ -290,6 +290,9 @@ impl Harness {
         }
         self.check_state(i)?;
         if (i + 1).is_multiple_of(ROUNDTRIP_EVERY) {
+            if let Some(e) = cells_len_diff(&after) {
+                return Err(fail(i, "cells", e));
+            }
             guarded(i, "xlsx roundtrip", || roundtrip_diff(&after))?;
         }
         let over = {
@@ -504,6 +507,16 @@ fn value_diff(a: &Workbook, b: &Workbook, what: &str, file: bool) -> Option<Stri
         }
     }
     None
+}
+
+/// `CellStore::len` must count exactly the cells `iter` yields. A shift that is not paired with a
+/// take leaves a cell no logical position reaches, which compaction and paging both assume away;
+/// walking the logical cells is the only check that sees it.
+fn cells_len_diff(wb: &Workbook) -> Option<String> {
+    wb.sheets.iter().find_map(|sh| {
+        let count = sh.cells.iter().count();
+        (sh.cells.len() != count).then(|| format!("{}: cells.len() is {} but iter() yields {count}", sh.name, sh.cells.len()))
+    })
 }
 
 /// A full recalculation from scratch must agree with the incrementally maintained values.
