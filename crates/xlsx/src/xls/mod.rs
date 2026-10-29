@@ -5,25 +5,31 @@
 //! Read: worksheets, shared strings, cell values, formulas (text and cached results, including
 //! shared and array formulas), number formats, the 1904 date system, merged cells, column
 //! widths, row heights, defined names, print areas, print titles and the calculation settings
-//! (mode, iteration, precision as displayed). Everything else (fonts, fills, borders, charts,
-//! pictures, comments, conditional formats, validation, macros) is skipped with a warning.
-//! Encrypted workbooks and pre-BIFF8 versions are refused.
+//! (mode, iteration, precision as displayed). Style records (_FONT_, _FORMAT_, _PALETTE_, _XF_,
+//! _STYLE_) are read into the workbook's style table, so cells keep their font, fill, borders,
+//! alignment and number format; cell comments are read with their author and text. Conditional
+//! formats, data validation, charts, pictures and OLE objects are skipped with a warning. Files
+//! encrypted with FILEPASS and pre-BIFF8 workbooks are refused with a message.
 
 mod formula;
 mod ftab;
 mod records;
+mod styles;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, DateSystem, MAX_COLS, MAX_ROWS, RangeRef, Value};
-use gridcraft_model::{CalcMode, CalcSettings, Cell, DefinedName, Formula, LineInfo, NumFmt, Sheet, Style, StyleId, Visibility, Workbook};
+use gridcraft_model::{
+    CalcMode, CalcSettings, Cell, Comment, DefinedName, Formula, LineInfo, Sheet, Style, StyleId, StyleTable, Visibility, Workbook,
+};
 
 use crate::cfb::Compound;
-use crate::tables::{builtin_format, col_width_to_px, pt_to_px};
+use crate::tables::{col_width_to_px, pt_to_px};
 use crate::{IoError, ReadReport};
 use formula::{Links, Mode, SupBook, Unsupported, Xti, cell_error, decode};
 use records::{Cursor, Record, Records};
+use styles::StylesIn;
 
 const MAX_CELLS: usize = 4_000_000;
 const MAX_STRINGS: usize = 4_000_000;
@@ -32,6 +38,8 @@ const MAX_SHEETS: usize = 4096;
 const MAX_NAMES: usize = 65_536;
 const MAX_XFS: usize = 65_536;
 const MAX_MERGES: usize = 100_000;
+/// Comments read per sheet (Excel allows far fewer).
+const MAX_COMMENTS: usize = 65_536;
 /// Records read from the whole Workbook stream at most (a 65,536 × 256 sheet has fewer). One
 /// allowance shared by every substream: many BoundSheet records pointing into one huge
 /// substream must not each get their own.
@@ -122,8 +130,7 @@ struct Lbl {
 struct Globals {
     sheets: Vec<BoundSheet>,
     date1904: bool,
-    formats: HashMap<u16, String>,
-    xf_formats: Vec<u16>,
+    styles: StylesIn,
     sst: Vec<Arc<str>>,
     links: Links,
     names: Vec<Lbl>,
@@ -153,19 +160,16 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     let mut wb = Workbook::new();
     wb.sheets.clear();
     wb.date_system = if g.date1904 { DateSystem::D1904 } else { DateSystem::D1900 };
-    // One model style per XF: only the number format is imported.
-    let styles: Vec<StyleId> = g
-        .xf_formats
-        .iter()
-        .map(|ifmt| {
-            let code = g.formats.get(ifmt).map(String::as_str).or_else(|| builtin_format(u32::from(*ifmt))).unwrap_or("General");
-            if code.eq_ignore_ascii_case("General") {
-                StyleId::DEFAULT
-            } else {
-                wb.styles.intern(Style { num_fmt: NumFmt::new(code), ..Style::default() })
-            }
-        })
-        .collect();
+    // One model style per XF, carrying the whole cell format: font, fill, borders, alignment,
+    // number format and protection. XF 0 is the Normal style, which every other format builds on.
+    let fonts = g.styles.font_models();
+    let resolved: Vec<Style> = g.styles.xfs.iter().map(|xf| xf.resolve(&fonts, &g.styles.palette, &g.styles.formats)).collect();
+    if let Some(normal) = resolved.first() {
+        wb.styles = StyleTable::with_default(normal.clone());
+    }
+    let styles: Vec<StyleId> =
+        resolved.iter().enumerate().map(|(i, s)| if i == 0 { StyleId::DEFAULT } else { wb.styles.intern(s.clone()) }).collect();
+    wb.cell_styles = g.styles.named(&resolved);
 
     // BoundSheet8 index → model sheet index.
     let mut model_index: Vec<Option<usize>> = Vec::with_capacity(g.sheets.len());
@@ -202,7 +206,7 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     // The overview comes first.
     report.warnings.insert(
         0,
-        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, number formats, merged cells, column widths, row heights and defined names were read. Fonts, fills, borders, charts, pictures, comments and other features are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
+        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments and defined names were read. Conditional formats, data validation, charts, pictures and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
     );
     Ok((wb, report))
 }
@@ -258,24 +262,8 @@ fn globals(stream: &[u8], budget: &mut Budget, report: &mut ReadReport) -> Resul
             }
             0x0022 => g.date1904 = c.u16()? == 1,
             0x000E => g.precision_as_displayed = c.u16()? == 0,
-            0x041E => {
-                let ifmt = c.u16()?;
-                let cch = usize::from(c.u16()?);
-                let high = c.u8()? & 1 != 0;
-                // Some writers count one character more than the record holds; Excel opens
-                // those files, so keep the characters that are there.
-                let fit = c.remaining() / if high { 2 } else { 1 };
-                if cch > fit {
-                    report.warn("Some number formats were shorter than their declared length; the characters present were kept.");
-                }
-                let code = c.chars(cch.min(fit), high)?;
-                budget.text(code.len())?;
-                g.formats.insert(ifmt, code);
-            }
-            0x00E0 if g.xf_formats.len() < MAX_XFS => {
-                c.u16()?;
-                g.xf_formats.push(c.u16()?);
-            }
+            // Font, number format, palette, cell format and named style records.
+            0x0031 | 0x041E | 0x0092 | 0x00E0 | 0x0293 => g.styles.record(rec.id, &mut c)?,
             0x00FC => g.sst = shared_strings(&mut c, budget)?,
             0x01AE => {
                 let _ctab = c.u16()?;
@@ -317,6 +305,9 @@ fn globals(stream: &[u8], budget: &mut Budget, report: &mut ReadReport) -> Resul
     // The same test `defined_names` applies, before any cell formula is decoded.
     let skipped = g.names.iter().map(|l| !l.rgce.is_empty() && decode(&l.rgce, &l.rgcb, CellRef::new(0, 0), Mode::Name, &g.links).is_err()).collect();
     g.links.skipped = skipped;
+    if g.styles.short_format {
+        report.warn("Some number formats were shorter than their declared length; the characters present were kept.");
+    }
     Ok(g)
 }
 
@@ -413,6 +404,10 @@ struct SheetState<'g> {
     /// The cell waiting for its String record, with its style: a blank cell isn't stored, so a
     /// formula kept as its value may have no cell to receive the text.
     pending_string: Option<(CellRef, StyleId)>,
+    /// `NOTE` records: the cell and the comment's author, in file order.
+    notes: Vec<(CellRef, String)>,
+    /// The text of each comment, from the `TXO` records that follow the notes.
+    note_texts: Vec<String>,
     dropped: usize,
     unsupported: Vec<&'static str>,
     calc: CalcSettings,
@@ -505,6 +500,8 @@ fn worksheet(
         arrays: HashMap::new(),
         last_formula: None,
         pending_string: None,
+        notes: vec![],
+        note_texts: vec![],
         dropped: 0,
         unsupported: vec![],
         calc: CalcSettings::default(),
@@ -557,6 +554,19 @@ fn worksheet(
     }
     if st.dropped > 0 {
         report.warn(format!("{} cells outside the grid were skipped.", st.dropped));
+    }
+    // Comments: a `NOTE` record names the cell and its author; the text that follows the matching
+    // `TXO` record is paired with it in file order (Excel writes one of each per comment).
+    let (notes, texts) = (std::mem::take(&mut st.notes), std::mem::take(&mut st.note_texts));
+    if !notes.is_empty() && texts.len() != notes.len() {
+        report.warn("Some cell comments were missing their text (the comment object was not in the file).");
+    }
+    for (i, (at, author)) in notes.into_iter().enumerate() {
+        let text = texts.get(i).cloned().unwrap_or_default();
+        budget.text(text.len())?;
+        st.sheet
+            .comments
+            .insert(at, Comment { author, text, replies: vec![], threaded: false, resolved: false, visible: false, dates: vec![], note_box: None });
     }
     for why in &st.unsupported {
         report.warn(format!("Some formulas use {why}; their saved results were kept as values."));
@@ -756,10 +766,38 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             st.sheet.show_zeros = on(0x0010);
             st.sheet.right_to_left = on(0x0040);
         }
-        0x001C => report.warn("Cell comments in .xls files are not imported yet."),
+        0x001C => {
+            // NOTE ([MS-XLS] 2.4.176): row, column, XF, flags, then the author as an
+            // XLUnicodeString. The comment's text follows in the drawing object's TXO record.
+            if st.notes.len() >= MAX_COMMENTS {
+                return Err(IoError::TooLarge("XLS: too many comments".into()));
+            }
+            let r = c.u16()?;
+            let col = c.u16()?;
+            let _ixfe = c.u16()?;
+            let _flags = c.u16()?;
+            let author = c.string()?;
+            if let Some(at) = st.pos(r, col) {
+                st.notes.push((at, author));
+            }
+        }
+        0x01B6 => {
+            // TXO ([MS-XLS] 2.4.344): the drawing object's text. The fixed part ends with
+            // cchText and cbRuns; the characters follow it, starting with their own compression
+            // flag, and continue into Continue records (which Records already gathered).
+            c.skip(10)?;
+            let cch = usize::from(c.u16()?);
+            let _runs = c.u16()?;
+            c.skip(4)?;
+            let high = c.u8()? & 1 != 0;
+            let text = c.chars(cch, high)?;
+            if st.note_texts.len() < MAX_COMMENTS {
+                st.note_texts.push(text);
+            }
+        }
         0x00EC => report.warn("Pictures, charts and shapes in .xls files are not imported yet."),
-        0x01B0 | 0x0879 => report.warn("Conditional formatting in .xls files is not imported yet."),
-        0x01B2 => report.warn("Data validation in .xls files is not imported yet."),
+        0x01B0 | 0x01B1 | 0x0879 => report.warn("Conditional formatting in .xls files is not imported yet."),
+        0x01B2 | 0x01BE => report.warn("Data validation in .xls files is not imported yet."),
         0x01B8 => report.warn("Hyperlinks in .xls files are not imported yet."),
         0x00B0 => report.warn("PivotTables in .xls files are not imported yet; their values were kept."),
         _ => {}
