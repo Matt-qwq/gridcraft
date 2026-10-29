@@ -139,7 +139,20 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             |s, p| set_view(s, p, SheetViewMode::PageBreakPreview)
         ),
-        cmd!(noundo "view.customViews", "Custom Views…", ["View", "Workbook Views"], None, "{save?: name, show?: name, delete?: name} → list", has_doc, custom_views),
+        // Saving or deleting a view writes it into the workbook's hidden names (`_sc_custom_views`),
+        // which is workbook state like any other edit, so the command records a history step (a
+        // `show` changes the sheet's zoom and panes, which are saved with the file too). Without
+        // the step, undoing every later action left the view behind and the workbook no longer
+        // matched the one the user started from.
+        cmd!(
+            "view.customViews",
+            "Custom Views…",
+            ["View", "Workbook Views"],
+            None,
+            "{save?: name, show?: name, delete?: name} → list",
+            has_doc,
+            custom_views
+        ),
         cmd!(noundo "view.split", "Split", ["View", "Window"], None, "{} (toggles a split at the active cell; shown as frozen panes in this version)", has_doc, split),
         cmd!(noundo "view.newWindow", "New Window", ["View", "Window"], None, "{} opens a second window on the same workbook (a linked copy)", has_doc, new_window),
         cmd!(noundo "view.arrangeAll", "Arrange All", ["View", "Window"], None, "{}", has_doc, |_, _| ok()),
@@ -182,7 +195,18 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!(query "data.queriesConnections", "Queries & Connections", ["Data", "Queries & Connections"], None, "{} → imported tables", has_doc, queries),
         // Automate
-        cmd!(noundo "automate.recordActions", "Record Actions", ["Automate", "Scripting Tools"], None, "{stop?: bool, name?: script name when stopping}", has_doc, record),
+        // Stopping a recording saves its steps as a script in the workbook (`automate.newScript`,
+        // undoable); starting one changes nothing. A not-undoable command that saved the script
+        // left it in the workbook after undoing everything.
+        cmd!(
+            "automate.recordActions",
+            "Record Actions",
+            ["Automate", "Scripting Tools"],
+            None,
+            "{stop?: bool, name?: script name when stopping}",
+            has_doc,
+            record
+        ),
         cmd!(
             "automate.newScript",
             "New Script",

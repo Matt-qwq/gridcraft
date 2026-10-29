@@ -895,8 +895,24 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
                     .filter_map(move |col| sh.hyperlinks.get(&CellRef::new(*row, col)).map(|h| (CellRef::new(start + i as u32, col), h.clone())))
             })
             .collect();
-        let rows: Vec<Vec<Option<Cell>>> =
+        // Legacy arrays are stored whole in their anchor cell, so a compaction that moves the
+        // anchor must move the range it covers with it, and one that would cut an array apart is
+        // refused. Without this the anchor moved up and the formula kept covering the cells it was
+        // at, which the fuzzer saw as `F11: array formula covers F14`.
+        let area = RangeRef::new(CellRef::new(start, r.start.col), CellRef::new(r.end.row, r.end.col));
+        let moved_arrays = arrays_moved_by_row_compaction(sh, area, start, &keep)?;
+        let mut rows: Vec<Vec<Option<Cell>>> =
             keep.iter().map(|row| (r.start.col..=r.end.col).map(|c| sh.cell(CellRef::new(*row, c))).collect()).collect();
+        for (i, cells) in rows.iter_mut().enumerate() {
+            for (j, cell) in cells.iter_mut().enumerate() {
+                let Some(cell) = cell else { continue };
+                let Some(f) = cell.formula.as_mut() else { continue };
+                let old = CellRef::new(keep[i], r.start.col + j as u32);
+                if let Some(new) = moved_arrays.get(&old) {
+                    Arc::make_mut(f).array = Some(*new);
+                }
+            }
+        }
         let shm = cx.sheet_mut(sheet)?;
         for row in start..=r.end.row {
             for c in r.start.col..=r.end.col {
@@ -927,10 +943,42 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
         for c in RangeRef::new(CellRef::new(start, r.start.col), r.end).iter() {
             cx.changed.push((sheet, c));
         }
+        // A moved array re-spills from its new anchor, which a full recalculation rebuilds.
+        cx.structural |= !moved_arrays.is_empty();
         Ok(())
     })?;
     let remaining = (r.end.row + 1 - start) as usize - removed;
     Ok(json!({"removed": removed, "remaining": remaining}))
+}
+
+/// Where a row compaction that writes the kept rows at `start` sends each legacy array inside
+/// `area`: old anchor → the range the formula must cover at its new place.
+///
+/// An array moves as a whole or not at all. Every one of its rows must survive, in order and
+/// adjacent, and the array must sit entirely inside the compacted area; otherwise the compaction
+/// would leave a formula whose range covers cells it no longer owns, so it is refused the way
+/// Excel refuses an edit of part of an array.
+fn arrays_moved_by_row_compaction(sh: &Sheet, area: RangeRef, start: u32, keep: &[u32]) -> Result<std::collections::HashMap<CellRef, RangeRef>> {
+    let dest: std::collections::HashMap<u32, u32> = keep.iter().enumerate().map(|(i, row)| (*row, start.saturating_add(i as u32))).collect();
+    let refuse = || EngineError::Other("You can't change part of an array.".into());
+    let mut out = std::collections::HashMap::new();
+    for (c, f, _) in sh.cells.formulas() {
+        let Some(a) = f.array.filter(|a| a.start == c && a.intersects(&area)) else { continue };
+        if !area.contains_range(&a) {
+            return Err(refuse());
+        }
+        let first = dest.get(&a.start.row).copied().ok_or_else(refuse)?;
+        for row in a.start.row..=a.end.row {
+            let want = first.checked_add(row - a.start.row).ok_or_else(refuse)?;
+            if dest.get(&row) != Some(&want) {
+                return Err(refuse());
+            }
+        }
+        let height = a.end.row - a.start.row;
+        let moved = RangeRef::new(CellRef::new(first, a.start.col), CellRef::new(first.checked_add(height).ok_or_else(refuse)?, a.end.col));
+        out.insert(c, moved);
+    }
+    Ok(out)
 }
 
 fn text_to_columns(s: &mut Session, p: &Json) -> Result<Json> {
