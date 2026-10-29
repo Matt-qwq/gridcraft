@@ -368,6 +368,27 @@ fn read_axis(a: &El) -> AxisOptions {
     }
 }
 
+/// Whether every chart group in a classic part is a kind GridCraft models. A part with any other
+/// group (3-D bars, lines, areas or pies, a surface, a pie of pie or bar of pie) is kept as it was
+/// instead of being read into the 2-D model and written back as something else.
+pub fn is_modelled(root: &El) -> bool {
+    let Some(plot) = root.path(&["chart", "plotArea"]) else { return false };
+    let mut groups = 0usize;
+    for g in &plot.children {
+        if !g.name.ends_with("Chart") {
+            continue;
+        }
+        groups += 1;
+        if !matches!(
+            g.name.as_str(),
+            "barChart" | "lineChart" | "pieChart" | "doughnutChart" | "areaChart" | "scatterChart" | "bubbleChart" | "radarChart" | "stockChart"
+        ) {
+            return false;
+        }
+    }
+    groups > 0
+}
+
 pub fn read_chart(root: &El) -> Option<Chart> {
     let chart = root.child("chart")?;
     let plot = chart.child("plotArea")?;
@@ -410,6 +431,10 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         }
     }
     let scatter = matches!(first_kind, ChartKind::Scatter | ChartKind::ScatterLines | ChartKind::Bubble);
+    // The secondary axis pair: the axes of the first group whose ids differ from the first group's
+    // (a combo chart's right-hand value axis).
+    let second_axes = groups.iter().skip(1).map(|(g, _)| axis_ids(g)).find(|ids| !ids.is_empty() && *ids != first_axes);
+    let y2_ax = second_axes.as_ref().and_then(|ids| ids.get(1)).and_then(|id| axis_by_id(plot, id));
     let (x_ax, y_ax) = {
         let x = first_axes.first().and_then(|id| axis_by_id(plot, id));
         let y = first_axes.get(1).and_then(|id| axis_by_id(plot, id));
@@ -454,6 +479,7 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         pivot: root.path(&["pivotSource", "name"]).map(|n| strip_book(n.text.trim()).to_string()).filter(|n| !n.is_empty()),
         x_axis: x_ax.map(read_axis).unwrap_or_default(),
         y_axis: y_ax.map(read_axis).unwrap_or_default(),
+        y2_axis: y2_ax.map(read_axis).unwrap_or_default(),
         labels,
         part: None,
     })
@@ -574,7 +600,7 @@ fn is_defined_name(wb: &Workbook, si: usize, f: &str) -> bool {
     chart_name(wb, si, f).is_some_and(|(_, _, d)| d.is_some())
 }
 
-fn num_data(tag: &str, f: Option<&str>, wb: &Workbook, si: usize) -> String {
+pub(crate) fn num_data(tag: &str, f: Option<&str>, wb: &Workbook, si: usize) -> String {
     let f = f.unwrap_or("").trim();
     if f.is_empty() {
         return format!("<c:{tag}><c:numLit><c:ptCount val=\"0\"/></c:numLit></c:{tag}>");
@@ -640,7 +666,7 @@ fn split_array_items(inner: &str) -> Vec<String> {
     items
 }
 
-fn str_data(tag: &str, f: &str, wb: &Workbook, si: usize) -> String {
+pub(crate) fn str_data(tag: &str, f: &str, wb: &Workbook, si: usize) -> String {
     let f = f.trim();
     if f.starts_with('{') {
         let vals = split_array_items(f.trim_matches(|c| c == '{' || c == '}'));
@@ -669,7 +695,7 @@ fn str_data(tag: &str, f: &str, wb: &Workbook, si: usize) -> String {
 /// category range has more columns than a column of values (or more rows than a row of values:
 /// year beside month). Its cache lists the innermost level first, then each outer level with
 /// only the cells that start a group, as Excel writes it.
-fn cat_data(f: &str, values: &str, wb: &Workbook, si: usize) -> String {
+pub(crate) fn cat_data(f: &str, values: &str, wb: &Workbook, si: usize) -> String {
     multi_level_cat(f.trim(), values, wb, si).unwrap_or_else(|| str_data("cat", f, wb, si))
 }
 
@@ -706,16 +732,30 @@ fn multi_level_cat(f: &str, values: &str, wb: &Workbook, si: usize) -> Option<St
     Some(s)
 }
 
+pub(crate) fn series_tx_xml(s: &Series, wb: &Workbook, si: usize) -> String {
+    let Some(n) = &s.name else { return String::new() };
+    if is_ref(n) || is_defined_name(wb, si, n) {
+        str_data("tx", n, wb, si)
+    } else {
+        let lit = n.trim().strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(n);
+        format!("<c:tx><c:v>{}</c:v></c:tx>", esc(lit))
+    }
+}
+
+/// A series' `spPr`: for a line-like series an outline in the series colour (line and radar charts),
+/// for anything else a fill.
+pub(crate) fn series_sp_pr(s: &Series, line_like: bool, wb: &Workbook) -> Option<String> {
+    let c = s.color.as_ref().and_then(|c: &Color| srgb(c, &wb.theme))?;
+    Some(if line_like {
+        format!("<c:spPr><a:ln w=\"28575\" cap=\"rnd\"><a:solidFill>{c}</a:solidFill><a:round/></a:ln></c:spPr>")
+    } else {
+        format!("<c:spPr><a:solidFill>{c}</a:solidFill></c:spPr>")
+    })
+}
+
 fn series_xml(s: &Series, idx: usize, g: G, labels_on: bool, wb: &Workbook, si: usize) -> String {
     let mut x = format!("<c:ser><c:idx val=\"{idx}\"/><c:order val=\"{idx}\"/>");
-    if let Some(n) = &s.name {
-        if is_ref(n) || is_defined_name(wb, si, n) {
-            x.push_str(&str_data("tx", n, wb, si));
-        } else {
-            let lit = n.trim().strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(n);
-            let _ = write!(x, "<c:tx><c:v>{}</c:v></c:tx>", esc(lit));
-        }
-    }
+    x.push_str(&series_tx_xml(s, wb, si));
     let color = s.color.as_ref().and_then(|c: &Color| srgb(c, &wb.theme));
     let line_like = matches!(g, G::Line { .. } | G::Radar | G::Scatter { lines: true });
     match (&color, line_like) {
@@ -790,7 +830,7 @@ fn series_xml(s: &Series, idx: usize, g: G, labels_on: bool, wb: &Workbook, si: 
 
 /// `<c:trendline>` with children in schema order: name, spPr, trendlineType, order, period,
 /// forward, backward, intercept, dispRSqr, dispEq, trendlineLbl.
-fn trendline_xml(t: &Trendline, wb: &Workbook) -> String {
+pub(crate) fn trendline_xml(t: &Trendline, wb: &Workbook) -> String {
     let mut x = String::from("<c:trendline>");
     if let Some(n) = &t.name {
         let _ = write!(x, "<c:name>{}</c:name>", esc(n));
@@ -845,45 +885,26 @@ fn trendline_xml(t: &Trendline, wb: &Workbook) -> String {
     x
 }
 
-/// `<c:dLbls>` in CT_DLbls order: deleted points, number format, position, the show flags, the
-/// separator. `labels` absent writes the deleted points only (a series with no options of its own).
-fn dlbls_xml(labels: Option<&LabelOptions>, deleted: &[u32]) -> String {
+/// `<c:dLbls>` in CT_DLbls order: deleted points, then the options. `labels` absent writes the
+/// deleted points only (a series with no options of its own).
+pub(crate) fn dlbls_xml(labels: Option<&LabelOptions>, deleted: &[u32]) -> String {
     let mut x = String::from("<c:dLbls>");
     for idx in deleted.iter().take(MAX_POINTS) {
         let _ = write!(x, "<c:dLbl><c:idx val=\"{idx}\"/><c:delete val=\"1\"/></c:dLbl>");
     }
-    let Some(l) = labels else {
-        x.push_str("</c:dLbls>");
-        return x;
-    };
-    if l.hidden {
-        x.push_str("<c:delete val=\"1\"/></c:dLbls>");
-        return x;
-    }
-    if let Some(code) = l.number_format.as_deref().filter(|c| !c.is_empty()) {
-        let _ = write!(x, "<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>", esc_attr(code));
-    }
-    if l.position != LabelPosition::Auto {
-        let _ = write!(x, "<c:dLblPos val=\"{}\"/>", label_position_file(l.position));
-    }
-    let _ = write!(
-        x,
-        "<c:showLegendKey val=\"{}\"/><c:showVal val=\"{}\"/><c:showCatName val=\"{}\"/><c:showSerName val=\"{}\"/><c:showPercent val=\"{}\"/><c:showBubbleSize val=\"0\"/>",
-        l.show_legend_key as u8, l.show_value as u8, l.show_category as u8, l.show_series as u8, l.show_percentage as u8
-    );
-    if let Some(sep) = l.separator.as_deref().filter(|s| !s.is_empty()) {
-        let _ = write!(x, "<c:separator>{}</c:separator>", esc(sep));
+    if let Some(l) = labels {
+        for (_, text) in label_children(l) {
+            if let Some(t) = text {
+                x.push_str(&t);
+            }
+        }
     }
     x.push_str("</c:dLbls>");
-    // A chart label with no part shown would show nothing; the flag alone always meant values.
-    if !l.shows_anything() {
-        x = x.replacen("<c:showVal val=\"0\"/>", "<c:showVal val=\"1\"/>", 1);
-    }
     x
 }
 
 /// `<c:dPt>` in CT_DPt order: idx, marker?, spPr?.
-fn point_xml(p: &PointFormat, marker: bool, wb: &Workbook) -> String {
+pub(crate) fn point_xml(p: &PointFormat, marker: bool, wb: &Workbook) -> String {
     let mut x = format!("<c:dPt><c:idx val=\"{}\"/>", p.index.min(MAX_POINTS as u32));
     if marker && let Some(c) = p.marker.as_ref().and_then(|c: &Color| srgb(c, &wb.theme)) {
         let _ = write!(x, "<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/><c:spPr><a:solidFill>{c}</a:solidFill></c:spPr></c:marker>");
@@ -904,8 +925,10 @@ fn point_xml(p: &PointFormat, marker: bool, wb: &Workbook) -> String {
     x
 }
 
-/// `<c:errBars>` in CT_ErrBars order: errBarType, errValType, noEndCap?, plus/minus?, val?.
-fn err_bars_xml(e: &ErrorBars, wb: &Workbook, si: usize) -> String {
+/// The children of a `<c:errBars>` in CT_ErrBars order: the type pair, end caps, the custom
+/// references and the amount. The writer emits them all; the patcher changes a subset and leaves
+/// the element's own formatting (`spPr`: the bar's line colour and width) alone.
+pub(crate) fn err_bars_children(e: &ErrorBars, wb: &Workbook, si: usize) -> Vec<(&'static str, Option<String>)> {
     let direction = match e.direction {
         ErrorBarDirection::Both => "both",
         ErrorBarDirection::Plus => "plus",
@@ -918,28 +941,33 @@ fn err_bars_xml(e: &ErrorBars, wb: &Workbook, si: usize) -> String {
         ErrorBarKind::Custom { .. } => "cust",
         ErrorBarKind::StdErr => "stdErr",
     };
-    let mut x = format!("<c:errBars><c:errBarType val=\"{direction}\"/><c:errValType val=\"{kind}\"/>");
-    if e.no_end_cap {
-        x.push_str("<c:noEndCap val=\"1\"/>");
-    }
-    match &e.kind {
+    let (plus, minus, val) = match &e.kind {
         ErrorBarKind::Custom { plus, minus } => {
-            if let Some(f) = plus {
-                x.push_str(&num_data("plus", Some(f), wb, si));
-            }
-            if let Some(f) = minus {
-                x.push_str(&num_data("minus", Some(f), wb, si));
-            }
+            (plus.as_deref().map(|f| num_data("plus", Some(f), wb, si)), minus.as_deref().map(|f| num_data("minus", Some(f), wb, si)), None)
         }
-        ErrorBarKind::Fixed(v) | ErrorBarKind::Percentage(v) => {
-            let _ = write!(x, "<c:val val=\"{}\"/>", num(*v));
+        ErrorBarKind::Fixed(v) | ErrorBarKind::Percentage(v) => (None, None, Some(format!("<c:val val=\"{}\"/>", num(*v)))),
+        ErrorBarKind::StdDev(v) => (None, None, Some(format!("<c:val val=\"{}\"/>", num(v.max(0.0))))),
+        ErrorBarKind::StdErr => (None, None, None),
+    };
+    vec![
+        ("errBarType", Some(format!("<c:errBarType val=\"{direction}\"/>"))),
+        ("errValType", Some(format!("<c:errValType val=\"{kind}\"/>"))),
+        ("noEndCap", e.no_end_cap.then(|| "<c:noEndCap val=\"1\"/>".to_string())),
+        ("plus", plus),
+        ("minus", minus),
+        ("val", val),
+    ]
+}
+
+/// `<c:errBars>` in CT_ErrBars order: errBarType, errValType, noEndCap?, plus/minus?, val?.
+pub(crate) fn err_bars_xml(e: &ErrorBars, wb: &Workbook, si: usize) -> String {
+    let mut x = String::from("<c:errBars>");
+    for (_, text) in err_bars_children(e, wb, si) {
+        if let Some(t) = text {
+            x.push_str(&t);
         }
-        ErrorBarKind::StdDev(v) => {
-            let _ = write!(x, "<c:val val=\"{}\"/>", num(v.max(0.0)));
-        }
-        ErrorBarKind::StdErr => {}
     }
-    x.push_str("</c:errBars>");
+    let _ = write!(x, "</c:errBars>");
     x
 }
 
@@ -979,7 +1007,7 @@ fn group_xml(g: G, series: &[(usize, &Series)], ch: &Chart, axes: (u32, u32), wb
     }
 }
 
-fn title_xml(t: &str) -> String {
+pub(crate) fn title_xml(t: &str) -> String {
     let mut s = String::from("<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/>");
     for line in t.split('\n') {
         let _ = write!(s, "<a:p><a:pPr><a:defRPr/></a:pPr><a:r><a:t>{}</a:t></a:r></a:p>", esc(line));
@@ -1002,7 +1030,47 @@ struct Ax<'a> {
 }
 
 /// CT_Scaling child order: logBase, orientation, max, min.
-fn scaling_xml(o: &AxisOptions) -> String {
+pub(crate) fn legend_pos_file(p: LegendPos) -> Option<&'static str> {
+    match p {
+        LegendPos::None => None,
+        LegendPos::Bottom => Some("b"),
+        LegendPos::Top => Some("t"),
+        LegendPos::Left => Some("l"),
+        LegendPos::Right => Some("r"),
+    }
+}
+
+/// A group's `<c:dLbls>` children in CT_DLbls order: the delete flag, number format, position, the
+/// show flags, the separator. The writer emits them all; the patcher changes only those an edit
+/// touched, and leaves the rest of the element (per-point labels, leader lines, text formatting)
+/// alone.
+pub(crate) fn label_children(l: &LabelOptions) -> Vec<(&'static str, Option<String>)> {
+    if l.hidden {
+        return vec![("delete", Some("<c:delete val=\"1\"/>".into()))];
+    }
+    // A chart label with no part shown would show nothing; the flag alone always meant values.
+    let show_value = l.show_value || !l.shows_anything();
+    vec![
+        ("delete", None),
+        (
+            "numFmt",
+            l.number_format
+                .as_deref()
+                .filter(|c| !c.is_empty())
+                .map(|code| format!("<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>", esc_attr(code))),
+        ),
+        ("dLblPos", (l.position != LabelPosition::Auto).then(|| format!("<c:dLblPos val=\"{}\"/>", label_position_file(l.position)))),
+        ("showLegendKey", Some(format!("<c:showLegendKey val=\"{}\"/>", l.show_legend_key as u8))),
+        ("showVal", Some(format!("<c:showVal val=\"{}\"/>", show_value as u8))),
+        ("showCatName", Some(format!("<c:showCatName val=\"{}\"/>", l.show_category as u8))),
+        ("showSerName", Some(format!("<c:showSerName val=\"{}\"/>", l.show_series as u8))),
+        ("showPercent", Some(format!("<c:showPercent val=\"{}\"/>", l.show_percentage as u8))),
+        ("showBubbleSize", Some("<c:showBubbleSize val=\"0\"/>".into())),
+        ("separator", l.separator.as_deref().filter(|s| !s.is_empty()).map(|s| format!("<c:separator>{}</c:separator>", esc(s)))),
+    ]
+}
+
+pub(crate) fn scaling_xml(o: &AxisOptions) -> String {
     let mut s = String::from("<c:scaling>");
     if let Some(b) = o.log_base.filter(|b| (2.0..=1000.0).contains(b)) {
         let _ = write!(s, "<c:logBase val=\"{}\"/>", num(b));
@@ -1087,19 +1155,24 @@ fn part_sheet_names(xml: &str) -> Vec<String> {
 }
 
 /// A PivotChart link without the workbook in brackets: `[Book.xlsx]Sheet2!PT` → `Sheet2!PT`.
-fn strip_book(link: &str) -> &str {
+pub(crate) fn strip_book(link: &str) -> &str {
     link.strip_prefix('[').and_then(|r| r.split_once(']')).map_or(link, |(_, rest)| rest)
 }
 
 /// Chart part XML for a model chart on sheet `si`.
 pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> String {
-    // Nothing in the model changed since the file was read: write the part back byte for byte, so
-    // every option GridCraft does not model survives (the pass-through contract). A sheet the part
-    // names that the workbook no longer has (renamed or deleted) makes it stale: write it again.
-    if let Some(part) = ch.unchanged_part()
+    // A part read from a file whose sheets still exist is written back from the file, not from the
+    // model: unchanged it is byte-identical, and an edit is patched into it field by field so every
+    // option GridCraft does not model survives the edit too.
+    if let Some((part, as_read)) = ch.kept_part()
         && part_sheet_names(part).iter().all(|n| wb.sheet_index(n).is_some())
     {
-        return part.to_string();
+        if let Some(unchanged) = ch.unchanged_part() {
+            return unchanged.to_string();
+        }
+        if let Some(patched) = crate::chart_patch::patch_chart(part, as_read, ch, wb, si, book_name) {
+            return patched;
+        }
     }
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><c:roundedCorners val=\"0\"/>",
@@ -1156,7 +1229,12 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
         s.push_str(&group_xml(primary_g, &all, ch, (1, 2), wb, si));
     }
     let no_options = AxisOptions::default();
-    let secondary_y = AxisOptions { crosses: AxisCrossing::Max, ..AxisOptions::default() };
+    // Excel's own secondary value axis crosses at max, which keeps the (hidden) secondary category
+    // axis on the right; the model's automatic crossing means exactly that.
+    let mut secondary_y = ch.y2_axis.clone();
+    if secondary_y.crosses == AxisCrossing::AutoZero {
+        secondary_y.crosses = AxisCrossing::Max;
+    }
     match primary_g {
         G::Pie | G::Doughnut => {}
         G::Scatter { .. } | G::Bubble => {
@@ -1257,13 +1335,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
         }));
     }
     s.push_str("</c:plotArea>");
-    let pos = match ch.legend {
-        LegendPos::None => None,
-        LegendPos::Bottom => Some("b"),
-        LegendPos::Top => Some("t"),
-        LegendPos::Left => Some("l"),
-        LegendPos::Right => Some("r"),
-    };
+    let pos = legend_pos_file(ch.legend);
     if let Some(p) = pos {
         let _ = write!(s, "<c:legend><c:legendPos val=\"{p}\"/><c:overlay val=\"0\"/></c:legend>");
     }

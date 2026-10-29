@@ -580,11 +580,47 @@ fn draw_legend(ctx: &mut Ctx, entries: &[(String, Rgba, Swatch)], pos: LegendPos
 
 enum CatAxis<'a> {
     /// Category labels and, for a multi-level axis, the outer levels (nearest the labels first;
-    /// one entry per category, non-empty where a group starts).
-    Labels(&'a [String], &'a [Vec<String>]),
+    /// one entry per category, non-empty where a group starts), and where the value axis crosses
+    /// the category axis.
+    Labels(&'a [String], &'a [Vec<String>], AxisCrossing),
     /// A numeric category axis (a scatter chart's X): scale, format, where the value axis crosses
     /// it and the display units its labels are divided by.
     Numeric(Scale, &'a Fmt, AxisCrossing, Option<DisplayUnits>),
+}
+
+/// The categories a category axis shows: `(first, end)`, 0-based and half-open. Explicit bounds
+/// crop the axis (Excel's Format Axis bounds on a category axis are 1-based category numbers) or
+/// leave empty slots past the data; an unusable pair (`min >= max`, a non-finite bound) is ignored.
+/// The extension is capped so a hostile bound cannot allocate an axis with billions of slots.
+fn category_window(o: &AxisOptions, ncat: usize) -> (usize, usize) {
+    const MAX_EXTRA: usize = 2000;
+    let n = ncat.max(1);
+    let mut lo = 0usize;
+    let mut hi = n;
+    if let (Some(a), Some(b)) = (o.min.filter(|v| v.is_finite()), o.max.filter(|v| v.is_finite()))
+        && a >= b
+    {
+        return (0, n);
+    }
+    if let Some(v) = o.min.filter(|v| v.is_finite()) {
+        lo = ((v - 1.0).floor().max(0.0) as usize).min(n.saturating_sub(1));
+    }
+    if let Some(v) = o.max.filter(|v| v.is_finite()) {
+        hi = (v.ceil().max(1.0) as usize).clamp(lo.saturating_add(1), n.saturating_add(MAX_EXTRA));
+    }
+    if hi <= lo { (0, n) } else { (lo, hi.min(n.saturating_add(MAX_EXTRA))) }
+}
+
+/// The 0-based category the value axis crosses a label axis at, when the crossing names one rather
+/// than spelling "automatic". Excel numbers categories from 1.
+fn category_crossing(c: AxisCrossing, n: usize) -> Option<f32> {
+    let nf = n as f64;
+    match c {
+        AxisCrossing::AutoZero => None,
+        AxisCrossing::Min => None,
+        AxisCrossing::Max => Some((nf.max(1.0) - 1.0) as f32),
+        AxisCrossing::At(v) => v.is_finite().then(|| (v - 1.0).clamp(0.0, nf.max(1.0) - 1.0) as f32),
+    }
 }
 
 /// Groups of an outer category level: `(first, end)` index pairs, a group starting at every
@@ -641,7 +677,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
             _ => 4.0,
         };
         let levels = match &cat {
-            CatAxis::Labels(_, o) => o.len() as f32,
+            CatAxis::Labels(_, o, _) => o.len() as f32,
             CatAxis::Numeric(..) => 0.0,
         };
         let plot = Bx { x: area.x + left, y: area.y + lh * 0.5, w: area.w - left - right, h: area.h - lh * 1.5 - 4.0 - lh * levels };
@@ -660,6 +696,10 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                 let yy = plot.bottom() - a.scale.frac(*v) * plot.h;
                 ctx.text(plot.right() + 4.0, yy, t, ls, TEXT, HAlign::Left, VAlign::Middle);
             }
+            // The secondary axis names its display unit above its labels, as Excel does.
+            if let Some(u) = a.units {
+                ctx.text(plot.right() + 4.0, plot.y, u.label(), ls * 0.9, TEXT, HAlign::Left, VAlign::Bottom);
+            }
         }
         let y0 = plot.bottom() - y.scale.frac(y.crossing()) * plot.h;
         ctx.hline(plot.x, plot.right(), y0, AXIS, 0.75);
@@ -667,7 +707,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
             ctx.text(plot.x - 4.0, plot.y, u.label(), ls * 0.9, TEXT, HAlign::Right, VAlign::Bottom);
         }
         match cat {
-            CatAxis::Labels(l, outer) => {
+            CatAxis::Labels(l, outer, crosses) => {
                 let n = l.len().max(1);
                 let cw = plot.w / n as f32;
                 let lw = l.iter().take(2000).map(|t| ctx.tw(t, ls)).fold(0.0f32, f32::max);
@@ -691,6 +731,12 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                         }
                     }
                     ctx.vline(plot.right(), plot.bottom(), top + lh - 2.0, AXIS, 0.75);
+                }
+                // The value axis crosses the category axis at a category (Format Axis ▸ Axis value
+                // on a category axis): draw it there rather than at the frame's left edge.
+                if let Some(at) = category_crossing(crosses, n) {
+                    let xx = plot.x + (at + 0.5) * cw;
+                    ctx.vline(xx, plot.y, plot.bottom(), AXIS, 0.75);
                 }
             }
             CatAxis::Numeric(s, f, crosses, units) => {
@@ -722,9 +768,9 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         }
         plot
     } else {
-        let (labels, outer): (Vec<String>, &[Vec<String>]) = match cat {
-            CatAxis::Labels(l, o) => (l.to_vec(), o),
-            CatAxis::Numeric(..) => (vec![], &[]),
+        let (labels, outer, crosses): (Vec<String>, &[Vec<String>], AxisCrossing) = match cat {
+            CatAxis::Labels(l, o, c) => (l.to_vec(), o, c),
+            CatAxis::Numeric(..) => (vec![], &[], AxisCrossing::AutoZero),
         };
         let lw = (labels.iter().take(2000).map(|t| ctx.tw(t, ls)).fold(0.0f32, f32::max) + 6.0).min(area.w * 0.35);
         // Outer levels stand in columns left of the labels, each as wide as its longest name.
@@ -759,6 +805,10 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         for (j, t) in labels.iter().enumerate().step_by(k) {
             let t = ctx.fit(t, ls, lw - 6.0);
             ctx.text(plot.x - 4.0, plot.bottom() - (j as f32 + 0.5) * ch, &t, ls, TEXT, HAlign::Right, VAlign::Middle);
+        }
+        if let Some(at) = category_crossing(crosses, n) {
+            let yy = plot.bottom() - (at + 0.5) * ch;
+            ctx.hline(plot.x, plot.right(), yy, AXIS, 0.75);
         }
         // Outer levels: a group's name centred beside its categories, separators at the
         // boundaries running right to the axis.
@@ -1201,7 +1251,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
             spans.get(*i).into_iter().flatten().flatten().flat_map(move |(b, t)| if line { vec![*t] } else { vec![*b, *t] })
         }));
         let (lo, hi) = range.unwrap_or((0.0, 0.0));
-        let options = if axis { &AxisOptions::default() } else { &chart.y_axis };
+        let options = if axis { &chart.y2_axis } else { &chart.y_axis };
         let (scale, fmt) = if all100 {
             let mut s = fixed_scale(if lo < -1e-9 { -1.0 } else { 0.0 }, if hi > 1e-9 || lo >= -1e-9 { 1.0 } else { 0.0 }, 0.2);
             s.reversed = options.reversed;
@@ -1222,7 +1272,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
     }
     let Some((s1, f1)) = axes.first() else { return };
     let y1 = ValAxis { scale: *s1, fmt: f1, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses };
-    let y2 = axes.get(1).map(|(s, f)| ValAxis { scale: *s, fmt: f, units: None, crosses: AxisCrossing::AutoZero });
+    let y2 = axes.get(1).map(|(s, f)| ValAxis { scale: *s, fmt: f, units: chart.y2_axis.display_units, crosses: chart.y2_axis.crosses });
     // A forward forecast on a category axis adds empty category slots after the data.
     let fwd = data
         .series
@@ -1231,20 +1281,33 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
         .filter(|(i, _)| kinds.get(*i).is_some_and(|k| supports_trendline(*k)))
         .map(|(_, s)| max_forward(s))
         .fold(0.0, f64::max);
-    let ncat_slots = ncat.saturating_add(fwd.min(max_forward_slots(ncat)).ceil() as usize).min(MAX_CATS.max(ncat));
-    // A reversed category axis mirrors the slots; the labels follow their mirrored slot.
+    // A category axis with explicit bounds shows only that range of categories (and empty slots
+    // past the data, as Excel does): `(first, end)`, 0-based and half-open.
+    let (cat_lo, cat_hi) = category_window(&chart.x_axis, ncat);
+    let nshown = cat_hi.saturating_sub(cat_lo).max(1);
+    let ncat_slots = nshown.saturating_add(fwd.min(max_forward_slots(nshown)).ceil() as usize).min(MAX_CATS.max(nshown));
+    // A reversed category axis mirrors the shown range; the labels follow their mirrored slot.
     let reversed = chart.x_axis.reversed;
-    let slot = |j: usize| if reversed { ncat_slots.saturating_sub(1).saturating_sub(j) } else { j };
-    let labels: Vec<String> = (0..ncat_slots)
-        .map(|p| {
-            let cat = slot(p);
-            if cat < ncat { cat_label(data, cat) } else { String::new() }
-        })
-        .collect();
+    let in_window = |j: usize| j >= cat_lo && j < cat_hi;
+    // The canvas slot a shown category sits in (0 outside the shown range).
+    let slot = |j: usize| -> usize {
+        let k = j.clamp(cat_lo, cat_hi.saturating_sub(1)) - cat_lo;
+        if reversed { nshown.saturating_sub(1).saturating_sub(k) } else { k }
+    };
+    let cat_at = |p: usize| -> Option<usize> {
+        if p >= nshown {
+            return None;
+        }
+        Some(if reversed { cat_lo + nshown - 1 - p } else { cat_lo + p })
+    };
+    let labels: Vec<String> = (0..ncat_slots).map(|p| cat_at(p).map(|c| cat_label(data, c)).unwrap_or_default()).collect();
     // Outer levels padded to the slots (forecast slots stay in the last group).
-    let outer: Vec<Vec<String>> =
-        data.category_levels.iter().map(|l| (0..ncat_slots).map(|j| l.get(slot(j)).cloned().unwrap_or_default()).collect()).collect();
-    let plot = frame(ctx, area, CatAxis::Labels(&labels, &outer), &y1, y2.as_ref(), horizontal, chart.gridlines);
+    let outer: Vec<Vec<String>> = data
+        .category_levels
+        .iter()
+        .map(|l| (0..ncat_slots).map(|p| cat_at(p).and_then(|c| l.get(c).cloned()).unwrap_or_default()).collect())
+        .collect();
+    let plot = frame(ctx, area, CatAxis::Labels(&labels, &outer, chart.x_axis.crosses), &y1, y2.as_ref(), horizontal, chart.gridlines);
     if !plot.ok() {
         return;
     }
@@ -1301,7 +1364,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                 0 => {
                     let mut top = Vec::with_capacity(ncat * 2);
                     let mut base = Vec::with_capacity(ncat);
-                    for (j, sp) in row.iter().enumerate() {
+                    for (j, sp) in row.iter().enumerate().filter(|(j, _)| in_window(*j)) {
                         let (b, t) = sp.unwrap_or((0.0, 0.0));
                         let c = center(j);
                         top.push([c, vpos(t, &sc)]);
@@ -1337,7 +1400,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                     let o = series_labels(chart, s);
                     let pos = resolved_position(chart, o);
                     let inside = matches!(pos, LabelPosition::Center | LabelPosition::InsideEnd | LabelPosition::InsideBase);
-                    for (j, sp) in row.iter().enumerate() {
+                    for (j, sp) in row.iter().enumerate().filter(|(j, _)| in_window(*j)) {
                         let Some((b, t)) = sp else { continue };
                         let (pb, pt) = (vpos(*b, &sc), vpos(*t, &sc));
                         let c = center(j);
@@ -1403,7 +1466,8 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                     }
                 }
                 _ => {
-                    let pts: Vec<Option<[f32; 2]>> = row.iter().enumerate().map(|(j, sp)| sp.map(|(_, t)| [center(j), vpos(t, &sc)])).collect();
+                    let pts: Vec<Option<[f32; 2]>> =
+                        row.iter().enumerate().map(|(j, sp)| sp.filter(|_| in_window(j)).map(|(_, t)| [center(j), vpos(t, &sc)])).collect();
                     draw_runs(ctx, &pts, s.color, 2.25, s.smooth.then_some(plot));
                     let k = kinds.get(i).copied().unwrap_or(ChartKind::Line);
                     if k == ChartKind::LineMarkers && cw >= 3.0 {
@@ -1441,7 +1505,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
         let stats: Vec<f64> = s.values.iter().flatten().copied().collect();
         let sd = stddev(&stats);
         let n = stats.len();
-        for (j, sp) in row.iter().enumerate() {
+        for (j, sp) in row.iter().enumerate().filter(|(j, _)| in_window(*j)) {
             let Some((_, t)) = sp else { continue };
             let Some((minus, plus)) = error_span(s, j, sd, n) else { continue };
             let (x, y) = if is_col(fam) {
@@ -1465,7 +1529,8 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
         let sc = scale_of(i);
         let pts: Vec<(f64, f64)> = s.values.iter().take(ncat).enumerate().filter_map(|(j, v)| v.map(|v| ((j + 1) as f64, v))).collect();
         // A reversed category axis mirrors the slot a category number sits in.
-        let cat_frac = |x: f64| if reversed { (ncat_slots as f64 - x) / ncat_slots as f64 } else { (x - 0.5) / ncat_slots as f64 };
+        let lo = cat_lo as f64;
+        let cat_frac = |x: f64| if reversed { 1.0 - (x - 0.5 - lo) / ncat_slots as f64 } else { (x - 0.5 - lo) / ncat_slots as f64 };
         let frac = |x: f64, y: f64| (cat_frac(x), (y - sc.min) / (sc.max - sc.min));
         let px = |(fx, fy): (f64, f64)| {
             if horizontal {
@@ -1633,7 +1698,7 @@ fn histogram(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let plot = frame(
         ctx,
         area,
-        CatAxis::Labels(&labels, &[]),
+        CatAxis::Labels(&labels, &[], AxisCrossing::AutoZero),
         &ValAxis { scale: ys, fmt: &fc, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,
@@ -1693,7 +1758,7 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let plot = frame(
         ctx,
         area,
-        CatAxis::Labels(&labels, &[]),
+        CatAxis::Labels(&labels, &[], AxisCrossing::AutoZero),
         &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,
@@ -2024,7 +2089,7 @@ fn box_whisker(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let plot = frame(
         ctx,
         area,
-        CatAxis::Labels(&labels, &[]),
+        CatAxis::Labels(&labels, &[], AxisCrossing::AutoZero),
         &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,
@@ -2081,7 +2146,7 @@ fn stock(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let plot = frame(
         ctx,
         area,
-        CatAxis::Labels(&labels, &[]),
+        CatAxis::Labels(&labels, &[], AxisCrossing::AutoZero),
         &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,

@@ -18,7 +18,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Format Axis",
             ["Format", "Current Selection"],
             None,
-            "{chart?, axis?: x|y (default y), reset?: bool, min?, max?, majorUnit?, logBase?: 2..1000|0, reversed?: bool, crosses?: autoZero|min|max|<axis value>, displayUnits?: none|hundreds|thousands|tenThousands|hundredThousands|millions|tenMillions|hundredMillions|billions|trillions, numberFormat?: code (\"\" follows the plotted values)}",
+            "{chart?, axis?: x|y|y2 (default y; y2 is the secondary axis of a combo chart), reset?: bool, min?, max?, majorUnit?, logBase?: 2..1000|0, reversed?: bool, crosses?: autoZero|min|max|<axis value>, displayUnits?: none|hundreds|thousands|tenThousands|hundredThousands|millions|tenMillions|hundredMillions|billions|trillions, numberFormat?: code (\"\" follows the plotted values)}",
             has_doc,
             set_axis
         ),
@@ -73,12 +73,30 @@ fn with_chart(s: &mut Session, p: &Json, f: impl FnOnce(&mut Chart) -> Result<()
     })
 }
 
-/// `axis` param: `true` for the value axis, `false` for the category axis.
-fn axis_is_value(p: &Json, cmd: &str) -> Result<bool> {
+/// Which axis of a chart an option command addresses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AxisSel {
+    /// The category axis (or a scatter chart's X).
+    X,
+    /// The primary value axis.
+    Y,
+    /// The secondary value axis of a combo chart.
+    Y2,
+}
+
+impl AxisSel {
+    fn is_value(self) -> bool {
+        self != AxisSel::X
+    }
+}
+
+/// `axis` param: the category axis, the value axis or a combo chart's secondary value axis.
+fn axis_param(p: &Json, cmd: &str) -> Result<AxisSel> {
     match str_param(p, "axis").unwrap_or("y") {
-        "y" | "value" | "val" => Ok(true),
-        "x" | "category" | "cat" => Ok(false),
-        other => Err(bad(cmd, format!("unknown axis `{other}`: expected x or y"))),
+        "y" | "value" | "val" => Ok(AxisSel::Y),
+        "x" | "category" | "cat" => Ok(AxisSel::X),
+        "y2" | "secondary" | "right" => Ok(AxisSel::Y2),
+        other => Err(bad(cmd, format!("unknown axis `{other}`: expected x, y or y2"))),
     }
 }
 
@@ -151,7 +169,8 @@ fn color_param(v: &Json, key: &str) -> Result<Option<Color>> {
 
 fn set_axis(s: &mut Session, p: &Json) -> Result<Json> {
     const CMD: &str = "chart.setAxis";
-    let value_axis = axis_is_value(p, CMD)?;
+    let axis_sel = axis_param(p, CMD)?;
+    let value_axis = axis_sel.is_value();
     let reset = bool_param(p, "reset").unwrap_or(false);
     let changes = ["min", "max", "majorUnit", "logBase", "reversed", "crosses", "displayUnits", "numberFormat"].iter().any(|k| p.get(*k).is_some());
     if !reset && !changes {
@@ -190,14 +209,17 @@ fn set_axis(s: &mut Session, p: &Json) -> Result<Json> {
             if units.is_some_and(|u| u.is_some()) {
                 return Err(bad(CMD, "display units apply to a value axis"));
             }
-            if min.is_some() || max.is_some() {
-                return Err(bad(CMD, "category bounds are not drawn; only a numeric X axis takes them"));
-            }
-            if crosses.is_some() {
-                return Err(bad(CMD, "where the value axis crosses a label category axis is not drawn"));
-            }
+            // Bounds crop (or extend) the categories, and a crossing puts the value axis at a
+            // category; both are drawn.
         }
-        let o: &mut AxisOptions = if value_axis { &mut c.y_axis } else { &mut c.x_axis };
+        if axis_sel == AxisSel::Y2 && !c.series.iter().any(|s| s.secondary) {
+            return Err(bad(CMD, "this chart has no secondary axis: no series is plotted against one"));
+        }
+        let o: &mut AxisOptions = match axis_sel {
+            AxisSel::X => &mut c.x_axis,
+            AxisSel::Y => &mut c.y_axis,
+            AxisSel::Y2 => &mut c.y2_axis,
+        };
         if reset {
             *o = AxisOptions::default();
         }

@@ -14,6 +14,7 @@
 mod array_formula;
 mod cfb;
 mod chart;
+mod chart_patch;
 mod chartex;
 mod crypto;
 mod csv;

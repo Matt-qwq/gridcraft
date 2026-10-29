@@ -136,6 +136,24 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
     })
 }
 
+/// Whether a chartex part is one GridCraft models: every plot-area series has a layout it can read
+/// and write, and none of them is a Pareto line (which belongs to a histogram the model would
+/// write back as a plain histogram, losing the line).
+pub fn is_modelled(root: &El) -> bool {
+    let Some(region) = root.path(&["chart", "plotArea", "plotAreaRegion"]) else { return false };
+    let mut any = false;
+    for s in region.kids("series") {
+        any = true;
+        let layout = s.attr("layoutId").unwrap_or("");
+        // A Pareto line belongs to its histogram; the model would write the histogram back without
+        // it. A layout the model does not know (a filled map) cannot be written at all.
+        if layout == "paretoLine" || kind_of(layout).is_none() {
+            return false;
+        }
+    }
+    any
+}
+
 // ---------------------------------------------------------------- writing
 
 /// Prefix of the hidden defined names chartex formulas go through: a chartex part refers to

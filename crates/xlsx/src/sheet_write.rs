@@ -545,7 +545,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
     }
 
     // Drawing: pictures, charts, shapes.
-    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.shapes.is_empty() {
+    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.kept_charts.is_empty() || !sheet.shapes.is_empty() {
         out.drawings += 1;
         let dn = out.drawings;
         let mut drels = Rels::default();
@@ -580,6 +580,25 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
                 drels.add("chart", &format!("../charts/chart{}.xml", out.charts))
             };
             objs.push(Obj::Chart(ch, rid));
+        }
+        for ch in &sheet.kept_charts {
+            out.charts += 1;
+            let n = out.charts;
+            let rid = if ch.chartex {
+                out.part(&format!("xl/charts/chartEx{n}.xml"), Some(crate::chartex::CT_CHARTEX), ch.xml.as_bytes().to_vec());
+                out.part(&format!("xl/charts/style{n}.xml"), Some(crate::chartex::CT_STYLE), crate::chartex::style_xml().into_bytes());
+                out.part(&format!("xl/charts/colors{n}.xml"), Some(crate::chartex::CT_COLORS), crate::chartex::colors_xml().into_bytes());
+                let mut crels = Rels::default();
+                crels.add_uri(crate::chartex::REL_STYLE, &format!("style{n}.xml"));
+                crels.add_uri(crate::chartex::REL_COLORS, &format!("colors{n}.xml"));
+                out.part(&format!("xl/charts/_rels/chartEx{n}.xml.rels"), None, crels.xml().into_bytes());
+                drels.add_uri(crate::chartex::REL_CHARTEX, &format!("../charts/chartEx{n}.xml"))
+            } else {
+                // Byte for byte as read: GridCraft does not model this chart's kind.
+                out.part(&format!("xl/charts/chart{n}.xml"), Some(CT_CHART), ch.xml.as_bytes().to_vec());
+                drels.add("chart", &format!("../charts/chart{n}.xml"))
+            };
+            objs.push(Obj::RawChart(ch, rid));
         }
         for sh in &sheet.shapes {
             objs.push(Obj::Shape(sh));

@@ -90,6 +90,11 @@ pub struct Sheet {
     #[serde(with = "crate::cellmap")]
     pub hyperlinks: BTreeMap<CellRef, Hyperlink>,
     pub charts: Vec<Chart>,
+    /// Charts of kinds GridCraft cannot model (3-D, surface, pie of pie…), kept whole: their
+    /// drawing frame and part are written back as they were. Not in JSON, not drawn, not
+    /// selectable.
+    #[serde(skip)]
+    pub kept_charts: Vec<KeptChart>,
     pub images: Vec<Image>,
     pub shapes: Vec<Shape>,
     pub sparklines: Vec<Sparkline>,
@@ -155,6 +160,7 @@ impl Sheet {
             comments: BTreeMap::new(),
             hyperlinks: BTreeMap::new(),
             charts: vec![],
+            kept_charts: vec![],
             images: vec![],
             shapes: vec![],
             sparklines: vec![],

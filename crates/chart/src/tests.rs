@@ -1478,3 +1478,86 @@ fn hostile_chart_options_do_not_panic_or_go_non_finite() {
     let prims = render(&c, &d, 640.0, 400.0, &m);
     assert_sane(&prims, 640.0, 400.0);
 }
+
+#[test]
+fn category_bounds_crop_and_extend_the_axis() {
+    let m = ApproxMeasure;
+    let d = sample(ChartKind::ColumnClustered);
+    let plain = render(&chart(ChartKind::ColumnClustered), &d, 640.0, 400.0, &m);
+    assert!(texts(&plain).contains(&"Q1"), "the whole axis by default");
+    let mut c = chart(ChartKind::ColumnClustered);
+    // Excel numbers categories from 1: bounds 2..4 show Q2, Q3 and Q4 only.
+    c.x_axis = AxisOptions { min: Some(2.0), max: Some(4.0), ..AxisOptions::default() };
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let t = texts(&prims);
+    assert!(!t.contains(&"Q1") && !t.contains(&"Q5") && !t.contains(&"Q6"), "categories outside the bounds: {t:?}");
+    assert!(t.contains(&"Q2") && t.contains(&"Q3") && t.contains(&"Q4"), "the shown categories: {t:?}");
+    assert_sane(&prims, 640.0, 400.0);
+    // Every bar sits inside the plot: the three shown ones are drawn, the rest are not.
+    let bars = prims.iter().filter(|p| matches!(p, Prim::Rect { .. })).count();
+    let wide = render(&chart(ChartKind::ColumnClustered), &d, 640.0, 400.0, &m).iter().filter(|p| matches!(p, Prim::Rect { .. })).count();
+    assert!(bars < wide, "cropping drew as many bars as the full axis: {bars} vs {wide}");
+    // A range that leaves no categories is ignored rather than drawn as an empty plot.
+    let mut bad = chart(ChartKind::ColumnClustered);
+    bad.x_axis = AxisOptions { min: Some(4.0), max: Some(2.0), ..AxisOptions::default() };
+    assert!(texts(&render(&bad, &d, 640.0, 400.0, &m)).contains(&"Q1"));
+    // Extending the axis past the data leaves blank slots, and the frame stays inside its box.
+    let mut ext = chart(ChartKind::ColumnClustered);
+    ext.x_axis = AxisOptions { min: Some(5.0), max: Some(9.0), ..AxisOptions::default() };
+    let p = render(&ext, &d, 640.0, 400.0, &m);
+    assert_sane(&p, 640.0, 400.0);
+    // Categories 7..9 of the extended axis are empty slots; 5 and 6 are still shown.
+    assert!(texts(&p).contains(&"Q5") && texts(&p).contains(&"Q6") && !texts(&p).contains(&"Q1"), "{:?}", texts(&p));
+}
+
+#[test]
+fn the_secondary_axis_takes_its_own_options() {
+    let m = ApproxMeasure;
+    let d = sample(ChartKind::Combo);
+    let mut c = chart(ChartKind::Combo);
+    c.y2_axis = AxisOptions { min: Some(0.0), max: Some(10.0), major_unit: Some(2.5), number_format: Some("0.0".into()), ..AxisOptions::default() };
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let t = texts(&prims);
+    for want in ["0.0", "2.5", "5.0", "7.5", "10.0"] {
+        assert!(t.contains(&want), "no right-axis label {want}: {t:?}");
+    }
+    // The primary axis keeps its own scale (a $0..$70,000 axis on the left).
+    assert!(t.contains(&"$30,000"), "the left axis lost its scale: {t:?}");
+    assert!(!t.contains(&"$10"), "the secondary scale leaked into the primary labels: {t:?}");
+    // Units on the secondary axis are named beside it.
+    let mut units = chart(ChartKind::Combo);
+    units.y2_axis = AxisOptions { display_units: Some(DisplayUnits::Thousands), ..AxisOptions::default() };
+    let t2 = render(&units, &d, 640.0, 400.0, &m);
+    let names = texts(&t2).iter().filter(|t| **t == "Thousands").count();
+    assert_eq!(names, 1, "the secondary unit is named once: {:?}", texts(&t2));
+}
+
+#[test]
+fn a_category_crossing_moves_the_value_axis_to_a_category() {
+    let m = ApproxMeasure;
+    let d = sample(ChartKind::ColumnClustered);
+    let verticals = |prims: &[Prim]| -> Vec<f32> {
+        prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { pts, width, .. } if (*width - 0.75).abs() < 1e-6 && pts.len() == 2 && (pts[0][0] - pts[1][0]).abs() < 1e-6 => {
+                    Some(pts[0][0])
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let auto = render(&chart(ChartKind::ColumnClustered), &d, 640.0, 400.0, &m);
+    assert!(verticals(&auto).is_empty(), "an automatic category axis draws no value-axis line");
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.x_axis = AxisOptions { crosses: AxisCrossing::At(3.0), ..AxisOptions::default() };
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let xs = verticals(&prims);
+    assert_eq!(xs.len(), 1, "one value-axis line at the crossing: {xs:?}");
+    assert_sane(&prims, 640.0, 400.0);
+    // Crossing after the last category puts it at the right edge.
+    let mut last = chart(ChartKind::ColumnClustered);
+    last.x_axis = AxisOptions { crosses: AxisCrossing::At(6.0), ..AxisOptions::default() };
+    let far = verticals(&render(&last, &d, 640.0, 400.0, &m));
+    assert!(far.first().is_some_and(|x| *x > xs.first().copied().unwrap_or(0.0)), "crossing at 6 is right of 3: {far:?}");
+}
