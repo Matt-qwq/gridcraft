@@ -663,6 +663,18 @@ fn package_structure() {
     assert!(texts["xl/workbook.xml"].contains("fullCalcOnLoad"));
 }
 
+/// The package a whole-feature workbook is written as, pinned. The writer lays the archive out
+/// itself, so its bytes are the contract a paged save, a reopened save and a streaming save must
+/// all keep: a change here has to be a deliberate update of this value.
+#[test]
+fn saved_package_bytes_are_stable() {
+    use sha2::Digest as _;
+    let bytes = write_xlsx(&sample()).unwrap();
+    let digest: String = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(bytes.len(), 37153, "the package changed size");
+    assert_eq!(digest, "ae15eeb11cee78f1259127f7bbfc3d7f8ffa46e228d2eb089388f593b3a712d7", "the package changed bytes");
+}
+
 #[test]
 fn iterative_calculation_settings_roundtrip() {
     let calc_pr = |wb: &Workbook| {

@@ -104,8 +104,12 @@ impl Sst {
     }
 }
 
-/// Package being assembled.
+/// Package being assembled. Each part's bytes are held once: they are built straight into
+/// [`Out::part`], kept for the package's layout, and then moved into the zip rather than copied.
 pub struct Out {
+    /// The parts, in creation order, until the layout hands each to [`ZipOut`]. [`Out::image_part`]
+    /// reads them back to write a picture used twice as one media part, which is why a part cannot
+    /// be dropped as soon as it is added.
     parts: Vec<(String, Vec<u8>)>,
     overrides: Vec<(String, String)>,
     defaults: BTreeMap<String, String>,
@@ -518,7 +522,7 @@ pub fn write_xlsx_named(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>) 
     }
     ct.push_str("</Types>");
     let mut zip = ZipOut::new();
-    zip.add("[Content_Types].xml", ct.as_bytes())?;
+    zip.add("[Content_Types].xml", ct.into_bytes())?;
     // Excel's order: rels, workbook rels, workbook, the rest, document properties last. libmagic (PHP
     // `finfo`, `file`) recognises an OOXML package only when an `xl/` entry name appears within the
     // first few KB, so no user-sized part (document properties, a long description) may precede it.
@@ -531,8 +535,9 @@ pub fn write_xlsx_named(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>) 
     };
     let mut parts = std::mem::take(&mut out.parts);
     parts.sort_by_key(|(n, _)| rank(n));
-    for (name, data) in &parts {
-        zip.add(name, data)?;
+    // Each part is handed to the zip by value, which drops it once it is deflated.
+    for (name, data) in parts {
+        zip.add(&name, data)?;
     }
     zip.finish()
 }
