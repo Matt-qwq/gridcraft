@@ -613,7 +613,10 @@ inserts still inherit the line above (size/style/custom, not hidden/outline/coll
 their entries, and `moveColumns` follows its insert/move/delete sequence. `LineIndex`, outline,
 geometry, sort/filter, clipboard and the file reader/writer all take the logical view; undo
 accounting charges only chunks a snapshot does not share. Model tests are 62, engine 419, xlsx 265;
-`cargo check --workspace --all-targets` compiles (the UI test suite was not run).
+`cargo check --workspace --all-targets` compiles (the UI test suite was not run). Measured on
+1M custom row heights (`_gridcraft-bench/linebench`, opt-level 3): `Sheet::clone` **0.13 ms**,
+`insert_lines`/`delete_lines` **0.013/0.007 ms**, 10k inherited lines 0.1 ms, and a `LineIndex`
+build 6.6 ms (now cached by the UI); a `LineMap::get` on the same map is 0.48 µs.
 
 **UI geometry (10-29).** `GridState` caches the derived `LineIndex` prefix sums and outline axes
 per `(document uid, revision, sheet)`; `Geo::new_with_lines`/`Geo::paged_with_lines` consume them.
@@ -750,7 +753,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-29 | minor | M20 UI line geometry is cached per (document, revision, sheet): scrolling/selection/zoom reuse the `LineIndex` and outline axes, an edit or sheet switch rebuilds them; 26 targeted grid tests |
+| 2026-10-29 | minor | M20 UI line geometry is cached per (document, revision, sheet): scrolling/selection/zoom reuse the `LineIndex` and outline axes, an edit or sheet switch rebuilds them; 26 targeted grid tests. 1M custom heights: clone 0.13 ms, insert/delete 0.013/0.007 ms (`linebench`) |
 | 2026-10-29 | minor | M20 line metadata maps through physical ids: chunked `LineMap`, logical JSON/XLSX, inserts inherit and deletes drop entries, undo charges unshared chunks; 62 model / 419 engine / 265 xlsx tests; wave 0 and beta estimate narrow to 20–30 base / ~155–240 |
 | 2026-10-29 | minor | M20 compaction at model level: `CellStore::compact` reclaims live orphan rows/columns and normalizes maps; 6 new model tests (52 total); page orphans and a save/idle caller remain |
 | 2026-10-29 | major | Roadmap re-planned after M19/M20: current focus, execution queue, parallel plan, beta gate status and post-beta order set; large-workbook gate marked met and the old PR-queue wave folded into the gaps |

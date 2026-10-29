@@ -146,6 +146,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-10-29 | M20 line metadata benchmark: 1M custom row heights now clone in **0.13 ms** (undo snapshots), insert/delete in **0.013/0.007 ms**, and 10k inherited lines in 0.1 ms (`_gridcraft-bench/linebench`); `LineIndex` build 6.6 ms, now cached per revision |
 | 2026-10-29 | M20 UI line geometry is cached per (document, revision, sheet): `Geo` takes the row/column `LineIndex` and outline axes from `GridState`, so a sheet with a custom height on every row no longer rebuilds 1M-entry prefix sums once or twice a frame; scrolling, selection and zoom reuse it, edits and sheet switches rebuild it. Targeted grid test only; the UI suite is unchanged |
 | 2026-10-29 | M20 line metadata maps through physical ids: `Sheet.rows`/`cols` are a `LineMap` with a logical→physical axis map and 128-line `Arc` chunks, so a row/column insert or delete moves runs instead of reindexing every custom line and an undo snapshot shares untouched chunks; JSON and XLSX still store logical lines, inheritance and delete semantics unchanged. Model 62 tests, engine 419, xlsx 265; undo accounting charges unshared chunks |
 | 2026-10-29 | M20 compaction at model level: `CellStore::compact()` reclaims live orphan rows/columns and normalizes row/column maps, with 6 new model tests (52 total); paged orphans and a save/idle caller remain |

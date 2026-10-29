@@ -208,6 +208,7 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 | Grid scrolling | virtualised, O(log n) geometry with custom row heights | smooth | measured in code |
 | Open a large workbook | 100M-cell / 551 MB export: **16.7 MiB live, 183 MiB peak**, 729 MiB compressed pages; 31.7M-cell / 118 MB report: 49.7 MiB live, 1.47 s | opens | measured 2026-10-28, `session_breakdown` / `cell_digest` |
 | Row / column structural insert | 1M×20: row **3.7 ms** command / 35.8 ms commit; column **9.8 ms** / 42.5 ms; zero cells moved | immediate | measured 2026-10-28, `gridcraft-cli` |
+| Line metadata, 1M custom heights | `Sheet::clone` **0.13 ms**, insert/delete **0.013/0.007 ms**, 10k inherited lines 0.1 ms; `LineIndex` build 6.6 ms (cached per revision) | immediate | measured 2026-10-29, `_gridcraft-bench/linebench` |
 | Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
 Work: M20/M19 polish (compaction wiring, mapped value writes, spill placement and byte budget,
