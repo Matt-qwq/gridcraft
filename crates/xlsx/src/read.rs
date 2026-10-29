@@ -5,7 +5,9 @@ use std::sync::Arc;
 use gridcraft_core::{DateSystem, RangeRef};
 use gridcraft_model::{CalcMode, CellPicture, DefinedName, PhoneticString, Sheet, ShowObjects, Style, StyleId, StyleTable, Visibility, Workbook};
 
+use crate::ReadOptions;
 use crate::package::{Package, Rel};
+use crate::sheet_read::{ReadPlan, SpillTarget};
 use crate::styles::{StylesIn, read_styles};
 use crate::xml::{self, El};
 use crate::{IoError, ReadReport};
@@ -97,34 +99,51 @@ pub fn find_rel<'r>(rels: &'r [Rel], kind: &str) -> Option<&'r Rel> {
 }
 
 pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
-    read_xlsx_with(bytes, crate::sheet_read::ReadPlan::default())
+    read_xlsx_with(bytes, ReadPlan::default())
 }
 
 /// [`read_xlsx`], choosing whether completed bands go to a page file while the sheets are read.
 /// The engine passes true for a package large enough that the live model would dominate memory;
-/// the plain entry point stays live so tests and small files pay nothing for paging.
+/// the plain entry point stays live so tests and small files pay nothing for paging. A workbook
+/// opened from bytes has no folder, so its pages go to the temp directory.
 pub fn read_xlsx_paged(bytes: &[u8], paging: bool) -> Result<(Workbook, ReadReport), IoError> {
-    read_xlsx_with(bytes, crate::sheet_read::ReadPlan { paging, ..Default::default() })
+    read_xlsx_with(bytes, ReadPlan { paging, ..ReadPlan::default() })
+}
+
+/// [`read_xlsx_with`]'s plan builder for a public [`ReadOptions`].
+impl ReadPlan {
+    fn from_options(options: ReadOptions) -> ReadPlan {
+        let spill = options.paging.then_some(SpillTarget { dir: options.spill_dir, name: options.spill_name, temp: options.spill_temp });
+        ReadPlan { paging: options.paging, spill, ..ReadPlan::default() }
+    }
 }
 
 /// [`read_xlsx`] with the row-reading plan spelled out: tests use it to read one fixture whole, in
 /// chunks and streamed, and to hold the three against each other.
-pub(crate) fn read_xlsx_with(bytes: &[u8], plan: crate::sheet_read::ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
+pub(crate) fn read_xlsx_with(bytes: &[u8], plan: ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
     read_package(Package::open(bytes)?, plan)
 }
 
 /// [`read_xlsx`] from a file, decompressing parts as they are needed instead of holding the file.
 pub fn read_xlsx_file(path: &std::path::Path) -> Result<(Workbook, ReadReport), IoError> {
-    read_xlsx_file_paged(path, false)
+    read_xlsx_file_with(path, ReadOptions::default())
 }
 
 /// [`read_xlsx_file`] with the reader allowed to spill completed bands to a page file.
 pub fn read_xlsx_file_paged(path: &std::path::Path, paging: bool) -> Result<(Workbook, ReadReport), IoError> {
-    let file = std::fs::File::open(path).map_err(|e| IoError::Format(format!("{}: {e}", path.display())))?;
-    read_package(Package::open_file(file)?, crate::sheet_read::ReadPlan { paging, ..Default::default() })
+    read_xlsx_file_with(path, ReadOptions { paging, ..ReadOptions::default() })
 }
 
-fn read_package(pkg: Package<'_>, plan: crate::sheet_read::ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
+/// [`read_xlsx_file`] with everything the read may be told: whether to page, and where the page
+/// file may live and what it may be called. The engine opens by path through this, so a spill goes
+/// beside the document rather than into the system temp directory (which may be a tmpfs, where
+/// paging would silently land in RAM).
+pub fn read_xlsx_file_with(path: &std::path::Path, options: ReadOptions) -> Result<(Workbook, ReadReport), IoError> {
+    let file = std::fs::File::open(path).map_err(|e| IoError::Format(format!("{}: {e}", path.display())))?;
+    read_package(Package::open_file(file)?, ReadPlan::from_options(options))
+}
+
+fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadReport), IoError> {
     let mut cx = Ctx {
         pkg,
         report: ReadReport::default(),
@@ -299,7 +318,7 @@ fn read_package(pkg: Package<'_>, plan: crate::sheet_read::ReadPlan) -> Result<(
             continue;
         }
         let name = unique_name(&wb, &name, i);
-        let mut sheet = match crate::sheet_read::read_sheet_with(&mut cx, &rel.target, &name, plan) {
+        let mut sheet = match crate::sheet_read::read_sheet_with(&mut cx, &rel.target, &name, &plan) {
             Ok(s) => s,
             Err(IoError::TooLarge(m)) => return Err(IoError::TooLarge(m)),
             Err(e) => {

@@ -15,6 +15,7 @@ mod malformed;
 mod multilevel_category_roundtrip;
 mod note_box;
 mod ods_tests;
+mod paging;
 mod passthrough_tests;
 mod phonetic_tests;
 mod pivot_tests;

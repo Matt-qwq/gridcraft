@@ -131,10 +131,108 @@ fn decrypt_message(name: &str, e: gridcraft_xlsx::DecryptError) -> String {
     }
 }
 
+/// The size above which an open spills completed bands to a page file: 200 MiB, unless
+/// `GRIDCRAFT_PAGE_MB` asks for another limit. `0` turns paging off (a folder a sync client watches,
+/// or a disk with no room for the spill), and the value is clamped to the 2 GiB the reader accepts,
+/// so a typo cannot turn paging off for a huge workbook.
+#[cfg(not(target_arch = "wasm32"))]
+const PAGE_DEFAULT_BYTES: u64 = 200 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PAGE_MAX_MB: u64 = 2048;
+
+/// Whether a package of `size` bytes is read with completed bands spilled to a page file.
+#[cfg(not(target_arch = "wasm32"))]
+fn should_page(size: u64) -> bool {
+    #[cfg(test)]
+    if let Some(forced) = paging_override() {
+        return forced;
+    }
+    let limit = page_limit_bytes();
+    limit > 0 && size > limit
+}
+
+/// wasm has no file system to spill to, so a workbook opened there stays live whatever its size
+/// (the browser's memory limit is the real constraint).
+#[cfg(target_arch = "wasm32")]
+fn should_page(_size: u64) -> bool {
+    false
+}
+
+/// `GRIDCRAFT_PAGE_MB` in bytes, or [`PAGE_DEFAULT_BYTES`]. Read once: the knob is a diagnostic and
+/// a test hook, not something every open should re-parse.
+#[cfg(not(target_arch = "wasm32"))]
+fn page_limit_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| match std::env::var("GRIDCRAFT_PAGE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(mb) => mb.min(PAGE_MAX_MB).saturating_mul(1024 * 1024),
+        None => PAGE_DEFAULT_BYTES,
+    })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// Whether this thread's opens page, overriding the size test. The environment is process-global
+    /// and unsafe to mutate in edition 2024, so a test that pages a small fixture pins the decision
+    /// here instead.
+    static PAGE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn paging_override() -> Option<bool> {
+    PAGE_OVERRIDE.try_with(|c| c.get()).ok().flatten()
+}
+
+/// Forces paging for opens on this thread while it is alive. Tests only: production reads the size
+/// and `GRIDCRAFT_PAGE_MB`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) struct ForcedPaging(Option<bool>);
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl ForcedPaging {
+    /// Paging on, whatever the file's size.
+    pub(crate) fn on() -> Self {
+        ForcedPaging(PAGE_OVERRIDE.try_with(|c| c.replace(Some(true))).unwrap_or(None))
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl Drop for ForcedPaging {
+    fn drop(&mut self) {
+        let previous = self.0;
+        let _ = PAGE_OVERRIDE.try_with(|c| c.set(previous));
+    }
+}
+
+/// Where a spill beside a document may go and what it may be called: the document's folder and its
+/// stem. A bare relative file name has no parent, and its folder is the current directory, which is
+/// where the file is. The model skips a UNC folder (network I/O) and applies `GRIDCRAFT_SPILL`; the
+/// fallback directory is left to the system temp directory.
+#[cfg(not(target_arch = "wasm32"))]
+fn spill_place(path: &str) -> (Option<std::path::PathBuf>, Option<String>) {
+    let path = std::path::Path::new(path);
+    let dir = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Some(std::path::PathBuf::from(".")),
+        Some(parent) => Some(parent.to_path_buf()),
+        None => None,
+    };
+    let name = path.file_stem().and_then(|stem| stem.to_str()).map(str::to_owned);
+    (dir, name)
+}
+
+/// wasm has no file system, and [`should_page`] keeps paging off there: no place to spill.
+#[cfg(target_arch = "wasm32")]
+fn spill_place(_path: &str) -> (Option<std::path::PathBuf>, Option<String>) {
+    (None, None)
+}
+
 /// Opens a workbook straight from a file, when its parts can be decompressed on demand instead of
 /// the whole file arriving as one buffer. `Ok(None)` means this file has to be read whole: an
 /// encrypted workbook (the decryption wants every byte), an old binary, ODS or XLSB package (their
 /// readers take bytes) or anything that is not a package at all.
+///
+/// A package large enough to page is read with completed bands spilled beside the document (see
+/// [`should_page`] and [`spill_place`]); a workbook opened from bytes has no folder, so its pages
+/// go to the temp directory.
 pub fn open_from_path(name: &str, path: &str, password: Option<&str>) -> Result<Option<(Workbook, Vec<String>)>> {
     if password.is_some() || !matches!(FileKind::from_path(name), Some(FileKind::Xlsx)) {
         return Ok(None);
@@ -150,8 +248,9 @@ pub fn open_from_path(name: &str, path: &str, password: Option<&str>) -> Result<
     if size > 2 * 1024 * 1024 * 1024 {
         return Err(EngineError::Other("files larger than 2 GB aren't supported".into()));
     }
-    let paging = size > 200 * 1024 * 1024;
-    let (mut wb, report) = match gridcraft_xlsx::read_xlsx_file_paged(std::path::Path::new(path), paging) {
+    let (spill_dir, spill_name) = spill_place(path);
+    let options = gridcraft_xlsx::ReadOptions { paging: should_page(size), spill_dir, spill_name, spill_temp: None };
+    let (mut wb, report) = match gridcraft_xlsx::read_xlsx_file_with(std::path::Path::new(path), options) {
         Ok(read) => read,
         // A size complaint is the answer, not a reason to load the file to hear it again.
         Err(e @ gridcraft_xlsx::IoError::TooLarge(_)) => {
@@ -197,8 +296,9 @@ fn open_plain(name: &str, bytes: &[u8], csv_as_text: bool) -> Result<(Workbook, 
     // Text named `.xlsx` is read as text.
     if sniffed == gridcraft_xlsx::Format::Xlsx || (kind == Some(FileKind::Xlsx) && sniffed != gridcraft_xlsx::Format::Csv) {
         // Above this a workbook's cells would dominate memory; the reader spills completed bands
-        // and the model keeps only the pages. The 100M-cell export is 551 MB.
-        let paging = bytes.len() > 200 * 1024 * 1024;
+        // and the model keeps only the pages. The 100M-cell export is 551 MB. A workbook opened
+        // from bytes has no folder, so the temp directory is all a spill can use.
+        let paging = should_page(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let (wb, report) = gridcraft_xlsx::read_xlsx_paged(bytes, paging).map_err(|e| {
             EngineError::Other(match (&e, gridcraft_xlsx::oversized_part(bytes)) {
                 (gridcraft_xlsx::IoError::TooLarge(_), Some((part, size))) => part_too_large_message(name, &part, size),

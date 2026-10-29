@@ -1758,11 +1758,38 @@ pub struct PageCacheStats {
     pub evictions: u64,
     /// Reads that found a page the file could not read or decode.
     pub corrupt: u64,
-    /// Page writes the file refused or that failed; the band stays live when this happens.
+    /// Page writes the file refused or that failed; the band stays live when this happens. The
+    /// first I/O failure stops further spills for the file's life (the pages already written stay
+    /// readable), so this counts the moment paging gave up, not every band that then stayed live.
     pub spill_failures: u64,
     /// The largest single band charged. When this is above `budget` the cache kept one oversize
     /// band rather than evicting it only to decode it again on the next read.
     pub max_entry_bytes: usize,
+}
+
+/// Where a page file may be created and what it may be called.
+///
+/// The directory is tried first, then the system temp directory, and both are attempted rather
+/// than probed for writability (`create_new` is the only test). A spill holds a second,
+/// zlib-compressed copy of (part of) the document, so it is private (`0600` on Unix) and has no
+/// life of its own: on Unix the name is removed as soon as the file is open (the handle survives),
+/// on Windows it is created with `FILE_FLAG_DELETE_ON_CLOSE`, and [`CellStore`] dropping the file
+/// removes whatever is left. On those platforms even a crash leaves nothing behind.
+///
+/// `GRIDCRAFT_SPILL` overrides the policy: `temp` never tries the document's directory (a
+/// sync-hostile folder, a network share), `off` never pages at all and the store stays live.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpillOptions<'a> {
+    /// The directory to try first — the document's folder. `None` leaves only the temp directory.
+    pub dir: Option<&'a std::path::Path>,
+    /// The document's stem, sanitized to `[A-Za-z0-9_-]` (at most 32 bytes, empty → `book`) and
+    /// used in the file's name. No full path and no sheet name reaches the name.
+    pub name: Option<&'a str>,
+    /// The decoded-band cache budget in bytes; `None` reads `GRIDCRAFT_PAGE_CACHE_MB`.
+    pub cache_bytes: Option<usize>,
+    /// The directory tried after `dir`; `None` is the system temp directory. Tests pin it so both
+    /// candidates can be made unusable without touching the process-global environment.
+    pub temp: Option<&'a std::path::Path>,
 }
 
 /// A `CellStore`'s packed bands, plus the count of stored cells.
@@ -2321,27 +2348,54 @@ impl CellStore {
         self.page_file.as_ref().map(|file| file.cache().stats())
     }
 
+    /// Where this store's page file was created, or `None` when it does not page.
+    ///
+    /// On Unix and Windows the file has no name of its own once it is open (it is unlinked at
+    /// creation, or delete-on-close), so this reports the place the spill was made in rather than
+    /// a file a caller can open: a diagnostic for a memory or disk report, not an input to one.
+    pub fn page_file_path(&self) -> Option<&std::path::Path> {
+        self.page_file.as_deref().map(page::PageFile::path)
+    }
+
     /// Turns paging on for this store: every completed band already in it is written to a fresh
-    /// temporary page file, and later `insert_batch` calls spill the bands they add. Called by the
-    /// reader before it fills a sheet, so a large open keeps pages instead of every band.
+    /// page file, and later `insert_batch` calls spill the bands they add. Called by the reader
+    /// before it fills a sheet, so a large open keeps pages instead of every band.
     ///
-    /// The decoded-band cache is created with the file and takes its budget from
-    /// `GRIDCRAFT_PAGE_CACHE_MB` (clamped to 8..=512 MiB, default 64 MiB). The budget belongs to
-    /// the file, so clones and undo snapshots share it and a later `enable_paging` keeps it.
+    /// The file goes in the system temp directory; [`enable_paging_with`](Self::enable_paging_with)
+    /// is the version that also says where else it may live. The decoded-band cache is created
+    /// with the file and takes its budget from `GRIDCRAFT_PAGE_CACHE_MB` (clamped to 8..=512 MiB,
+    /// default 64 MiB). The budget belongs to the file, so clones and undo snapshots share it and a
+    /// later `enable_paging` keeps it.
     ///
-    /// Returns false when a temporary file cannot be created; the store stays ordinary.
+    /// Returns false when no spill file can be created; the store stays ordinary.
     pub fn enable_paging(&mut self) -> bool {
-        self.enable_paging_with_cache(page::default_cache_bytes())
+        self.enable_paging_with(SpillOptions::default())
     }
 
     /// [`enable_paging`](Self::enable_paging) with an explicit cache budget in bytes. Tests pin the
     /// budget this way: the environment is process-global and the model tests run in parallel. A
     /// store that already pages keeps the budget it was created with.
     pub fn enable_paging_with_cache(&mut self, cache_bytes: usize) -> bool {
+        self.enable_paging_with(SpillOptions { cache_bytes: Some(cache_bytes), ..SpillOptions::default() })
+    }
+
+    /// [`enable_paging`](Self::enable_paging) with everything pinned: the directory the file is
+    /// tried in first (the document's folder), the stem its name is built from and the cache
+    /// budget. The temp directory is the fallback; see [`SpillOptions`] for the policy, the name
+    /// and how the file's lifetime is bounded.
+    ///
+    /// Returns false when no spill file can be created, and the store stays live.
+    pub fn enable_paging_with(&mut self, options: SpillOptions<'_>) -> bool {
         if self.page_file.is_some() {
+            // The budget and the place belong to the file the store already shares with its clones.
             return true;
         }
-        let Some(file) = page::PageFile::new(cache_bytes) else { return false };
+        let cache_bytes = options.cache_bytes.unwrap_or_else(page::default_cache_bytes);
+        let file = match options.temp {
+            Some(temp) => page::PageFile::new_in(options.dir, options.name, cache_bytes, temp),
+            None => page::PageFile::new(options.dir, options.name, cache_bytes),
+        };
+        let Some(file) = file else { return false };
         self.page_file = Some(Arc::new(file));
         self.spill_pages();
         true
@@ -2358,6 +2412,12 @@ impl CellStore {
 
     fn spill_band(&mut self, key: u32) {
         let Some(file) = self.page_file.clone() else { return };
+        // A file that has already failed a write is not tried again: every later band would hit
+        // the same failing syscall. The bands stay live and the pages already written stay
+        // readable, so a full disk or a dropped share costs memory, never cells.
+        if file.has_failed() {
+            return;
+        }
         let Some(band) = self.bands.get(&key).cloned() else { return };
         let Some(bytes) = page::encode_band(&band) else { return };
         let Some(at) = file.write(&bytes) else { return };
@@ -3969,9 +4029,10 @@ mod packed_tests {
 ///
 /// A page holds one finished band: the four stripes, the number table, the text table and the
 /// style table. The format is deliberately small and self-checking on read; a page that does not
-/// parse is reported as missing rather than trusted. The file is a temporary beside the system's
-/// temp directory, removed when the last store that owns it drops, and never referenced by a
-/// document on disk.
+/// parse is reported as missing rather than trusted. The file lives beside the document it belongs
+/// to (the system temp directory when that is unusable) and is never referenced by a document on
+/// disk: it is unlinked as soon as it is open on Unix, delete-on-close on Windows, and removed by
+/// the last store that owns it when it drops.
 mod page {
     use std::collections::VecDeque;
     use std::fs::{File, OpenOptions};
@@ -3980,8 +4041,8 @@ mod page {
     use flate2::Compression;
     use flate2::read::ZlibDecoder;
     use flate2::write::ZlibEncoder;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
     use gridcraft_core::{CellError, CellRef, RangeRef, Value};
@@ -3996,6 +4057,11 @@ mod page {
     const MAX_CELLS: usize = 1_048_576;
     const MAX_TEXT: usize = 16 * 1024 * 1024;
     const MAX_DEPTH: u32 = 8;
+    /// How many names are tried per directory before paging is given up. `create_new` still
+    /// refuses a collision; the loop only moves to the next name.
+    const SPILL_ATTEMPTS: u32 = 16;
+    /// The longest document stem the spill name carries (`[A-Za-z0-9_-]`, so bytes are chars).
+    pub(super) const SPILL_STEM_MAX: usize = 32;
 
     #[derive(Clone, Copy, Debug)]
     pub(super) struct PageRef {
@@ -4282,9 +4348,9 @@ mod page {
         }
     }
 
-    /// A temporary file pages are appended to. One handle is shared by every clone of a store and
-    /// by its undo snapshots; writes and reads serialise on the mutex, which is fine for the read
-    /// path a viewport exercises (one page at a time).
+    /// A page file pages are appended to. One handle is shared by every clone of a store and by
+    /// its undo snapshots; writes and reads serialise on the mutex, which is fine for the read path
+    /// a viewport exercises (one page at a time).
     #[derive(Debug)]
     pub(super) struct PageFile {
         path: PathBuf,
@@ -4293,6 +4359,10 @@ mod page {
         /// nothing to reclaim must decode none, and a test can prove it because the count belongs
         /// to this file (not to the process, where parallel tests would see each other's reads).
         decodes: AtomicU64,
+        /// Set by the first write the file refuses or fails: from then on every band stays live
+        /// rather than retrying the same failing syscall. The pages already written stay readable,
+        /// so a full disk or a dropped share costs memory, never cells.
+        spill_failed: AtomicBool,
         /// The decoded bands read through this file. It lives here because the budget has to: there
         /// is one decoded copy per page, the pages belong to one file, and so the file's owner,
         /// clones and undo snapshots all share one cache.
@@ -4300,19 +4370,42 @@ mod page {
     }
 
     impl PageFile {
-        pub(super) fn new(cache_bytes: usize) -> Option<PageFile> {
-            // A counter, not the clock: `SystemTime::now` traps on wasm. The pid separates
-            // processes; `create_new` still refuses a stale collision, and the loop tries the next
-            // name rather than trusting an existing file.
+        /// A page file in `dir` (the document's folder), falling back to the system temp
+        /// directory. `hint` is the document's stem, sanitized into the name. `None` means no
+        /// spill file could be created anywhere, and the caller keeps the store live.
+        pub(super) fn new(dir: Option<&Path>, hint: Option<&str>, cache_bytes: usize) -> Option<PageFile> {
+            let temp = std::env::temp_dir();
+            PageFile::new_in(dir, hint, cache_bytes, &temp)
+        }
+
+        /// [`new`](Self::new) with the fallback directory spelled out. Tests use it to make both
+        /// candidates unusable, which the process-global environment cannot be asked to do without
+        /// mutating it from a parallel test.
+        pub(super) fn new_in(dir: Option<&Path>, hint: Option<&str>, cache_bytes: usize, fallback: &Path) -> Option<PageFile> {
+            let candidates = spill_candidates(dir, fallback);
+            if candidates.is_empty() {
+                return None;
+            }
+            // A counter, not the clock: `SystemTime::now` traps on wasm. The pid (in the temp
+            // fallback) separates processes; `create_new` still refuses a collision, and the loop
+            // tries the next name rather than trusting an existing file.
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
-            for attempt in 0..16u32 {
-                let path = std::env::temp_dir().join(format!("gridcraft-page-{}-{nonce}-{attempt}.bin", std::process::id()));
-                match OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
-                    Ok(file) => {
-                        return Some(PageFile { path, file: Mutex::new(Some(file)), decodes: AtomicU64::new(0), cache: PageCache::new(cache_bytes) });
+            let base = NEXT.fetch_add(1, Ordering::Relaxed);
+            let stem = spill_stem(hint);
+            for (dir, in_temp) in candidates {
+                let pid = if in_temp { Some(std::process::id()) } else { None };
+                for attempt in 0..SPILL_ATTEMPTS {
+                    let nonce = base.saturating_mul(u64::from(SPILL_ATTEMPTS)).saturating_add(u64::from(attempt));
+                    let path = dir.join(spill_file_name(&stem, pid, nonce));
+                    if let Some(file) = create_spill_file(&path) {
+                        return Some(PageFile {
+                            path,
+                            file: Mutex::new(Some(file)),
+                            decodes: AtomicU64::new(0),
+                            spill_failed: AtomicBool::new(false),
+                            cache: PageCache::new(cache_bytes),
+                        });
                     }
-                    Err(_) => continue,
                 }
             }
             None
@@ -4323,9 +4416,24 @@ mod page {
             &self.cache
         }
 
-        #[cfg(test)]
-        pub(super) fn path(&self) -> &std::path::Path {
+        /// Where the spill was created. On Unix the name is already gone, and on Windows it goes
+        /// when the last handle closes; see [`super::CellStore::page_file_path`].
+        pub(super) fn path(&self) -> &Path {
             &self.path
+        }
+
+        /// Whether a write has already failed (see the field's comment).
+        pub(super) fn has_failed(&self) -> bool {
+            self.spill_failed.load(Ordering::Relaxed)
+        }
+
+        /// The file handle is gone, as if the volume holding the spill had been pulled: later
+        /// writes fail and latch, and pages already written can no longer be read. Tests only.
+        #[cfg(test)]
+        pub(super) fn close_handle(&self) {
+            if let Ok(mut guard) = self.file.lock() {
+                guard.take();
+            }
         }
 
         /// Pages decoded through [`Page::decode`] so far (see the field's comment).
@@ -4334,33 +4442,55 @@ mod page {
             self.decodes.load(Ordering::Relaxed)
         }
 
-        /// Appends `bytes` and returns where they landed. A page larger than the cap is refused
-        /// before it is written. A refusal or a failed write is counted as a spill failure; the
-        /// caller leaves the band live, so paging never loses cells.
-        pub(super) fn write(&self, bytes: &[u8]) -> Option<PageRef> {
-            let at = self.append(bytes);
-            if at.is_none() {
-                self.cache.spill_failure();
+        /// Overwrites `len` bytes at `offset` with zeros, as a disk fault or a foreign writer would:
+        /// the page can no longer be decoded. Through the file's own handle, because on Unix the
+        /// name is gone as soon as the file is open. Tests only.
+        #[cfg(test)]
+        pub(super) fn corrupt(&self, offset: u64, len: usize) -> bool {
+            let Ok(mut guard) = self.file.lock() else { return false };
+            let Some(file) = guard.as_mut() else { return false };
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                return false;
             }
-            at
+            file.write_all(&vec![0u8; len]).is_ok()
         }
 
-        fn append(&self, bytes: &[u8]) -> Option<PageRef> {
-            if bytes.is_empty() || bytes.len() > MAX_PAGE {
+        /// Appends `bytes` and returns where they landed. A page larger than the cap is refused
+        /// before it is written. A refusal or a failed write is counted as a spill failure; the
+        /// caller leaves the band live, so paging never loses cells. The first I/O failure also
+        /// latches the file shut: every later `write` returns `None` without touching the disk.
+        pub(super) fn write(&self, bytes: &[u8]) -> Option<PageRef> {
+            if self.has_failed() {
                 return None;
+            }
+            match self.append(bytes) {
+                Ok(at) => Some(at),
+                Err(failure) => {
+                    self.cache.spill_failure();
+                    if failure == SpillFailure::Io {
+                        self.spill_failed.store(true, Ordering::Relaxed);
+                    }
+                    None
+                }
+            }
+        }
+
+        fn append(&self, bytes: &[u8]) -> Result<PageRef, SpillFailure> {
+            if bytes.is_empty() || bytes.len() > MAX_PAGE {
+                return Err(SpillFailure::TooLarge);
             }
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-            encoder.write_all(bytes).ok()?;
-            let packed = encoder.finish().ok()?;
-            let len = u32::try_from(packed.len()).ok()?;
+            encoder.write_all(bytes).map_err(|_| SpillFailure::Io)?;
+            let packed = encoder.finish().map_err(|_| SpillFailure::Io)?;
+            let len = u32::try_from(packed.len()).map_err(|_| SpillFailure::TooLarge)?;
             if packed.is_empty() || packed.len() > MAX_PAGE {
-                return None;
+                return Err(SpillFailure::TooLarge);
             }
-            let mut guard = self.file.lock().ok()?;
-            let file = guard.as_mut()?;
-            let offset = file.seek(SeekFrom::End(0)).ok()?;
-            file.write_all(&packed).ok()?;
-            Some(PageRef { offset, len })
+            let mut guard = self.file.lock().map_err(|_| SpillFailure::Io)?;
+            let file = guard.as_mut().ok_or(SpillFailure::Io)?;
+            let offset = file.seek(SeekFrom::End(0)).map_err(|_| SpillFailure::Io)?;
+            file.write_all(&packed).map_err(|_| SpillFailure::Io)?;
+            Ok(PageRef { offset, len })
         }
 
         fn read(&self, at: PageRef) -> Option<Vec<u8>> {
@@ -4388,8 +4518,153 @@ mod page {
             {
                 drop(file);
             }
+            // The belt to the braces above: on Unix the name was already removed and on Windows
+            // the handle's close removed it; elsewhere (or when the last handle was not ours) this
+            // is what removes it.
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+
+    /// Why [`PageFile::append`] returned no `PageRef`. A page too large for the format stays live
+    /// and the next band is still tried; an I/O failure latches the file shut.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SpillFailure {
+        TooLarge,
+        Io,
+    }
+
+    /// The directories a spill is tried in, in order, each marked with whether it is the temp
+    /// fallback (whose name carries the pid). Empty means paging is off.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spill_candidates(dir: Option<&Path>, fallback: &Path) -> Vec<(PathBuf, bool)> {
+        spill_candidates_for(spill_policy(), dir, fallback)
+    }
+
+    /// [`spill_candidates`] for a policy that is spelled out instead of read from the environment.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn spill_candidates_for(policy: SpillPolicy, dir: Option<&Path>, fallback: &Path) -> Vec<(PathBuf, bool)> {
+        match policy {
+            SpillPolicy::Off => Vec::new(),
+            SpillPolicy::Temp => vec![(fallback.to_path_buf(), true)],
+            SpillPolicy::Beside => {
+                let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
+                // A UNC folder is skipped: the page file is written and read sequentially, hundreds
+                // of megabytes per session, and over SMB that is worse than a local temp directory.
+                if let Some(dir) = dir
+                    && !is_network_dir(dir)
+                {
+                    candidates.push((dir.to_path_buf(), false));
+                }
+                if !candidates.iter().any(|(candidate, _)| candidate == fallback) {
+                    candidates.push((fallback.to_path_buf(), true));
+                }
+                candidates
+            }
+        }
+    }
+
+    /// wasm has no file system to spill to: a request to page leaves the store live.
+    #[cfg(target_arch = "wasm32")]
+    fn spill_candidates(_dir: Option<&Path>, _fallback: &Path) -> Vec<(PathBuf, bool)> {
+        Vec::new()
+    }
+
+    /// What `GRIDCRAFT_SPILL` asks for; unset (or anything unrecognized) means beside the document.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum SpillPolicy {
+        /// Try the document's folder, then the temp directory.
+        Beside,
+        /// Never try the document's folder (a sync-hostile folder, a network share).
+        Temp,
+        /// Never page at all.
+        Off,
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spill_policy() -> SpillPolicy {
+        parse_spill_policy(std::env::var("GRIDCRAFT_SPILL").ok().as_deref())
+    }
+
+    /// [`spill_policy`]'s rule, without the environment: tests pin the policy this way because the
+    /// environment is process-global and the model tests run in parallel.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn parse_spill_policy(value: Option<&str>) -> SpillPolicy {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("temp") => SpillPolicy::Temp,
+            Some(value) if value.eq_ignore_ascii_case("off") => SpillPolicy::Off,
+            _ => SpillPolicy::Beside,
+        }
+    }
+
+    /// A Windows UNC folder (`\\server\share\…`), whose spill would be network I/O.
+    #[cfg(all(windows, not(target_arch = "wasm32")))]
+    fn is_network_dir(dir: &Path) -> bool {
+        use std::path::{Component, Prefix};
+        matches!(
+            dir.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+        )
+    }
+
+    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
+    fn is_network_dir(_dir: &Path) -> bool {
+        false
+    }
+
+    /// The document stem as the spill file may use it: `[A-Za-z0-9_-]` only, at most
+    /// [`SPILL_STEM_MAX`] bytes, `book` when nothing survives. A name, never a full path or a
+    /// sheet name.
+    pub(super) fn spill_stem(hint: Option<&str>) -> String {
+        let mut stem: String =
+            hint.unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).take(SPILL_STEM_MAX).collect();
+        if stem.is_empty() {
+            stem.push_str("book");
+        }
+        stem
+    }
+
+    /// `.gridcraft-spill-{stem}-{nonce}.bin`, with the pid before the nonce in the temp fallback (a
+    /// stale file there is conceivable, and it must not collide with another process). The leading
+    /// dot hides it on Unix and `.bin` stops a shell or an Office handler from treating it as a
+    /// document.
+    pub(super) fn spill_file_name(stem: &str, pid: Option<u32>, nonce: u64) -> String {
+        match pid {
+            Some(pid) => format!(".gridcraft-spill-{stem}-{pid}-{nonce}.bin"),
+            None => format!(".gridcraft-spill-{stem}-{nonce}.bin"),
+        }
+    }
+
+    /// Opens a new spill file, private and with no life of its own: on Unix the name is removed as
+    /// soon as the handle exists (the open file survives, so a crash leaves nothing behind), and on
+    /// Windows the file is created delete-on-close. A platform with neither keeps the name and
+    /// relies on [`PageFile`]'s `Drop`.
+    #[cfg(unix)]
+    fn create_spill_file(path: &Path) -> Option<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 0600: the pages are a decodable copy of the document, so nobody else may read them. The
+        // process umask the plain `create` used could leave them at 0644 in a shared /tmp.
+        let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path).ok()?;
+        let _ = std::fs::remove_file(path);
+        Some(file)
+    }
+
+    #[cfg(windows)]
+    fn create_spill_file(path: &Path) -> Option<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_DELETE_ON_CLOSE: the last handle closes the file away, including after an
+        // abnormal end. Some filter drivers refuse the flag, so a refused create is retried
+        // without it and `Drop` removes the name.
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        if let Ok(file) = OpenOptions::new().read(true).write(true).create_new(true).custom_flags(FILE_FLAG_DELETE_ON_CLOSE).open(path) {
+            return Some(file);
+        }
+        OpenOptions::new().read(true).write(true).create_new(true).open(path).ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn create_spill_file(path: &Path) -> Option<File> {
+        OpenOptions::new().read(true).write(true).create_new(true).open(path).ok()
     }
 
     /// The cache budget [`enable_paging`](super::CellStore::enable_paging) creates a page file
@@ -4971,16 +5246,190 @@ mod tests {
     }
 
     #[test]
-    fn a_page_file_is_removed_with_its_store() {
-        let path = {
+    fn a_page_file_lives_only_as_long_as_its_store() {
+        let (path, spilled) = {
             let mut s = CellStore::new();
             s.set(c(0, 0), Cell::value(Value::Number(1.0)));
             assert!(s.enable_paging());
-            let path = s.page_file.as_ref().map(|file| file.path().to_path_buf()).expect("page file");
-            assert!(path.exists());
+            let path = s.page_file_path().expect("the store pages").to_path_buf();
+            assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()), "no directory given, so the temp directory");
+            let name = path.file_name().and_then(|n| n.to_str()).expect("a file name");
+            assert!(name.starts_with(".gridcraft-spill-book-") && name.ends_with(".bin"), "{name}");
+            // Unix removes the name as soon as the file is open, so a crash leaves nothing; the
+            // handle keeps the pages readable. Windows keeps the name, delete-on-close.
+            #[cfg(unix)]
+            assert!(!path.exists(), "the spill has no name once it is open");
+            #[cfg(windows)]
+            assert!(path.exists(), "the spill exists while it is open");
+            assert!(s.paged_band_count() > 0, "the band went to the file");
+            assert_eq!(s.get(c(0, 0)).map(|cell| cell.value), Some(Value::Number(1.0)), "the open file still reads");
+            (path, s.paged_band_count())
+        };
+        assert!(spilled > 0);
+        assert!(!path.exists(), "dropping the store removes the spill file");
+    }
+
+    /// A spill asked for beside a document goes there, carries the document's stem (sanitized), and
+    /// leaves nothing behind when the store goes.
+    #[test]
+    fn a_spill_beside_the_document_goes_in_its_folder() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-model-spill-{}-{}", std::process::id(), page_stem_nonce()));
+        std::fs::create_dir(&dir).expect("a temp directory for the test");
+        let path = {
+            let mut s = CellStore::new();
+            for row in 0..200u32 {
+                s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+            }
+            assert!(s.enable_paging_with(SpillOptions { dir: Some(&dir), name: Some("Q3 report.v2"), ..SpillOptions::default() }));
+            let path = s.page_file_path().expect("the store pages").to_path_buf();
+            assert_eq!(path.parent(), Some(dir.as_path()), "the document's folder was used");
+            assert_eq!(path.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with(".gridcraft-spill-Q3reportv2-")), Some(true), "{path:?}");
+            assert!(s.paged_band_count() > 0, "the bands were spilled");
+            assert_eq!(s.get(c(1, 0)).map(|cell| cell.value), Some(Value::Number(1.0)));
+            assert_eq!(s.get(c(199, 0)).map(|cell| cell.value), Some(Value::Number(199.0)), "a paged band still reads");
             path
         };
-        assert!(!path.exists(), "dropping the store removes the spill file");
+        assert!(!path.exists(), "the spill is gone with its store");
+        assert_eq!(std::fs::read_dir(&dir).expect("the test directory").count(), 0, "the folder is as it was");
+        std::fs::remove_dir_all(&dir).expect("clean up the test directory");
+    }
+
+    /// A document folder that does not exist, or is a file, is not a reason to open without
+    /// paging: the temp directory is tried next, and the store pages.
+    #[test]
+    fn an_unusable_document_folder_falls_back_to_temp() {
+        let base = std::env::temp_dir().join(format!("gridcraft-model-fallback-{}-{}", std::process::id(), page_stem_nonce()));
+        std::fs::create_dir(&base).expect("a temp directory for the test");
+        let not_there = base.join("missing");
+        let a_file = base.join("a-file");
+        std::fs::write(&a_file, b"not a directory").expect("a file where a directory would be");
+        for dir in [not_there.as_path(), a_file.as_path()] {
+            let mut s = CellStore::new();
+            s.set(c(0, 0), Cell::value(Value::Number(7.0)));
+            assert!(
+                s.enable_paging_with(SpillOptions { dir: Some(dir), name: Some("book"), ..SpillOptions::default() }),
+                "{dir:?} is unusable, so the temp directory answers"
+            );
+            let path = s.page_file_path().expect("the store pages");
+            assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()), "{dir:?}");
+            assert!(s.paged_band_count() > 0);
+        }
+        std::fs::remove_dir_all(&base).expect("clean up the test directory");
+    }
+
+    /// Two unusable directories leave the store live, exactly as `GRIDCRAFT_SPILL=off` does: no
+    /// page file, nothing refused, every cell still there. The option pins both so the test does
+    /// not touch the process-global environment.
+    #[test]
+    fn paging_stays_off_when_no_directory_can_hold_the_spill() {
+        let base = std::env::temp_dir().join(format!("gridcraft-model-off-{}-{}", std::process::id(), page_stem_nonce()));
+        std::fs::create_dir(&base).expect("a temp directory for the test");
+        let missing = base.join("missing");
+        let mut s = CellStore::new();
+        s.set(c(0, 0), Cell::value(Value::Number(3.0)));
+        s.set(c(70, 1), Cell::value(Value::Text(Arc::from("kept"))));
+        let options = SpillOptions { dir: Some(&missing), name: Some("book"), cache_bytes: None, temp: Some(&missing) };
+        assert!(!s.enable_paging_with(options), "no file could be created, so paging stays off");
+        assert_eq!(s.page_file_path(), None);
+        assert_eq!(s.paged_band_count(), 0);
+        assert_eq!(s.page_cache_stats(), None);
+        assert_eq!(s.len(), 2, "the store stayed ordinary");
+        assert_eq!(s.get(c(0, 0)).map(|cell| cell.value), Some(Value::Number(3.0)));
+        assert_eq!(s.get(c(70, 1)).map(|cell| cell.value), Some(Value::Text(Arc::from("kept"))));
+        std::fs::remove_dir_all(&base).expect("clean up the test directory");
+    }
+
+    /// `GRIDCRAFT_SPILL` parsing, without touching the environment: `off` never pages, `temp`
+    /// skips the document's folder, and anything else keeps the default.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_spill_policy_knob_reads_off_and_temp() {
+        assert_eq!(page::parse_spill_policy(Some("off")), page::SpillPolicy::Off);
+        assert_eq!(page::parse_spill_policy(Some(" OFF ")), page::SpillPolicy::Off);
+        assert_eq!(page::parse_spill_policy(Some("temp")), page::SpillPolicy::Temp);
+        assert_eq!(page::parse_spill_policy(Some("beside")), page::SpillPolicy::Beside);
+        assert_eq!(page::parse_spill_policy(None), page::SpillPolicy::Beside, "unset keeps the default");
+        let dir = std::env::temp_dir();
+        assert!(page::spill_candidates_for(page::SpillPolicy::Off, Some(&dir), &dir).is_empty(), "off never creates a file");
+        let document = std::path::Path::new("a-document-folder");
+        assert_eq!(
+            page::spill_candidates_for(page::SpillPolicy::Temp, Some(document), &dir),
+            vec![(dir.clone(), true)],
+            "temp skips the document's folder"
+        );
+        assert_eq!(
+            page::spill_candidates_for(page::SpillPolicy::Beside, Some(document), &dir),
+            vec![(std::path::PathBuf::from("a-document-folder"), false), (dir, true)],
+            "beside tries the document's folder first"
+        );
+    }
+
+    /// A Windows UNC document folder is skipped: a page file there would be hundreds of megabytes
+    /// of sequential I/O over SMB. A local folder is still tried first.
+    #[cfg(windows)]
+    #[test]
+    fn a_network_document_folder_is_skipped() {
+        let temp = std::env::temp_dir();
+        let unc = std::path::Path::new(r"\\server\share\reports");
+        assert_eq!(page::spill_candidates_for(page::SpillPolicy::Beside, Some(unc), &temp), vec![(temp.clone(), true)], "a UNC folder is not used");
+        let local = std::path::Path::new(r"C:\reports");
+        assert_eq!(
+            page::spill_candidates_for(page::SpillPolicy::Beside, Some(local), &temp),
+            vec![(std::path::PathBuf::from(r"C:\reports"), false), (temp, true)],
+            "a local folder is"
+        );
+    }
+
+    /// The name carries the document's stem only: no path, no sheet name, and the sanitized stem is
+    /// bounded. An empty hint falls back to `book`.
+    #[test]
+    fn the_spill_name_never_carries_a_path_or_a_sheet_name() {
+        assert_eq!(page::spill_stem(Some("Q3 report.v2")), "Q3reportv2");
+        assert_eq!(page::spill_stem(Some("/etc/passwd")), "etcpasswd");
+        assert_eq!(page::spill_stem(Some("..")), "book");
+        assert_eq!(page::spill_stem(None), "book");
+        assert_eq!(page::spill_stem(Some(&"x".repeat(100))).len(), page::SPILL_STEM_MAX);
+        let beside = page::spill_file_name("book", None, 3);
+        assert_eq!(beside, ".gridcraft-spill-book-3.bin");
+        let temp = page::spill_file_name("book", Some(7), 3);
+        assert_eq!(temp, format!(".gridcraft-spill-book-7-3.bin"));
+    }
+
+    /// The first write failure latches the file shut: later bands are not retried against the same
+    /// failing file, the failure is counted once, and no cell is lost.
+    #[test]
+    fn a_failed_spill_stops_further_spills() {
+        let mut s = CellStore::new();
+        for row in 0..200u32 {
+            s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
+        }
+        assert!(s.enable_paging_with_cache(64 << 20));
+        let paged = s.paged_band_count();
+        assert!(paged > 0);
+        let file = s.page_file.clone().expect("page file");
+        file.close_handle();
+        // A band added after the volume went away stays live instead of being lost.
+        s.set(c(300, 0), Cell::value(Value::Number(300.0)));
+        s.spill_pages();
+        let first = s.page_cache_stats().expect("the store pages");
+        assert_eq!(first.spill_failures, 1, "the failure is counted once");
+        assert!(file.has_failed());
+        assert!(s.bands.contains_key(&(300u32 / 64)), "the band stayed live");
+        assert_eq!(s.get(c(300, 0)).map(|cell| cell.value), Some(Value::Number(300.0)));
+        // A second band is not even attempted: the count does not move.
+        s.set(c(400, 0), Cell::value(Value::Number(400.0)));
+        s.spill_pages();
+        assert_eq!(s.page_cache_stats().expect("the store pages").spill_failures, 1);
+        assert_eq!(s.get(c(400, 0)).map(|cell| cell.value), Some(Value::Number(400.0)));
+        assert_eq!(s.paged_band_count(), paged, "the pages already written are still listed");
+    }
+
+    /// A process-unique number for a test's temp directory name (the clock is not read: it traps on
+    /// wasm, and these tests are native only).
+    fn page_stem_nonce() -> u64 {
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     #[test]
@@ -5125,24 +5574,17 @@ mod tests {
     /// panics and nothing is cached.
     #[test]
     fn a_scan_skips_a_page_it_cannot_decode() {
-        use std::io::{Seek, SeekFrom, Write};
         let mut s = CellStore::new();
         for row in 0..200u32 {
             s.set(c(row, 0), Cell::value(Value::Number(f64::from(row))));
         }
-        assert!(s.enable_paging_with_cache(64 << 20), "a temporary page file is created");
+        assert!(s.enable_paging_with_cache(64 << 20), "a page file is created");
         assert_eq!(s.paged_band_count(), 4);
         // Pages are appended in band order, so band 0's page starts at offset 0. Overwrite it with
-        // bytes that are not a page.
-        let path = s.page_file.as_ref().map(|file| file.path().to_path_buf()).expect("page file");
+        // bytes that are not a page, through the file's own handle (on Unix the name is gone).
+        let file = s.page_file.clone().expect("page file");
         let len = s.pages.get(&0).map(|page| page.page_len()).expect("the first page");
-        let zeros = vec![0u8; len];
-        {
-            let mut file = std::fs::OpenOptions::new().write(true).open(&path).expect("open the page file");
-            file.seek(SeekFrom::Start(0)).expect("seek");
-            file.write_all(&zeros).expect("overwrite the first page");
-            file.flush().expect("flush");
-        }
+        assert!(file.corrupt(0, len), "overwrite the first page");
         let rows: Vec<u32> = s.iter_scan(RangeRef::all()).map(|(at, _)| at.row).collect();
         assert_eq!(rows, (64..200).collect::<Vec<_>>(), "only the corrupt band's rows are missing");
         assert!(s.pages.values().all(|page| !page.is_cached()), "a skipped page is not remembered");
@@ -5282,7 +5724,7 @@ mod tests {
         s.insert_batch(batch);
         let band = s.bands.get(&0).expect("band");
         let bytes = page::encode_band(band).expect("encode");
-        let file = page::PageFile::new(page::default_cache_bytes()).expect("page file");
+        let file = page::PageFile::new(None, None, page::default_cache_bytes()).expect("page file");
         let at = file.write(&bytes).expect("write");
         let page = page::Page::new(at, page::band_bounds(band), true, true);
         let loaded = page.load(&file).0.expect("decode");

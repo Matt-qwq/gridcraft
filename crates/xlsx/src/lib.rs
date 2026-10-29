@@ -105,6 +105,31 @@ pub fn read_xlsx_file_paged(path: &std::path::Path, paging: bool) -> Result<(Wor
     read::read_xlsx_file_paged(path, paging)
 }
 
+/// [`read_xlsx_file`] with everything the read may be told: whether to page, and where the spill
+/// may live and what it may be called.
+#[derive(Clone, Debug, Default)]
+pub struct ReadOptions {
+    /// Spill completed bands to a page file while the sheets are read, so a large workbook keeps
+    /// pages instead of every band. `false` keeps the whole model live.
+    pub paging: bool,
+    /// The directory the page file is tried in first: the document's folder. `None` uses the
+    /// system temp directory, whose pages may land in RAM when `/tmp` is a tmpfs.
+    pub spill_dir: Option<std::path::PathBuf>,
+    /// The document's stem. The model sanitizes it into the spill file's name; no path and no
+    /// sheet name is used.
+    pub spill_name: Option<String>,
+    /// The directory tried when `spill_dir` is unusable. `None` is the system temp directory.
+    /// Tests pin it so a read with no usable place can be proven without touching the process
+    /// environment, which is global and unsafe to mutate from a parallel test.
+    pub spill_temp: Option<std::path::PathBuf>,
+}
+
+/// [`read_xlsx_file`] with a [`ReadOptions`] plan. The engine opens a document by path through
+/// this, so completed bands are spilled beside it.
+pub fn read_xlsx_file_with(path: &std::path::Path, options: ReadOptions) -> Result<(Workbook, ReadReport), IoError> {
+    read::read_xlsx_file_with(path, options)
+}
+
 /// [`read_xlsx`] straight from a file: the zip directory is read and parts are decompressed as they
 /// are wanted, so a workbook whose sheets are small relative to its size does not arrive as one
 /// resident buffer. A 1.3 GB report of 26,000 cells reads 49 MB of parts.

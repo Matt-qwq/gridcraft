@@ -68,7 +68,7 @@ const MAX_COLUMN_ASSIGNMENTS: u64 = 1_000_000;
 /// How a worksheet part is read. Parts at least `stream_min` bytes long are decompressed as they
 /// are decoded, window by window, so the buffer never grows to the size of the part; smaller ones
 /// are read whole, which is faster when the whole part fits in a window anyway.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReadPlan {
     /// Parts at least this big are decompressed as they are decoded.
     pub stream_min: u64,
@@ -77,26 +77,65 @@ pub(crate) struct ReadPlan {
     /// Rows region at least this long may be cut into parallel chunks. Tests lower it so a small
     /// fixture exercises the chunked path.
     pub chunk_min: usize,
-    /// Spill completed bands to a temporary page file while reading. The engine turns this on for
-    /// a workbook large enough that holding all its cells live is not worth it.
+    /// Spill completed bands to a page file while reading. The engine turns this on for a
+    /// workbook large enough that holding all its cells live is not worth it.
     pub paging: bool,
+    /// Where the page file may live and what it may be called. `None`, or a target with no
+    /// directory, leaves the store to choose the system temp directory under its own name.
+    pub spill: Option<SpillTarget>,
+}
+
+/// A place and a name hint for the page file a paging read creates. The model sanitizes the hint
+/// and applies the `GRIDCRAFT_SPILL` policy; nothing here reaches a document or a sheet name.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpillTarget {
+    /// The directory to try first: the document's folder.
+    pub dir: Option<std::path::PathBuf>,
+    /// The document's stem, used in the file's name.
+    pub name: Option<String>,
+    /// The directory tried when `dir` is unusable; `None` is the system temp directory.
+    pub temp: Option<std::path::PathBuf>,
 }
 
 impl Default for ReadPlan {
     fn default() -> Self {
         // One window is big enough to keep the parallel row decode busy and small enough that a
         // sheet unpacks through memory instead of into it.
-        ReadPlan { stream_min: 64 * 1024 * 1024, window: 24 * 1024 * 1024, chunk_min: 8 * 1024 * 1024, paging: false }
+        ReadPlan { stream_min: 64 * 1024 * 1024, window: 24 * 1024 * 1024, chunk_min: 8 * 1024 * 1024, paging: false, spill: None }
     }
 }
 
-pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: ReadPlan) -> Result<Sheet, IoError> {
+/// What a read says when paging was asked for and no spill file could be created. It names no sheet
+/// so a multi-sheet workbook reports it once: [`ReadReport`](crate::ReadReport) keeps one copy of an
+/// identical warning.
+fn no_spill_warning(dir: Option<&std::path::Path>) -> String {
+    match dir {
+        Some(dir) => format!(
+            "opened without paging: no spill file could be created in {} or the temporary directory; a workbook this large will use much more memory",
+            dir.display()
+        ),
+        None => "opened without paging: no spill file could be created in the temporary directory; a workbook this large will use much more memory"
+            .to_string(),
+    }
+}
+
+pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: &ReadPlan) -> Result<Sheet, IoError> {
     let rels = cx.pkg.rels(part)?;
     let mut sheet = Sheet::new(name);
     if plan.paging {
         // Start the page file before the first row is packed, so no band is ever held live only to
-        // be spilled later. A file that cannot be created leaves the sheet in the ordinary store.
-        sheet.cells.enable_paging();
+        // be spilled later. A file that cannot be created leaves the sheet in the ordinary store
+        // and costs one warning: a large workbook will use much more memory, but it still opens.
+        let spill = plan.spill.as_ref();
+        let enabled = sheet.cells.enable_paging_with(gridcraft_model::SpillOptions {
+            dir: spill.and_then(|s| s.dir.as_deref()),
+            name: spill.and_then(|s| s.name.as_deref()),
+            cache_bytes: None,
+            temp: spill.and_then(|s| s.temp.as_deref()),
+        });
+        if !enabled {
+            cx.warn(no_spill_warning(spill.and_then(|s| s.dir.as_deref())));
+        }
     }
     let default_height = sheet.default_row_height;
     // A big worksheet is decompressed and decoded window by window; a small one is read whole,
@@ -442,7 +481,7 @@ fn adopt_spills(sheet: &mut Sheet) {
 /// events. A rows region whose rows carry no cross-row state (no shared or array formulas) is cut
 /// at row boundaries and decoded on several threads; the rows are then applied in document order,
 /// so the model sees exactly the sequence a single pass gives it.
-fn read_rows(bytes: &[u8], dc: &DecodeCtx<'_>, sheet: &mut Sheet, default_height: f32, name: &str, plan: ReadPlan) -> (El, Vec<String>, u64, u64) {
+fn read_rows(bytes: &[u8], dc: &DecodeCtx<'_>, sheet: &mut Sheet, default_height: f32, name: &str, plan: &ReadPlan) -> (El, Vec<String>, u64, u64) {
     let mut warn = Vec::new();
     let Some((open_start, open_end, self_closing)) = sheet_data_span(bytes) else {
         // No `<sheetData>` at all: read the part as the document it is.
@@ -523,7 +562,7 @@ fn decode_rows(
     warn: &mut Vec<String>,
     rows_read: &mut u64,
     dropped: &mut u64,
-    plan: ReadPlan,
+    plan: &ReadPlan,
 ) {
     if bytes.is_empty() {
         return;
@@ -767,7 +806,7 @@ const READ_CHUNK: usize = 1024 * 1024;
 /// Reads a worksheet part as it decompresses: rows are decoded window by window, so a sheet that
 /// unpacks to a gigabyte costs a window instead of a gigabyte. Everything outside `<sheetData>` is
 /// small and still goes through the `El` tree, exactly as the whole-buffer read does it.
-fn stream_rows(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet, default_height: f32, plan: ReadPlan) -> Result<Streamed, IoError> {
+fn stream_rows(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet, default_height: f32, plan: &ReadPlan) -> Result<Streamed, IoError> {
     // The reader borrows the package; the decode context borrows the shared strings and the
     // formats. Two disjoint halves of `cx`, which is what lets the inflating thread take the first
     // and this thread keep the second.
@@ -842,7 +881,7 @@ fn consume_windows(
     sheet: &mut Sheet,
     part: &str,
     default_height: f32,
-    plan: ReadPlan,
+    plan: &ReadPlan,
 ) -> Result<Streamed, IoError> {
     let mut warn = Vec::new();
     let mut cut_at_limit = false;

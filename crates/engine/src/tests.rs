@@ -2569,6 +2569,112 @@ fn an_xlsx_opened_under_an_unknown_extension_saves_back_as_xlsx() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The spill files `stem` leaves in `dir`. On Unix the name is removed as soon as the page file is
+/// open, so a listing only ever sees one on Windows and on platforms that keep the name.
+#[cfg(not(target_arch = "wasm32"))]
+fn spill_files(dir: &std::path::Path, stem: &str) -> Vec<std::path::PathBuf> {
+    let prefix = format!(".gridcraft-spill-{stem}-");
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with(&prefix)))
+        .collect()
+}
+
+/// A workbook that pages is spilled beside the document, not into the temp directory (which may be
+/// a tmpfs, silently negating paging), and the spill is gone when the document closes.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn opening_a_paged_workbook_spills_beside_it_and_not_in_temp() {
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("gridcraft-spill-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("quarterly.xlsx");
+    let mut src = s();
+    src.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3]]})).unwrap();
+    src.execute("cell.set", json!({"cell": "B1", "input": "=A1*2"})).unwrap();
+    std::fs::write(&path, crate::io::save_bytes(&src.doc().unwrap().wb, "quarterly.xlsx").unwrap()).unwrap();
+    assert!(spill_files(&dir, "quarterly").is_empty(), "the folder starts clean");
+    assert!(spill_files(&std::env::temp_dir(), "quarterly").is_empty(), "and so does the temp directory");
+
+    let mut s = s();
+    {
+        let _forced = crate::io::ForcedPaging::on();
+        s.execute("file.open", json!({"path": path})).unwrap();
+    }
+    let spill = {
+        let d = s.doc().unwrap();
+        let sheet = d.wb.active().unwrap();
+        let spill = sheet.cells.page_file_path().expect("the opened sheet pages").to_path_buf();
+        assert_eq!(spill.parent(), Some(dir.as_path()), "the spill went beside the workbook");
+        let name = spill.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        assert!(name.starts_with(".gridcraft-spill-quarterly-"), "{name}");
+        assert_eq!(sheet.cells.iter().count(), 4, "every cell is still there");
+        assert_eq!(sheet.cells.get(CellRef::parse("B1").unwrap()).map(|cell| cell.value), Some(Value::Number(2.0)));
+        spill
+    };
+    assert!(spill_files(&std::env::temp_dir(), "quarterly").is_empty(), "nothing of ours landed in temp");
+    // Windows keeps the name while the handle is open (delete-on-close); Unix unlinked it at birth,
+    // so the folder is clean even before the document closes.
+    #[cfg(unix)]
+    {
+        assert!(!spill.exists(), "the spill has no name once it is open");
+        assert!(spill_files(&dir, "quarterly").is_empty(), "the folder is clean while the workbook is open");
+    }
+    #[cfg(windows)]
+    {
+        assert!(spill.exists(), "the spill exists while it is open");
+        assert_eq!(spill_files(&dir, "quarterly"), vec![spill.clone()], "the spill is in the workbook's folder");
+    }
+
+    assert_eq!(s.execute("file.close", json!({})).unwrap()["closed"], true, "closing is clean");
+    assert!(!spill.exists(), "closing the document removes the spill");
+    assert!(spill_files(&dir, "quarterly").is_empty());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the workbook is left");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A document folder the spill cannot be created in is not a reason to open without paging: the
+/// temp directory answers. (Root ignores the folder's permissions, so the test skips itself there.)
+#[test]
+#[cfg(unix)]
+fn a_read_only_document_folder_falls_back_to_temp() {
+    use std::os::unix::fs::PermissionsExt;
+    #[allow(clippy::disallowed_methods)] // native-only test: a unique temp dir name
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("gridcraft-spill-ro-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("book.xlsx");
+    let mut src = s();
+    src.execute("cell.set", json!({"cell": "A1", "input": "7"})).unwrap();
+    std::fs::write(&path, crate::io::save_bytes(&src.doc().unwrap().wb, "book.xlsx").unwrap()).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = dir.join("probe");
+    if std::fs::write(&probe, b"root can write here").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    }
+    let mut s = s();
+    {
+        let _forced = crate::io::ForcedPaging::on();
+        s.execute("file.open", json!({"path": path})).unwrap();
+    }
+    {
+        let d = s.doc().unwrap();
+        let sheet = d.wb.active().unwrap();
+        let spill = sheet.cells.page_file_path().expect("the sheet pages anyway");
+        assert_eq!(spill.parent(), Some(std::env::temp_dir().as_path()), "the temp directory answered");
+        assert_eq!(sheet.cells.get(CellRef::parse("A1").unwrap()).map(|cell| cell.value), Some(Value::Number(7.0)));
+    }
+    drop(s);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn validation_formulas_are_relative_and_see_the_new_value() {
     let mut s = s();

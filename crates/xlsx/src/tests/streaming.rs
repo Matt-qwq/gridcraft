@@ -17,17 +17,17 @@ use crate::sheet_read::ReadPlan;
 
 /// One pass over a buffer: no chunking, no streaming.
 fn whole() -> ReadPlan {
-    ReadPlan { stream_min: u64::MAX, window: usize::MAX, chunk_min: usize::MAX, paging: false }
+    ReadPlan { stream_min: u64::MAX, window: usize::MAX, chunk_min: usize::MAX, paging: false, spill: None }
 }
 
 /// One buffer, cut into chunks that run on several threads.
 fn chunked() -> ReadPlan {
-    ReadPlan { stream_min: u64::MAX, window: usize::MAX, chunk_min: 256, paging: false }
+    ReadPlan { stream_min: u64::MAX, window: usize::MAX, chunk_min: 256, paging: false, spill: None }
 }
 
 /// Decompressed as it is decoded, with a window small enough to split almost every row band.
 fn streamed() -> ReadPlan {
-    ReadPlan { stream_min: 0, window: 700, chunk_min: 256, paging: false }
+    ReadPlan { stream_min: 0, window: 700, chunk_min: 256, paging: false, spill: None }
 }
 
 fn open(body: &str, plan: ReadPlan) -> (Workbook, Vec<String>) {
@@ -179,7 +179,7 @@ fn an_inline_string_across_a_window_boundary_keeps_its_text() {
         "<sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>{long}</t></is></c></row><row r=\"2\"><c r=\"A2\"><v>7</v></c></row></sheetData>"
     );
     // A window smaller than the string forces it to span windows.
-    let plan = ReadPlan { stream_min: 0, window: 512, chunk_min: 256, paging: false };
+    let plan = ReadPlan { stream_min: 0, window: 512, chunk_min: 256, paging: false, spill: None };
     let sheet = sheet_of(&body, plan);
     let at = gridcraft_core::CellRef::parse("A1").expect("address");
     let text = sheet.cells.get(at).and_then(|c| c.value.as_text().map(str::to_string)).unwrap_or_default();
