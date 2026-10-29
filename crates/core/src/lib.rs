@@ -6,6 +6,7 @@
 pub mod addr;
 pub mod color;
 pub mod date;
+pub mod fonts;
 pub mod parse;
 pub mod value;
 

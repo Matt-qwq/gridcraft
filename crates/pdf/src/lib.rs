@@ -1,9 +1,16 @@
 //! A tiny, self-contained PDF 1.7 writer for GridCraft's print and PDF export.
 //!
-//! - The 14 standard fonts (no embedding) with WinAnsiEncoding, plus approximate width tables
-//!   ([`text_width`]) so callers can measure, align and wrap text. Characters outside
-//!   WinAnsiEncoding (CJK and other scripts) are set in a predefined, non-embedded Adobe-GB1 CID
-//!   font with the `UniGB-UTF16-H` CMap instead of being replaced by `?`.
+//! - The 14 standard fonts with WinAnsiEncoding, plus approximate width tables ([`text_width`]) so
+//!   callers can measure, align and wrap text.
+//! - An optional **embedded TrueType subset** ([`PdfDoc::set_font`]) for characters
+//!   WinAnsiEncoding cannot set: the font is read and subset in [`truetype`], embedded as a
+//!   `CIDFontType2` with `FontFile2`, a `ToUnicode` CMap and a `/W` widths array taken from
+//!   `hmtx`, and text is drawn with two-byte glyph ids (`/Identity-H`). A document that sets no
+//!   font, or whose text stays inside WinAnsi, is byte-for-byte what it was: the embedded font is
+//!   only written when a page actually used it.
+//! - Characters outside WinAnsiEncoding that the embedded font does not cover (and every such
+//!   character when no font is set) are set in a predefined, non-embedded Adobe-GB1 CID font with
+//!   the `UniGB-UTF16-H` CMap instead of being replaced by `?`.
 //! - Vector drawing: rectangles, lines (solid or dashed), polygons, circles (Bézier), clipping.
 //! - RGBA images as RGB image XObjects with a soft mask for alpha (run-length encoded).
 //! - Coordinates are points with a **top-left origin** (y grows down); text `y` is the baseline.
@@ -14,8 +21,17 @@
 #![forbid(unsafe_code)]
 
 mod metrics;
+pub mod truetype;
 
+#[cfg(test)]
+mod testfont;
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::rc::Rc;
+
+pub use truetype::{Error as FontError, Face, Subset};
 
 /// RGB colour, 0–255 per channel.
 pub type Rgb = [u8; 3];
@@ -150,8 +166,27 @@ impl Font {
 
 /// Width of `text` in points when set in `font` at `size` points.
 pub fn text_width(font: Font, size: f32, text: &str) -> f32 {
+    text_width_with(None, font, size, text)
+}
+
+/// Width of `text` in points, measured with `face` for the characters it covers (the advance
+/// widths come from the font's `hmtx`) and with the standard font's table for the rest. Pass the
+/// same face the document draws with so centring, right alignment and wrapping match the glyphs.
+pub fn text_width_with(face: Option<&Face>, font: Font, size: f32, text: &str) -> f32 {
     // u64: a u32 sum overflows for ~8 million characters.
-    let units: u64 = text.chars().map(|c| u64::from(font.char_width(c))).sum();
+    let mut units: u64 = 0;
+    for c in text.chars() {
+        if needs_cid(c)
+            && let Some(face) = face
+            && face.covers(c)
+        {
+            // Scale the face's units-per-em to the 1/1000 em the table uses.
+            let advance = u64::from(face.advance(face.glyph(c)));
+            units += advance.saturating_mul(1000) / u64::from(face.units_per_em().max(1));
+        } else {
+            units += u64::from(font.char_width(c));
+        }
+    }
     units as f32 * size / 1000.0
 }
 
@@ -196,8 +231,12 @@ pub fn win_ansi(c: char) -> u8 {
 
 /// Index of the CID font in a page's font flags (after the [`Font::ALL`] faces).
 const CID_FONT: usize = Font::ALL.len();
+/// Index of the embedded TrueType subset in a page's font flags.
+const EMBED_FONT: usize = CID_FONT + 1;
 /// Number of font resources a page can use.
-const FONT_SLOTS: usize = CID_FONT + 1;
+const FONT_SLOTS: usize = EMBED_FONT + 1;
+/// Most characters one embedded font maps (a `CIDFontType2` numbers glyphs with two bytes).
+const MAX_EMBEDDED_GLYPHS: usize = 65_534;
 /// Base font of the CID font used for characters WinAnsiEncoding lacks.
 const CID_BASE_FONT: &str = "STSong-Light";
 /// Default glyph width of the CID font (full-width), in 1/1000 em.
@@ -208,12 +247,128 @@ fn needs_cid(c: char) -> bool {
     !c.is_control() && c != '?' && win_ansi(c) == b'?'
 }
 
+/// The font a document embeds for text WinAnsiEncoding cannot set, and the glyphs it has handed
+/// out so far.
+///
+/// Glyph ids are assigned the first time a character is drawn, so the content stream written
+/// while drawing already carries the subset's glyph ids: subset glyph 1 is the first character
+/// the document set, and so on. Composite components are appended when the subset is built (they
+/// have no character of their own), which is why the ids of drawn glyphs never move.
+struct FontUse {
+    face: Face,
+    /// Character → subset glyph id (1-based; 0 is `.notdef`).
+    chars: BTreeMap<char, u16>,
+    /// Subset glyph id - 1 → source glyph id.
+    order: Vec<u16>,
+}
+
+impl FontUse {
+    fn new(face: Face) -> FontUse {
+        FontUse { face, chars: BTreeMap::new(), order: Vec::new() }
+    }
+
+    /// The subset glyph id for `c`, assigning one on first use. `None` when the font has no glyph
+    /// for `c`, or when its outline data cannot be read (the caller then keeps the CID fallback,
+    /// so a broken font cannot produce a broken subset).
+    fn glyph_for(&mut self, c: char) -> Option<u16> {
+        if let Some(gid) = self.chars.get(&c) {
+            return Some(*gid);
+        }
+        let src = self.face.glyph(c);
+        if src == 0 || !self.face.sound(src) {
+            return None;
+        }
+        if self.order.len() >= MAX_EMBEDDED_GLYPHS {
+            return None;
+        }
+        let gid = self.order.len() as u16 + 1;
+        self.order.push(src);
+        self.chars.insert(c, gid);
+        Some(gid)
+    }
+
+    /// The font program, widths and mappings for the subset this document used. If the used
+    /// glyphs cannot be subset (a font that parsed but whose outlines are inconsistent), a
+    /// `.notdef`-only subset keeps the PDF valid instead of leaving the pages pointing at a font
+    /// that was never written.
+    fn build(&self) -> Result<BuiltFont, FontError> {
+        self.build_of(&self.order).or_else(|_| self.build_of(&[]))
+    }
+
+    fn build_of(&self, glyphs: &[u16]) -> Result<BuiltFont, FontError> {
+        let pairs: Vec<(char, u16)> = if glyphs.is_empty() {
+            Vec::new()
+        } else {
+            self.chars.iter().filter_map(|(c, gid)| glyphs.get((*gid as usize).checked_sub(1)?).map(|src| (*c, *src))).collect()
+        };
+        let subset = self.face.subset(glyphs, &pairs)?;
+        let upem = self.face.units_per_em().max(1);
+        let to_em = |v: i16| -> i32 { (i32::from(v).saturating_mul(1000)) / i32::from(upem) };
+        Ok(BuiltFont {
+            data: subset.data,
+            // A PDF subset name is six uppercase letters and a `+` prefix.
+            name: subset_name(self.face.postscript_name().or_else(|| self.face.family_name()).as_deref()),
+            widths: subset.gids.iter().map(|g| to_em(self.face.advance(*g) as i16).clamp(0, 30_000) as u16).collect(),
+            unicode: subset.chars,
+            bbox: self.face.bbox().map(to_em),
+            ascent: to_em(self.face.ascent_descent().0),
+            descent: to_em(self.face.ascent_descent().1),
+            italic: self.face.italic_angle(),
+        })
+    }
+}
+
+/// Everything the PDF objects need from a used font.
+struct BuiltFont {
+    data: Vec<u8>,
+    name: String,
+    /// Advance width per subset glyph id, in 1/1000 em.
+    widths: Vec<u16>,
+    /// Subset glyph id → character, for the `ToUnicode` CMap.
+    unicode: Vec<(char, u16)>,
+    /// `[xMin, yMin, xMax, yMax]` in 1/1000 em.
+    bbox: [i32; 4],
+    ascent: i32,
+    descent: i32,
+    italic: f32,
+}
+
+/// `BASENAME+` as a PDF subset name: six uppercase letters (ASCII for the font's own name, so
+/// `/Name` needs no escaping) and a deterministic tag.
+fn subset_name(name: Option<&str>) -> String {
+    let base: String = name.unwrap_or("Embedded").chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).take(48).collect();
+    let base = if base.is_empty() { "Embedded".to_string() } else { base };
+    // The tag must be six uppercase letters; deriving it from the name keeps the output stable.
+    let seed: u32 = base.bytes().fold(0x811C_9DC5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    let mut tag = String::new();
+    let mut v = seed;
+    for _ in 0..6 {
+        tag.push((b'A' + (v % 26) as u8) as char);
+        v /= 26;
+        if v == 0 {
+            v = seed.rotate_left(3) | 1;
+        }
+    }
+    format!("{tag}+{base}")
+}
+
 /// A PDF hex string `< … >` of `text` in UTF-16BE (the `UniGB-UTF16-H` encoding).
 fn pdf_utf16_string(text: &str) -> String {
     let mut s = String::with_capacity(text.len() * 4 + 2);
     s.push('<');
     for unit in text.encode_utf16() {
         let _ = write!(s, "{unit:04X}");
+    }
+    s.push('>');
+    s
+}
+
+/// A PDF hex string `< … >` of two-byte glyph ids for an `/Identity-H` embedded font.
+fn pdf_glyph_string(glyphs: &[u16]) -> String {
+    let mut s = String::with_capacity(glyphs.len() * 4 + 2);
+    s.push('<');
+    for g in glyphs {
+        let _ = write!(s, "{g:04X}");
     }
     s.push('>');
     s
@@ -323,6 +478,10 @@ pub struct Page {
     images: Vec<ImageData>,
     links: Vec<LinkAnnotation>,
     depth: u32,
+    /// Set when a run was drawn with the embedded font (its objects are only then written).
+    embedded_used: bool,
+    /// The document's embedded font: glyph ids are handed out as text is drawn.
+    font: Rc<RefCell<Option<FontUse>>>,
 }
 
 /// Most bytes of content per page before further drawing is dropped (keeps hostile inputs from
@@ -557,22 +716,70 @@ impl Page {
         let (sn, cs) = if angle.is_finite() { angle.sin_cos() } else { (0.0, 1.0) };
         // Clockwise in y-down = counter-clockwise negated in PDF's y-up space.
         let mut s = format!("BT\n{}\n{} {} {} {} {} {} Tm\n", rgb_op(color, false), n(cs), n(-sn), n(sn), n(cs), n(x), n(self.y(y)));
-        // Runs of WinAnsi text use `font`; runs it cannot encode use the CID font. Each `Tj`
+        // Runs of WinAnsi text use `font`; runs it cannot encode use the embedded subset when the
+        // document set one that covers them, and the predefined CID font otherwise. Each `Tj`
         // advances the text position, so the runs follow each other on the baseline.
         let mut rest = text;
-        while let Some(first) = rest.chars().next() {
-            let cid = needs_cid(first);
-            let end = rest.char_indices().find(|(_, c)| needs_cid(*c) != cid).map_or(rest.len(), |(i, _)| i);
+        while !rest.is_empty() {
+            let (class, end, glyphs) = self.next_run(rest);
+            let end = end.clamp(1, rest.len());
             let (run, tail) = rest.split_at(end);
-            let (slot, string) = if cid { (CID_FONT, pdf_utf16_string(run)) } else { (fi, pdf_string(run)) };
+            // A run the embedded font could not map keeps the non-embedded CID fallback.
+            let (slot, string) = match class {
+                1 if !glyphs.is_empty() => (EMBED_FONT, pdf_glyph_string(&glyphs)),
+                2 => (CID_FONT, pdf_utf16_string(run)),
+                _ => (fi, pdf_string(run)),
+            };
             if let Some(f) = self.fonts.get_mut(slot) {
                 *f = true;
+            }
+            if slot == EMBED_FONT {
+                self.embedded_used = true;
             }
             let _ = writeln!(s, "/F{} {} Tf\n{} Tj", slot + 1, size, string);
             rest = tail;
         }
         s.push_str("ET");
         self.op(&s);
+    }
+
+    /// Splits the next text run off `rest`: `(class, byte length, glyph ids)` where class 0 is a
+    /// standard-font run, 1 an embedded-font run (with one glyph id per character) and 2 a run for
+    /// the predefined CID font.
+    fn next_run(&self, rest: &str) -> (u8, usize, Vec<u16>) {
+        let Some(first) = rest.chars().next() else { return (0, 0, Vec::new()) };
+        if !needs_cid(first) {
+            let end = rest.char_indices().find(|(_, c)| needs_cid(*c)).map_or(rest.len(), |(i, _)| i);
+            return (0, end, Vec::new());
+        }
+        // Try the embedded font first: it hands out subset glyph ids as it goes, and stops at the
+        // first character it cannot set (that character starts the next run).
+        let mut glyphs = Vec::new();
+        let mut end = rest.len();
+        {
+            let mut bank = self.font.try_borrow_mut().ok();
+            if let Some(font) = bank.as_mut().and_then(|b| b.as_mut()) {
+                for (i, c) in rest.char_indices() {
+                    if !needs_cid(c) {
+                        end = i;
+                        break;
+                    }
+                    match font.glyph_for(c) {
+                        Some(g) => glyphs.push(g),
+                        None => {
+                            end = i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !glyphs.is_empty() {
+            return (1, end, glyphs);
+        }
+        // No embedded font (or no glyph for the first character): the CID font takes the run.
+        let end = rest.char_indices().find(|(_, c)| !needs_cid(*c)).map_or(rest.len(), |(i, _)| i);
+        (2, end, Vec::new())
     }
 
     /// Draws an RGBA image (`pw`×`ph` pixels, row-major, straight alpha) into the box
@@ -610,6 +817,8 @@ pub struct Info {
 pub struct PdfDoc {
     pages: Vec<Page>,
     pub info: Info,
+    /// The face embedded for characters WinAnsiEncoding cannot set (see [`PdfDoc::set_font`]).
+    font: Rc<RefCell<Option<FontUse>>>,
 }
 
 /// PackBits-style run-length encoding (PDF `RunLengthDecode`).
@@ -668,16 +877,107 @@ fn pdf_text_string(text: &str) -> String {
     s
 }
 
+/// Writes the five objects of an embedded `CIDFontType2`: the Type0 font, its descendant, the
+/// font descriptor, the font program and the `ToUnicode` CMap. `id` is the Type0 font's object
+/// number; the rest follow it.
+fn push_embedded_font(objects: &mut Vec<(u32, Vec<u8>)>, id: u32, font: &BuiltFont) {
+    let (cid_id, desc_id, file_id, unicode_id) = (id + 1, id + 2, id + 3, id + 4);
+    let name = &font.name;
+    objects.push((
+        id,
+        format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /{name} /Encoding /Identity-H /DescendantFonts [{cid_id} 0 R] /ToUnicode {unicode_id} 0 R >>"
+        )
+        .into_bytes(),
+    ));
+    let widths: Vec<String> = font.widths.iter().map(u16::to_string).collect();
+    objects.push((
+        cid_id,
+        format!(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor {desc_id} 0 R /CIDToGIDMap /Identity /DW 1000 /W [0 [{}]] >>",
+            widths.join(" ")
+        )
+        .into_bytes(),
+    ));
+    let [x0, y0, x1, y1] = font.bbox;
+    let cap = (font.ascent * 7 / 10).max(0);
+    objects.push((
+        desc_id,
+        format!(
+            "<< /Type /FontDescriptor /FontName /{name} /Flags 4 /FontBBox [{x0} {y0} {x1} {y1}] /ItalicAngle {} /Ascent {} /Descent {} /CapHeight {cap} /StemV 80 /FontFile2 {file_id} 0 R >>",
+            n(font.italic),
+            font.ascent,
+            font.descent
+        )
+        .into_bytes(),
+    ));
+    let mut program = format!("<< /Length {} /Length1 {} >>\nstream\n", font.data.len(), font.data.len()).into_bytes();
+    program.extend_from_slice(&font.data);
+    program.extend_from_slice(b"\nendstream");
+    objects.push((file_id, program));
+    // `ToUnicode`: subset glyph id → the character it came from, so text can be copied and
+    // searched. At most 100 entries per `bfchar` block, as the CMap syntax requires.
+    let mut entries: Vec<(char, u16)> = font.unicode.clone();
+    entries.sort_unstable_by_key(|(c, gid)| (*gid, *c));
+    entries.dedup_by_key(|(_, gid)| *gid);
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    for chunk in entries.chunks(100) {
+        let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
+        for (c, gid) in chunk {
+            let _ = write!(cmap, "<{gid:04X}> <");
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                let _ = write!(cmap, "{unit:04X}");
+            }
+            cmap.push_str(">\n");
+        }
+        cmap.push_str("endbfchar\n");
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend");
+    let mut stream = format!("<< /Length {} >>\nstream\n", cmap.len()).into_bytes();
+    stream.extend_from_slice(cmap.as_bytes());
+    stream.extend_from_slice(b"\nendstream");
+    objects.push((unicode_id, stream));
+}
+
 impl PdfDoc {
     pub fn new() -> PdfDoc {
         PdfDoc::default()
+    }
+
+    /// Embeds `face` and sets its glyphs for every character WinAnsiEncoding cannot encode.
+    ///
+    /// One font per document: characters it does not cover keep the non-embedded CID fallback. A
+    /// document that sets a font but only draws WinAnsi text is unchanged — the font program is
+    /// written only when a page used it.
+    pub fn set_font(&mut self, face: Face) {
+        if let Ok(mut slot) = self.font.try_borrow_mut() {
+            *slot = Some(FontUse::new(face));
+        }
+    }
+
+    /// The embedded face, if any (for measuring text with [`text_width_with`]).
+    pub fn embedded_face(&self) -> Option<Face> {
+        self.font.try_borrow().ok().and_then(|f| f.as_ref().map(|u| u.face.clone()))
     }
 
     /// Adds a page of `width_pt` × `height_pt` points and returns it for drawing.
     pub fn add_page(&mut self, width_pt: f32, height_pt: f32) -> &mut Page {
         let width = if width_pt.is_finite() { width_pt.clamp(3.0, 14_400.0) } else { 612.0 };
         let height = if height_pt.is_finite() { height_pt.clamp(3.0, 14_400.0) } else { 792.0 };
-        self.pages.push(Page { width, height, content: String::new(), fonts: [false; FONT_SLOTS], images: Vec::new(), links: Vec::new(), depth: 0 });
+        self.pages.push(Page {
+            width,
+            height,
+            content: String::new(),
+            fonts: [false; FONT_SLOTS],
+            images: Vec::new(),
+            links: Vec::new(),
+            depth: 0,
+            embedded_used: false,
+            font: Rc::clone(&self.font),
+        });
         let i = self.pages.len() - 1;
         &mut self.pages[i]
     }
@@ -703,13 +1003,24 @@ impl PdfDoc {
                 *u |= *f;
             }
         }
+        // The embedded subset, built once: glyph ids were assigned while pages were drawn.
+        let embedded = if used[EMBED_FONT] { self.font.try_borrow().ok().and_then(|f| f.as_ref().and_then(|u| u.build().ok())) } else { None };
+        // A subset that could not be built (a font that parsed but whose outlines are
+        // inconsistent) leaves the slot as a standard font: every `/F` reference in a content
+        // stream must resolve, so those runs print as garbage but the document stays a valid PDF.
         let mut next = 4u32;
         let mut font_ids = [0u32; FONT_SLOTS];
         for (i, u) in used.iter().enumerate() {
             if *u {
                 font_ids[i] = next;
-                // The CID font also needs its descendant font and font descriptor.
-                next += if i == CID_FONT { 3 } else { 1 };
+                // The CID font also needs its descendant font and font descriptor; the embedded
+                // font adds its font program and `ToUnicode` CMap (and needs none of them when
+                // the subset could not be built).
+                next += match i {
+                    CID_FONT => 3,
+                    EMBED_FONT if embedded.is_some() => 5,
+                    _ => 1,
+                };
             }
         }
         let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -743,6 +1054,13 @@ impl PdfDoc {
                         )
                         .into_bytes(),
                     ));
+                    continue;
+                }
+                if i == EMBED_FONT {
+                    match &embedded {
+                        Some(font) => push_embedded_font(&mut objects, *id, font),
+                        None => objects.push((*id, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec())),
+                    }
                     continue;
                 }
                 let name = Font::ALL.get(i).copied().unwrap_or_default().base_name();

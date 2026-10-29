@@ -9,3 +9,8 @@ description = "GridCraft's tiny self-contained PDF 1.7 writer (standard 14 fonts
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+# An independent font parser (the one epaint uses for system fonts) so the subsetter is checked
+# against a second implementation, not only against its own reader.
+skrifa = { workspace = true }

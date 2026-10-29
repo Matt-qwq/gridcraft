@@ -318,3 +318,133 @@ fn cjk_text_is_not_replaced_by_question_marks() {
     // Measured as full-width glyphs, matching the CID font's default width.
     assert_eq!(text_width(Font::Helvetica, 10.0, "签字"), 20.0);
 }
+
+// ---------------------------------------------------------------- embedded TrueType fonts
+
+/// A document with the synthetic font embedded and `text` drawn on one page.
+fn embedded_pdf(text: &str) -> Vec<u8> {
+    let face = Face::parse(crate::testfont::basic().build()).expect("the synthetic font parses");
+    let mut doc = PdfDoc::new();
+    doc.set_font(face);
+    let p = doc.add_page(300.0, 200.0);
+    p.text(10.0, 20.0, 12.0, Font::Helvetica, [0, 0, 0], text);
+    let pdf = doc.finish();
+    check_xref(&pdf);
+    pdf
+}
+
+/// The bytes of the `FontFile2` stream and the number the `/Length1` entry declares.
+fn font_program(pdf: &[u8]) -> (usize, Vec<u8>) {
+    let at = find(pdf, b"/Length1 ").expect("a FontFile2 dictionary");
+    let window = &pdf[at + 9..(at + 9 + 24).min(pdf.len())];
+    let text: String = window.iter().take_while(|b| b.is_ascii_digit()).map(|b| *b as char).collect();
+    let len: usize = text.parse().expect("a length");
+    let start = at + find(&pdf[at..], b"stream\n").expect("a stream") + 7;
+    (len, pdf[start..start + len].to_vec())
+}
+
+#[test]
+fn non_winansi_text_embeds_a_subset_font() {
+    let pdf = embedded_pdf("Ж");
+    // The font objects: a Type0 font, its CIDFontType2 descendant, a descriptor, the program and
+    // a ToUnicode CMap.
+    assert!(find(&pdf, b"/Subtype /Type0").is_some());
+    assert!(find(&pdf, b"/Encoding /Identity-H").is_some());
+    assert!(find(&pdf, b"/Subtype /CIDFontType2").is_some());
+    assert!(find(&pdf, b"/CIDToGIDMap /Identity").is_some());
+    assert!(find(&pdf, b"/FontFile2").is_some());
+    assert!(find(&pdf, b"/Type /FontDescriptor").is_some());
+    // The text is drawn with a two-byte glyph id (the first character the document set) …
+    assert!(find(&pdf, b"<0001> Tj").is_some(), "glyph ids in the content stream");
+    // … the widths come from the font's hmtx (`.notdef` then `Ж`, in 1/1000 em) …
+    assert!(find(&pdf, b"/W [0 [600 650]]").is_some(), "widths from hmtx");
+    // … and ToUnicode maps the glyph back to U+0416.
+    assert!(find(&pdf, b"<0001> <0416>").is_some(), "ToUnicode maps the glyph back");
+    assert!(find(&pdf, b"/BaseFont /").is_some());
+    // The program is a standalone TrueType font with exactly the used glyphs.
+    let (len, program) = font_program(&pdf);
+    assert_eq!(len, program.len(), "/Length1 is the uncompressed length");
+    let sub = Face::parse(program).expect("the embedded program parses");
+    assert_eq!(sub.glyph_count(), 2, ".notdef and Ж");
+    assert_eq!(sub.glyph('Ж'), 1);
+    assert_eq!(sub.advance(1), 650);
+}
+
+#[test]
+fn mixed_text_keeps_winansi_runs_in_the_standard_font() {
+    let pdf = embedded_pdf("No. 2 Ж and back");
+    // ASCII runs are still WinAnsi literals in Helvetica, unchanged by the embedded font.
+    assert!(find(&pdf, b"(No. 2 ) Tj").is_some());
+    assert!(find(&pdf, b"( and back) Tj").is_some());
+    assert!(find(&pdf, b"<0001> Tj").is_some());
+    assert!(find(&pdf, b"/BaseFont /Helvetica /Encoding /WinAnsiEncoding").is_some());
+}
+
+#[test]
+fn a_character_the_font_lacks_keeps_the_cid_fallback() {
+    // The synthetic font maps Ж but not अ: that run falls back to the predefined CID font.
+    let pdf = embedded_pdf("Жअ");
+    assert!(find(&pdf, b"<0001> Tj").is_some());
+    assert!(find(&pdf, b"<0905> Tj").is_some(), "uncovered text keeps the UTF-16 CID font");
+    assert!(find(&pdf, b"/Encoding /UniGB-UTF16-H").is_some());
+}
+
+#[test]
+fn an_ascii_document_is_byte_identical_with_a_font_set() {
+    let plain = {
+        let mut doc = PdfDoc::new();
+        let p = doc.add_page(300.0, 200.0);
+        p.text(10.0, 20.0, 12.0, Font::Helvetica, [0, 0, 0], "Invoice (draft) €5 — café");
+        doc.info.title = "Report".into();
+        doc.finish()
+    };
+    let with_font = {
+        let face = Face::parse(crate::testfont::basic().build()).expect("parse");
+        let mut doc = PdfDoc::new();
+        doc.set_font(face);
+        let p = doc.add_page(300.0, 200.0);
+        p.text(10.0, 20.0, 12.0, Font::Helvetica, [0, 0, 0], "Invoice (draft) €5 — café");
+        doc.info.title = "Report".into();
+        doc.finish()
+    };
+    assert_eq!(plain, with_font, "setting a font must not change a WinAnsi-only document");
+}
+
+#[test]
+fn astral_characters_survive_to_unicode_as_surrogate_pairs() {
+    let pdf = embedded_pdf("😀");
+    assert!(find(&pdf, b"<0001> Tj").is_some());
+    assert!(find(&pdf, b"<0001> <D83DDE00>").is_some(), "a bfchar destination may be a surrogate pair");
+}
+
+#[test]
+fn embedded_widths_come_from_hmtx() {
+    let face = Face::parse(crate::testfont::basic().build()).expect("parse");
+    // Ж is 650/1000 em, 字 is 1000/1000 em; the standard table would report 556 for both.
+    assert!((text_width_with(Some(&face), Font::Helvetica, 10.0, "Ж字") - 16.5).abs() < 0.01);
+    // Without a face the CID fallback's full-width advance (1000/1000 em) is assumed.
+    assert_eq!(text_width(Font::Helvetica, 10.0, "Ж字"), 20.0);
+    // ASCII still comes from the table, whether a face is passed or not.
+    assert_eq!(text_width_with(Some(&face), Font::Helvetica, 10.0, "Hello"), text_width(Font::Helvetica, 10.0, "Hello"));
+}
+
+#[test]
+fn every_embedded_glyph_is_mapped_once() {
+    // The same character drawn twice reuses its glyph id, and a second page shares the font.
+    let pdf = embedded_pdf("ЖЖ 字 Ж");
+    assert!(find(&pdf, b"<0001> <0416>").is_some());
+    assert!(find(&pdf, b"<0002> <5B57>").is_some());
+    assert!(find(&pdf, b"<00010001> Tj").is_some(), "the repeated glyph keeps one id");
+    assert!(find(&pdf, b"<0003>").is_none(), "no third glyph is created");
+    let mut doc = PdfDoc::new();
+    doc.set_font(Face::parse(crate::testfont::basic().build()).expect("parse"));
+    let p = doc.add_page(100.0, 100.0);
+    p.text(1.0, 1.0, 8.0, Font::Helvetica, [0, 0, 0], "Ж");
+    let p = doc.add_page(100.0, 100.0);
+    p.text(1.0, 1.0, 8.0, Font::Helvetica, [0, 0, 0], "Ж");
+    let pdf = doc.finish();
+    check_xref(&pdf);
+    assert!(find(&pdf, b"<0001> Tj").is_some());
+    assert!(find(&pdf, b"<0002> Tj").is_none(), "the second page reused the glyph id");
+    assert!(find(&pdf, b"/W [0 [600 650]]").is_some());
+}
