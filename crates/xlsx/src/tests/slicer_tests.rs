@@ -208,3 +208,275 @@ fn a_widget_with_no_tiles_gets_the_fields_values() {
     assert_eq!(sl.items.iter().map(|i| i.label()).collect::<Vec<_>>(), ["East", "West", "North"]);
     assert!(sl.all_selected());
 }
+
+/// A table, a table slicer on its `Region` column, and the sheet filter the slicer drives (the
+/// engine writes the selection into the AutoFilter; the table slicer model is the widget).
+fn table_workbook() -> Workbook {
+    let mut wb = Workbook::new();
+    {
+        let sh = wb.sheet_mut(0).unwrap();
+        sh.name = "Data".into();
+        for (c, h) in ["Region", "Amount"].iter().enumerate() {
+            sh.cells.set(CellRef::new(0, c as u32), Cell::value(Value::text(*h)));
+        }
+        for (r, (region, amount)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)].iter().enumerate() {
+            sh.cells.set(CellRef::new(r as u32 + 1, 0), Cell::value(Value::text(*region)));
+            sh.cells.set(CellRef::new(r as u32 + 1, 1), Cell::value(Value::number(*amount)));
+        }
+        let column =
+            |name: &str| TableColumn { name: name.into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None };
+        sh.tables.push(Table {
+            id: 1,
+            name: "Sales".into(),
+            range: rr("A1:B4"),
+            header_row: true,
+            totals_row: false,
+            columns: vec![column("Region"), column("Amount")],
+            style: "TableStyleMedium2".into(),
+            banded_rows: true,
+            banded_cols: false,
+            first_col: false,
+            last_col: false,
+            filter_button: true,
+            filter: vec![],
+            table_type: None,
+            connection_id: None,
+        });
+        // The selection a table slicer keeps in the file: its column's value filter.
+        sh.autofilter =
+            Some(AutoFilter { range: rr("A1:B4"), criteria: vec![(0, FilterCriterion::Values { values: vec!["East".into()], blanks: false })] });
+        sh.slicers.push(Slicer {
+            id: 1,
+            table: "Sales".into(),
+            column: "Region".into(),
+            caption: "Regions".into(),
+            anchor: Anchor { cell: at("D2"), dx: 4.0, dy: 4.0, width: 168.0, height: 160.0, mode: AnchorMode::MoveOnly },
+            selected: Some(vec!["East".into()]),
+            columns: 1,
+        });
+    }
+    wb
+}
+
+#[test]
+fn a_slicer_and_a_timeline_are_placed_where_the_model_says() {
+    let wb = workbook();
+    let out = write_xlsx(&wb).unwrap();
+    check_package(&out).unwrap();
+    let drawing = text(&unpack(&out), "xl/drawings/");
+    // Each view is an anchored graphic frame naming its drawing namespace and view.
+    assert!(drawing.contains("<a:graphicData uri=\"http://schemas.microsoft.com/office/drawing/2010/slicer\">"), "{drawing}");
+    assert!(drawing.contains("<sle:slicer ") && drawing.contains("name=\"Region\""), "{drawing}");
+    assert!(drawing.contains("<a:graphicData uri=\"http://schemas.microsoft.com/office/drawing/2012/timeslicer\">"), "{drawing}");
+    assert!(drawing.contains("<sle:timeslicer ") && drawing.contains("name=\"Date\""), "{drawing}");
+    // The first frame is anchored at D3 (0-based col 3, row 2) + 4 px, 168 x 200 px.
+    assert!(drawing.contains("<xdr:twoCellAnchor editAs=\"oneCell\"><xdr:from><xdr:col>3</xdr:col><xdr:colOff>38100</xdr:colOff><xdr:row>2</xdr:row><xdr:rowOff>38100</xdr:rowOff>"), "{drawing}");
+
+    // The model reads the anchors back from the frames: the parts carry no position.
+    let (back, rep) = read_xlsx(&out).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains("kept as they came") || w.contains("not placed")), "{:?}", rep.warnings);
+    let report = back.sheet_index("Report").and_then(|i| back.sheet(i)).unwrap();
+    let sl = &report.pivot_slicers[0];
+    assert_eq!((sl.anchor.cell, sl.anchor.dx, sl.anchor.dy, sl.anchor.width, sl.anchor.height), (at("D3"), 4.0, 4.0, 168.0, 200.0));
+    assert_eq!(sl.anchor.mode, AnchorMode::MoveOnly);
+    let tl = &report.pivot_timelines[0];
+    assert_eq!((tl.anchor.cell, tl.anchor.width, tl.anchor.height), (at("H3"), 240.0, 96.0));
+
+    // A second save draws the same frames: the anchor is the model's, not a fresh guess. The kept
+    // sheet extension the first save's file carried is replaced, not written a second time.
+    let out2 = write_xlsx(&back).unwrap();
+    check_package(&out2).unwrap();
+    let parts2 = unpack(&out2);
+    assert_eq!(text(&parts2, "xl/drawings/"), drawing);
+    let sx = String::from_utf8_lossy(&parts2["xl/worksheets/sheet2.xml"]).into_owned();
+    assert_eq!(sx.matches("<x14:slicerList>").count(), 1, "one slicerList: {sx}");
+    assert_eq!(sx.matches("<x15:timelineRefs>").count(), 1, "one timelineRefs: {sx}");
+    let wbx = String::from_utf8_lossy(&parts2["xl/workbook.xml"]).into_owned();
+    assert_eq!(wbx.matches("<x14:slicerCaches>").count(), 1, "one slicerCaches list: {wbx}");
+    assert_eq!(wbx.matches("<x15:timelineCacheRefs>").count(), 1, "one timelineCacheRefs list: {wbx}");
+}
+
+#[test]
+fn a_table_slicer_round_trips_through_its_table_slicer_cache() {
+    let wb = table_workbook();
+    let out = write_xlsx(&wb).unwrap();
+    check_package(&out).unwrap();
+    let parts = unpack(&out);
+    let cache = text(&parts, "xl/slicerCaches/");
+    // The cache is the table's, named by the table and column ids the file writes.
+    assert!(cache.contains("<ext uri=\"{2F2917AC-EB37-4324-AD4E-5DD8C200BD13}\""), "{cache}");
+    assert!(cache.contains("<x15:tableSlicerCache tableId=\"1\" column=\"1\"/>"), "{cache}");
+    assert!(cache.contains("name=\"Slicer_Sales_Region\" sourceName=\"Region\""), "{cache}");
+    assert!(!cache.contains("<items"), "a table slicer keeps its selection in the table filter: {cache}");
+    let slicer = text(&parts, "xl/slicers/");
+    assert!(slicer.contains("name=\"Sales_Region\" cache=\"Slicer_Sales_Region\" caption=\"Regions\""), "{slicer}");
+    // It is placed, and the sheet lists the part it lives in.
+    let drawing = text(&parts, "xl/drawings/");
+    assert!(
+        drawing.contains("uri=\"http://schemas.microsoft.com/office/drawing/2010/slicer\"") && drawing.contains("name=\"Sales_Region\""),
+        "{drawing}"
+    );
+    let sheet = String::from_utf8_lossy(&parts["xl/worksheets/sheet1.xml"]).into_owned();
+    assert!(sheet.contains("slicerList"), "{sheet}");
+
+    // Reading models the table slicer again, with the anchor and the table filter's selection.
+    let (back, rep) = read_xlsx(&out).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains("kept as they came") || w.contains("not placed")), "{:?}", rep.warnings);
+    let sh = back.sheet(0).unwrap();
+    assert_eq!(sh.slicers.len(), 1, "{:?}", rep.warnings);
+    let sl = &sh.slicers[0];
+    assert_eq!((sl.table.as_str(), sl.column.as_str(), sl.caption.as_str(), sl.columns), ("Sales", "Region", "Regions", 1));
+    assert_eq!(sl.selected, Some(vec!["East".to_string()]));
+    assert_eq!((sl.anchor.cell, sl.anchor.width, sl.anchor.height), (at("D2"), 168.0, 160.0));
+
+    let out2 = write_xlsx(&back).unwrap();
+    check_package(&out2).unwrap();
+    let parts2 = unpack(&out2);
+    assert_eq!(text(&parts2, "xl/slicerCaches/"), cache);
+    assert_eq!(text(&parts2, "xl/drawings/"), drawing);
+}
+
+#[test]
+fn views_on_one_sheet_share_its_parts_and_are_each_placed() {
+    // One slicers part and one timelines part per sheet, as the format requires, holding every view
+    // on that sheet; each view still gets its own anchored frame.
+    let mut wb = workbook();
+    {
+        let report = wb.sheet_mut(1).unwrap();
+        report.pivot_timelines.push(PivotTimeline {
+            id: 3,
+            name: "Date by day".into(),
+            cache: "Timeline_Day".into(),
+            caption: "By day".into(),
+            field: "Date".into(),
+            pivot_tables: vec!["Report Pivot".into()],
+            unit: TimeUnit::Days,
+            anchor: Anchor { cell: at("H10"), dx: 4.0, dy: 4.0, width: 240.0, height: 96.0, mode: AnchorMode::MoveOnly },
+            ..PivotTimeline::default()
+        });
+        // A table on the same sheet, with a table slicer on it beside the pivot slicer.
+        report.tables.push(Table {
+            id: 1,
+            name: "Sales".into(),
+            range: rr("J1:K4"),
+            header_row: true,
+            totals_row: false,
+            columns: vec![
+                TableColumn { name: "Region".into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None },
+                TableColumn { name: "Amount".into(), totals: TotalsFn::None, totals_label: None, formula: None, unique_name: None, xml: None },
+            ],
+            style: "TableStyleMedium2".into(),
+            banded_rows: true,
+            banded_cols: false,
+            first_col: false,
+            last_col: false,
+            filter_button: true,
+            filter: vec![],
+            table_type: None,
+            connection_id: None,
+        });
+        for (r, (region, amount)) in [("East", 10.0), ("West", 20.0), ("East", 30.0)].iter().enumerate() {
+            report.cells.set(CellRef::new(r as u32 + 1, 9), Cell::value(Value::text(*region)));
+            report.cells.set(CellRef::new(r as u32 + 1, 10), Cell::value(Value::number(*amount)));
+        }
+        report.slicers.push(Slicer {
+            id: 4,
+            table: "Sales".into(),
+            column: "Region".into(),
+            caption: "Sales region".into(),
+            anchor: Anchor { cell: at("N2"), dx: 4.0, dy: 4.0, width: 168.0, height: 160.0, mode: AnchorMode::MoveOnly },
+            selected: None,
+            columns: 1,
+        });
+    }
+    let out = write_xlsx(&wb).unwrap();
+    check_package(&out).unwrap();
+    let parts = unpack(&out);
+    let slicer = text(&parts, "xl/slicers/");
+    assert_eq!(slicer.matches("<slicer ").count(), 2, "one part holds both views: {slicer}");
+    assert!(slicer.contains("name=\"Region\"") && slicer.contains("name=\"Sales_Region\""), "{slicer}");
+    let timeline = text(&parts, "xl/timelines/");
+    assert_eq!(timeline.matches("<timeline ").count(), 2, "{timeline}");
+    let sheet = String::from_utf8_lossy(&parts["xl/worksheets/sheet2.xml"]).into_owned();
+    assert_eq!(sheet.matches("<x14:slicer ").count(), 1, "one slicers part means one reference: {sheet}");
+    assert_eq!(sheet.matches("<x15:timelineRef ").count(), 1, "{sheet}");
+    let drawing = text(&parts, "xl/drawings/");
+    assert_eq!(drawing.matches("uri=\"http://schemas.microsoft.com/office/drawing/2010/slicer\"").count(), 2, "{drawing}");
+    assert_eq!(drawing.matches("uri=\"http://schemas.microsoft.com/office/drawing/2012/timeslicer\"").count(), 2, "{drawing}");
+
+    // All four views come back with their anchors.
+    let (back, rep) = read_xlsx(&out).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains("kept as they came") || w.contains("not placed")), "{:?}", rep.warnings);
+    let report = back.sheet(1).unwrap();
+    assert_eq!((report.pivot_slicers.len(), report.slicers.len(), report.pivot_timelines.len()), (1, 1, 2));
+    assert_eq!(report.slicers[0].anchor.cell, at("N2"));
+    assert_eq!(report.pivot_timelines[1].anchor.cell, at("H10"));
+    assert_eq!(report.pivot_timelines[1].unit, TimeUnit::Days);
+    let out2 = write_xlsx(&back).unwrap();
+    check_package(&out2).unwrap();
+    let parts2 = unpack(&out2);
+    assert_eq!(text(&parts2, "xl/slicers/"), slicer);
+    assert_eq!(text(&parts2, "xl/timelines/"), timeline);
+    assert_eq!(text(&parts2, "xl/drawings/"), drawing);
+}
+
+#[test]
+fn a_slicer_cache_the_model_does_not_understand_keeps_its_bytes() {
+    // A cache with an attribute the model does not carry must stay exactly as it came: the whole
+    // slicer set is kept, not half-rewritten.
+    let out = write_xlsx(&workbook()).unwrap();
+    let mut parts = unpack(&out);
+    let patched = text(&parts, "xl/slicerCaches/").replace("name=\"Slicer_Region\"", "name=\"Slicer_Region\" sortOrder=\"descending\"");
+    parts.insert("xl/slicerCaches/slicerCache1.xml".into(), patched.clone().into_bytes());
+    let slicer_before = text(&parts, "xl/slicers/").into_bytes();
+    let repacked = super::make_zip(&parts.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect::<Vec<_>>());
+
+    let (back, rep) = read_xlsx(&repacked).unwrap();
+    assert!(rep.warnings.iter().any(|w| w.contains("kept as they came")), "{:?}", rep.warnings);
+    assert!(back.sheet(1).unwrap().pivot_slicers.is_empty());
+    let out2 = write_xlsx(&back).unwrap();
+    check_package(&out2).unwrap();
+    let parts2 = unpack(&out2);
+    let kept = parts2.keys().filter(|n| n.starts_with("xl/slicerCaches/")).collect::<Vec<_>>();
+    assert_eq!(kept.len(), 1, "{:?}", parts2.keys());
+    assert_eq!(parts2[kept[0]], patched.as_bytes(), "the kept cache is written byte for byte");
+    assert_eq!(text(&parts2, "xl/slicers/").as_bytes(), slicer_before.as_slice(), "the kept slicer part is written byte for byte");
+    // The timeline of the same file is independent of the slicers and stays modelled.
+    assert_eq!(parts2.keys().filter(|n| n.starts_with("xl/timelines/")).count(), 1);
+}
+
+#[test]
+fn a_timeline_on_a_field_without_dates_is_not_written() {
+    // A timeline needs a date range to show; a text field has none, so nothing names a timeline the
+    // file could not draw (and no drawing frame is left behind for it).
+    let mut wb = workbook();
+    wb.sheet_mut(1).unwrap().pivot_timelines[0].field = "Region".into();
+    let parts = unpack(&write_xlsx(&wb).unwrap());
+    assert!(parts.keys().all(|n| !n.starts_with("xl/timelines/") && !n.starts_with("xl/timelineCaches/")), "{:?}", parts.keys());
+    assert!(!text(&parts, "xl/drawings/").contains("timeslicer"));
+    assert!(text(&parts, "xl/slicers/").contains("name=\"Region\""), "the slicer is unaffected");
+}
+
+#[test]
+fn a_hostile_anchor_is_clamped_not_trusted() {
+    let mut wb = workbook();
+    wb.sheet_mut(1).unwrap().pivot_slicers[0].anchor =
+        Anchor { cell: CellRef::new(u32::MAX, u32::MAX), dx: f32::NAN, dy: -12.0, width: f32::INFINITY, height: 1e30, mode: AnchorMode::MoveOnly };
+    let out = write_xlsx(&wb).unwrap();
+    check_package(&out).unwrap();
+    let drawing = text(&unpack(&out), "xl/drawings/");
+    assert!(!drawing.contains("NaN") && !drawing.contains("inf"), "{drawing}");
+    // The start cell is the sheet's last cell and the offsets are finite: a number a reader can use.
+    assert!(
+        drawing.contains(&format!(
+            "<xdr:from><xdr:col>{}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff>",
+            gridcraft_core::MAX_COLS - 1,
+            gridcraft_core::MAX_ROWS - 1
+        )),
+        "{drawing}"
+    );
+    let (back, _) = read_xlsx(&out).unwrap();
+    let a = back.sheet(1).unwrap().pivot_slicers[0].anchor;
+    assert!(a.dx.is_finite() && a.dy.is_finite() && a.width.is_finite() && a.height.is_finite());
+    assert!(a.dx >= 0.0 && a.dy >= 0.0 && a.width >= 0.0 && a.height >= 0.0);
+}

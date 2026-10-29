@@ -1,5 +1,11 @@
-//! DrawingML spreadsheet drawings (`xl/drawings/drawingN.xml`): anchors, pictures, shapes and
-//! chart frames.
+//! DrawingML spreadsheet drawings (`xl/drawings/drawingN.xml`): anchors, pictures, shapes, chart
+//! frames, and the frames that place slicers and timelines.
+//!
+//! A slicer or timeline view lives in its own part but is placed by a drawing: an `xdr:graphicFrame`
+//! whose `a:graphicData` names the drawing namespace of the widget and holds a `<slicer name>` /
+//! `<timeslicer name>` element ([MS-XLSX] 2.2.4.2, 5.2, 5.7). The frame carries no relationship —
+//! the name matches the view in the sheet's slicers/timelines part — so the model reads a widget's
+//! anchor from here and writes it back here ([`WidgetFrame`]).
 
 use std::fmt::Write as _;
 
@@ -12,6 +18,24 @@ use crate::tables::EMU_PER_PX;
 use crate::xml::{El, esc, esc_attr};
 
 mod ink;
+
+/// The anchor a slicer or timeline view is placed with, read from a sheet's drawing.
+pub struct WidgetFrame {
+    /// The view's name (a slicer's or timeline's `name`, unique per kind in the workbook).
+    pub name: String,
+    pub anchor: Anchor,
+    /// `false` for a slicer view, `true` for a timeline view.
+    pub timeline: bool,
+}
+
+/// The largest object side, in pixels, an anchor is written with: 1,000,000 px is wider than any
+/// sheet. Model anchors come from files and commands, so their numbers are hostile — NaN, negative
+/// or absurd values are clamped here rather than trusted.
+const MAX_OBJECT_PX: f64 = 1_000_000.0;
+
+fn clamp_px(v: f64) -> f64 {
+    if v.is_finite() { v.clamp(0.0, MAX_OBJECT_PX) } else { 0.0 }
+}
 
 // ---------------------------------------------------------------- reading
 
@@ -161,6 +185,19 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                 "graphicFrame" => {
                     let Some(gd) = obj.path(&["graphic", "graphicData"]) else { continue };
                     let uri = gd.attr("uri").unwrap_or("");
+                    // A slicer/timeline frame names its view; the part is read separately and the
+                    // anchor is what this drawing contributes.
+                    if uri == crate::slicer::NS_DRAWING_SLICER || uri == crate::slicer::NS_DRAWING_TIMELINE {
+                        let timeline = uri == crate::slicer::NS_DRAWING_TIMELINE;
+                        let tag = if timeline { "timeslicer" } else { "slicer" };
+                        match gd.child(tag).and_then(|e| e.attr("name")) {
+                            Some(name) if !name.trim().is_empty() => {
+                                cx.widget_frames.push(WidgetFrame { name: name.to_string(), anchor, timeline });
+                            }
+                            _ => cx.warn("a slicer/timeline drawing frame that names no view was skipped"),
+                        }
+                        continue;
+                    }
                     if let Some(rid) = gd.child("chart").and_then(|c| c.attr("id")) {
                         let Some(rel) = rels.iter().find(|r| r.id == rid) else { continue };
                         let target = rel.target.clone();
@@ -302,26 +339,28 @@ fn read_text_format(body: Option<&El>) -> ShapeFormat {
 /// the standalone `oneCellAnchor`/`absoluteAnchor` elements are read on import but not written.)
 /// Returns the opening tag and the matching closing tag.
 fn anchor_open(sheet: &Sheet, a: &Anchor) -> (String, &'static str) {
-    let px = |v: f64| ((v.max(0.0)) * EMU_PER_PX).round() as i64;
-    let x1 = sheet.col_left(a.cell.col) + a.dx as f64;
-    let y1 = sheet.row_top(a.cell.row) + a.dy as f64;
-    let x2 = x1 + a.width.max(0.0) as f64;
-    let y2 = y1 + a.height.max(0.0) as f64;
+    let px = |v: f64| (clamp_px(v) * EMU_PER_PX).round() as i64;
+    let col = a.cell.col.min(MAX_COLS - 1);
+    let row = a.cell.row.min(MAX_ROWS - 1);
+    let dx = clamp_px(a.dx as f64);
+    let dy = clamp_px(a.dy as f64);
+    let x1 = sheet.col_left(col) + dx;
+    let y1 = sheet.row_top(row) + dy;
+    let x2 = x1 + clamp_px(a.width as f64);
+    let y2 = y1 + clamp_px(a.height as f64);
     let tc = sheet.col_at(x2);
     let tr = sheet.row_at(y2);
-    let tdx = x2 - sheet.col_left(tc);
-    let tdy = y2 - sheet.row_top(tr);
+    let tdx = clamp_px(x2 - sheet.col_left(tc));
+    let tdy = clamp_px(y2 - sheet.row_top(tr));
     let edit = match a.mode {
         AnchorMode::MoveAndSize => "",
         AnchorMode::MoveOnly => " editAs=\"oneCell\"",
         AnchorMode::Absolute => " editAs=\"absolute\"",
     };
     let open = format!(
-        "<xdr:twoCellAnchor{edit}><xdr:from><xdr:col>{}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:from><xdr:to><xdr:col>{tc}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{tr}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:to>",
-        a.cell.col,
-        px(a.dx as f64),
-        a.cell.row,
-        px(a.dy as f64),
+        "<xdr:twoCellAnchor{edit}><xdr:from><xdr:col>{col}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:from><xdr:to><xdr:col>{tc}</xdr:col><xdr:colOff>{}</xdr:colOff><xdr:row>{tr}</xdr:row><xdr:rowOff>{}</xdr:rowOff></xdr:to>",
+        px(dx),
+        px(dy),
         px(tdx),
         px(tdy)
     );
@@ -345,6 +384,12 @@ pub enum Obj<'a> {
     /// A chart of a kind GridCraft does not model: its frame only (the part is written as it was).
     RawChart(&'a gridcraft_model::KeptChart, String),
     Shape(&'a Shape),
+    /// A slicer or timeline view's frame: the part is written from the model, the frame places it.
+    Widget {
+        name: &'a str,
+        anchor: &'a Anchor,
+        timeline: bool,
+    },
 }
 
 /// The drawing part for a sheet's objects (relationship ids already assigned).
@@ -414,6 +459,21 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                     "<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"Chart {}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>{}<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>",
                     id - 1,
                     xfrm(&ch.anchor, "xdr:xfrm")
+                );
+            }
+            Obj::Widget { name, anchor, timeline } => {
+                let (open, close) = anchor_open(sheet, anchor);
+                close_tag = close;
+                s.push_str(&open);
+                let (uri, tag) =
+                    if *timeline { (crate::slicer::NS_DRAWING_TIMELINE, "timeslicer") } else { (crate::slicer::NS_DRAWING_SLICER, "slicer") };
+                // MS-XLSX 5.2/5.7: the view is named, not related; the frame's transform is the
+                // anchor's (Excel writes a zero ext for a frame in a twoCellAnchor).
+                let _ = write!(
+                    s,
+                    "<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"{}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm><a:graphic><a:graphicData uri=\"{uri}\"><sle:{tag} xmlns:sle=\"{uri}\" name=\"{}\"/></a:graphicData></a:graphic></xdr:graphicFrame>",
+                    esc_attr(name),
+                    esc_attr(name)
                 );
             }
             Obj::Shape(sh) => {
