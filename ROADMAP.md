@@ -281,6 +281,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | trivial | The soak harness reports its **wall clock**, budgets a single seed (`GRIDCRAFT_FUZZ_SEED_BUDGET_MS`, reported as its own `slow` kind rather than stalling), writes the **whole** failing sequence to a file and replays it with `GRIDCRAFT_FUZZ_REPLAY` — a seed's sequence depends on the registered command set, so the file is the durable artefact |
 | 2026-10-30 | minor | One rule for table header names applied in memory (`header_names`), and `sync_headers` reconciles the whole header row after a structural edit, so a duplicate can no longer be created and then silently renamed at save (`Column3` → `Column32`). Five regressions |
 | 2026-10-30 | minor | A spill that feeds its own source is `#CIRC!` and sheds nothing (the pass used to oscillate between two states and stop at the round cap, so no single answer was right); a `#CIRC!` anchor is re-evaluated when an edit lands in its would-be spill area. Two regressions in `fuzz_regressions_empty` |
 | 2026-10-30 | minor | A Ctrl+Shift+Enter array too large to lay out is refused (it created cells the save lost); `defaultColWidth="0"` is read and column widths clamp to the format's 255-character maximum; a legacy array marks every cell it clears as a change so dependents recalculate. The soak's 24-step case is pinned as a fixed replay |
