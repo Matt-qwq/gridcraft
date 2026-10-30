@@ -163,13 +163,21 @@ pub fn specs() -> Vec<CommandSpec> {
             "Column Width…",
             ["Home", "Cells", "Format"],
             None,
-            "{sheet?, cols?: \"B:D\" | \"B:B,D:F\" | \"Sheet2!B:D\", width: 64 (pixels) | chars: 8.43}",
+            "{sheet?, cols?: \"B:D\" | \"B:B,D:F\" | \"Sheet2!B:D\", width: 64 (pixels, max 1785) | chars: 8.43}",
             has_doc,
             col_width
         ),
         cmd!("home.autofitRowHeight", "AutoFit Row Height", ["Home", "Cells", "Format"], None, "{sheet?, rows?}", has_doc, autofit_rows),
         cmd!("home.autofitColumnWidth", "AutoFit Column Width", ["Home", "Cells", "Format"], None, "{sheet?, cols?}", has_doc, autofit_cols),
-        cmd!("home.defaultWidth", "Default Width…", ["Home", "Cells", "Format"], None, "{sheet?, width: 64 (pixels)}", has_doc, default_width),
+        cmd!(
+            "home.defaultWidth",
+            "Default Width…",
+            ["Home", "Cells", "Format"],
+            None,
+            "{sheet?, width: 64 (pixels, max 1785)}",
+            has_doc,
+            default_width
+        ),
         cmd!("home.hideRows", "Hide Rows", ["Home", "Cells", "Format", "Hide & Unhide"], Some("Cmd+9"), "{sheet?, rows?}", has_doc, |s, p| hide(
             s, p, true, true
         )),
@@ -1085,8 +1093,8 @@ fn row_height(s: &mut Session, p: &Json) -> Result<Json> {
 fn col_width(s: &mut Session, p: &Json) -> Result<Json> {
     let w = match (f64_param(p, "width"), f64_param(p, "chars")) {
         (Some(w), _) => {
-            if !(0.0..=1800.0).contains(&w) {
-                return Err(EngineError::Other("Column width must be between 0 and 1800 pixels.".into()));
+            if !(0.0..=max_col_width()).contains(&w) {
+                return Err(EngineError::Other(format!("Column width must be between 0 and {} pixels.", max_col_width())));
             }
             w
         }
@@ -1094,10 +1102,15 @@ fn col_width(s: &mut Session, p: &Json) -> Result<Json> {
             if !(0.0..=255.0).contains(&c) {
                 return Err(EngineError::Other("Column width must be between 0 and 255 characters.".into()));
             }
-            chars_to_points(c)
+            // 255 characters is the widest the file format stores (and reads back as 1785 px):
+            // a request for more pixels than that is the format's maximum, not a wider column.
+            chars_to_points(c).min(max_col_width())
         }
         _ => return Err(bad("home.columnWidth", "missing `width` (pixels) or `chars`")),
     };
+    // The file stores a width in 1/256 characters and a whole number of pixels, so a fractional
+    // one would silently change on the next save: keep the width the file will give back.
+    let w = w.round();
     let (si, lines) = line_targets(s, p, false)?;
     edit(s, |cx| {
         let sh = cx.sheet_mut(si)?;
@@ -1110,6 +1123,13 @@ fn col_width(s: &mut Session, p: &Json) -> Result<Json> {
         }
         Ok(Json::Null)
     })
+}
+
+/// The widest column the file format holds, in pixels: 255 characters (its maximum stored width)
+/// at 7 px each plus the 5 px of padding, which is the width the reader gives back as 1785 px. The
+/// 1800 px limit this replaces accepted widths the writer silently shrank on save.
+pub(crate) const fn max_col_width() -> f64 {
+    1785.0
 }
 
 /// Excel column width in characters (of the default font's digit width, 7 px) → pixels.
@@ -1188,7 +1208,7 @@ fn autofit_cols(s: &mut Session, p: &Json) -> Result<Json> {
                     }
                 }
                 if max > 0.0 {
-                    widths.push((c, max.clamp(8.0, 1785.0)));
+                    widths.push((c, max.clamp(8.0, max_col_width() as f32)));
                 }
             }
         }
@@ -1226,7 +1246,7 @@ fn default_width(s: &mut Session, p: &Json) -> Result<Json> {
     let w = f64_param(p, "width").ok_or_else(|| bad("home.defaultWidth", "missing `width`"))?;
     let si = target_sheet(s, p)?;
     edit(s, |cx| {
-        cx.sheet_mut(si)?.default_col_width = w.clamp(0.0, 1800.0) as f32;
+        cx.sheet_mut(si)?.default_col_width = w.clamp(0.0, max_col_width()).round() as f32;
         Ok(Json::Null)
     })
 }

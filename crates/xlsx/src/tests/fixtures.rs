@@ -670,6 +670,27 @@ fn user_defined_function_prefix_round_trips() {
     }
 }
 
+/// A written `defaultColWidth="0"` is the sheet's width, not a missing value: the reader used to
+/// drop it and keep 64, and then every column the writer sized from the default (a styled or hidden
+/// one) came back with an explicit width instead of none — `cols differ after reload` in the
+/// command-sequence fuzzer.
+#[test]
+fn a_zero_default_column_width_round_trips() {
+    let body = r#"<sheetFormatPr defaultColWidth="0" defaultRowHeight="15"/>
+      <cols><col min="1" max="1" width="0" hidden="1"/><col min="3" max="3" width="0" customWidth="1"/></cols>
+      <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    let s = wb.sheet(0).unwrap();
+    assert_eq!(s.default_col_width, 0.0, "the written default width is read back");
+    assert_eq!(s.cols.get(&0).map(|i| (i.size, i.hidden)), Some((None, true)), "a line at the default keeps no width");
+    assert_eq!(s.cols.get(&2).and_then(|i| i.size), Some(0.0), "customWidth pins a zero width");
+
+    let (back, _) = read_xlsx(&crate::write_xlsx(&wb).unwrap()).unwrap();
+    let b = back.sheet(0).unwrap();
+    assert_eq!(b.default_col_width, 0.0);
+    assert_eq!(b.cols, s.cols, "cols differ after reload");
+}
+
 /// `customWidth="1"` pins a column even when its width rounds to the default: Standard Width does not
 /// move it, and a save must keep its `<col>` (openpyxl writes 9.08 for Excel's 8.43, #1607).
 #[test]

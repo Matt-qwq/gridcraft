@@ -305,16 +305,22 @@ pub fn col_width_to_px(w: f64) -> f32 {
 
 /// Model width (px) → stored column width.
 pub fn px_to_col_width(px: f32) -> f64 {
-    let px = (px.max(0.0) as f64).round().min(1790.0);
+    // 1785 px is the widest a stored width reads back as: `col_width_to_px` caps the file's 255
+    // characters at 255, so a wider request can only be written out of the format's range (the
+    // old 1790 clamp stored 255.6 characters for it). The engine refuses such widths anyway.
+    let px = (px.max(0.0) as f64).round().min(1785.0);
     let back = |w: f64| col_width_to_px(w) as f64;
     let chars = if px > 12.0 { ((px - 5.0) / 7.0 * 100.0 + 0.5).trunc() / 100.0 } else { px / 12.0 };
     let w = ((chars * 7.0 + 5.0) / 7.0 * 256.0).trunc() / 256.0;
+    // 255 characters is the format's maximum stored width: the 5 px of padding can push the last
+    // pixel past it, and the reader caps it there anyway (255 chars = 1785 px).
+    let w = w.min(255.0);
     if back(w) == px {
         return w;
     }
     // Smallest stored width that reads back as `px`.
     let s = (px * 256.0 / 7.0 - 18.0).ceil().max(0.0);
-    s / 256.0
+    (s / 256.0).min(255.0)
 }
 
 /// Row height in typographic points → model px.
@@ -339,6 +345,17 @@ mod tests {
         assert_eq!(px_to_col_width(64.0), 9.140625);
         for px in 0..400 {
             assert_eq!(col_width_to_px(px_to_col_width(px as f32)), px as f32, "px {px}");
+        }
+        // The format stores at most 255 characters, which reads back as 1785 px. Everything up to
+        // that round-trips; a wider request (a model typed before the width limit existed) is the
+        // maximum, never a stored width past 255 characters that would read back narrower.
+        for px in 0..=1785u32 {
+            assert_eq!(col_width_to_px(px_to_col_width(px as f32)), px as f32, "px {px}");
+        }
+        for px in [1786.0, 1790.0, 1800.0, 5_000.0] {
+            let w = px_to_col_width(px);
+            assert!(w <= 255.0, "{px} px stored as {w} characters");
+            assert_eq!(col_width_to_px(w), 1785.0, "{px} px reads back as the maximum");
         }
         assert_eq!(pt_to_px(15.0), 20.0);
         assert_eq!(px_to_pt(20.0), 15.0);

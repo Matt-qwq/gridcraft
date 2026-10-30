@@ -4295,21 +4295,25 @@ fn row_height_and_column_width_take_pixels_or_excel_units() {
         assert!(xml.contains(row), "{row} missing from {xml}");
     }
 
-    // Out of range, the message gives the limit in the unit that was passed.
+    // Out of range, the message gives the limit in the unit that was passed. A column width the
+    // file cannot store (past 255 characters, 1785 px) is refused rather than shrunk on save.
     for (id, params, message) in [
         ("home.rowHeight", json!({"height": 547}), "Row height must be between 0 and 546 pixels (409.5 points)."),
         ("home.rowHeight", json!({"points": 410}), "Row height must be between 0 and 409.5 points."),
-        ("home.columnWidth", json!({"width": 1801}), "Column width must be between 0 and 1800 pixels."),
+        ("home.columnWidth", json!({"width": 1786}), "Column width must be between 0 and 1785 pixels."),
         ("home.columnWidth", json!({"chars": 256}), "Column width must be between 0 and 255 characters."),
     ] {
         assert_eq!(s.execute(id, params).unwrap_err().to_string(), message);
     }
+    // 255 characters is the format's maximum stored width; the model's equivalent is 1785 px.
+    s.execute("home.columnWidth", json!({"cols": "C:C", "chars": 255})).unwrap();
+    assert_eq!(s.doc().unwrap().wb.active().unwrap().col_width(2), 1785.0);
 
     // The parameter docs agents read (`list_commands`) name the unit.
     for (id, unit) in [
         ("home.rowHeight", "height: 20 (pixels) | points: 15"),
-        ("home.columnWidth", "width: 64 (pixels) | chars: 8.43"),
-        ("home.defaultWidth", "width: 64 (pixels)"),
+        ("home.columnWidth", "width: 64 (pixels, max 1785) | chars: 8.43"),
+        ("home.defaultWidth", "width: 64 (pixels, max 1785)"),
     ] {
         let params = s.commands().into_iter().find(|c| c.id == id).map(|c| c.params).unwrap_or_default();
         assert!(params.contains(unit), "{id}: {params}");

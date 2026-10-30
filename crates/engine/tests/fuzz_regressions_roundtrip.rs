@@ -15,7 +15,7 @@ use gridcraft_core::CellRef;
 use gridcraft_engine::Session;
 use gridcraft_engine::calc::Calc;
 use gridcraft_engine::io;
-use gridcraft_engine::model::{Sheet, Workbook};
+use gridcraft_engine::model::{Sheet, Style, StyleId, Workbook};
 use serde_json::json;
 
 fn at(address: &str) -> CellRef {
@@ -51,6 +51,21 @@ fn legacy_arrays(sheet: &Sheet) -> Vec<(String, String)> {
     sheet.cells.iter().filter_map(|(c, cell)| cell.formula.as_ref().and_then(|f| f.array).map(|r| (c.a1(), r.a1()))).collect()
 }
 
+/// The column properties a save and reload must give back, styles by content (the file renumbers
+/// them), the way the fuzz harness's `kept_lines` compares them.
+fn kept_cols(sheet: &Sheet, styles: &gridcraft_engine::model::StyleTable) -> Vec<(u32, bool, u8, bool, Option<Style>, Option<i64>)> {
+    sheet
+        .cols
+        .iter()
+        .filter_map(|(c, info)| {
+            let style = info.style.filter(|s| *s != StyleId::DEFAULT).map(|s| styles.get(s).clone());
+            let size = info.size.map(|px| px.round() as i64);
+            let content = info.hidden || info.outline > 0 || info.collapsed || style.is_some() || size.is_some();
+            content.then_some((c, info.hidden, info.outline.min(7), info.collapsed, style, size))
+        })
+        .collect()
+}
+
 #[test]
 fn a_legacy_array_too_big_to_lay_out_is_refused_and_leaves_the_cells_it_would_cover() {
     // Seeds 6: `home.insertSheet`, `edit.selectAll`, a value at the bottom of the sheet, then a
@@ -77,4 +92,52 @@ fn a_legacy_array_too_big_to_lay_out_is_refused_and_leaves_the_cells_it_would_co
     // Before the fix the entry succeeded and this value came back empty.
     let after = reload(&before);
     assert_eq!(value(&after, "K1048575"), "East", "the cell at the bottom of the sheet survives the save");
+}
+
+#[test]
+fn a_column_wider_than_the_file_can_store_is_refused_and_the_widest_it_can_is_kept() {
+    // Seeds 34 and 60: the command took up to 1800 px, the writer stores 255 characters at most
+    // (1785 px), so 1786..=1800 came back 1785 — memory and file disagreed.
+    let mut s = session();
+    let message =
+        s.execute("home.columnWidth", json!({"cols": "B:B", "width": 1786})).expect_err("the format cannot store a wider column").to_string();
+    assert!(message.contains("1785"), "{message}");
+
+    // The widest representable width, by pixels and by characters (255 is the format's maximum).
+    s.execute("home.columnWidth", json!({"cols": "B:B", "width": 1785})).expect("the widest width");
+    s.execute("home.columnWidth", json!({"cols": "C:C", "chars": 255})).expect("255 characters");
+    // A fractional width would be rounded by the writer: the model keeps the width it can return.
+    s.execute("home.columnWidth", json!({"cols": "D:D", "width": 100.6})).expect("a fractional width");
+
+    let before = workbook(&s);
+    let sheet = before.active().expect("sheet");
+    assert_eq!([sheet.col_width(1), sheet.col_width(2), sheet.col_width(3)], [1785.0, 1785.0, 101.0]);
+
+    let after = reload(&before);
+    let sheet = after.active().expect("sheet");
+    assert_eq!([sheet.col_width(1), sheet.col_width(2), sheet.col_width(3)], [1785.0, 1785.0, 101.0]);
+    assert_eq!(kept_cols(before.active().expect("sheet"), &before.styles), kept_cols(sheet, &after.styles), "cols differ after reload");
+}
+
+#[test]
+fn a_sheet_default_width_of_zero_keeps_its_columns_through_a_save() {
+    // Seeds 34 and 60, as the shrinker reduced them: `home.defaultWidth {"width": 0}` and a
+    // column line without a width of its own (`A:A` formatted). The reader ignored the written
+    // `defaultColWidth="0"` and kept 64, so every line the writer sized from the default (styled,
+    // hidden) came back with an explicit width instead of none.
+    let mut s = session();
+    s.execute("home.defaultWidth", json!({"width": 0.0})).expect("default width zero");
+    s.execute("home.numberFormat", json!({"range": "A:A", "format": "Percentage"})).expect("a styled column line");
+    s.execute("home.hideColumns", json!({"cols": "E:E"})).expect("a hidden column line");
+
+    let before = workbook(&s);
+    assert_eq!(before.active().expect("sheet").default_col_width, 0.0);
+
+    let after = reload(&before);
+    let sheet = after.active().expect("sheet");
+    assert_eq!(sheet.default_col_width, 0.0, "the written default width is read back");
+    assert_eq!(kept_cols(before.active().expect("sheet"), &before.styles), kept_cols(sheet, &after.styles), "cols differ after reload");
+    // The styled line still has no width of its own, and the hidden one is still hidden.
+    assert_eq!(sheet.cols.get(&0).map(|i| i.size), Some(None), "A has no width");
+    assert_eq!(sheet.cols.get(&4).map(|i| (i.size, i.hidden)), Some((None, true)), "E is hidden, not sized");
 }
