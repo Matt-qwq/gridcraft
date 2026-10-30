@@ -836,6 +836,17 @@ impl PassHost<'_> {
             }
             _ => v,
         };
+        // A formula that read its own cell — directly, or through a range read that came back to
+        // it — is circular now, not only when the pass ends: a formula evaluated after it reads
+        // the #CIRC! a full recalculation gives it, instead of a number computed from whatever the
+        // cell showed mid-pass. Two formulas that feed each other that way otherwise swap values
+        // every round until the round limit cuts the pass off in one of the two states.
+        let v = if !self.iterate && self.cycle_seen.contains(&k) {
+            self.spills.remove(&k);
+            Value::Error(CellError::Circ)
+        } else {
+            v
+        };
         self.results.insert(k, Slot { value: Some(v.clone()) });
         self.in_flight = self.in_flight.saturating_sub(1);
         v

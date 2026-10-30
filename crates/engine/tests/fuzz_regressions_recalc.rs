@@ -153,3 +153,26 @@ fn seed_229_a_defined_name_reading_a_discarded_spill_is_evaluated_again() {
     assert_eq!(formula(&s, "F54").as_deref(), Some("SUM(Totals)"));
     assert_eq!(value(&s, "F54"), Value::Number(0.0));
 }
+
+/// Seed 229 as the soak found it: the fill wrote `COUNTIF(D:D)` into D8:D14, counting the column
+/// that holds the formulas themselves. A formula that reads its own cell is circular, and it has
+/// to be circular for the formulas evaluated after it in the same pass too: the `SORT` and the
+/// `COUNTIF`s fed each other and the pass ended with the `SORT`'s array from the previous round.
+#[test]
+fn seed_229_a_formula_that_reads_its_own_cell_is_circular_in_the_same_pass() {
+    let mut s = session("budget");
+    run(&mut s, "edit.cut", json!({"range": "C21:E22"}));
+    run(&mut s, "edit.paste", json!({"at": "G5"}));
+    run(&mut s, "range.fill", json!({"input": "=COUNTIF(G:G,\">0\")", "range": "B8:F14"}));
+    run(&mut s, "home.deleteRows", json!({"rows": "14:14"}));
+    run(&mut s, "home.mergeAcross", json!({}));
+    run(&mut s, "edit.clearComments", json!({}));
+    run(&mut s, "edit.undo", json!({"steps": 3}));
+    run(&mut s, "home.insertRows", json!({"rows": "15:15"}));
+    run(&mut s, "cell.set", json!({"cell": "L12", "input": "=INDIRECT(\"I15\")"}));
+    run(&mut s, "cell.set", json!({"cell": "K16", "input": "=SORT(D7:G12)"}));
+
+    assert_recalc_agrees(&s);
+    assert_eq!(value(&s, "D8"), Value::Error(CellError::Circ));
+    assert_eq!(value(&s, "K16"), Value::Number(212.8));
+}
