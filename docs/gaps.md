@@ -276,6 +276,13 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   range from the dependency graph, so dynamic formulas and used-range readers are re-evaluated on any
   spill change); and `#SPILL!` after an edit moved the used range. Each has a direct regression test
   that asserts the two paths agree **and** the right value.
+- **Soak, save/reload (10-30):** an array entry over more cells than the evaluator lays out left the
+  array `#NUM!` while cells inside its declared range kept values that the reader's own array rule
+  drops — the entry is refused now (as Excel refuses it), so that state cannot be created; a written
+  `defaultColWidth="0"` was silently dropped by the reader, and `home.columnWidth` accepted widths
+  past the format's 255-character maximum, which were saved as 1785 px behind the user's back; the
+  legacy-array entry now marks every cell it clears as a change, so a formula reading part of the
+  range recalculates instead of keeping a value a full recalc disagrees with.
 - **Oracle suite (10-30):** `crates/calc/tests/formula_oracle.rs` runs **595 documented examples over
   275 functions** through the real calc path (`gridcraft_calc::evaluate`), plus dedicated tests for
   real spills, `#SPILL!` unblocking, the 1904 date system, 3-D references and qualified names. Each
