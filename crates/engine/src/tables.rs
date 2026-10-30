@@ -148,73 +148,87 @@ pub fn gallery() -> Vec<String> {
     v
 }
 
+/// The first `ColumnN` at or after `from` that `used` (lower-case names) does not hold.
+///
+/// At most `used.len()` names are taken, so one of the next `used.len() + 1` is free; the loop is
+/// bounded by that even when a table holds hostile names such as `Column18446744073709551615`.
+fn first_free_column(used: &std::collections::HashSet<String>, from: usize) -> String {
+    let start = from.max(1);
+    let end = start.saturating_add(used.len()).saturating_add(1);
+    (start..end).map(|n| format!("Column{n}")).find(|n| !used.contains(&n.to_lowercase())).unwrap_or_else(|| format!("Column{start}"))
+}
+
+/// The column names a table's header row must have, in column order, from the header cells' texts
+/// (`None` where a cell is blank). Names are unique and non-empty, and this is the rule the engine
+/// and the XLSX writer share, so the table in memory and the table in the file can never disagree:
+/// - a blank header takes the first free `ColumnN` at or after its position, so a table resized or
+///   grown over blank cells keeps counting (Column1, Column2, Column3…) even when it no longer
+///   starts at A, and never lands on a name an earlier column already has;
+/// - a name an earlier column already has takes the first free `{name}{k}` from 2 (`x`, `x2`,
+///   `x3`…), so a typed duplicate is renamed on the column that repeats it, by position — never
+///   silently on save, matched by some other rule.
+///
+/// `crates/xlsx/src/sheet_write.rs`'s `table_columns` applies the same repeated-name suffix for a
+/// table that arrives from a file; it repairs a malformed model, it is not how the engine names a
+/// table.
+pub(crate) fn header_names(texts: &[Option<String>]) -> Vec<String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(texts.len());
+    // The next suffix to try for a repeated name, so a wide header row stays linear.
+    let mut next: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(texts.len());
+    for (i, text) in texts.iter().enumerate() {
+        let base = match text.as_deref() {
+            Some(t) if !t.trim().is_empty() => t.to_string(),
+            _ => first_free_column(&used, i.saturating_add(1)),
+        };
+        let key = base.to_lowercase();
+        let mut name = base.clone();
+        let mut k = next.get(&key).copied().unwrap_or(2);
+        if used.contains(&key) {
+            // At most `i` names are used, so one of the next `i + 1` suffixes is free.
+            let last = k.saturating_add(i as u32).saturating_add(2);
+            loop {
+                let candidate = format!("{base}{k}");
+                k = k.saturating_add(1);
+                if !used.contains(&candidate.to_lowercase()) || k > last {
+                    name = candidate;
+                    break;
+                }
+            }
+        }
+        next.insert(key, k.max(2));
+        used.insert(name.to_lowercase());
+        out.push(name);
+    }
+    out
+}
+
 /// Editing a table's header row renames the column, as in Excel: an empty or repeated header
 /// gets a unique name written back into the cell, and structured references follow the rename.
+/// The whole header row is reconciled at once, because uniqueness is a property of the row: had
+/// this only looked at the cells that changed, a duplicate made by a structural edit (a resized
+/// table's blank column taking the name a neighbour already had) survived here and was renamed
+/// silently when the file was written, so `Column3` came back as `Column32`.
 pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
     if cx.wb.sheets.iter().all(|s| s.tables.is_empty()) {
         return;
     }
     // (sheet, table name, table range, old column name, new column name)
     let mut renames: Vec<(usize, String, RangeRef, String, String)> = Vec::new();
-    let heads: Vec<(usize, RangeRef)> = (0..cx.wb.sheets.len())
-        .flat_map(|si| cx.wb.sheet(si).into_iter().flat_map(move |sh| sh.tables.iter().filter(|t| t.header_row).map(move |t| (si, t.range))))
-        .map(|(si, r)| (si, RangeRef::new(r.start, CellRef::new(r.start.row, r.end.col))))
-        .collect();
-    // A structural edit can move anything into a header row: then every header is checked.
-    let changed: std::collections::BTreeSet<(usize, CellRef)> = if cx.structural {
-        heads.iter().flat_map(|(s, r)| r.iter().map(move |c| (*s, c))).collect()
-    } else {
-        cx.changed.iter().filter(|(si, c)| heads.iter().any(|(s, r)| s == si && r.contains(*c))).copied().collect()
-    };
-    // Per table: lower-case column name → column, and the next number to try for a repeated name
-    // (both kept up to date, so a wide header row stays linear).
-    type Names = (std::collections::HashMap<String, usize>, std::collections::HashMap<String, usize>);
-    let mut names: std::collections::HashMap<(usize, usize), Names> = std::collections::HashMap::new();
-    for (si, c) in changed {
+    // Every table whose header row to reconcile: all of them after a structural edit (it can move
+    // anything into a header row), else the ones a changed cell falls in.
+    let mut targets: Vec<(usize, usize)> = Vec::new();
+    for si in 0..cx.wb.sheets.len() {
         let Some(sh) = cx.wb.sheet(si) else { continue };
-        let Some(ti) = sh.tables.iter().position(|t| t.header_row && c.row == t.range.start.row && t.range.contains(c)) else { continue };
-        let Some(t) = sh.tables.get(ti) else { continue };
-        let col = (c.col - t.range.start.col) as usize;
-        let Some(old) = t.columns.get(col).map(|x| x.name.clone()) else { continue };
-        // A text header names its column as it is: a number format only changes how it looks (an
-        // accounting format pads text with spaces), and the file writes the name into the cell.
-        let value = sh.value(c);
-        let text = match value.as_text() {
-            Some(t) => t.to_string(),
-            None => crate::display::cell_text(&cx.wb, sh, c),
-        };
-        // Headers hold constant text: a formula (or a spilled value) there becomes its text.
-        let is_text = value.is_text() && sh.cell(c).is_some_and(|x| x.formula.is_none());
-        if text == old && is_text {
-            continue;
+        for (ti, t) in sh.tables.iter().enumerate() {
+            let hit = cx.structural || cx.changed.iter().any(|(s, c)| *s == si && c.row == t.range.start.row && t.range.contains(*c));
+            if hit && t.header_row {
+                targets.push((si, ti));
+            }
         }
-        let (taken, next) = names
-            .entry((si, ti))
-            .or_insert_with(|| (t.columns.iter().enumerate().map(|(i, x)| (x.name.to_lowercase(), i)).collect(), Default::default()));
-        if taken.get(&old.to_lowercase()) == Some(&col) {
-            taken.remove(&old.to_lowercase());
-        }
-        let base = if text.trim().is_empty() { format!("Column{}", col + 1) } else { text.clone() };
-        let k = next.entry(base.to_lowercase()).or_insert(2);
-        let mut name = base.clone();
-        while taken.contains_key(&name.to_lowercase()) {
-            name = format!("{base}{k}");
-            *k += 1;
-        }
-        taken.insert(name.to_lowercase(), col);
-        let (table, range) = (t.name.clone(), t.range);
-        let Some(sh) = cx.wb.sheet_mut(si) else { continue };
-        if let Some(x) = sh.tables.get_mut(ti).and_then(|t| t.columns.get_mut(col)) {
-            x.name = name.clone();
-        }
-        // Headers are text: a number typed there, or a generated name, is written back as text.
-        if name != text || !is_text {
-            let style = sh.style_id(c);
-            sh.cells.set(c, Cell { value: gridcraft_core::Value::text(name.as_str()), style, ..Default::default() });
-        }
-        if !old.eq_ignore_ascii_case(&name) {
-            renames.push((si, table, range, old, name));
-        }
+    }
+    for (si, ti) in targets {
+        sync_table_headers(cx, si, ti, &mut renames);
     }
     if renames.is_empty() {
         return;
@@ -253,6 +267,72 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
         }
     }
     cx.structural = true;
+}
+
+/// Reconciles one table's column names with its header cells and records the renames, so
+/// structured references can follow them.
+fn sync_table_headers(cx: &mut crate::cmd::Ctx, si: usize, ti: usize, renames: &mut Vec<(usize, String, RangeRef, String, String)>) {
+    let Some(sh) = cx.wb.sheet(si) else { return };
+    let Some(t) = sh.tables.get(ti) else { return };
+    if !t.header_row {
+        return;
+    }
+    let (range, table) = (t.range, t.name.clone());
+    let old: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
+    // Each header's text and whether it is constant text. A number format only changes how a text
+    // header looks (an accounting format pads it with spaces); anything else — a number, a formula
+    // or a spilled value — becomes its text, because a header holds constant text.
+    let mut texts: Vec<Option<String>> = Vec::with_capacity(range.width() as usize);
+    let mut is_text: Vec<bool> = Vec::with_capacity(range.width() as usize);
+    for c in range.start.col..=range.end.col {
+        let value = sh.value(CellRef::new(range.start.row, c));
+        let constant = value.is_text() && sh.cell(CellRef::new(range.start.row, c)).is_some_and(|x| x.formula.is_none());
+        texts.push(match value.as_text() {
+            Some(t) => Some(t.to_string()),
+            None => Some(crate::display::cell_text(&cx.wb, sh, CellRef::new(range.start.row, c))),
+        });
+        is_text.push(constant);
+    }
+    let names = header_names(&texts);
+    // (column offset, name, whether the cell must be written back). A column the model does not
+    // have (a hostile file's table part can name fewer columns than its range is wide) keeps its
+    // name out of the table; the writer then treats it as blank.
+    let mut plan: Vec<(usize, String, bool)> = Vec::new();
+    for (i, name) in names.into_iter().enumerate() {
+        let Some(old_name) = old.get(i) else { continue };
+        let text = texts.get(i).and_then(|t| t.as_deref()).unwrap_or_default();
+        let write = name != text || !is_text.get(i).copied().unwrap_or(false);
+        if *old_name == name && !write {
+            continue;
+        }
+        plan.push((i, name, write));
+    }
+    if plan.is_empty() {
+        return;
+    }
+    let Some(sh) = cx.wb.sheet_mut(si) else { return };
+    if let Some(t) = sh.tables.get_mut(ti) {
+        for (i, name, _) in &plan {
+            if let Some(c) = t.columns.get_mut(*i) {
+                c.name = name.clone();
+            }
+        }
+    }
+    for (i, name, write) in &plan {
+        if !*write {
+            continue;
+        }
+        let cell = CellRef::new(range.start.row, range.start.col.saturating_add(*i as u32));
+        let style = sh.style_id(cell);
+        sh.cells.set(cell, Cell { value: gridcraft_core::Value::text(name.as_str()), style, ..Default::default() });
+    }
+    for (i, name, _) in &plan {
+        if let Some(old_name) = old.get(*i)
+            && !old_name.eq_ignore_ascii_case(name)
+        {
+            renames.push((si, table.clone(), range, old_name.clone(), name.clone()));
+        }
+    }
 }
 
 #[cfg(test)]
