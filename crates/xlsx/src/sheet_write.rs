@@ -77,6 +77,26 @@ pub(crate) fn table_is_written(t: &Table) -> bool {
     t.range.height() > t.header_row as u32 + t.totals_row as u32 || (t.header_row && t.range.height() > t.totals_row as u32)
 }
 
+/// Writes a chart's own style and colour parts beside its part (`style{n}.xml`, `colors{n}.xml`,
+/// numbered like the chart part) and returns the chart part's relationships to them. `kept` holds
+/// the parts the file had: a chart part that is kept or patched keeps them byte for byte, because a
+/// style part describes the chart's look, not its data. A chartex part always gets both parts (Excel
+/// expects them), falling back to the defaults; a classic part gets none it did not have.
+fn write_style_parts(out: &mut Out, n: u32, chartex: bool, kept: (Option<&str>, Option<&str>)) -> Rels {
+    let mut rels = Rels::default();
+    let style = kept.0.map(str::to_string).or_else(|| chartex.then(crate::chartex::style_xml));
+    let colors = kept.1.map(str::to_string).or_else(|| chartex.then(crate::chartex::colors_xml));
+    if let Some(style) = style {
+        out.part(&format!("xl/charts/style{n}.xml"), Some(crate::chartex::CT_STYLE), style.into_bytes());
+        rels.add_uri(crate::chartex::REL_STYLE, &format!("style{n}.xml"));
+    }
+    if let Some(colors) = colors {
+        out.part(&format!("xl/charts/colors{n}.xml"), Some(crate::chartex::CT_COLORS), colors.into_bytes());
+        rels.add_uri(crate::chartex::REL_COLORS, &format!("colors{n}.xml"));
+    }
+    rels
+}
+
 pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slicers: &crate::slicer::SlicerWriter) -> (String, Rels) {
     let mut rels = Rels::default();
     let Some(sheet) = wb.sheet(si) else { return (String::new(), rels) };
@@ -566,21 +586,21 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
         }
         for ch in &sheet.charts {
             out.charts += 1;
+            let n = out.charts;
             let rid = if ch.kind.is_chartex() {
-                let n = out.charts;
-                let xml = crate::chartex::write_chartex(wb, si, ch, &mut out.chart_names);
-                out.part(&format!("xl/charts/chartEx{n}.xml"), Some(crate::chartex::CT_CHARTEX), xml.into_bytes());
-                // Excel expects a chartex part's style and colour parts.
-                out.part(&format!("xl/charts/style{n}.xml"), Some(crate::chartex::CT_STYLE), crate::chartex::style_xml().into_bytes());
-                out.part(&format!("xl/charts/colors{n}.xml"), Some(crate::chartex::CT_COLORS), crate::chartex::colors_xml().into_bytes());
-                let mut crels = Rels::default();
-                crels.add_uri(crate::chartex::REL_STYLE, &format!("style{n}.xml"));
-                crels.add_uri(crate::chartex::REL_COLORS, &format!("colors{n}.xml"));
+                let written = crate::chartex::write_chartex(wb, si, ch, &mut out.chart_names);
+                out.part(&format!("xl/charts/chartEx{n}.xml"), Some(crate::chartex::CT_CHARTEX), written.xml.into_bytes());
+                // A file's own style and colour parts are kept; a regenerated part gets the defaults.
+                let crels = write_style_parts(out, n, true, (written.style.as_deref(), written.colors.as_deref()));
                 out.part(&format!("xl/charts/_rels/chartEx{n}.xml.rels"), None, crels.xml().into_bytes());
                 drels.add_uri(crate::chartex::REL_CHARTEX, &format!("../charts/chartEx{n}.xml"))
             } else {
-                let name = format!("xl/charts/chart{}.xml", out.charts);
-                out.part(&name, Some(CT_CHART), crate::chart::write_chart(wb, si, ch, &out.book_name).into_bytes());
+                let written = crate::chart::write_chart(wb, si, ch, &out.book_name);
+                out.part(&format!("xl/charts/chart{n}.xml"), Some(CT_CHART), written.xml.into_bytes());
+                let crels = write_style_parts(out, n, false, (written.style.as_deref(), written.colors.as_deref()));
+                if !crels.is_empty() {
+                    out.part(&format!("xl/charts/_rels/chart{n}.xml.rels"), None, crels.xml().into_bytes());
+                }
                 drels.add("chart", &format!("../charts/chart{}.xml", out.charts))
             };
             objs.push(Obj::Chart(ch, rid));
@@ -590,16 +610,17 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
             let n = out.charts;
             let rid = if ch.chartex {
                 out.part(&format!("xl/charts/chartEx{n}.xml"), Some(crate::chartex::CT_CHARTEX), ch.xml.as_bytes().to_vec());
-                out.part(&format!("xl/charts/style{n}.xml"), Some(crate::chartex::CT_STYLE), crate::chartex::style_xml().into_bytes());
-                out.part(&format!("xl/charts/colors{n}.xml"), Some(crate::chartex::CT_COLORS), crate::chartex::colors_xml().into_bytes());
-                let mut crels = Rels::default();
-                crels.add_uri(crate::chartex::REL_STYLE, &format!("style{n}.xml"));
-                crels.add_uri(crate::chartex::REL_COLORS, &format!("colors{n}.xml"));
+                // The part is kept whole, so its look goes with it.
+                let crels = write_style_parts(out, n, true, (ch.style.as_deref(), ch.colors.as_deref()));
                 out.part(&format!("xl/charts/_rels/chartEx{n}.xml.rels"), None, crels.xml().into_bytes());
                 drels.add_uri(crate::chartex::REL_CHARTEX, &format!("../charts/chartEx{n}.xml"))
             } else {
                 // Byte for byte as read: GridCraft does not model this chart's kind.
                 out.part(&format!("xl/charts/chart{n}.xml"), Some(CT_CHART), ch.xml.as_bytes().to_vec());
+                let crels = write_style_parts(out, n, false, (ch.style.as_deref(), ch.colors.as_deref()));
+                if !crels.is_empty() {
+                    out.part(&format!("xl/charts/_rels/chart{n}.xml.rels"), None, crels.xml().into_bytes());
+                }
                 drels.add("chart", &format!("../charts/chart{n}.xml"))
             };
             objs.push(Obj::RawChart(ch, rid));

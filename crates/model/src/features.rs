@@ -682,6 +682,10 @@ pub struct ChartPart {
     /// reading workbook defined them. A chartex part refers to its data through these names, so a
     /// kept part is only valid while the names are written again.
     names: Vec<(String, String)>,
+    /// The chart's own style and colour parts (`xl/charts/styleN.xml`, `colorsN.xml`), as the file
+    /// held them. They describe the chart's look, not its data, so a patched chart part keeps them.
+    style: Option<std::sync::Arc<str>>,
+    colors: Option<std::sync::Arc<str>>,
 }
 
 impl ChartPart {
@@ -706,6 +710,10 @@ pub struct KeptChart {
     pub xml: std::sync::Arc<str>,
     /// A `chartEx` part (Office 2016 and later), drawn through a `mc:AlternateContent` frame.
     pub chartex: bool,
+    /// The chart's own style and colour parts (`xl/charts/styleN.xml`, `colorsN.xml`), written back
+    /// with it byte for byte.
+    pub style: Option<std::sync::Arc<str>>,
+    pub colors: Option<std::sync::Arc<str>>,
 }
 
 impl std::fmt::Debug for KeptChart {
@@ -916,7 +924,24 @@ impl Chart {
     pub fn keep_part(&mut self, xml: std::sync::Arc<str>) {
         let mut as_read = self.clone();
         as_read.part = None;
-        self.part = Some(Box::new(ChartPart { xml, as_read: Box::new(as_read), names: Vec::new() }));
+        self.part = Some(Box::new(ChartPart { xml, as_read: Box::new(as_read), names: Vec::new(), style: None, colors: None }));
+    }
+
+    /// Keeps the chart's own style and colour parts (`styleN.xml`, `colorsN.xml`) with its chart
+    /// part. They do not depend on the chart's data, so an edit that only patches the part keeps
+    /// them; a chart part regenerated from the model drops them.
+    pub fn keep_style_parts(&mut self, style: Option<std::sync::Arc<str>>, colors: Option<std::sync::Arc<str>>) {
+        let Some(part) = self.part.as_deref_mut() else { return };
+        part.style = style;
+        part.colors = colors;
+    }
+
+    /// The kept style and colour parts, as the file held them (`None` for one the file had not).
+    pub fn kept_style_parts(&self) -> (Option<&str>, Option<&str>) {
+        match self.part.as_deref() {
+            Some(part) => (part.style.as_deref(), part.colors.as_deref()),
+            None => (None, None),
+        }
     }
 
     /// Records the workbook's hidden chartex names (`_xlchart.v1.3` → `Data!$B$2:$B$5`) on the kept

@@ -9,6 +9,8 @@ use gridcraft_formula::{Expr, SheetSel};
 use gridcraft_model::{Anchor, AxisOptions, Chart, ChartKind, LabelOptions, LegendPos, QuartileMethod, Series, Workbook};
 
 use crate::drawing::{dml_color, srgb};
+use crate::package::Rel;
+use crate::read::Ctx;
 use crate::xml::{El, esc, esc_attr};
 
 pub const CT_CHARTEX: &str = "application/vnd.ms-office.chartex+xml";
@@ -17,6 +19,51 @@ pub const CT_STYLE: &str = "application/vnd.ms-office.chartstyle+xml";
 pub const CT_COLORS: &str = "application/vnd.ms-office.chartcolorstyle+xml";
 pub const REL_STYLE: &str = "http://schemas.microsoft.com/office/2011/relationships/chartStyle";
 pub const REL_COLORS: &str = "http://schemas.microsoft.com/office/2011/relationships/chartColorStyle";
+
+/// Most bytes kept from a chart's own style or colour part. Excel's are a few kilobytes; the cap
+/// only keeps a hostile file from making an open hold megabytes for one chart.
+pub const MAX_STYLE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The chart part's own style and colour parts (`styleN.xml`, `colorsN.xml`), as the package holds
+/// them. They are written back beside the chart part, which is how a file's chart keeps its look.
+/// A part that is missing, too large, not UTF-8 or not XML is left out with a warning, so the
+/// writer falls back to a default for it and the package stays valid.
+pub fn read_style_parts(cx: &mut Ctx<'_>, rels: &[Rel]) -> (Option<std::sync::Arc<str>>, Option<std::sync::Arc<str>>) {
+    fn one(cx: &mut Ctx<'_>, rels: &[Rel], kind: &str) -> Option<std::sync::Arc<str>> {
+        let rel = rels.iter().find(|r| !r.external && r.kind == kind)?;
+        let target = rel.target.clone();
+        let bytes = match cx.pkg.read_limited(&target, MAX_STYLE_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                cx.warn(format!("missing part {target}"));
+                return None;
+            }
+            Err(crate::IoError::TooLarge(m)) => {
+                cx.warn(format!("skipped {target}: {m}"));
+                return None;
+            }
+            Err(e) => {
+                cx.warn(format!("skipped {target}: {e}"));
+                return None;
+            }
+        };
+        // Kept as text and written back as bytes: only a part that is already UTF-8 survives a
+        // round trip byte for byte, so a UTF-16 one is left to the default instead.
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                cx.warn(format!("skipped {target}: not UTF-8"));
+                return None;
+            }
+        };
+        if let Err(e) = crate::xml::parse(&bytes) {
+            cx.warn(format!("skipped {target}: {e}"));
+            return None;
+        }
+        Some(std::sync::Arc::from(text))
+    }
+    (one(cx, rels, "chartStyle"), one(cx, rels, "chartColorStyle"))
+}
 
 #[path = "chartex_patch.rs"]
 mod chartex_patch;
@@ -304,13 +351,15 @@ pub(crate) fn accent(i: usize) -> String {
 }
 
 /// Chartex part XML for a model chart on sheet `si`. The references it uses are appended to
-/// `names` (see [`NAME_PREFIX`]).
-pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<String>) -> String {
+/// `names` (see [`NAME_PREFIX`]). With the part come the chart's own style and colour parts: kept
+/// from the file while the part is kept or patched, dropped when it has to be regenerated.
+pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<String>) -> crate::chart::ChartXml {
     // A part read from a file is written back as it was when nothing changed, and patched field by
     // field when something the part stores changed: everything GridCraft does not model in it
     // survives. A change it cannot express regenerates the part from the model.
     if let Some(text) = kept_part(wb, si, ch, names) {
-        return text;
+        let (style, colors) = ch.kept_style_parts();
+        return crate::chart::ChartXml { xml: text, style: style.map(str::to_string), colors: colors.map(str::to_string) };
     }
     let hierarchy = matches!(ch.kind, ChartKind::Treemap | ChartKind::Sunburst);
     let mut s = String::from(
@@ -429,7 +478,9 @@ pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<Strin
         s,
         "</cx:chart><cx:spPr><a:solidFill><a:schemeClr val=\"bg1\"/></a:solidFill><a:ln w=\"9525\"><a:solidFill>{GREY}</a:solidFill></a:ln></cx:spPr></cx:chartSpace>"
     );
-    s
+    // A part regenerated from the model gets the default style: the file's style and colour parts
+    // described a chart whose kind or series changed, so they no longer fit it.
+    crate::chart::ChartXml { xml: s, style: None, colors: None }
 }
 
 /// The model as the chartex part read it, with its hidden `_xlchart` names resolved to references
