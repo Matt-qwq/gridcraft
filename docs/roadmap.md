@@ -818,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | major | A whole-column/row fill narrows to its own lines' content (one stray far cell used to make a `Ctrl+D` over two columns write 2.1M cells; soak seed 415 s → 5 s), `pasteSpecial`'s moved-cell lookup is a map (O(cells²) → linear); three time regressions with 10× budgets, and the measured scaling/memory recorded in gaps §2 |
 | 2026-10-30 | minor | Chart style/colour parts kept byte-identically (chartex and classic); per-point label prefix proven not expressible and retired; #4 → 0–2 h, beta ~75–134 h |
 | 2026-10-30 | trivial | Soak harness: per-seed time budget reported as `slow`, wall clock always printed, full capture file, `GRIDCRAFT_FUZZ_REPLAY` |
 | 2026-10-30 | minor | Table header names get one in-memory rule and the whole header row is reconciled after a structural edit, so the writer's repair can no longer rename a column behind the model's back |
