@@ -140,6 +140,15 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   estimate is superseded by those waves.
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)
+- **Landed (10-30, fills and pastes):** a whole-row/whole-column fill narrowed its target to the
+  *sheet's* used-range box, so one stray cell far down the sheet made `Ctrl+D` over two columns write
+  1,048,576 rows (2,097,102 cells where the sheet held 84, 830 ms); it now narrows to the content in
+  **its own lines** (spilled arrays included), 50 cells in under a millisecond. `pasteSpecial`
+  looked a moved cell up by scanning a list (`O(cells²)`): 25/90/332/1,322 ms at 10k/20k/40k/80k rows
+  → 10/20/67/97 ms. Both pinned by time tests with 10× budgets. Measured with them: structural edits
+  scale linearly (delete an empty column 0.42/2.4/18.7/32.9 ms at 20k/200k/1M/2.1M cells; a filled one
+  2.6/25.1/157/293 ms), 2.1M unique cells hold 171 MB (≈75 B/cell), and a **save transiently doubles
+  cell memory** because the writer serialises through a second, unshared copy.
 - **Landed (10-29):** pass-through keeps slicers and their caches, timelines and their caches,
   table-attached query tables, and unknown `extLst` children on the workbook, worksheet, table,
   PivotTable and pivot cache definition. Part bytes come back byte-identical, rels are re-pointed
