@@ -1025,7 +1025,7 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
             }
             *style_map.entry(id).or_insert_with(|| wb.styles.intern(src_wb.styles.get(id).clone()))
         };
-        let mut moved_formulas = Vec::new();
+        let mut moved_formulas: std::collections::BTreeMap<CellRef, Cell> = std::collections::BTreeMap::new();
         let mut moved_pictures = std::collections::BTreeMap::new();
         if cut_move {
             // Remove the source first (contents and formats), and fix references to it.
@@ -1042,7 +1042,7 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
             for (c, _) in &taken {
                 cx.touch(clip.sheet, *c);
             }
-            moved_formulas = taken;
+            moved_formulas = taken.into_iter().collect();
         }
         for tr in 0..tiles_r {
             for tc in 0..tiles_c {
@@ -1051,8 +1051,7 @@ fn paste_special(s: &mut Session, p: &Json) -> Result<Json> {
                         let sc = CellRef::new(src.start.row + r, src.start.col + c);
                         let (dr, dc) = if transpose { (c, r) } else { (r, c) };
                         let Some(dest) = at.offset((tr * h + dr) as i64, (tc * w + dc) as i64) else { continue };
-                        let src_cell =
-                            if cut_move { moved_formulas.iter().find(|(k, _)| *k == sc).map(|(_, v)| v.clone()) } else { src_sheet.cell(sc) };
+                        let src_cell = if cut_move { moved_formulas.get(&sc).cloned() } else { src_sheet.cell(sc) };
                         let src_val = src_sheet.value(sc);
                         let src_picture = if cut_move { moved_pictures.get(&sc) } else { src_sheet.cell_pictures.get(&sc) }.cloned();
                         if skip_blanks && src_picture.is_none() && src_val.is_empty() && src_cell.as_ref().is_none_or(|x| x.formula.is_none()) {
@@ -1410,7 +1409,7 @@ fn fill_dir(s: &mut Session, p: &Json, dr: i64, dc: i64) -> Result<Json> {
     let mut r = target_range(s, p)?;
     // Whole rows or columns fill only where the sheet has content (nothing on an empty sheet).
     if r.is_full_cols() || r.is_full_rows() {
-        match s.doc()?.wb.sheet(sheet).and_then(|sh| sh.used_range()).and_then(|u| r.intersection(&u)) {
+        match s.doc()?.wb.sheet(sheet).and_then(|sh| content_in_lines(sh, r)) {
             Some(u) => r = u,
             None => return Ok(Json::Null),
         }
@@ -1438,6 +1437,29 @@ fn fill_dir(s: &mut Session, p: &Json, dr: i64, dc: i64) -> Result<Json> {
         crate::fill::fill(cx, sheet, src, r, crate::fill::FillMode::Copy)?;
         Ok(Json::Null)
     })
+}
+
+/// The content a whole-row/whole-column fill covers: the data in the lines being filled, not the
+/// sheet's used-range box. The box is a bounding rectangle, so one cell at the bottom of another
+/// column made `Fill Down` on two columns write a million rows (and, from the commit that added
+/// the narrowing: "Fill Up and Fill Left ... filled up to row 1,048,576 even when the sheet had
+/// data").
+fn content_in_lines(sh: &crate::model::Sheet, r: RangeRef) -> Option<RangeRef> {
+    let mut out: Option<RangeRef> = None;
+    let mut add = |x: RangeRef| match out {
+        Some(u) => out = Some(u.union(&x)),
+        None => out = Some(x),
+    };
+    for (c, _) in sh.cells.iter_range(r) {
+        add(RangeRef::cell(c));
+    }
+    // A spilled array's cells are content without being stored cells.
+    for sr in sh.spill_ranges.values() {
+        if let Some(x) = sr.intersection(&r) {
+            add(x);
+        }
+    }
+    out
 }
 
 fn auto_fill(s: &mut Session, p: &Json) -> Result<Json> {
