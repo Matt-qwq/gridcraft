@@ -24,14 +24,54 @@
 //! Knobs (environment variables):
 //! - `GRIDCRAFT_FUZZ_SEEDS` (default 6) and `GRIDCRAFT_FUZZ_STEPS` (default 40): the budget. Soak with
 //!   `GRIDCRAFT_FUZZ_SEEDS=200 GRIDCRAFT_FUZZ_STEPS=200 cargo test --release -p gridcraft-engine --test command_sequence_fuzz`.
+//! - `GRIDCRAFT_FUZZ_SEED_BUDGET_MS` (default 20000, `0` disables): the wall clock one seed may take.
+//!   A seed that runs past it is cut *between* steps and reported `slow` with the step it was cut at
+//!   and the time it took, instead of stalling the run (see "cutting a seed" below).
 //! - `GRIDCRAFT_FUZZ_SEED=17`: replay that one seed (the failure message prints the command line).
+//! - `GRIDCRAFT_FUZZ_REPLAY=<path>`: replay a capture file a failing run wrote, instead of generating
+//!   sequences. Takes precedence over the seeds and steps, and a replay the budget cuts fails: a
+//!   sequence that did not reach its end has proven nothing.
 //! - `GRIDCRAFT_FUZZ_SHRINK=1`: on failure, shrink the sequence to a minimal list of commands that
 //!   still fails the same way, printed as `execute` calls ready for a regression test.
 //! - `GRIDCRAFT_FUZZ_KEEP_GOING=1`: report every failing seed instead of stopping at the first.
 //! - `GRIDCRAFT_FUZZ_TRACE=1`: print each step before running it, so a hang names its command.
+//!
+//! Every run prints one summary line, whatever the outcome:
+//! `soak: 30 seeds × 100 steps, 41.7 s wall, 0 invariant failures, 0 slow seeds, slowest seed 12 (3102 ms)`
+//! so a green run that took two hours and cut eight seeds cannot pass for a green run that took
+//! twenty minutes. (Test output is captured on a green test: `-- --nocapture` or
+//! `RUST_TEST_NOCAPTURE=1` shows it.)
+//!
+//! A failure report writes the whole sequence to a capture file under the OS temp dir (the path is
+//! printed) and shows only the first and last few steps inline: `#` metadata lines (seed, sample,
+//! planned and captured steps, the invariant) followed by one step per line, `id json`, starting from
+//! the workbook `file.new` opens for that sample.
+//!
+//! Seeds are not portable: a sequence is drawn from the registered commands in registration order
+//! (`command_specs()`), so adding, renaming, removing or reordering a command changes every seed's
+//! sequence, and `GRIDCRAFT_FUZZ_SEED=<n>` only reproduces a run at the commit that generated it. The
+//! capture file is the durable artefact: `GRIDCRAFT_FUZZ_REPLAY=<path>` replays it verbatim against
+//! the current tree, with the same checks and the same report, so a soak failure stays usable after
+//! the command set changes.
+//!
+//! Cutting a seed: the budget is checked before each step, after the previous step's command and all
+//! of its checks (structure, recalculation, the XLSX round-trip when due) have passed. It cannot turn
+//! a failure into a pass at the step it cut at, and a failure in the step that crosses the budget is
+//! still reported as that invariant — a real failure always wins over `slow`. A cut seed still runs
+//! its end-of-episode checks (undo everything, redo everything, one save and reload), which cost what
+//! the steps already run cost; a failure there is likewise reported as a failure, not as the cut.
+//! What a cut does not check is the steps after it, so a `slow` seed is not an invariant failure (the
+//! test stays green) but is counted apart in the summary and reported in full;
+//! `GRIDCRAFT_FUZZ_SEED=<seed> GRIDCRAFT_FUZZ_SEED_BUDGET_MS=0` finishes a seed that was cut. The one
+//! thing the budget cannot bound is a single step that runs longer than the whole budget: it is not
+//! interrupted, because cutting inside a command would report a half-applied edit.
+//! `GRIDCRAFT_FUZZ_TRACE=1` names that step, and the overshoot is one step rather than the hours a
+//! pathological seed used to take.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value, col_to_letters};
 use gridcraft_engine::calc::Calc;
@@ -54,6 +94,12 @@ const EPISODE_UNDO_DEPTH: usize = 90;
 const EPISODE_UNDO_BYTES: usize = 48 * 1024 * 1024;
 /// Save and reload every this many steps (and at the end of every episode).
 const ROUNDTRIP_EVERY: usize = 10;
+/// Default wall clock one seed may take (`GRIDCRAFT_FUZZ_SEED_BUDGET_MS`). A healthy seed runs 200
+/// commands in well under a second; the seeds that took minutes (one grew past 5 GB) made the same
+/// 400 × 200 soak take 22 min on one commit and two hours on another, so a stall now names itself.
+const DEFAULT_SEED_BUDGET_MS: u64 = 20_000;
+/// Steps of a failing sequence shown inline; the whole sequence goes to the capture file.
+const INLINE_STEPS: usize = 5;
 
 /// Commands the fuzzer never runs, and why.
 const EXCLUDED: &[(&str, &str)] = &[
@@ -105,9 +151,14 @@ impl Rng {
 
 type Step = (String, Json);
 
+/// What a seed cut short by `GRIDCRAFT_FUZZ_SEED_BUDGET_MS` is reported as: a failure `kind`, so the
+/// report and the shrink filter can name it, counted apart from the invariant failures.
+const SLOW: &str = "slow";
+
 #[derive(Debug)]
 struct Failure {
-    /// Index of the step that broke an invariant (`steps.len()` for the end-of-run checks).
+    /// Index of the step that broke an invariant (`steps.len()` for the end-of-run checks, the first
+    /// step the budget did not allow for a `slow` cut).
     step: usize,
     /// Short category, used to keep shrinking on the same bug.
     kind: &'static str,
@@ -118,72 +169,184 @@ fn env_num(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
+/// The wall clock one seed may take, `None` when `GRIDCRAFT_FUZZ_SEED_BUDGET_MS=0` disables it.
+fn seed_budget() -> Option<Duration> {
+    match env_num("GRIDCRAFT_FUZZ_SEED_BUDGET_MS", DEFAULT_SEED_BUDGET_MS) {
+        0 => None,
+        ms => Some(Duration::from_millis(ms)),
+    }
+}
+
+fn ms(d: Duration) -> u128 {
+    d.as_millis()
+}
+
+/// What a run covered, as one line: the point of the line is that a green run that cut seeds and
+/// took two hours cannot pass for a green run that took twenty minutes.
+struct Summary {
+    seeds: usize,
+    steps: usize,
+    wall: Duration,
+    invariants: usize,
+    slow: usize,
+    slowest: Option<(u64, Duration)>,
+}
+
+impl Summary {
+    fn line(&self) -> String {
+        let slowest = match self.slowest {
+            Some((seed, d)) => format!("seed {seed} ({} ms)", ms(d)),
+            None => "none (0 ms)".to_string(),
+        };
+        format!(
+            "soak: {} seeds × {} steps, {:.1} s wall, {} invariant failures, {} slow seeds, slowest {slowest}",
+            self.seeds,
+            self.steps,
+            self.wall.as_secs_f64(),
+            self.invariants,
+            self.slow
+        )
+    }
+}
+
 #[test]
+#[allow(clippy::disallowed_methods)] // the soak times itself; this test never runs on wasm
 fn command_sequences_keep_the_workbook_consistent() {
+    if let Some(path) = std::env::var_os("GRIDCRAFT_FUZZ_REPLAY") {
+        replay_capture(Path::new(&path));
+        return;
+    }
     let seeds = env_num("GRIDCRAFT_FUZZ_SEEDS", 6);
     let steps = env_num("GRIDCRAFT_FUZZ_STEPS", 40) as usize;
+    let budget = seed_budget();
     let keep_going = std::env::var_os("GRIDCRAFT_FUZZ_KEEP_GOING").is_some();
     let list: Vec<u64> = match std::env::var("GRIDCRAFT_FUZZ_SEED").ok().and_then(|v| v.trim().parse().ok()) {
         Some(one) => vec![one],
         None => (0..seeds).collect(),
     };
+    let start = Instant::now();
+    let mut summary = Summary { seeds: 0, steps, wall: Duration::ZERO, invariants: 0, slow: 0, slowest: None };
     let mut reports = Vec::new();
     for seed in list {
-        let (sample, sequence, failure) = run_seed(seed, steps);
-        if let Some(f) = failure {
-            reports.push(report(seed, steps, sample, &sequence, &f));
-            if !keep_going {
-                break;
+        let run = run_seed(seed, steps, budget);
+        summary.seeds += 1;
+        if summary.slowest.is_none_or(|(_, best)| run.elapsed > best) {
+            summary.slowest = Some((seed, run.elapsed));
+        }
+        match &run.failure {
+            // Not a failure — every step it ran passed every check — and not a pass either: a green
+            // run has to say which seeds it did not finish, so the summary counts them apart.
+            Some(f) if f.kind == SLOW => {
+                summary.slow += 1;
+                eprintln!("{}", report(Some(seed), run.sample, &run.sequence, f, Capture::Write { seed, planned: steps }));
             }
+            Some(f) => {
+                summary.invariants += 1;
+                reports.push(report(Some(seed), run.sample, &run.sequence, f, Capture::Write { seed, planned: steps }));
+                if !keep_going {
+                    break;
+                }
+            }
+            None => {}
         }
     }
+    summary.wall = start.elapsed();
+    println!("{}", summary.line());
     assert!(reports.is_empty(), "{} failing seed(s)\n\n{}", reports.len(), reports.join("\n\n"));
 }
 
-fn report(seed: u64, steps: usize, sample: &str, sequence: &[Step], f: &Failure) -> String {
-    let at = match sequence.get(f.step) {
-        Some((id, p)) => format!("step {} of {}: `{id}` {p}", f.step, sequence.len()),
-        None => format!("end-of-run checks after {} steps", sequence.len()),
-    };
-    let mut out = format!(
-        "command-sequence fuzz failure: seed {seed} (sample `{sample}`), {at}\n  invariant [{}]: {}\n  replay: GRIDCRAFT_FUZZ_SEED={seed} GRIDCRAFT_FUZZ_STEPS={steps} cargo test -p gridcraft-engine --test command_sequence_fuzz\n",
-        f.kind, f.what
+/// `GRIDCRAFT_FUZZ_REPLAY`: replay a captured sequence against the current tree, with the same checks
+/// a generated run makes, and print the same result. A capture the budget cuts fails the replay: a
+/// sequence that did not reach its end has proven nothing.
+#[allow(clippy::disallowed_methods)] // the replay times itself; this test never runs on wasm
+fn replay_capture(path: &Path) {
+    let (sample, steps) = read_capture(path);
+    assert!(
+        SAMPLES.contains(&sample.as_str()),
+        "{}: sample `{sample}` is not one of {SAMPLES:?}; the capture names it on its `# sample:` line",
+        path.display()
     );
-    let end = (f.step + 1).min(sequence.len());
-    let from = end.saturating_sub(30);
-    out.push_str(&format!("  steps {from}..{end}:\n"));
-    for (i, (id, p)) in sequence.iter().enumerate().take(end).skip(from) {
-        out.push_str(&format!("    {i:4} {id} {p}\n"));
+    let (failure, elapsed) = replay_budgeted(&sample, &steps, seed_budget());
+    let result = match &failure {
+        None => "no invariant failure".to_string(),
+        Some(f) if f.kind == SLOW => format!("cut at step {} of {} by the budget", f.step, steps.len()),
+        Some(f) => format!("invariant [{}] at step {}", f.kind, f.step),
+    };
+    println!("soak replay: {} (sample `{sample}`), {} steps, {:.1} s wall, {result}", path.display(), steps.len(), elapsed.as_secs_f64());
+    if let Some(f) = &failure {
+        eprintln!("{}", report(None, &sample, &steps, f, Capture::Existing(path)));
     }
-    if std::env::var_os("GRIDCRAFT_FUZZ_SHRINK").is_some() {
-        let min = shrink(sample, &sequence[..end], f.kind);
-        out.push_str(&format!("  minimal sequence ({} steps) from file.new {{\"sample\": \"{sample}\"}}:\n", min.len()));
-        for (id, p) in &min {
-            out.push_str(&format!("    s.execute(\"{id}\", json!({p})).ok();\n"));
-        }
-        if let Some(f) = replay(sample, &min) {
-            out.push_str(&format!("  which fails with [{}]: {}\n", f.kind, f.what));
-        }
-    } else {
-        out.push_str("  (set GRIDCRAFT_FUZZ_SHRINK=1 for a minimal sequence)\n");
-    }
-    out
+    assert!(failure.is_none(), "replay of {} did not pass", path.display());
 }
 
-/// Generates and runs one seed's sequence; returns the sample, the steps run and the first failure.
-#[allow(clippy::disallowed_methods)] // the clock times traced steps; this test never runs on wasm
-fn run_seed(seed: u64, steps: usize) -> (&'static str, Vec<Step>, Option<Failure>) {
+/// Reads a capture written by [`capture_file`], or by hand: `#` lines are metadata (`# sample:` names
+/// the workbook) and every other non-blank line is one step, `id json`. A leading `file.new` names
+/// the sample instead and is not run twice, so a capture may start with the command that opens it.
+fn read_capture(path: &Path) -> (String, Vec<Step>) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("GRIDCRAFT_FUZZ_REPLAY={}: {e}", path.display()));
+    let mut sample = None;
+    let mut steps = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(meta) = line.strip_prefix('#') {
+            if let Some(name) = meta.trim().strip_prefix("sample:") {
+                sample = Some(name.trim().to_string());
+            }
+            continue;
+        }
+        let (id, rest) = line.split_once(' ').unwrap_or_else(|| panic!("{}:{}: expected `id json`: {line}", path.display(), n + 1));
+        let params: Json = serde_json::from_str(rest).unwrap_or_else(|e| panic!("{}:{}: {e}: {rest}", path.display(), n + 1));
+        if steps.is_empty() && id == "file.new" && sample.is_none() {
+            sample = params.get("sample").and_then(Json::as_str).map(str::to_string);
+            if sample.is_some() {
+                continue;
+            }
+        }
+        steps.push((id.to_string(), params));
+    }
+    let sample = sample.unwrap_or_else(|| panic!("{}: no `# sample: <name>` line and no leading file.new with a sample", path.display()));
+    (sample, steps)
+}
+
+/// What one seed did: the sample it ran on, the steps it ran, its wall clock and what stopped it.
+struct SeedRun {
+    sample: &'static str,
+    sequence: Vec<Step>,
+    elapsed: Duration,
+    /// The first invariant failure, or `slow` when the budget cut the seed.
+    failure: Option<Failure>,
+}
+
+/// Generates and runs one seed's sequence; `budget` cuts it between steps.
+#[allow(clippy::disallowed_methods)] // the clock times the seed; this test never runs on wasm
+fn run_seed(seed: u64, steps: usize, budget: Option<Duration>) -> SeedRun {
+    let start = Instant::now();
     let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) ^ 0x5EED);
     let sample = SAMPLES[(seed % SAMPLES.len() as u64) as usize];
     let mut h = Harness::new(sample);
     let mut sequence = Vec::new();
     let trace = std::env::var_os("GRIDCRAFT_FUZZ_TRACE").is_some();
     for i in 0..steps {
+        // Between steps, never inside one: the previous step's command and every check it ran have
+        // passed, so the cut cannot turn a failure into a pass.
+        let elapsed = start.elapsed();
+        if let Some(b) = budget
+            && elapsed > b
+        {
+            let cut = format!("cut after {i} of {steps} steps at {} ms (budget {} ms)", ms(elapsed), ms(b));
+            // The end-of-episode checks cost what the steps already run cost, so they still run: an
+            // invariant failure there is a real failure and is reported instead of the cut.
+            let failure = h.finish(i).err().unwrap_or_else(|| fail(i, SLOW, cut));
+            return SeedRun { sample, sequence, elapsed: start.elapsed(), failure: Some(failure) };
+        }
         let (id, params) = generate(&mut rng, &h.s);
         if trace {
             eprintln!("{i} start {id} {params}");
         }
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let step = h.step(i, &id, &params);
         if trace {
             let undo = h.s.doc().map(|d| d.undo.len()).unwrap_or(0);
@@ -191,22 +354,37 @@ fn run_seed(seed: u64, steps: usize) -> (&'static str, Vec<Step>, Option<Failure
         }
         sequence.push((id.clone(), params.clone()));
         if let Err(f) = step {
-            return (sample, sequence, Some(f));
+            return SeedRun { sample, sequence, elapsed: start.elapsed(), failure: Some(f) };
         }
     }
     let failure = h.finish(steps).err();
-    (sample, sequence, failure)
+    SeedRun { sample, sequence, elapsed: start.elapsed(), failure }
 }
 
-/// Runs a recorded sequence with the same checks.
-fn replay(sample: &str, steps: &[Step]) -> Option<Failure> {
+/// Runs a recorded sequence with the same checks; `budget` cuts it between steps like a seed.
+#[allow(clippy::disallowed_methods)] // the clock times the replay; this test never runs on wasm
+fn replay_budgeted(sample: &str, steps: &[Step], budget: Option<Duration>) -> (Option<Failure>, Duration) {
+    let start = Instant::now();
     let mut h = Harness::new(sample);
     for (i, (id, p)) in steps.iter().enumerate() {
+        let elapsed = start.elapsed();
+        if let Some(b) = budget
+            && elapsed > b
+        {
+            let cut = format!("cut after {i} of {} steps at {} ms (budget {} ms)", steps.len(), ms(elapsed), ms(b));
+            // A failure in the checks the seed's own steps reached is a real failure, not a cut.
+            return (Some(h.finish(i).err().unwrap_or_else(|| fail(i, SLOW, cut))), start.elapsed());
+        }
         if let Err(f) = h.step(i, id, p) {
-            return Some(f);
+            return (Some(f), start.elapsed());
         }
     }
-    h.finish(steps.len()).err()
+    (h.finish(steps.len()).err(), start.elapsed())
+}
+
+/// Runs a recorded sequence unbounded: what shrinking and the fixed-regression test use.
+fn replay(sample: &str, steps: &[Step]) -> Option<Failure> {
+    replay_budgeted(sample, steps, None).0
 }
 
 /// Greedy delta debugging: drop chunks of steps while the run still fails the same way.
@@ -233,6 +411,117 @@ fn shrink(sample: &str, steps: &[Step], kind: &str) -> Vec<Step> {
             chunk = chunk.div_ceil(2);
         }
     }
+}
+
+// ---------------------------------------------------------------- reporting
+
+/// Where the whole sequence can be replayed from: a file the caller already has (`GRIDCRAFT_FUZZ_REPLAY`
+/// read it) or one the report writes now.
+enum Capture<'a> {
+    Existing(&'a Path),
+    Write { seed: u64, planned: usize },
+}
+
+/// The report of one failing or cut seed: what stopped it, where the whole sequence lives, the first
+/// and last few steps inline, and how to replay it. The file — not the seed — is what outlives the
+/// commit, so its path is printed with the command that replays it.
+fn report(seed: Option<u64>, sample: &str, sequence: &[Step], f: &Failure, capture: Capture<'_>) -> String {
+    let planned = match &capture {
+        Capture::Write { planned, .. } => *planned,
+        Capture::Existing(_) => sequence.len(),
+    };
+    let who = match seed {
+        Some(seed) => format!("seed {seed} (sample `{sample}`)"),
+        None => format!("sample `{sample}`"),
+    };
+    let at = match (f.kind, sequence.get(f.step)) {
+        (SLOW, _) => format!("cut before step {} of {planned}", f.step),
+        (_, Some((id, p))) => format!("step {} of {planned}: `{id}` {p}", f.step),
+        (_, None) => format!("end-of-run checks after {} steps", sequence.len()),
+    };
+    let what = if f.kind == SLOW { "slow" } else { "failure" };
+    let mut out = format!("command-sequence fuzz {what}: {who}, {at}\n");
+    out.push_str(&format!("  {} [{}]: {}\n", if f.kind == SLOW { "budget" } else { "invariant" }, f.kind, f.what));
+    let file = match &capture {
+        Capture::Existing(p) => Ok((*p).to_path_buf()),
+        Capture::Write { seed, planned } => capture_file(*seed, sample, *planned, sequence, f),
+    };
+    match file {
+        Ok(path) => {
+            out.push_str(&format!("  whole sequence ({} steps) in {}\n", sequence.len(), path.display()));
+            out.push_str(&format!(
+                "  replay the file: GRIDCRAFT_FUZZ_REPLAY={} cargo test -p gridcraft-engine --test command_sequence_fuzz\n",
+                path.display()
+            ));
+        }
+        // A capture that cannot be written is reported beside the invariant, never instead of it.
+        Err(e) => out.push_str(&format!("  whole sequence ({} steps) could not be written: {e}\n", sequence.len())),
+    }
+    if let Capture::Write { seed, planned } = capture {
+        out.push_str(&format!(
+            "  replay the seed: GRIDCRAFT_FUZZ_SEED={seed} GRIDCRAFT_FUZZ_STEPS={planned} cargo test -p gridcraft-engine --test command_sequence_fuzz\n    (a seed's sequence depends on the registered command set: that line is only valid at the commit that generated it)\n"
+        ));
+    }
+    out.push_str(&steps_inline(sequence));
+    if f.kind != SLOW {
+        if std::env::var_os("GRIDCRAFT_FUZZ_SHRINK").is_some() {
+            let end = (f.step + 1).min(sequence.len());
+            let min = shrink(sample, &sequence[..end], f.kind);
+            out.push_str(&format!("  minimal sequence ({} steps) from file.new {{\"sample\": \"{sample}\"}}:\n", min.len()));
+            for (id, p) in &min {
+                out.push_str(&format!("    s.execute(\"{id}\", json!({p})).ok();\n"));
+            }
+            if let Some(f) = replay(sample, &min) {
+                out.push_str(&format!("  which fails with [{}]: {}\n", f.kind, f.what));
+            }
+        } else {
+            out.push_str("  (set GRIDCRAFT_FUZZ_SHRINK=1 for a minimal sequence)\n");
+        }
+    }
+    out
+}
+
+/// The first and last few steps, with the count of what sits between them in the file.
+fn steps_inline(sequence: &[Step]) -> String {
+    let n = sequence.len();
+    if n == 0 {
+        return "  (no steps ran)\n".to_string();
+    }
+    let head = n.min(INLINE_STEPS);
+    let tail = INLINE_STEPS.min(n - head);
+    let mut out = format!("  first {head} steps:\n");
+    for (i, (id, p)) in sequence.iter().take(head).enumerate() {
+        out.push_str(&format!("    {i:4} {id} {p}\n"));
+    }
+    if n > head {
+        out.push_str(&format!("    ... {} more in the file ...\n", n - head - tail));
+    }
+    if tail > 0 {
+        out.push_str(&format!("  last {tail} steps:\n"));
+        for (i, (id, p)) in sequence.iter().enumerate().skip(n - tail) {
+            out.push_str(&format!("    {i:4} {id} {p}\n"));
+        }
+    }
+    out
+}
+
+/// Writes the whole sequence to a capture file under the OS temp dir and returns its path. Only the
+/// steps that ran are written (a cut seed stops early), and the file starts from the workbook
+/// `file.new` opens for `# sample:`.
+#[allow(clippy::disallowed_methods)] // the capture is stamped with the clock; this test never runs on wasm
+fn capture_file(seed: u64, sample: &str, planned: usize, sequence: &[Step], f: &Failure) -> Result<PathBuf, String> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("gridcraft-soak-seed-{seed}-{stamp}.txt"));
+    let mut text = String::from("# GridCraft command-sequence soak capture: replay it with GRIDCRAFT_FUZZ_REPLAY=<this file>.\n");
+    text.push_str("# Steps are `id json`, one per line, from the workbook `file.new` opens for `# sample:`.\n");
+    text.push_str(&format!("# seed: {seed}\n# sample: {sample}\n# planned steps: {planned}\n# captured steps: {}\n", sequence.len()));
+    let stopped = if f.kind == SLOW { "cut" } else { "failure" };
+    text.push_str(&format!("# {stopped} at step {} [{}]: {}\n", f.step, f.kind, f.what.replace('\n', " ")));
+    for (id, p) in sequence {
+        text.push_str(&format!("{id} {p}\n"));
+    }
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 struct Harness {
