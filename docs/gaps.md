@@ -283,6 +283,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   past the format's 255-character maximum, which were saved as 1785 px behind the user's back; the
   legacy-array entry now marks every cell it clears as a change, so a formula reading part of the
   range recalculates instead of keeping a value a full recalc disagrees with.
+- **Soak, names (10-30):** a table resized over a blank column kept **two columns named `Column3`**
+  (the reconciler deduped through a name→column map that cannot hold a duplicate), and the writer's
+  documented repair then renamed the later one to `Column32` **at the file boundary** — a rename by a
+  rule nothing in memory had applied, which no undo can reach. One function owns the naming rule now and
+  the whole header row is reconciled after a structural edit, so model, cells and file cannot disagree.
 - **Oracle suite (10-30):** `crates/calc/tests/formula_oracle.rs` runs **595 documented examples over
   275 functions** through the real calc path (`gridcraft_calc::evaluate`), plus dedicated tests for
   real spills, `#SPILL!` unblocking, the 1904 date system, 3-D references and qualified names. Each
