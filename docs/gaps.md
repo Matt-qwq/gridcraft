@@ -205,9 +205,18 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Corrected (10-30):** the claim that a chart's custom error-bar references are lost on an edit was
   **wrong** — they already survived read → edit → save byte-for-byte; a regression test now pins
   read → patch → save → read.
-- **Missing:** chartex `styleN.xml`/`colorsN.xml` are still written from defaults (only `chartExN.xml`
-  is kept); per-point label prefix/suffix and per-point label formatting are not modelled, nor is
-  per-point marker size;
+- **Landed (10-30, style parts):** a chart's own `styleN.xml`/`colorsN.xml` are **read and written back
+  byte-identically** for both chartex and classic parts (classic parts with style/colour relationships
+  are now kept too, which real Excel files usually have); they survive a field patch and are dropped
+  only when the part must be regenerated (a kind, series-set or reference change), which is stated in
+  `chart-parity.md`.
+- **Settled (10-30):** a **per-point label prefix/suffix does not exist in the schema** — `c:dLbl`
+  carries `idx`/`delete`/`layout`/`tx` (`strRef` or rich text)/`numFmt`/`spPr`/`txPr`/`dLblPos`/show flags/
+  `separator`, and chartex's `cx:dataLabel` has **no text element at all**. A fixed rich text replaces the
+  composed label, which is exactly what `PointLabel::text` already does, so the claim is retired rather
+  than faked.
+- **Missing:** per-point label formatting (font/fill/callout shape) and per-point marker size are not
+  modelled;
   date-axis units are kept but not editable; custom error-bar references are carried by the command
   but not wired in the pane; a chart element cannot be selected by clicking it (the selection is a
   dropdown); no command moves a series onto the secondary axis (so it applies to charts read from
@@ -221,7 +230,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   lines (#62), Switch Row/Column (#116) and trendlines (read, written, drawn) landed; multi-level
   category axes (year beside month) are read, drawn and written back.
 - **Impact:** charts are in most business workbooks.
-- **Estimate:** 1–3 h for beta (35–50 h full). [chart-parity.md](chart-parity.md)
+- **Estimate:** 0–2 h for beta (30–45 h full). [chart-parity.md](chart-parity.md)
 
 ### 5. Text in non-Latin scripts doesn't render or export (L)
 - **Landed 10-29 (font discovery + PDF embedding):** `gridcraft-core::fonts` finds a font file
