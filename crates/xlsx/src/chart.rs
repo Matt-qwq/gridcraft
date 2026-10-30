@@ -1276,19 +1276,36 @@ pub(crate) fn strip_book(link: &str) -> &str {
     link.strip_prefix('[').and_then(|r| r.split_once(']')).map_or(link, |(_, rest)| rest)
 }
 
+/// A chart part to write, and the chart's own style and colour parts (`styleN.xml`, `colorsN.xml`)
+/// that go beside it. `style` and `colors` hold the file's parts as read: a chart part that is kept
+/// or patched keeps them, because they describe the chart's look, not its data. Both are `None`
+/// when the part is regenerated from the model — a chart whose kind or series changed no longer
+/// matches them — and a default style applies instead.
+pub struct ChartXml {
+    pub xml: String,
+    pub style: Option<String>,
+    pub colors: Option<String>,
+}
+
 /// Chart part XML for a model chart on sheet `si`.
-pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> String {
+pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> ChartXml {
     // A part read from a file whose sheets still exist is written back from the file, not from the
     // model: unchanged it is byte-identical, and an edit is patched into it field by field so every
     // option GridCraft does not model survives the edit too.
     if let Some((part, as_read)) = ch.kept_part()
         && part_sheet_names(part).iter().all(|n| wb.sheet_index(n).is_some())
     {
+        let kept = || {
+            let (style, colors) = ch.kept_style_parts();
+            (style.map(str::to_string), colors.map(str::to_string))
+        };
         if let Some(unchanged) = ch.unchanged_part() {
-            return unchanged.to_string();
+            let (style, colors) = kept();
+            return ChartXml { xml: unchanged.to_string(), style, colors };
         }
         if let Some(patched) = crate::chart_patch::patch_chart(part, as_read, ch, wb, si, book_name) {
-            return patched;
+            let (style, colors) = kept();
+            return ChartXml { xml: patched, style, colors };
         }
     }
     let mut s = String::from(
@@ -1457,5 +1474,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Str
         let _ = write!(s, "<c:legend><c:legendPos val=\"{p}\"/><c:overlay val=\"0\"/></c:legend>");
     }
     s.push_str("<c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>");
-    s
+    // A part regenerated from the model gets no kept style: the file's style and colour parts
+    // described a chart whose kind or series changed, so they no longer fit it.
+    ChartXml { xml: s, style: None, colors: None }
 }

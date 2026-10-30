@@ -157,27 +157,52 @@ fn unmodelled_chart_xml() -> String {
         .to_string()
 }
 
+/// A chart style part as Excel writes one after the style gallery applies a style: a filled title
+/// and a layered point line. GridCraft models none of it, so the part is the whole of the look.
+const CUSTOM_STYLE: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
+    "<cs:chartStyle xmlns:cs=\"http://schemas.microsoft.com/office/drawing/2012/chartStyle\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" id=\"201\">",
+    "<cs:title><cs:lnRef idx=\"0\"/><cs:fillRef idx=\"3\"><a:schemeClr val=\"accent1\"/></cs:fillRef><cs:effectRef idx=\"0\"/><cs:fontRef idx=\"minor\"><a:schemeClr val=\"lt1\"/></cs:fontRef></cs:title>",
+    "<cs:dataPointLine><cs:lnRef idx=\"2\"><a:schemeClr val=\"accent1\"><a:lumMod val=\"80000\"/></a:schemeClr></cs:lnRef><cs:fillRef idx=\"0\"/><cs:effectRef idx=\"0\"/><cs:fontRef idx=\"minor\"><a:schemeClr val=\"tx1\"/></cs:fontRef></cs:dataPointLine>",
+    "</cs:chartStyle>"
+);
+
+/// A colour style part with its own cycling colours and variations.
+const CUSTOM_COLORS: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
+    "<cs:colorStyle xmlns:cs=\"http://schemas.microsoft.com/office/drawing/2012/chartStyle\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" meth=\"cycle\" id=\"10\">",
+    "<a:schemeClr val=\"accent2\"/><a:schemeClr val=\"accent4\"/><a:schemeClr val=\"accent6\"/>",
+    "<cs:variation><a:lumMod val=\"60000\"/></cs:variation><cs:variation><a:lumMod val=\"80000\"/><a:lumOff val=\"20000\"/></cs:variation>",
+    "</cs:colorStyle>"
+);
+
+/// The chart part's own relationships to its style and colour parts.
+const STYLE_RELS: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#;
+
 fn chart_fixture() -> Vec<u8> {
     chart_package(&unmodelled_chart_xml())
 }
 
 /// A package holding one sheet of data and one chart part.
 fn chart_package(part: &str) -> Vec<u8> {
+    chart_package_with(part, &[])
+}
+
+/// [`chart_package`] plus `extra` parts: a chart's own style and colour parts go behind its
+/// relationships, as Excel writes them for a chart whose style was customised.
+fn chart_package_with<'a>(part: &'a str, extra: &[(&'a str, &'a str)]) -> Vec<u8> {
     let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>10</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>15</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId1"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>"#;
     let drels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/></Relationships>"#;
     let srels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
     let sheet = r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Sales</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>One</t></is></c><c r="B2"><v>1</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>Two</t></is></c><c r="B3"><v>4</v></c></row><row r="4"><c r="A4" t="inlineStr"><is><t>Three</t></is></c><c r="B4"><v>9</v></c></row><row r="5"><c r="A5" t="inlineStr"><is><t>Four</t></is></c><c r="B5"><v>16</v></c></row></sheetData><drawing r:id="rId1"/>"#;
-    super::minimal(
-        sheet,
-        &[
-            ("xl/worksheets/_rels/sheet1.xml.rels", srels),
-            ("xl/drawings/drawing1.xml", drawing),
-            ("xl/drawings/_rels/drawing1.xml.rels", drels),
-            ("xl/charts/chart1.xml", part),
-        ],
-        "",
-        "",
-    )
+    let mut parts = vec![
+        ("xl/worksheets/_rels/sheet1.xml.rels", srels),
+        ("xl/drawings/drawing1.xml", drawing),
+        ("xl/drawings/_rels/drawing1.xml.rels", drels),
+        ("xl/charts/chart1.xml", part),
+    ];
+    parts.extend_from_slice(extra);
+    super::minimal(sheet, &parts, "", "")
 }
 
 #[test]
@@ -677,6 +702,8 @@ fn chartex_package(part: &str) -> Vec<u8> {
             ("xl/drawings/drawing1.xml", drawing),
             ("xl/drawings/_rels/drawing1.xml.rels", drels),
             ("xl/charts/chartEx1.xml", part),
+            ("xl/charts/style1.xml", CUSTOM_STYLE),
+            ("xl/charts/colors1.xml", CUSTOM_COLORS),
             (
                 "xl/charts/_rels/chartEx1.xml.rels",
                 r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/></Relationships>"#,
@@ -1060,4 +1087,152 @@ fn two_chartex_parts_keep_their_own_names_at_their_own_indices() {
     assert_eq!(again.sheets[0].charts[1].y_axis.min, Some(1.0));
     assert_eq!(again.sheets[0].charts[1].series[0].values, "Data!$B$2:$B$5");
     assert_eq!(chart_part(&write_xlsx(&again).unwrap(), "xl/charts/chartEx2.xml"), b);
+}
+
+// ---------------------------------------------------------------- the chart's own style parts
+
+/// How many `[Content_Types].xml` overrides the package declares for `part`: one, or none when the
+/// part is not written.
+fn content_type_count(types: &str, part: &str) -> usize {
+    types.matches(&format!("PartName=\"/{part}\"")).count()
+}
+
+/// A chart's own style and colour parts as saved.
+fn style_parts(output: &[u8], style: &str, colors: &str) -> (String, String) {
+    (chart_part(output, style), chart_part(output, colors))
+}
+
+#[test]
+fn a_classic_chart_keeps_its_own_style_and_colour_parts_byte_for_byte() {
+    let bytes = chart_package_with(
+        &unmodelled_chart_xml(),
+        &[("xl/charts/_rels/chart1.xml.rels", STYLE_RELS), ("xl/charts/style1.xml", CUSTOM_STYLE), ("xl/charts/colors1.xml", CUSTOM_COLORS)],
+    );
+    let (wb, _rep) = read_xlsx(&bytes).unwrap();
+    let back = write_xlsx(&wb).unwrap();
+    // Neither the part nor its look changed, byte for byte.
+    assert_eq!(part_of(&back), unmodelled_chart_xml());
+    let (style, colors) = style_parts(&back, "xl/charts/style1.xml", "xl/charts/colors1.xml");
+    assert_eq!((style.as_str(), colors.as_str()), (CUSTOM_STYLE, CUSTOM_COLORS));
+    // The package is consistent: the chart part owns the two parts, and each is typed once.
+    crate::testing::check_package(&back).expect("the package with style parts is valid");
+    let rels = chart_part(&back, "xl/charts/_rels/chart1.xml.rels");
+    assert!(rels.contains("relationships/chartStyle") && rels.contains(r#"Target="style1.xml""#), "{rels}");
+    assert!(rels.contains("relationships/chartColorStyle") && rels.contains(r#"Target="colors1.xml""#), "{rels}");
+    let types = chart_part(&back, "[Content_Types].xml");
+    assert_eq!(content_type_count(&types, "xl/charts/style1.xml"), 1, "{types}");
+    assert_eq!(content_type_count(&types, "xl/charts/colors1.xml"), 1, "{types}");
+    // A second save is stable.
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    let twice = write_xlsx(&again).unwrap();
+    assert_eq!(part_of(&twice), unmodelled_chart_xml());
+    assert_eq!(style_parts(&twice, "xl/charts/style1.xml", "xl/charts/colors1.xml"), (style, colors));
+}
+
+#[test]
+fn a_classic_edit_keeps_the_style_and_colour_parts() {
+    let bytes = chart_package_with(
+        &unmodelled_chart_xml(),
+        &[("xl/charts/_rels/chart1.xml.rels", STYLE_RELS), ("xl/charts/style1.xml", CUSTOM_STYLE), ("xl/charts/colors1.xml", CUSTOM_COLORS)],
+    );
+    let (mut wb, _rep) = read_xlsx(&bytes).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].y_axis.min = Some(5.0);
+    }
+    let back = write_xlsx(&wb).unwrap();
+    // The value axis' scaling changed and nothing else: a style part does not depend on the data.
+    let then = r#"<c:scaling><c:orientation val="minMax"/></c:scaling>"#;
+    let now = r#"<c:scaling><c:orientation val="minMax"/><c:min val="5"/></c:scaling>"#;
+    let part = part_of(&back);
+    assert_eq!(part.matches(now).count(), 1, "{part}");
+    assert_eq!(part.replace(now, then), unmodelled_chart_xml(), "the edit touched more than the axis:\n{part}");
+    assert_eq!(style_parts(&back, "xl/charts/style1.xml", "xl/charts/colors1.xml"), (CUSTOM_STYLE.into(), CUSTOM_COLORS.into()));
+    crate::testing::check_package(&back).expect("the package with style parts is valid");
+}
+
+#[test]
+fn a_classic_kind_change_drops_the_style_and_colour_parts() {
+    let bytes = chart_package_with(
+        &unmodelled_chart_xml(),
+        &[("xl/charts/_rels/chart1.xml.rels", STYLE_RELS), ("xl/charts/style1.xml", CUSTOM_STYLE), ("xl/charts/colors1.xml", CUSTOM_COLORS)],
+    );
+    let (mut wb, _rep) = read_xlsx(&bytes).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].kind = ChartKind::BarClustered;
+    }
+    let back = write_xlsx(&wb).unwrap();
+    // The part had to be regenerated from the model, so the file's look no longer applies: it is
+    // dropped rather than left behind as an orphan.
+    let part = part_of(&back);
+    assert!(!part.contains("unknownChartThing") && !part.contains("printSettings"), "the part was patched, not regenerated:\n{part}");
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(back.clone())).unwrap();
+    for name in ["xl/charts/style1.xml", "xl/charts/colors1.xml", "xl/charts/_rels/chart1.xml.rels"] {
+        assert!(z.by_name(name).is_err(), "{name} outlived the part it styled");
+    }
+    // A default applies instead, and the package stays consistent.
+    let types = chart_part(&back, "[Content_Types].xml");
+    assert_eq!(content_type_count(&types, "xl/charts/style1.xml"), 0, "{types}");
+    crate::testing::check_package(&back).expect("the regenerated package is valid");
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    assert_eq!(again.sheets[0].charts[0].kind, ChartKind::BarClustered);
+}
+
+#[test]
+fn a_chartex_chart_keeps_its_own_style_and_colour_parts_byte_for_byte() {
+    let (wb, _rep) = read_xlsx(&chartex_package(CHARTEX_HISTOGRAM)).unwrap();
+    let back = write_xlsx(&wb).unwrap();
+    assert_eq!(chartex_part_of(&back), CHARTEX_HISTOGRAM);
+    let (style, colors) = style_parts(&back, "xl/charts/style1.xml", "xl/charts/colors1.xml");
+    assert_eq!((style.as_str(), colors.as_str()), (CUSTOM_STYLE, CUSTOM_COLORS), "the chart's look was replaced by a default");
+    crate::testing::check_package(&back).expect("the package with style parts is valid");
+    let rels = chart_part(&back, "xl/charts/_rels/chartEx1.xml.rels");
+    assert!(rels.contains("relationships/chartStyle") && rels.contains(r#"Target="style1.xml""#), "{rels}");
+    assert!(rels.contains("relationships/chartColorStyle") && rels.contains(r#"Target="colors1.xml""#), "{rels}");
+    // A second save is stable.
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    assert_eq!(style_parts(&write_xlsx(&again).unwrap(), "xl/charts/style1.xml", "xl/charts/colors1.xml"), (style, colors));
+}
+
+#[test]
+fn a_chartex_title_edit_keeps_the_style_and_colour_parts() {
+    let original = chartex_part(ChartKind::Waterfall);
+    let (mut wb, _rep) = read_xlsx(&chartex_package(&original)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].title = Some("Edited".into());
+    }
+    let back = write_xlsx(&wb).unwrap();
+    let part = chartex_part_of(&back);
+    assert_eq!(part.replace("<cx:v>Edited</cx:v>", "<cx:v>Old</cx:v>"), original, "the patch touched more than the title:\n{part}");
+    assert_eq!(style_parts(&back, "xl/charts/style1.xml", "xl/charts/colors1.xml"), (CUSTOM_STYLE.into(), CUSTOM_COLORS.into()));
+    crate::testing::check_package(&back).expect("the package with style parts is valid");
+    // The look survives reopening, byte for byte.
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    let twice = write_xlsx(&again).unwrap();
+    assert_eq!(style_parts(&twice, "xl/charts/style1.xml", "xl/charts/colors1.xml"), (CUSTOM_STYLE.into(), CUSTOM_COLORS.into()));
+}
+
+#[test]
+fn a_chartex_kind_change_drops_the_custom_style_and_colour_parts() {
+    let (mut wb, _rep) = read_xlsx(&chartex_package(&chartex_part(ChartKind::Waterfall))).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].kind = ChartKind::Histogram;
+    }
+    let back = write_xlsx(&wb).unwrap();
+    // The part is regenerated from the model: the file's style described a waterfall, and keeping
+    // it would style the histogram with the wrong chart's look. The defaults apply instead.
+    let part = chartex_part_of(&back);
+    assert!(part.contains(r#"<cx:series layoutId="clusteredColumn""#), "{part}");
+    assert_eq!(style_parts(&back, "xl/charts/style1.xml", "xl/charts/colors1.xml"), (crate::chartex::style_xml(), crate::chartex::colors_xml()));
+    // Still a chartex part: it gets its style and colour parts, and the package is consistent.
+    let rels = chart_part(&back, "xl/charts/_rels/chartEx1.xml.rels");
+    assert!(rels.contains("chartStyle") && rels.contains("chartColorStyle"), "{rels}");
+    let types = chart_part(&back, "[Content_Types].xml");
+    assert_eq!(content_type_count(&types, "xl/charts/style1.xml"), 1, "{types}");
+    crate::testing::check_package(&back).expect("the regenerated package is valid");
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    assert_eq!(again.sheets[0].charts[0].kind, ChartKind::Histogram);
 }

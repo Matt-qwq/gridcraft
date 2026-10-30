@@ -18,6 +18,21 @@ const PARETO_PART: &str = r##"<?xml version="1.0" encoding="UTF-8" standalone="y
 <cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:numDim type="val"><cx:f>_xlchart.v1.0</cx:f></cx:numDim></cx:data><cx:data id="1"><cx:numDim type="val"><cx:f>_xlchart.v1.1</cx:f></cx:numDim></cx:data></cx:chartData><cx:chart><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="clusteredColumn" uniqueId="{00000000-0000-0000-0000-000000000000}"><cx:dataId val="0"/></cx:series><cx:series layoutId="paretoLine" uniqueId="{00000000-0000-0000-0000-000000000001}"><cx:dataId val="1"/></cx:series></cx:plotAreaRegion></cx:plotArea></cx:chart></cx:chartSpace>
 "##;
 
+/// The Pareto chart's own style and colour parts: its whole look, none of which GridCraft models.
+const PARETO_STYLE: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
+    "<cs:chartStyle xmlns:cs=\"http://schemas.microsoft.com/office/drawing/2012/chartStyle\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" id=\"201\">",
+    "<cs:dataPoint><cs:lnRef idx=\"0\"/><cs:fillRef idx=\"1\"><a:schemeClr val=\"accent6\"/></cs:fillRef><cs:effectRef idx=\"0\"/><cs:fontRef idx=\"minor\"><a:schemeClr val=\"tx1\"/></cs:fontRef></cs:dataPoint>",
+    "</cs:chartStyle>"
+);
+const PARETO_COLORS: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
+    "<cs:colorStyle xmlns:cs=\"http://schemas.microsoft.com/office/drawing/2012/chartStyle\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" meth=\"cycle\" id=\"10\">",
+    "<a:schemeClr val=\"accent5\"/><a:schemeClr val=\"accent3\"/><cs:variation><a:lumMod val=\"40000\"/></cs:variation>",
+    "</cs:colorStyle>"
+);
+const PARETO_STYLE_RELS: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2011/relationships/chartStyle" Target="style3.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors3.xml"/></Relationships>"#;
+
 fn frame(rid: &str, row: i32) -> String {
     format!(
         r#"<xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>10</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame><xdr:nvGraphicFramePr><xdr:cNvPr id="{row}" name="Chart {row}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="{rid}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"#,
@@ -51,6 +66,9 @@ fn package() -> Vec<u8> {
             ("xl/charts/chart1.xml", SURFACE_PART),
             ("xl/charts/chart2.xml", PIE3D_PART),
             ("xl/charts/chartEx3.xml", PARETO_PART),
+            ("xl/charts/_rels/chartEx3.xml.rels", PARETO_STYLE_RELS),
+            ("xl/charts/style3.xml", PARETO_STYLE),
+            ("xl/charts/colors3.xml", PARETO_COLORS),
         ],
         "",
         "",
@@ -76,6 +94,9 @@ fn unmodelled_chart_kinds_keep_their_frame_and_their_part() {
     assert_eq!(part(&back, "xl/charts/chart1.xml"), SURFACE_PART);
     assert_eq!(part(&back, "xl/charts/chart2.xml"), PIE3D_PART);
     assert_eq!(part(&back, "xl/charts/chartEx3.xml"), PARETO_PART);
+    // A kept part takes its whole look with it: the Pareto chart's own style and colour parts.
+    assert_eq!(part(&back, "xl/charts/style3.xml"), PARETO_STYLE);
+    assert_eq!(part(&back, "xl/charts/colors3.xml"), PARETO_COLORS);
     // The drawing still frames all three, the chartex one through mc:AlternateContent.
     let drawing = part(&back, "xl/drawings/drawing1.xml");
     assert_eq!(drawing.matches("<xdr:graphicFrame").count(), 3, "{drawing}");
@@ -87,7 +108,11 @@ fn unmodelled_chart_kinds_keep_their_frame_and_their_part() {
     let twice = write_xlsx(&again).unwrap();
     assert_eq!(part(&twice, "xl/charts/chart1.xml"), SURFACE_PART);
     assert_eq!(part(&twice, "xl/charts/chartEx3.xml"), PARETO_PART);
+    assert_eq!(part(&twice, "xl/charts/style3.xml"), PARETO_STYLE);
+    assert_eq!(part(&twice, "xl/charts/colors3.xml"), PARETO_COLORS);
     assert_eq!(part(&twice, "xl/drawings/drawing1.xml"), drawing);
+    // The package validates with the kept style and colour parts in it.
+    crate::testing::check_package(&twice).expect("the package with kept style parts is valid");
     // The chartex part comes with the style and colour parts Excel expects.
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(twice.clone())).unwrap();
     for name in ["xl/charts/chartEx3.xml", "xl/charts/style3.xml", "xl/charts/colors3.xml", "xl/charts/_rels/chartEx3.xml.rels"] {

@@ -207,9 +207,10 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                         // would dangle.
                         let rels = cx.pkg.rels(&target)?;
                         // A kept part is written back on its own, so it may only carry relationships
-                        // GridCraft writes again: a chartex part's style and colour parts are.
-                        let kept_ok = rels.is_empty()
-                            || (chartex && rels.iter().all(|r| !r.external && matches!(r.kind.as_str(), "chartStyle" | "chartColorStyle")));
+                        // GridCraft writes again: a chart's own style and colour parts are, for a
+                        // chartex part and a classic one alike.
+                        let kept_ok =
+                            rels.is_empty() || rels.iter().all(|r| !r.external && matches!(r.kind.as_str(), "chartStyle" | "chartColorStyle"));
                         let part = cx.optional_xml_text(&target)?;
                         if let Some((cx_xml, text)) = part {
                             let modelled = if chartex { crate::chartex::is_modelled(&cx_xml) } else { crate::chart::is_modelled(&cx_xml) };
@@ -230,6 +231,10 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                                     // it by the reader and written again).
                                     if kept_ok {
                                         ch.keep_part(text.into());
+                                        // A file's chart keeps its look: its own style and colour
+                                        // parts go back with the chart part, byte for byte.
+                                        let (style, colors) = crate::chartex::read_style_parts(cx, &rels);
+                                        ch.keep_style_parts(style, colors);
                                     }
                                     sheet.charts.push(ch);
                                 }
@@ -239,7 +244,8 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                                 None if kept_ok => {
                                     let id = cx.next_object_id();
                                     cx.warn(format!("chart {target} is a kind GridCraft does not model: kept as it was, not drawn"));
-                                    sheet.kept_charts.push(gridcraft_model::KeptChart { id, anchor, xml: text.into(), chartex });
+                                    let (style, colors) = crate::chartex::read_style_parts(cx, &rels);
+                                    sheet.kept_charts.push(gridcraft_model::KeptChart { id, anchor, xml: text.into(), chartex, style, colors });
                                 }
                                 None => cx.warn(format!("chart {target} has no supported plot and was skipped")),
                             }
