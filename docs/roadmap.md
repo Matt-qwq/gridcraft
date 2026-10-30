@@ -818,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | A spill that feeds its own source is `#CIRC!` with no values (the pass used to oscillate between two states and stop at its round cap, so neither answer was a fixed point), and a `#CIRC!` anchor is re-evaluated when an edit lands where it would spill. Bounded walk ≤4,096 formulas; two regressions |
 | 2026-10-30 | major | Recalc correctness after the soak: a `u16` payload index in the cell store wrapped past 65,535 entries on a heavily rewritten row and aliased another cell's text (a **full** recalc caught it); plus circular self-reads marked in the same pass, discarded spills / defined-name readers / used-range readers re-evaluated, and `#SPILL!` after a used-range move. Five direct regressions |
 | 2026-10-30 | minor | Remove Duplicates moves a legacy array with the compacted rows (or refuses when a row would cut it); `view.customViews` and `automate.recordActions` record the workbook-level state they write, so a full undo restores names and scripts. Five soak regressions landed as direct tests |
 | 2026-10-30 | minor | Standard (ECMA-376) encryption written with the scheme selectable and remembered; verified by our reader, a from-the-spec Python reader and Excel opening the file; #7 → 7–16 h, beta ~77–136 h |
