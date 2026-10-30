@@ -363,7 +363,8 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if structural {
         d.calc.recalc_all(&mut wb);
     } else if !changed.is_empty() {
-        d.calc.cells_changed(&mut wb, &changed);
+        let used = used_range_changes(&d.calc, &d.wb, &wb, &changed);
+        d.calc.cells_changed_with_used(&mut wb, &changed, &used);
     }
     if let Some(t0) = t0 {
         eprintln!("commit: + recalc {:?}", t0.elapsed());
@@ -379,6 +380,20 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     d.wb = std::sync::Arc::new(wb);
     d.selection = sel;
     Ok(r)
+}
+
+/// Sheets whose used range the edit moved, among those holding a formula that reads a reference
+/// through it (a whole column or row): the formula has to be evaluated again even though none of
+/// the cells it names changed. Sheets without such a formula are skipped without walking the store.
+pub(crate) fn used_range_changes(calc: &gridcraft_calc::Calc, before: &Workbook, after: &Workbook, changed: &[Key]) -> Vec<usize> {
+    let mut sheets: Vec<usize> = changed.iter().map(|(si, _)| *si).collect();
+    sheets.sort_unstable();
+    sheets.dedup();
+    sheets
+        .into_iter()
+        .filter(|si| calc.trims_used_range(*si))
+        .filter(|si| before.sheet(*si).and_then(|s| s.used_range()) != after.sheet(*si).and_then(|s| s.used_range()))
+        .collect()
 }
 
 /// Excel's message for an edit of a locked cell on a protected sheet.

@@ -60,6 +60,9 @@ struct Node {
     /// The formula may return an array and therefore spill: it cannot be evaluated on a thread of
     /// its own while other formulas are being laid out (the spill layout is a pass of its own).
     may_spill: bool,
+    /// A reference is read through the sheet's used range (see [`crate::eval::trimmed`]), so the
+    /// value changes when the used range moves even if no cell the formula names changed.
+    trim: bool,
 }
 
 /// Ranges wider than this many columns go to the per-sheet wide index instead of per-column ones.
@@ -214,6 +217,9 @@ pub struct Graph {
     /// A pass checks these against its dirty set: a dirty one means the pass cannot be split.
     may_spill: HashSet<Key>,
     legacy: HashSet<Key>,
+    /// Formulas with a reference read through the used range. An edit that moves the used range
+    /// (or a spill that does) has to evaluate them again: they read cells it didn't name.
+    trim: HashSet<Key>,
     /// Range indexes changed since the last [`Graph::settle`].
     unsettled_cols: HashSet<(usize, u32)>,
     unsettled_wide: HashSet<usize>,
@@ -274,6 +280,9 @@ impl Graph {
         if node.legacy.is_some() {
             self.legacy.insert(k);
         }
+        if node.trim {
+            self.trim.insert(k);
+        }
         self.nodes.insert(k, node);
     }
 
@@ -303,6 +312,7 @@ impl Graph {
         self.dynamic.remove(&k);
         self.may_spill.remove(&k);
         self.legacy.remove(&k);
+        self.trim.remove(&k);
     }
 
     /// Tidies the range indexes changed by `insert`/`remove` (queries stay correct without it,
@@ -825,6 +835,17 @@ impl PassHost<'_> {
                 Value::Error(CellError::Spill)
             }
             _ => v,
+        };
+        // A formula that read its own cell — directly, or through a range read that came back to
+        // it — is circular now, not only when the pass ends: a formula evaluated after it reads
+        // the #CIRC! a full recalculation gives it, instead of a number computed from whatever the
+        // cell showed mid-pass. Two formulas that feed each other that way otherwise swap values
+        // every round until the round limit cuts the pass off in one of the two states.
+        let v = if !self.iterate && self.cycle_seen.contains(&k) {
+            self.spills.remove(&k);
+            Value::Error(CellError::Circ)
+        } else {
+            v
         };
         self.results.insert(k, Slot { value: Some(v.clone()) });
         self.in_flight = self.in_flight.saturating_sub(1);
@@ -1558,8 +1579,9 @@ impl Calc {
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, f, _) in sheet.cells.formulas() {
                 if let Some(e) = f.expr_arc() {
-                    let (areas, dynamic) = precedents(wb, si, &e);
-                    self.graph.insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill: may_return_array(&e) });
+                    let (areas, dynamic, trim) = precedents(wb, si, &e);
+                    self.graph
+                        .insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill: may_return_array(&e), trim });
                 }
             }
         }
@@ -1627,8 +1649,22 @@ impl Calc {
         self.run(wb, stale, true, &HashSet::default());
     }
 
+    /// Whether any formula on `sheet` reads a reference through the used range, so an edit that
+    /// moves the used range has to evaluate it again.
+    pub fn trims_used_range(&self, sheet: usize) -> bool {
+        self.graph.trim.iter().any(|k| k.0 == sheet)
+    }
+
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
     pub fn cells_changed(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        self.cells_changed_with_used(wb, changed, &[]);
+    }
+
+    /// [`cells_changed`](Self::cells_changed) for an edit that moved the used range of the sheets
+    /// in `used_changed`: their formulas that read a reference through the used range (a whole
+    /// column or row, `SUM(A:A)`, `=23:26`) are evaluated again, because the cells they read
+    /// changed without any of them being named as a precedent.
+    pub fn cells_changed_with_used(&mut self, wb: &mut Workbook, changed: &[Key], used_changed: &[usize]) {
         self.parallel_fallback = false;
         let mut cleared: Vec<(usize, RangeRef)> = Vec::new();
         for &k in changed {
@@ -1636,9 +1672,9 @@ impl Calc {
             let parsed = formula.as_ref().and_then(|f| f.expr_arc().map(|e| (e, f.array)));
             match parsed {
                 Some((e, legacy)) => {
-                    let (areas, dynamic) = precedents(wb, k.0, &e);
+                    let (areas, dynamic, trim) = precedents(wb, k.0, &e);
                     let may_spill = may_return_array(&e);
-                    self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy, may_spill });
+                    self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy, may_spill, trim });
                 }
                 None => {
                     self.graph.remove(k);
@@ -1670,6 +1706,9 @@ impl Calc {
             return;
         }
         let mut seeds: Vec<Key> = changed.to_vec();
+        for &si in used_changed {
+            seeds.extend(self.graph.trim.iter().filter(|k| k.0 == si).copied());
+        }
         let mut emptied: Vec<Key> = Vec::new();
         // Per-sheet bounds of the edit, so a bulk change scans for blocked arrays once instead of
         // once per cell: redoing a whole row of Remove Duplicates used to walk a 64×64 block for
@@ -1865,10 +1904,22 @@ impl Calc {
             // the other cells and ignores the error). Excel shows 0 with a warning; we keep it
             // explicit. Without this the loop's cells hold values that depend on the order the
             // pass happened to compute them in (found by the command-sequence fuzzer).
+            //
+            // An array this pass laid out but then dropped (the anchor turned out to be circular)
+            // leaves the cells it would have spilled over empty. Formulas that read that area —
+            // a whole-column `COUNTIF` is one — read its values during the pass, so they are
+            // evaluated again after the write-back.
+            let mut discarded: Vec<(usize, RangeRef)> = Vec::new();
             if !wb.calc.iterative && !cycles.is_empty() {
                 for k in &cycles {
                     results.insert(*k, Slot { value: Some(Value::Error(CellError::Circ)) });
-                    spills.remove(k);
+                    if let Some(arr) = spills.remove(k) {
+                        let end = CellRef::new(
+                            k.1.row.saturating_add((arr.rows as u32).saturating_sub(1)),
+                            k.1.col.saturating_add((arr.cols as u32).saturating_sub(1)),
+                        );
+                        discarded.push((k.0, RangeRef::new(k.1, end)));
+                    }
                 }
             }
             if std::env::var_os("GRIDCRAFT_PROFILE").is_some() {
@@ -1879,6 +1930,9 @@ impl Calc {
             found_cycles.extend(cycles.iter().copied());
             // Write back.
             let mut spill_changes: Vec<Key> = Vec::new();
+            for (si, range) in discarded {
+                self.graph.dependents_of_range(si, range, &mut spill_changes);
+            }
             let mut freed: Vec<(usize, RangeRef)> = Vec::new();
             let twr = prof_now();
             // Row-major order: the results come out of a hash map, and walking bands in row order
@@ -1984,6 +2038,13 @@ impl Calc {
                         (None, Some(_)) => false,
                     };
                     spill_changes.extend(deps.into_iter().filter(|d| d != k || freed));
+                    // The spill moved the sheet's used range, and a formula that reads a whole
+                    // column or row (trimmed to it) reads different cells now even when the
+                    // spill lies nowhere near it.
+                    spill_changes.extend(self.graph.trim.iter().filter(|t| t.0 == k.0).copied());
+                    // A dynamic reference (INDIRECT, OFFSET, a defined name) can hide a read of
+                    // the cells the spill just gave back; the graph does not name them.
+                    spill_changes.extend(self.graph.dynamic.iter().filter(|d| d.0 == k.0).copied());
                 }
                 if let Some(o) = old
                     && !sheet.spill_ranges.get(&k.1).is_some_and(|n| n.contains(o.start) && n.contains(o.end))
