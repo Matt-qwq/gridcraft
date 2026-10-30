@@ -1410,7 +1410,7 @@ fn fill_dir(s: &mut Session, p: &Json, dr: i64, dc: i64) -> Result<Json> {
     let mut r = target_range(s, p)?;
     // Whole rows or columns fill only where the sheet has content (nothing on an empty sheet).
     if r.is_full_cols() || r.is_full_rows() {
-        match s.doc()?.wb.sheet(sheet).and_then(|sh| sh.used_range()).and_then(|u| r.intersection(&u)) {
+        match s.doc()?.wb.sheet(sheet).and_then(|sh| content_in_lines(sh, r)) {
             Some(u) => r = u,
             None => return Ok(Json::Null),
         }
@@ -1438,6 +1438,29 @@ fn fill_dir(s: &mut Session, p: &Json, dr: i64, dc: i64) -> Result<Json> {
         crate::fill::fill(cx, sheet, src, r, crate::fill::FillMode::Copy)?;
         Ok(Json::Null)
     })
+}
+
+/// The content a whole-row/whole-column fill covers: the data in the lines being filled, not the
+/// sheet's used-range box. The box is a bounding rectangle, so one cell at the bottom of another
+/// column made `Fill Down` on two columns write a million rows (and, from the commit that added
+/// the narrowing: "Fill Up and Fill Left ... filled up to row 1,048,576 even when the sheet had
+/// data").
+fn content_in_lines(sh: &crate::model::Sheet, r: RangeRef) -> Option<RangeRef> {
+    let mut out: Option<RangeRef> = None;
+    let mut add = |x: RangeRef| match out {
+        Some(u) => out = Some(u.union(&x)),
+        None => out = Some(x),
+    };
+    for (c, _) in sh.cells.iter_range(r) {
+        add(RangeRef::cell(c));
+    }
+    // A spilled array's cells are content without being stored cells.
+    for sr in sh.spill_ranges.values() {
+        if let Some(x) = sr.intersection(&r) {
+            add(x);
+        }
+    }
+    out
 }
 
 fn auto_fill(s: &mut Session, p: &Json) -> Result<Json> {
