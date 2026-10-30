@@ -1126,3 +1126,40 @@ fn params_docs_parse_into_keys() {
         assert!(find_command(id).is_some(), "CURATED names unknown command `{id}`");
     }
 }
+
+/// Fixed sequences the soak turned up, replayed verbatim, because a seed's generated sequence changes
+/// whenever the command set changes. Seed 295: a legacy array placed over the selection cleared cells
+/// inside `B11`'s precedent range without marking them as changes, so the incremental pass kept
+/// 1914.35 where a full recalc said 1755.
+#[test]
+fn fixed_regressions_from_the_soak() {
+    let steps: &[Step] = &[
+        ("table.resize".to_string(), json!({"range":"G3:K5","table":"NoSuchTable"})),
+        ("edit.copy".to_string(), json!({})),
+        ("cell.set".to_string(), json!({"cell":"C14","input":"=MAX(J10:K16)-MIN(J10:K16)"})),
+        ("data.filter".to_string(), json!({"range":"C:E"})),
+        ("cell.set".to_string(), json!({"cell":"K10","input":"=OFFSET(A21,1,1)"})),
+        ("edit.undo".to_string(), json!({"steps":2})),
+        ("data.sortAscending".to_string(), json!({"column":"C","range":"J9:M9"})),
+        ("edit.autoFill".to_string(), json!({"mode":"series","source":"H16:H21","target":"H16:I27"})),
+        ("edit.paste".to_string(), json!({"at":"E1"})),
+        ("formulas.errorChecking".to_string(), json!({})),
+        ("cell.set".to_string(), json!({"cell":"AO1","input":"=I6*C3"})),
+        ("home.insertRows".to_string(), json!({"count":1,"rows":"19:19"})),
+        ("edit.undo".to_string(), json!({"steps":2})),
+        ("selection.column".to_string(), json!({})),
+        ("edit.copy".to_string(), json!({})),
+        ("home.mergeCenter".to_string(), json!({})),
+        ("cell.set".to_string(), json!({"cell":"B11","input":"=MAX(A3:E10)-MIN(A3:E10)"})),
+        ("cell.set".to_string(), json!({"cell":"L15","input":"=B9*D21"})),
+        ("cell.set".to_string(), json!({"cell":"XFB1048574","input":"'007"})),
+        ("range.setValues".to_string(), json!({"range":"G2","values":[[true,"#N/A","=UNIQUE(A22:B28)"],["1e3","86.55",null]]})),
+        ("data.filter".to_string(), json!({"range":"5:7"})),
+        ("chart.selectData".to_string(), json!({"categories":false,"chart":5,"range":"I4:K10"})),
+        ("view.normal".to_string(), json!({})),
+        ("cell.set".to_string(), json!({"array":true,"input":"=XLOOKUP(K4,D1:D20,D1:D20)"})),
+    ];
+    if let Some(f) = replay("budget", steps) {
+        panic!("seed 295 regression: invariant [{}]: {}", f.kind, f.what);
+    }
+}

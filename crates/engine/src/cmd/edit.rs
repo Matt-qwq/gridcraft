@@ -264,15 +264,24 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
                 std::sync::Arc::make_mut(f).array = Some(range);
             }
             let sh = cx.sheet_mut(sheet)?;
-            // The array takes the whole range: other cells in it lose their contents.
+            // The array takes the whole range: other cells in it lose their contents. Every cell
+            // that loses something is a change the recalc must see — a formula reading part of the
+            // range (say `=MAX(A3:E10)-MIN(A3:E10)`) otherwise keeps its stale value while a full
+            // recalc, which walks the whole sheet, gives the right one. Touching only the anchor was
+            // exactly that bug (found by the command-sequence fuzzer, seed 295).
+            let mut cleared: Vec<CellRef> = Vec::new();
             for c in range.iter().skip(1).take(1_000_000) {
                 if let Some(old) = sh.cells.get(c).filter(|x| !x.value.is_empty() || x.formula.is_some()) {
                     let style = old.style;
                     sh.set_cell(c, Cell { style, ..Cell::default() });
+                    cleared.push(c);
                 }
             }
             sh.set_cell(range.start, cell);
             cx.touch(sheet, range.start);
+            for c in cleared {
+                cx.touch(sheet, c);
+            }
             return Ok(Json::Null);
         }
         let cell = input_to_cell(&input, sheet, at, &mut cx.wb)?;
