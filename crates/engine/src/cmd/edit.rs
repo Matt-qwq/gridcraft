@@ -248,6 +248,17 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
             if !range.is_single() && cx.wb.sheet(sheet).is_some_and(|sh| sh.tables.iter().any(|t| t.range.intersects(&range))) {
                 return Err(EngineError::Other("Multi-cell array formulas aren't allowed in tables.".into()));
             }
+            // The array owns every cell of its range and its result is fitted to the range, but the
+            // evaluator lays out at most `MAX_CELLS`. A larger range would be `#NUM!` and the cells
+            // its range still covers would keep stale values that the save loses: the file says the
+            // array owns them, so reading it back drops them (`sheet_read`'s legacy-array rule).
+            // Excel refuses the entry too; an error here keeps every cell as it was.
+            if range.count() > gridcraft_calc::eval::MAX_CELLS {
+                return Err(EngineError::Other(format!(
+                    "An array formula can't cover more than {} cells. Select a smaller range.",
+                    gridcraft_calc::eval::MAX_CELLS
+                )));
+            }
             let mut cell = input_to_cell(&input, sheet, range.start, &mut cx.wb)?.unwrap_or_default();
             if let Some(f) = cell.formula.as_mut() {
                 std::sync::Arc::make_mut(f).array = Some(range);

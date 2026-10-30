@@ -181,8 +181,11 @@ pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: &R
                     }
                 }
                 if let Some(w) = e.attr_f64("defaultColWidth") {
+                    // A written width is the sheet's width, zero included: rejecting 0 kept 64 and
+                    // made every column the writer sized from the default come back with an
+                    // explicit width (the fuzzer's `cols differ after reload`).
                     let px = col_width_to_px(w);
-                    if px > 0.0 {
+                    if w.is_finite() && w >= 0.0 {
                         sheet.default_col_width = px;
                     }
                 } else if let Some(b) = e.attr_f64("baseColWidth") {
