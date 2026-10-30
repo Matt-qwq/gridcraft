@@ -265,6 +265,17 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   structural edits and cleared blockers (#133, #139; PRs #148, #157), 3-D span deletion (#140),
   and qualified names after a sheet rename (#134). Iterative calculation for circular references
   landed too (no Options dialog yet, which is §13's).
+- **Soak (10-30):** a 400-seed × 200-command release soak found class-level defects the reported bugs
+  never showed. Fixed here: a `u16` payload index in the cell store's per-row wide table **wrapped past
+  65,535 entries** on a row rewritten thousands of times, so rewriting one cell's text aliased another
+  cell's value (a *full* recalc disagreeing with memory is what exposed it; the table now compacts to
+  one entry per distinct value its row still uses); a formula that read its own cell was marked
+  `#CIRC!` only after the pass, so later formulas in the round read its pre-override number and an
+  eight-round cap could leave a spill from one state with cells from another; a `COUNTIF` reading a
+  spill the same pass discarded as circular; a defined name reading a discarded spill (a name hides its
+  range from the dependency graph, so dynamic formulas and used-range readers are re-evaluated on any
+  spill change); and `#SPILL!` after an edit moved the used range. Each has a direct regression test
+  that asserts the two paths agree **and** the right value.
 - **Oracle suite (10-30):** `crates/calc/tests/formula_oracle.rs` runs **595 documented examples over
   275 functions** through the real calc path (`gridcraft_calc::evaluate`), plus dedicated tests for
   real spills, `#SPILL!` unblocking, the 1904 date system, 3-D references and qualified names. Each
