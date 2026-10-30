@@ -874,7 +874,17 @@ fn table_resize(s: &mut Session, p: &Json) -> Result<Json> {
     .ok_or_else(|| bad("table.resize", "select a cell in a table"))?;
     edit(s, |cx| {
         let sheet = cx.sheet_mut(si)?;
-        let headers: Vec<String> = (r.start.col..=r.end.col).map(|c| sheet.value(CellRef::new(r.start.row, c)).display()).collect();
+        // The header row the resized range would have, and the unique names it must hold: a blank
+        // cell takes the first free `ColumnN` at or after its position, so a column added by
+        // resizing can't be handed a name a neighbouring column already has (which the XLSX
+        // writer would then silently rename on save: `Column3` came back as `Column32`).
+        let headers: Vec<Option<String>> = (r.start.col..=r.end.col)
+            .map(|c| {
+                let text = sheet.value(CellRef::new(r.start.row, c)).display();
+                if text.trim().is_empty() { None } else { Some(text) }
+            })
+            .collect();
+        let names = crate::tables::header_names(&headers);
         if sheet.tables.iter().enumerate().any(|(i, o)| i != ti && o.range.intersects(&r)) {
             return Err(EngineError::Other("A table can't overlap another table.".into()));
         }
@@ -884,9 +894,8 @@ fn table_resize(s: &mut Session, p: &Json) -> Result<Json> {
                 "The headers must remain in the same row, and the resulting table range must overlap the original table range.".into(),
             ));
         }
-        let mut cols = Vec::new();
-        for (i, h) in headers.iter().enumerate() {
-            let name = if h.is_empty() { format!("Column{}", i + 1) } else { h.clone() };
+        let mut cols = Vec::with_capacity(names.len());
+        for name in names {
             let existing = t.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&name)).cloned();
             cols.push(existing.unwrap_or(TableColumn {
                 name,
