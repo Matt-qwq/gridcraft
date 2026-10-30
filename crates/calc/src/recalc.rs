@@ -642,6 +642,50 @@ fn reads_own_spill(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool
     node.areas.iter().any(|area| area.sheet == sheet && area.range.intersects(&range))
 }
 
+/// How many formulas [`spill_feeds_its_source`] walks before it stops looking. A source range that
+/// runs through thousands of formulas is not how an array reads its own spill back; the check has
+/// to cost a little next to the pass it guards, so it gives up rather than walk a huge sheet.
+const SPILL_LOOP_FORMULAS: usize = 4096;
+
+/// Whether spilling `a` at `(sheet, anchor)` would write a cell that a formula the anchor's own
+/// formula reads — directly, or through further formulas — also reads. The array's value then
+/// depends on a cell it writes: a circular reference through its spill. The static graph cannot
+/// see it (the spill's area is only known once the array is computed), and without the check the
+/// pass alternated between two layouts — the array spilling, the reader feeding the source making
+/// it `#SPILL!`, the reader firing it again — and stopped on whichever one the round limit met, so
+/// the value in memory depended on how many rounds the sequence took to get there.
+fn spill_feeds_its_source(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool {
+    let Some(node) = host.graph.nodes.get(&(sheet, anchor)) else { return false };
+    let end =
+        CellRef::new(anchor.row.saturating_add((a.rows as u32).saturating_sub(1)), anchor.col.saturating_add((a.cols as u32).saturating_sub(1)));
+    let range = RangeRef::new(anchor, end);
+    let mut seen: HashSet<Key> = HashSet::default();
+    let mut queue: VecDeque<Area> = node.areas.iter().cloned().collect();
+    while let Some(area) = queue.pop_front() {
+        let Some(sh) = host.wb.sheet(area.sheet) else { continue };
+        for (c, cell) in sh.cells.iter_range(area.range) {
+            if cell.formula.is_none() {
+                continue;
+            }
+            let k = (area.sheet, c);
+            // The anchor reading itself is circular whether or not it spills; `compute` refuses it
+            // while it is in flight, and `reads_own_spill` handles the rest.
+            if k == (sheet, anchor) || !seen.insert(k) {
+                continue;
+            }
+            let Some(n) = host.graph.nodes.get(&k) else { continue };
+            if n.areas.iter().any(|x| x.sheet == sheet && x.range.intersects(&range)) {
+                return true;
+            }
+            queue.extend(n.areas.iter().cloned());
+            if seen.len() >= SPILL_LOOP_FORMULAS {
+                return false;
+            }
+        }
+    }
+    false
+}
+
 /// Whether an array result at `k` can't spill: it is in a table, or its area runs off the sheet,
 /// overlaps merged cells, holds other cells, or another formula's spill (unless that formula is
 /// recalculated in this pass, and so may spill elsewhere now).
@@ -661,6 +705,14 @@ fn spill_blocked(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool {
         || sh.tables.iter().any(|t| t.range.contains(anchor))
         || sh.cells.iter_range(range).any(|(c, cell)| c != anchor && (!cell.value.is_empty() || cell.formula.is_some()))
         || sh.spill.range(range.start..=range.end).any(|(c, _)| range.contains(*c) && spilled_over(*c))
+}
+
+/// Whether a cell's value says its formula is an array that spilled nothing: blocked (`#SPILL!`)
+/// or circular through its own spill (`#CIRC!`). An edit where such an anchor would spill is the
+/// only thing that can wake it: the sheet stores no spill range for it, so the edit names no
+/// dependent of it.
+fn spilled_nothing(v: &Value) -> bool {
+    matches!(v, Value::Error(CellError::Spill | CellError::Circ))
 }
 
 /// Whether `arr`, anchored at `anchor`, would spill exactly what the sheet already holds over
@@ -833,6 +885,13 @@ impl PassHost<'_> {
             Some(a) if spill_blocked(self, k, a) => {
                 self.spills.remove(&k);
                 Value::Error(CellError::Spill)
+            }
+            Some(a) if spill_feeds_its_source(self, k, a) => {
+                self.spills.remove(&k);
+                if self.cycle_seen.insert(k) {
+                    self.cycles.push(k);
+                }
+                Value::Error(CellError::Circ)
             }
             _ => v,
         };
@@ -1743,7 +1802,7 @@ impl Calc {
                 let Some(sh) = wb.sheet(si) else { continue };
                 let area = RangeRef::new(CellRef::new(r0.saturating_sub(64), c0.saturating_sub(64)), CellRef::new(r1, c1));
                 for (c, cell) in sh.cells.iter_range(area) {
-                    if cell.value == Value::Error(CellError::Spill) {
+                    if spilled_nothing(&cell.value) {
                         seeds.push((si, c));
                     }
                 }
@@ -1765,7 +1824,7 @@ impl Calc {
                         }
                     }
                     for (c, cell) in sh.cells.iter_range(RangeRef::new(CellRef::new(k.1.row.saturating_sub(64), k.1.col.saturating_sub(64)), k.1)) {
-                        if c != k.1 && cell.value == Value::Error(CellError::Spill) {
+                        if c != k.1 && spilled_nothing(&cell.value) {
                             seeds.push((k.0, c));
                         }
                     }
@@ -1775,7 +1834,7 @@ impl Calc {
         // An emptied cell can unblock an anchor any distance above or to the left of it.
         for (si, end) in emptied {
             for &(s, c) in self.graph.nodes.keys() {
-                if s == si && c.row <= end.row && c.col <= end.col && wb.sheet(s).is_some_and(|sh| sh.value(c) == Value::Error(CellError::Spill)) {
+                if s == si && c.row <= end.row && c.col <= end.col && wb.sheet(s).is_some_and(|sh| spilled_nothing(&sh.value(c))) {
                     seeds.push((s, c));
                 }
             }
