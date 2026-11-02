@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** major (chartex parts are patched and per-point data labels are modelled — §4 down to 1–3 h; a shaping + bidi engine lands in `core::text`, so §5 has one wiring task left; a documentation-derived formula oracle suite lands and §6 closes; encryption hardening — OS CSPRNG, integrity HMAC verified on read, web refuses a password save — leaves §7 at 10–21 h; the chart Format pane and drag-resize landed, §4 2–6 h; slicers and timelines modelled, §8 14–22 h) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** minor (a table slicer follows its table's and column's names, so a rename neither empties its tiles nor stops its filter; `insert.slicer` applies the documented `caption`; a filter changed on the PivotTable itself mirrors onto a connected slicer when every report agrees and the labels are tiles — §8's remaining items are the timeline drag, calculated items, PivotCharts and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -381,7 +381,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 7–16 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, RC4 write 1,
   an Excel run over a `.xls` 1–6). [file-format-parity.md](file-format-parity.md)
 
-### 8. PivotTables: no slicer UI, calculated items, PivotCharts; unverified in Excel (F)
+### 8. PivotTables: timeline handles, calculated items, PivotCharts; unverified in Excel (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
   field, the PivotTables they filter, item values with their selected flags, name, caption, style,
   column count, timeline unit and anchor — read into the model and written once from it, so
@@ -416,10 +416,19 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   can hold the range now, wiring the drag is UI work in the next round. Fidelity note: the pivot
   filters by item labels, so a range covering part of a month shows the whole month; a real
   Excel-authored timeline with non-zero refresh versions stays on the kept path.
+- **Landed 10-30 (names and a report-side filter):** a table slicer follows its table's rename and
+  its column's header rename (`Slicer.column`, and `caption` while it still shows the column's
+  name), so a rename can neither empty its tile list nor leave its filter pointing at a column that
+  no longer exists;
+  `insert.slicer` now applies a `caption` the caller passes (it was documented but dropped). And a
+  field selection changed from the PivotTable itself (`pivot.filter`, and any update that rewrites
+  the report's filters) is mirrored onto a slicer connected to that field **when every connected
+  report agrees on the selection and every label names a tile**. A grouped date label or a
+  number-format label has no tile, so the widget keeps its state rather than showing a filter the
+  model does not hold; a slicer whose reports disagree is left alone; timelines keep their own range.
 - **Missing:** the timeline handles' drag in the UI; a filter on a field outside Rows/Columns is drawn as an extra page-filter row
-  (`PivotFilter` has no flag to distinguish it); timeline date ranges are kept but not editable;
-  calculated items, PivotCharts, value/label filters, number grouping, GETPIVOTDATA and data-model
-  pivots; a table slicer is still not written to XLSX; `pivot.filter` does not sync a slicer's tiles.
+  (`PivotFilter` has no flag to distinguish it); calculated items, PivotCharts, value/label filters,
+  number grouping, GETPIVOTDATA and data-model pivots.
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has

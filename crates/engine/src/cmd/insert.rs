@@ -531,6 +531,16 @@ fn table_rename(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(t) = cx.sheet_mut(si)?.tables.get_mut(ti) {
             t.name = name.clone();
         }
+        // A table slicer names its table, so it follows the rename rather than reading a table
+        // that no longer exists (its tiles would go empty and its filter would stop applying).
+        for sheet in 0..cx.wb.sheets.len() {
+            let Some(sh) = cx.wb.sheet_mut(sheet) else { continue };
+            for sl in &mut sh.slicers {
+                if sl.table.eq_ignore_ascii_case(&old) {
+                    sl.table = name.clone();
+                }
+            }
+        }
         // Structured references follow the rename.
         for i in 0..cx.wb.sheets.len() {
             let keys: Vec<(CellRef, std::sync::Arc<Formula>)> =

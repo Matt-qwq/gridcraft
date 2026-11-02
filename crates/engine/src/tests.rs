@@ -1863,6 +1863,71 @@ fn slicer_filters_table() {
 }
 
 #[test]
+fn a_table_slicer_follows_a_column_rename() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Qty"], ["East", 2], ["West", 5]]})).unwrap();
+    s.execute("insert.table", json!({"range": "A1:B3", "name": "Sales"})).unwrap();
+    let r = s.execute("insert.slicer", json!({"table": "Sales", "column": "Region", "at": "D2"})).unwrap();
+    let id = r["slicer"].as_u64().unwrap();
+
+    // The header's name is the column's identity, so the slicer follows it (and the default
+    // caption, which was the column's name, does too).
+    s.execute("cell.set", json!({"cell": "A1", "input": "Territory"})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(0).unwrap();
+        assert_eq!(sh.slicers[0].column, "Territory");
+        assert_eq!(sh.slicers[0].caption, "Territory");
+    }
+
+    // The rename and the slicer's new column are one undo step.
+    s.execute("edit.undo", json!({})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(0).unwrap();
+        assert_eq!(sh.value(gridcraft_core::CellRef::new(0, 0)), Value::from("Region"));
+        assert_eq!(sh.slicers[0].column, "Region");
+        assert_eq!(sh.slicers[0].caption, "Region");
+    }
+    s.execute("edit.redo", json!({})).unwrap();
+
+    // It still filters the table under the new name.
+    s.execute("slicer.toggle", json!({"slicer": id, "value": "East"})).unwrap();
+    let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+    assert!(!sh.is_row_hidden(1) && sh.is_row_hidden(2));
+}
+
+#[test]
+fn a_table_slicer_keeps_a_custom_caption_and_follows_a_table_rename() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Qty"], ["East", 2], ["West", 5]]})).unwrap();
+    s.execute("insert.table", json!({"range": "A1:B3", "name": "Sales"})).unwrap();
+    let r = s.execute("insert.slicer", json!({"table": "Sales", "column": "Region", "caption": "Zone", "at": "D2"})).unwrap();
+    let id = r["slicer"].as_u64().unwrap();
+
+    // A caption the caller set is not the column's name, so it stays.
+    s.execute("cell.set", json!({"cell": "A1", "input": "Territory"})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(0).unwrap();
+        assert_eq!(sh.slicers[0].column, "Territory");
+        assert_eq!(sh.slicers[0].caption, "Zone");
+    }
+
+    // The table's own name is the slicer's binding too: after a rename it reads the table that
+    // exists, so its tiles and its filter keep working.
+    s.execute("table.rename", json!({"table": "Sales", "name": "Revenue"})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(0).unwrap();
+        assert_eq!(sh.slicers[0].table, "Revenue");
+    }
+    s.execute("slicer.toggle", json!({"slicer": id, "value": "East"})).unwrap();
+    let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+    assert!(!sh.is_row_hidden(1) && sh.is_row_hidden(2));
+}
+
+#[test]
 fn accounting_format_takes_the_symbol_it_is_given() {
     // The command documents `symbol`; it used to be dropped, so only `$` was ever reachable
     // from the control channel (asking for lempiras, #1893, changed nothing).
@@ -5860,6 +5925,33 @@ fn every_label_of_a_pivot_slicer_comes_from_the_selected_tiles() {
     s.execute("slicer.toggle", json!({"slicer": "Region", "value": "West"})).unwrap();
     let shown = sheet_texts(&s, "Report");
     assert!(shown.iter().any(|t| t == "East") && shown.iter().any(|t| t == "North"), "{shown:?}");
+}
+
+#[test]
+fn filtering_the_report_updates_its_slicer_tiles() {
+    let mut s = pivot_session();
+    s.execute("insert.slicer", json!({"field": "Region"})).unwrap();
+    let tiles = |s: &Session| {
+        let d = s.doc().unwrap();
+        d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap().pivot_slicers[0].selected_labels()
+    };
+
+    // A filter set from the PivotTable itself is the field's item selection, so the tiles follow
+    // it (the labels are compared as the report compares them, case-insensitively).
+    s.execute("pivot.filter", json!({"pivot": "P1", "field": "Region", "selected": ["east"]})).unwrap();
+    assert_eq!(tiles(&s), Some(vec!["East".to_string()]));
+    // It is one undo step: the report's rows and the tiles come back together.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(tiles(&s), None);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(tiles(&s), Some(vec!["East".to_string()]));
+    // Clearing the report's filter selects every tile again.
+    s.execute("pivot.filter", json!({"pivot": "P1", "field": "Region", "selected": null})).unwrap();
+    assert_eq!(tiles(&s), None);
+    // A label no tile can show (a grouped date, a number-format label) stays a report filter the
+    // widget does not pretend to hold.
+    s.execute("pivot.filter", json!({"pivot": "P1", "field": "Region", "selected": ["Nowhere"]})).unwrap();
+    assert_eq!(tiles(&s), None);
 }
 
 #[test]

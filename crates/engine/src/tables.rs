@@ -266,6 +266,19 @@ pub(crate) fn sync_headers(cx: &mut crate::cmd::Ctx) {
             }
         }
     }
+    // A table slicer names its column, so it follows a header rename too. A caption that still
+    // shows the old name follows it; one the user set stays as it is.
+    for (si, table, _, old, name) in &renames {
+        let Some(sh) = cx.wb.sheet_mut(*si) else { continue };
+        for sl in &mut sh.slicers {
+            if sl.table.eq_ignore_ascii_case(table) && sl.column.eq_ignore_ascii_case(old) {
+                sl.column = name.clone();
+                if sl.caption.eq_ignore_ascii_case(old) {
+                    sl.caption = name.clone();
+                }
+            }
+        }
+    }
     cx.structural = true;
 }
 

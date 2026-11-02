@@ -30,7 +30,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 | **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi | #5 | 0–3 | **Shaping engine landed 10-30** (`core::text`: unicode-bidi levels + rustybuzz, visual-order runs, logical clusters, 26 tests). What remains is wiring it into the grid and the PDF writer — two tasks in flight. |
 | **2c** | Keyboard: key tips, shortcut audit, context menus | #9 | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects |
 | **3** | `.xls` import and password-protected workbooks | #7 | 9–19 | **Encryption (write + verified integrity + CSPRNG) and `.xls` styles, comments, validation, conditional formats, hyperlinks and frozen panes landed 10-29/30**; CF12 rules, charts/pictures, BIFF5 (not in [MS-XLS]) and Standard/RC4 writing remain. |
-| **3b** | PivotTables: PivotCharts, calculated items, Excel verification | #8 | 6–11 | **Slicers and timelines landed 10-30** (model, XLSX, six commands, a selection filters the pivot); the widgets are not drawn yet. Excel verification waits for #1. |
+| **3b** | PivotTables: PivotCharts, calculated items, Excel verification | #8 | 6–11 | **Slicers and timelines landed 10-30** (model, XLSX, six commands, drawn on the sheet, a selection filters the pivot, a timeline range filters through `slicer.setRange`); a table slicer follows a table/column rename and a report-side filter mirrors onto its slicer. Remaining: the timeline handles' drag, PivotCharts, calculated items, value/label filters, GETPIVOTDATA and the Excel check (#1). |
 | **4** | **Beta exit**: stability soak, all gates green, full `cargo xtask ci`, docs, release, corpus re-run | all | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read half and linked tables (20–30 h) · M17 zone maps (8–12 h) · localization, twelve languages (100–165 h) · Get & Transform/data model (60–100 h) · full chart depth, collaboration, mobile, AI · M22 only if a measured trigger fires | M17/M21/M22 | — | Not beta blockers. Keep the 100M/paging base stable; no native format before a trigger. |
 
@@ -818,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (its caption too while it still shows the old name); `insert.slicer` applies the documented `caption`; a filter changed on the PivotTable mirrors onto a connected slicer when every connected report agrees and the labels are tiles. Timeline drag, calculated items and PivotCharts remain in #8 |
 | 2026-10-30 | major | A whole-column/row fill narrows to its own lines' content (one stray far cell used to make a `Ctrl+D` over two columns write 2.1M cells; soak seed 415 s → 5 s), `pasteSpecial`'s moved-cell lookup is a map (O(cells²) → linear); three time regressions with 10× budgets, and the measured scaling/memory recorded in gaps §2 |
 | 2026-10-30 | minor | Chart style/colour parts kept byte-identically (chartex and classic); per-point label prefix proven not expressible and retired; #4 → 0–2 h, beta ~75–134 h |
 | 2026-10-30 | trivial | Soak harness: per-seed time budget reported as `slow`, wall clock always printed, full capture file, `GRIDCRAFT_FUZZ_REPLAY` |

@@ -539,6 +539,9 @@ fn update(s: &mut Session, p: &Json, f: impl FnOnce(&mut PivotTable, &pv::Source
             *slot = new;
         }
         let area = pv::refresh(&mut cx.wb, si, pi, replace).map_err(other)?;
+        // A filter changed from the report itself is the same field selection a slicer shows, so
+        // an already-inserted widget follows it (and the tiles cannot disagree with the cells).
+        super::slicer::sync_slicers_from_pivot(&mut cx.wb, si, pi);
         cx.structural = true;
         if out.is_null() {
             out = json!({});

@@ -421,6 +421,78 @@ fn widget_targets(wb: &Workbook, pivots: &[String]) -> Vec<(usize, usize)> {
     out
 }
 
+/// Whether two item selections name the same set of labels (case-insensitive, order-free). The
+/// report stores labels as the caller typed them; the widget compares tile labels the same way.
+fn same_selection(a: &[String], b: &[String]) -> bool {
+    let key = |v: &[String]| {
+        let mut k: Vec<String> = v.iter().map(|s| s.trim().to_lowercase()).collect();
+        k.sort();
+        k.dedup();
+        k
+    };
+    key(a) == key(b)
+}
+
+/// The selection every report connected to a slicer agrees on for `field`: `Some(None)` when they
+/// all show every item, `Some(Some(labels))` when they agree on a filter, `None` when they
+/// disagree, when a connected report is gone, or when there is no report at all. A slicer shows a
+/// selection that really applies to its reports; it never mirrors one report while another differs.
+fn agreed_selection(wb: &Workbook, pivots: &[String], field: &str) -> Option<Option<Vec<String>>> {
+    let mut agreed: Option<Option<Vec<String>>> = None;
+    let mut seen = 0usize;
+    for name in pivots {
+        let pt = wb.sheets.iter().flat_map(|s| s.pivots.iter()).find(|p| p.name.eq_ignore_ascii_case(name))?;
+        let selection = pt.filters.iter().find(|f| f.source_col.eq_ignore_ascii_case(field)).and_then(|f| f.selected.clone());
+        if seen == 0 {
+            agreed = Some(selection);
+        } else {
+            match (agreed.as_ref().and_then(|x| x.as_ref()), selection.as_ref()) {
+                (None, None) => {}
+                (Some(a), Some(b)) if same_selection(a, b) => {}
+                _ => return None,
+            }
+        }
+        seen = seen.saturating_add(1);
+    }
+    if seen == 0 { None } else { agreed }
+}
+
+/// Mirrors a filter changed on the PivotTable itself onto a slicer connected to it, so the tiles
+/// and the report cannot disagree (Excel's slicer shows the field's item selection, however it was
+/// changed). Only a label set that every connected report agrees on is applied, and only when every
+/// label names a tile; a grouped date label or a number-format-dependent label has no tile to
+/// select, so the widget keeps its state instead of showing a filter the model does not hold.
+/// Timelines keep their own range: a date range is not derivable from item labels.
+pub(crate) fn sync_slicers_from_pivot(wb: &mut Workbook, si: usize, pi: usize) {
+    let Some(name) = wb.sheet(si).and_then(|s| s.pivots.get(pi)).map(|p| p.name.clone()) else { return };
+    // Collect the work first: `agreed_selection` reads the whole workbook through `&`.
+    let mut plan: Vec<(usize, usize, Option<Vec<String>>)> = vec![];
+    for (sheet_i, sh) in wb.sheets.iter().enumerate() {
+        for (wi, sl) in sh.pivot_slicers.iter().enumerate() {
+            if !sl.pivot_tables.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            if let Some(selection) = agreed_selection(wb, &sl.pivot_tables, &sl.field) {
+                plan.push((sheet_i, wi, selection));
+            }
+        }
+    }
+    for (sheet_i, wi, selection) in plan {
+        let Some(sl) = wb.sheet_mut(sheet_i).and_then(|s| s.pivot_slicers.get_mut(wi)) else { continue };
+        match selection {
+            None => {
+                sl.select(None);
+            }
+            Some(labels) => {
+                let mut trial = sl.clone();
+                if trial.select(Some(&labels)).is_empty() {
+                    *sl = trial;
+                }
+            }
+        }
+    }
+}
+
 /// Writes `labels` as a report's filter on `field` (`None` removes the field's filter) and
 /// re-renders it: the one filter path a slicer's tiles and a timeline's range both use.
 fn filter_pivot_field(wb: &mut Workbook, si: usize, pi: usize, field: &str, labels: Option<Vec<String>>) -> Result<()> {
@@ -512,11 +584,12 @@ fn insert_slicer(s: &mut Session, p: &Json) -> Result<Json> {
     let width = f64_param(p, "width").unwrap_or(168.0).clamp(60.0, 10000.0) as f32;
     let height = f64_param(p, "height").unwrap_or(200.0).clamp(60.0, 10000.0) as f32;
     let id = d.wb.next_object_id();
+    let caption = str_param(p, "caption").map(str::to_string).unwrap_or_else(|| column.clone());
     let slicer = Slicer {
         id,
         table,
-        column: column.clone(),
-        caption: column,
+        column,
+        caption,
         anchor: Anchor { cell: at, dx: 4.0, dy: 4.0, width, height, mode: AnchorMode::MoveOnly },
         selected: None,
         columns,
