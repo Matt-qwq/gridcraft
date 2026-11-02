@@ -389,7 +389,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 7–16 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, RC4 write 1,
   an Excel run over a `.xls` 1–6). [file-format-parity.md](file-format-parity.md)
 
-### 8. PivotTables: timeline handles, calculated items, value/label filters; unverified in Excel (F)
+### 8. PivotTables: calculated items, value/label filters; unverified in Excel (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
   field, the PivotTables they filter, item values with their selected flags, name, caption, style,
   column count, timeline unit and anchor — read into the model and written once from it, so
