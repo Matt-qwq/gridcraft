@@ -543,6 +543,31 @@ pub enum LabelPosition {
     Bottom,
 }
 
+/// A label's own text formatting (`c:txPr/a:p/a:pPr/a:defRPr`): its size, weight and colour.
+///
+/// The typeface, italic and the label's fill are not modelled: they stay with the part while the
+/// element is untouched and are lost when the point's or series' label font is edited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LabelFont {
+    /// Size in points (`sz`, hundredths of a point in the file); `None` keeps the chart's size.
+    pub size: Option<f32>,
+    pub bold: Option<bool>,
+    pub color: Option<Color>,
+}
+
+impl LabelFont {
+    /// Whether the font says anything (a font with nothing set is no font).
+    pub fn is_set(&self) -> bool {
+        self.size.is_some() || self.bold.is_some() || self.color.is_some()
+    }
+
+    /// The font with its size forced into the range the file and the command accept.
+    pub fn sane(&self) -> LabelFont {
+        LabelFont { size: self.size.filter(|s| s.is_finite() && (1.0..=400.0).contains(s)), ..*self }
+    }
+}
+
 /// What a data label shows and where (Add Chart Element ▸ Data Labels, Format Data Labels).
 ///
 /// A chart's labels are on when [`Chart::data_labels`] is set; this says which parts of the label
@@ -564,6 +589,8 @@ pub struct LabelOptions {
     /// No labels at all for this series (`c:dLbls/c:delete`): Excel hides one series' labels
     /// while the others keep theirs.
     pub hidden: bool,
+    /// The labels' own text formatting; a point's own font overrides it for that point.
+    pub font: Option<LabelFont>,
 }
 
 impl LabelOptions {
@@ -648,6 +675,8 @@ pub struct PointLabel {
     pub show_percentage: Option<bool>,
     /// `Auto` keeps the series' or the chart's position (`c:dLblPos` absent).
     pub position: LabelPosition,
+    /// This label's own text formatting (`c:txPr`), overriding the series' or the chart's.
+    pub font: Option<LabelFont>,
 }
 
 impl PointLabel {
@@ -656,7 +685,7 @@ impl PointLabel {
         self.show_value.is_some() || self.show_series.is_some() || self.show_category.is_some() || self.show_percentage.is_some()
     }
 
-    /// Whether the label shows anything at all: a text, a flag switched on, or a position.
+    /// Whether the label shows anything at all: a text, a flag switched on, a position or a font.
     pub fn shows_anything(&self) -> bool {
         self.text.as_deref().is_some_and(|t| !t.is_empty())
             || self.show_value == Some(true)
@@ -664,6 +693,7 @@ impl PointLabel {
             || self.show_category == Some(true)
             || self.show_percentage == Some(true)
             || self.position != LabelPosition::Auto
+            || self.font.is_some_and(|f| f.is_set())
     }
 
     /// Nothing but its index: the record carries no label and is dropped.

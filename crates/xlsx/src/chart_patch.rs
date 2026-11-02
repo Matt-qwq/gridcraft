@@ -714,7 +714,7 @@ fn label_option_tags() -> [&'static str; 9] {
 /// The `dLbl` children the model owns: the point's index, its deletion and its label. Anything else
 /// in the element (layout, text formatting, a callout's leader lines) is somebody else's and stays.
 fn is_own_label_child(name: &str) -> bool {
-    matches!(name, "idx" | "delete" | "tx" | "dLblPos" | "showVal" | "showCatName" | "showSerName" | "showPercent")
+    matches!(name, "idx" | "delete" | "tx" | "txPr" | "dLblPos" | "showVal" | "showCatName" | "showSerName" | "showPercent")
 }
 
 /// [`is_own_label_child`] for a whole element: nothing in it would be lost by rebuilding it.
@@ -808,7 +808,7 @@ fn patch_dlbls(
             let pe = plan.edits(d, DLBLS_ORDER);
             match state.options.as_ref() {
                 Some(l) => {
-                    for (tag, text) in label_children(l) {
+                    for (tag, text) in label_children(l, wb) {
                         pe.set(tag, text);
                     }
                     if l.hidden {
@@ -866,6 +866,7 @@ fn patch_point_labels(plan: &mut Plan, xml: &str, dlbls: &Node, then: &LabelStat
                 pe.set("delete", b.no_label.then(|| "<c:delete val=\"1\"/>".to_string()));
                 let label = b.label.as_ref().filter(|_| !b.no_label);
                 pe.set("tx", label.and_then(|l| l.text.as_deref()).map(|t| crate::chart::label_tx_xml(t, wb, si)));
+                pe.set("txPr", label.and_then(|l| l.font).filter(|f| f.is_set()).map(|f| crate::chart::label_tx_pr_xml(&f, wb)));
                 pe.set(
                     "dLblPos",
                     label
@@ -891,7 +892,7 @@ fn patch_point_labels(plan: &mut Plan, xml: &str, dlbls: &Node, then: &LabelStat
                     }
                 } else {
                     let pe = plan.edits(n, DLABEL_ORDER);
-                    for tag in ["delete", "tx", "dLblPos", "showVal", "showCatName", "showSerName", "showPercent"] {
+                    for tag in ["delete", "tx", "txPr", "dLblPos", "showVal", "showCatName", "showSerName", "showPercent"] {
                         pe.set(tag, None);
                     }
                 }
@@ -1227,7 +1228,9 @@ pub fn patch_chart(xml: &str, then: &Chart, now: &Chart, wb: &Workbook, si: usiz
     // Chart-level labels: one `<c:dLbls>` per group.
     let then_group = label_state(then, None);
     let now_group = label_state(now, None);
-    if then_group.as_ref().map(|s| s.options.as_ref().map(label_children)) != now_group.as_ref().map(|s| s.options.as_ref().map(label_children)) {
+    let then_kids = then_group.as_ref().map(|s| s.options.as_ref().map(|l| label_children(l, wb)));
+    let now_kids = now_group.as_ref().map(|s| s.options.as_ref().map(|l| label_children(l, wb)));
+    if then_kids != now_kids {
         for g in &groups {
             patch_dlbls(&mut plan, xml, g, group_order(g), then_group.as_ref(), now_group.as_ref(), wb, si);
         }

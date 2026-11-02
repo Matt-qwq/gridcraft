@@ -5642,6 +5642,50 @@ fn chart_formatting_commands_set_every_modelled_option() {
 }
 
 #[test]
+fn a_label_font_is_set_at_each_level_and_survives_a_save() {
+    use gridcraft_model::{Color, LabelFont};
+    let mut s = s();
+    chart_data(&mut s);
+    s.execute("insert.chart", json!({"type": "column", "range": "A1:E7"})).unwrap();
+    let chart = |s: &Session| s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+
+    // The chart's labels: size, weight and colour together.
+    s.execute("chart.setDataLabels", json!({"value": true, "fontSize": 11, "bold": true, "color": "C00000"})).unwrap();
+    assert_eq!(
+        chart(&s).labels.font,
+        Some(LabelFont { size: Some(11.0), bold: Some(true), color: Some(Color::Rgb(0xC00000)) }),
+        "the chart's label font"
+    );
+    // One series' labels take only the size; the rest stays at the chart's (absent) values.
+    s.execute("chart.setDataLabels", json!({"series": 0, "fontSize": 8.5})).unwrap();
+    assert_eq!(chart(&s).series[0].labels.as_ref().unwrap().font, Some(LabelFont { size: Some(8.5), ..LabelFont::default() }));
+    assert_eq!(chart(&s).series[1].labels, None, "another series is untouched");
+    // One point's label: weight and colour, no size of its own.
+    s.execute("chart.setDataLabels", json!({"series": 0, "point": 1, "bold": false, "color": "0070C0"})).unwrap();
+    let label = chart(&s).series[0].point_label(1).cloned().unwrap();
+    assert_eq!(label.font, Some(LabelFont { size: None, bold: Some(false), color: Some(Color::Rgb(0x0070C0)) }));
+
+    // A size outside the range the file holds is refused, not clamped.
+    assert!(s.execute("chart.setDataLabels", json!({"fontSize": 0})).is_err());
+    assert!(s.execute("chart.setDataLabels", json!({"fontSize": 401})).is_err());
+    assert!(s.execute("chart.setDataLabels", json!({"color": "not a colour"})).is_err());
+
+    // A chartex chart keeps its label font where GridCraft cannot model it, so it says so.
+    s.execute("insert.chart", json!({"type": "treemap", "range": "A1:E7"})).unwrap();
+    let treemap = s.doc().unwrap().wb.active().unwrap().charts[1].id;
+    assert!(s.execute("chart.setDataLabels", json!({"chart": treemap, "fontSize": 10})).is_err(), "a chartex label font is not modelled");
+
+    // Every level survives a save and reopen.
+    let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    s.execute("file.open", json!({"name": "label-font.xlsx", "base64": b64})).unwrap();
+    let c = chart(&s);
+    assert_eq!(c.labels.font, Some(LabelFont { size: Some(11.0), bold: Some(true), color: Some(Color::Rgb(0xC00000)) }));
+    assert_eq!(c.series[0].labels.as_ref().unwrap().font, Some(LabelFont { size: Some(8.5), ..LabelFont::default() }));
+    assert_eq!(c.series[0].point_label(1).and_then(|l| l.font), Some(LabelFont { size: None, bold: Some(false), color: Some(Color::Rgb(0x0070C0)) }));
+}
+
+#[test]
 fn a_combo_charts_secondary_axis_and_category_bounds_are_commands() {
     use gridcraft_model::{AxisCrossing, ChartKind};
     let mut s = s();

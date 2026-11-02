@@ -55,6 +55,7 @@ fn chart(kind: ChartKind) -> Chart {
 
 fn series(name: &str, values: &[f64], color: Rgba, kind: ChartKind) -> SeriesData {
     SeriesData {
+        label_font: None,
         name: name.into(),
         values: values.iter().map(|v| Some(*v)).collect(),
         x: Some(values.iter().enumerate().map(|(i, _)| Some(i as f64 * 1.5 + 2.0)).collect()),
@@ -76,6 +77,7 @@ fn sample(kind: ChartKind) -> ChartData {
     let mut b = series("East", &[38000.0, 30000.0, 45000.0, 61870.0, 52000.0, 41000.0], [200, 80, 40, 255], k2);
     b.secondary = kind == ChartKind::Combo;
     ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: cats.iter().map(|s| s.to_string()).collect(),
@@ -380,8 +382,13 @@ fn scatter_with_text_x_values_numbers_the_points() {
         let d = resolve(&wb, 0, &c);
         assert_eq!(d.series[0].x, None, "{kind:?}");
         let prims = render(&c, &d, 400.0, 300.0, &ApproxMeasure);
-        let empty =
-            render(&c, &ChartData { category_levels: vec![], palette: vec![], categories: vec![], series: vec![] }, 400.0, 300.0, &ApproxMeasure);
+        let empty = render(
+            &c,
+            &ChartData { label_font: None, category_levels: vec![], palette: vec![], categories: vec![], series: vec![] },
+            400.0,
+            300.0,
+            &ApproxMeasure,
+        );
         assert!(prims.len() > empty.len() + 2, "{kind:?} draws its points");
         // Numeric X values are kept.
         c.series[0].categories = Some("Sheet1!$C$1:$C$3".into());
@@ -475,6 +482,7 @@ fn pie_starts_at_twelve_clockwise() {
 fn negative_values_put_axis_below_zero() {
     let c = chart(ChartKind::ColumnClustered);
     let d = ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: vec![],
@@ -491,16 +499,19 @@ fn edge_cases_never_panic() {
     let m = ApproxMeasure;
     let empty = ChartData::default();
     let zeros = ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: vec!["a".into(), "b".into()],
         series: vec![series("z", &[0.0, 0.0], [0, 0, 0, 255], ChartKind::Line)],
     };
     let weird = ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: vec![String::new(); 3],
         series: vec![SeriesData {
+            label_font: None,
             name: "w".repeat(500),
             values: vec![Some(f64::NAN), Some(f64::INFINITY), None, Some(-1e308), Some(1e308)],
             x: Some(vec![Some(f64::NAN)]),
@@ -530,6 +541,7 @@ fn thousands_of_points_are_decimated() {
     let mut c = chart(ChartKind::Line);
     c.data_labels = true;
     let d = ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: vec![],
@@ -559,7 +571,7 @@ fn smooth_line_adds_interpolated_points_and_keeps_endpoints() {
     let line_pts = |smooth: bool, m: &ApproxMeasure| -> usize {
         let mut s = series("L", &[1.0, 5.0, 2.0, 6.0], [10, 20, 30, 255], ChartKind::Line);
         s.smooth = smooth;
-        let d = ChartData { category_levels: vec![], palette: vec![], categories: cats.clone(), series: vec![s] };
+        let d = ChartData { label_font: None, category_levels: vec![], palette: vec![], categories: cats.clone(), series: vec![s] };
         render(&chart(ChartKind::Line), &d, 600.0, 400.0, m)
             .iter()
             .filter_map(|p| match p {
@@ -576,7 +588,7 @@ fn smooth_line_adds_interpolated_points_and_keeps_endpoints() {
     // Rendering either way must stay finite and inside the canvas.
     let mut s = series("L", &[1.0, 5.0, 2.0, 6.0], [10, 20, 30, 255], ChartKind::Line);
     s.smooth = true;
-    let d = ChartData { category_levels: vec![], palette: vec![], categories: cats, series: vec![s] };
+    let d = ChartData { label_font: None, category_levels: vec![], palette: vec![], categories: cats, series: vec![s] };
     assert_sane(&render(&chart(ChartKind::Line), &d, 600.0, 400.0, &m), 600.0, 400.0);
 }
 
@@ -586,7 +598,13 @@ fn smooth_line_splits_at_gaps() {
     let mut s = series("L", &[1.0, 5.0, 2.0, 6.0], [10, 20, 30, 255], ChartKind::Line);
     s.smooth = true;
     s.values[1] = None; // gap between two data points
-    let d = ChartData { category_levels: vec![], palette: vec![], categories: vec!["a".into(), "b".into(), "c".into(), "d".into()], series: vec![s] };
+    let d = ChartData {
+        label_font: None,
+        category_levels: vec![],
+        palette: vec![],
+        categories: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        series: vec![s],
+    };
     let prims = render(&chart(ChartKind::Line), &d, 600.0, 400.0, &m);
     // Two separate runs (before/after the gap) → at least two line primitives.
     let lines = prims.iter().filter(|p| matches!(p, Prim::Line { .. })).count();
@@ -629,6 +647,7 @@ fn fuzz_random_data_and_sizes() {
         };
         let series: Vec<SeriesData> = (0..nser)
             .map(|i| SeriesData {
+                label_font: None,
                 name: format!("S{i}"),
                 values: (0..npts).map(|_| val(&mut r)).collect(),
                 x: if r.next().is_multiple_of(2) { Some((0..npts).map(|_| val(&mut r)).collect()) } else { None },
@@ -665,6 +684,7 @@ fn fuzz_random_data_and_sizes() {
             .collect();
         let ncat = (r.next() % 50) as usize;
         let d = ChartData {
+            label_font: None,
             category_levels: vec![],
             palette: vec![],
             categories: (0..ncat).map(|i| "c".repeat(i % 7) + &i.to_string()).collect(),
@@ -844,8 +864,13 @@ fn line_chart_draws_trendline_forecast_and_labels() {
     let mut s = series("Sales", &[9.0, 7.0, 5.0, 3.0], [10, 20, 30, 255], ChartKind::Line);
     s.trendlines =
         vec![TrendlineData { spec: Trendline { forward: 1.0, display_equation: true, display_r_squared: true, ..Trendline::default() }, color: tc }];
-    let d =
-        ChartData { category_levels: vec![], palette: vec![], categories: ["a", "b", "c", "d"].map(String::from).to_vec(), series: vec![s.clone()] };
+    let d = ChartData {
+        label_font: None,
+        category_levels: vec![],
+        palette: vec![],
+        categories: ["a", "b", "c", "d"].map(String::from).to_vec(),
+        series: vec![s.clone()],
+    };
     let mut c = chart(ChartKind::Line);
     c.legend = LegendPos::None; // keeps legend swatches out of the line counts
     let prims = render(&c, &d, 600.0, 400.0, &m);
@@ -869,7 +894,7 @@ fn line_chart_draws_trendline_forecast_and_labels() {
     assert!(lines_of(&pie, tc).is_empty());
     // One point: nothing to fit, nothing drawn.
     s.values.truncate(1);
-    let one = ChartData { category_levels: vec![], palette: vec![], categories: vec!["a".into()], series: vec![s] };
+    let one = ChartData { label_font: None, category_levels: vec![], palette: vec![], categories: vec!["a".into()], series: vec![s] };
     assert!(lines_of(&render(&c, &one, 600.0, 400.0, &m), tc).is_empty());
 }
 
@@ -889,7 +914,7 @@ fn scatter_trendlines_use_x_values_and_stay_in_the_plot() {
         TrendlineData { spec: Trendline { kind: TrendlineKind::Exponential, forward: 30.0, ..Trendline::default() }, color: colors[1] },
         TrendlineData { spec: Trendline { kind: TrendlineKind::MovingAverage(2), ..Trendline::default() }, color: colors[2] },
     ];
-    let d = ChartData { category_levels: vec![], palette: vec![], categories: vec![], series: vec![s] };
+    let d = ChartData { label_font: None, category_levels: vec![], palette: vec![], categories: vec![], series: vec![s] };
     let mut c = chart(ChartKind::Scatter);
     c.legend = LegendPos::None;
     let prims = render(&c, &d, 600.0, 400.0, &m);
@@ -904,6 +929,7 @@ fn scatter_trendlines_use_x_values_and_stay_in_the_plot() {
 #[test]
 fn treemap_and_histogram_shapes() {
     let d = ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: vec!["a".into(), "b".into(), "c".into(), "d".into()],
@@ -927,6 +953,7 @@ fn treemap_and_histogram_shapes() {
 
     let vals: Vec<f64> = (0..100).map(|i| i as f64).collect();
     let d = ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: vec![],
@@ -941,6 +968,7 @@ fn treemap_and_histogram_shapes() {
 fn histogram_boundary_values_match_interval_labels() {
     let heights = |vals: &[f64]| -> Vec<f32> {
         let d = ChartData {
+            label_font: None,
             category_levels: vec![],
             palette: vec![],
             categories: vec![],
@@ -1014,6 +1042,7 @@ fn box_and_stock_charts_honour_the_gridlines_flag() {
 #[test]
 fn funnel_value_labels_follow_the_data_labels_flag() {
     let data = ChartData {
+        label_font: None,
         category_levels: vec![],
         palette: vec![],
         categories: vec!["a".into(), "b".into(), "c".into()],
@@ -1189,7 +1218,13 @@ fn a_huge_trendline_forecast_does_not_collapse_the_columns() {
     let col: Rgba = [10, 20, 30, 255];
     let mut s = series("Sales", &[1.0, 3.0, 2.0, 5.0, 4.0], col, ChartKind::ColumnClustered);
     s.trendlines = vec![TrendlineData { spec: Trendline { forward: 1e6, backward: 1e6, ..Trendline::default() }, color: tc }];
-    let d = ChartData { palette: vec![], category_levels: vec![], categories: ["a", "b", "c", "d", "e"].map(String::from).to_vec(), series: vec![s] };
+    let d = ChartData {
+        label_font: None,
+        palette: vec![],
+        category_levels: vec![],
+        categories: ["a", "b", "c", "d", "e"].map(String::from).to_vec(),
+        series: vec![s],
+    };
     let mut c = chart(ChartKind::ColumnClustered);
     c.legend = LegendPos::None;
     let prims = render(&c, &d, 600.0, 400.0, &m);
@@ -1211,6 +1246,7 @@ fn box_whisker_draws_each_series_quartile_method() {
     c.series = vec![Series::default(), Series { quartiles: QuartileMethod::Inclusive, ..Default::default() }];
     let color = [12, 34, 56, 255];
     let d = ChartData {
+        label_font: None,
         series: vec![series("A", &[1., 2., 3., 4., 5., 6.], color, c.kind), series("B", &[1., 2., 3., 4., 5., 6.], color, c.kind)],
         ..Default::default()
     };
@@ -1242,8 +1278,9 @@ fn axis_bounds_and_major_unit_set_the_scale() {
     let mut log = chart(ChartKind::Line);
     log.y_axis = AxisOptions { log_base: Some(10.0), ..AxisOptions::default() };
     let log_data = ChartData {
+        label_font: None,
         categories: vec!["a".into(), "b".into(), "c".into()],
-        series: vec![SeriesData { values: vec![Some(1.0), Some(100.0), Some(1000.0)], ..SeriesData::default() }],
+        series: vec![SeriesData { label_font: None, values: vec![Some(1.0), Some(100.0), Some(1000.0)], ..SeriesData::default() }],
         ..ChartData::default()
     };
     let prims = render(&log, &log_data, 640.0, 400.0, &m);
@@ -1305,13 +1342,20 @@ fn a_reversed_axis_maps_high_values_to_the_bottom() {
 fn data_labels_show_the_parts_asked_for() {
     let m = ApproxMeasure;
     let mut c = chart(ChartKind::ColumnClustered);
-    c.labels = LabelOptions { show_value: true, show_category: true, show_series: true, separator: Some(" / ".into()), ..LabelOptions::default() };
+    c.labels = LabelOptions {
+        font: None,
+        show_value: true,
+        show_category: true,
+        show_series: true,
+        separator: Some(" / ".into()),
+        ..LabelOptions::default()
+    };
     let prims = render(&c, &sample(ChartKind::ColumnClustered), 640.0, 400.0, &m);
     let t: Vec<String> = texts(&prims).iter().map(|s| (*s).to_string()).collect();
     assert!(t.iter().any(|s| s == "North / Q1 / $12,000"), "no composed label: {t:?}");
     // Only the percentage on a pie: a share of the whole.
     let mut pie = chart(ChartKind::Pie);
-    pie.labels = LabelOptions { show_percentage: true, ..LabelOptions::default() };
+    pie.labels = LabelOptions { font: None, show_percentage: true, ..LabelOptions::default() };
     let prims = render(&pie, &sample(ChartKind::Pie), 640.0, 400.0, &m);
     let t = texts(&prims);
     assert!(t.iter().any(|s| s.ends_with('%')), "no percentage label: {t:?}");
@@ -1321,7 +1365,7 @@ fn data_labels_show_the_parts_asked_for() {
 fn a_deleted_point_label_is_not_drawn() {
     let m = ApproxMeasure;
     let mut c = chart(ChartKind::ColumnClustered);
-    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    c.labels = LabelOptions { font: None, show_value: true, ..LabelOptions::default() };
     let mut d = sample(ChartKind::ColumnClustered);
     d.series[0].points = vec![PointStyle { index: 0, no_label: true, ..PointStyle::default() }];
     let prims = render(&c, &d, 640.0, 400.0, &m);
@@ -1334,9 +1378,9 @@ fn a_deleted_point_label_is_not_drawn() {
 fn a_series_can_hide_its_labels_while_the_chart_keeps_them() {
     let m = ApproxMeasure;
     let mut c = chart(ChartKind::ColumnClustered);
-    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    c.labels = LabelOptions { font: None, show_value: true, ..LabelOptions::default() };
     let mut d = sample(ChartKind::ColumnClustered);
-    d.series[1].labels = Some(LabelOptions { hidden: true, ..LabelOptions::default() });
+    d.series[1].labels = Some(LabelOptions { font: None, hidden: true, ..LabelOptions::default() });
     let prims = render(&c, &d, 640.0, 400.0, &m);
     let t = texts(&prims);
     assert!(t.contains(&"$12,000"), "the other series keeps its labels: {t:?}");
@@ -1407,6 +1451,7 @@ fn every_kind_renders_sanely_with_every_option_set() {
             number_format: Some("0.0".into()),
         };
         c.labels = LabelOptions {
+            font: None,
             show_value: true,
             show_percentage: true,
             show_series: true,
@@ -1419,7 +1464,7 @@ fn every_kind_renders_sanely_with_every_option_set() {
         };
         let mut d = sample(kind);
         for (i, s) in d.series.iter_mut().enumerate() {
-            s.labels = Some(LabelOptions { show_category: true, position: LabelPosition::Center, ..LabelOptions::default() });
+            s.labels = Some(LabelOptions { font: None, show_category: true, position: LabelPosition::Center, ..LabelOptions::default() });
             s.error_bars = Some(ErrorBarsData {
                 spec: ErrorBars {
                     direction: match i % 3 {
@@ -1468,7 +1513,7 @@ fn hostile_chart_options_do_not_panic_or_go_non_finite() {
         number_format: Some("General".into()),
     };
     c.x_axis = AxisOptions { min: Some(-1e300), max: Some(1e300), major_unit: Some(1e-300), ..AxisOptions::default() };
-    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    c.labels = LabelOptions { font: None, show_value: true, ..LabelOptions::default() };
     let mut d = sample(ChartKind::Scatter);
     d.series[0].error_bars = Some(ErrorBarsData {
         spec: ErrorBars { direction: ErrorBarDirection::Both, kind: ErrorBarKind::Fixed(1e300), no_end_cap: false },
@@ -1573,8 +1618,16 @@ fn point_labels_draw_their_own_text_and_position() {
     s.number_format = "0.0".into();
     s.point_labels = vec![
         // The series shows values, so a point with its own text keeps its value unless it says not.
-        PointLabelData { index: 1, text: Some("Above".into()), show_value: Some(false), position: LabelPosition::Top, ..PointLabelData::default() },
         PointLabelData {
+            font: None,
+            index: 1,
+            text: Some("Above".into()),
+            show_value: Some(false),
+            position: LabelPosition::Top,
+            ..PointLabelData::default()
+        },
+        PointLabelData {
+            font: None,
             index: 2,
             text: Some("Below".into()),
             show_value: Some(false),
@@ -1582,9 +1635,9 @@ fn point_labels_draw_their_own_text_and_position() {
             ..PointLabelData::default()
         },
         // Every part switched off for this point: its label shows nothing.
-        PointLabelData { index: 3, text: None, show_value: Some(false), ..PointLabelData::default() },
+        PointLabelData { font: None, index: 3, text: None, show_value: Some(false), ..PointLabelData::default() },
     ];
-    let d = ChartData { categories: vec!["A".into(), "B".into(), "C".into(), "D".into()], series: vec![s], ..ChartData::default() };
+    let d = ChartData { label_font: None, categories: vec!["A".into(), "B".into(), "C".into(), "D".into()], series: vec![s], ..ChartData::default() };
     let prims = render(&c, &d, 640.0, 400.0, &ApproxMeasure);
     let t = texts(&prims);
     assert!(t.contains(&"Above") && t.contains(&"Below"), "both point texts are drawn: {t:?}");
@@ -1611,11 +1664,12 @@ fn point_labels_draw_their_own_text_and_position() {
 fn a_point_flag_overrides_the_series_labels() {
     let mut c = chart(ChartKind::ColumnClustered);
     c.data_labels = true;
-    c.labels = LabelOptions { show_value: true, ..LabelOptions::default() };
+    c.labels = LabelOptions { font: None, show_value: true, ..LabelOptions::default() };
     let mut s = series("East", &[7.0, 9.0, 11.0], [200, 80, 40, 255], ChartKind::ColumnClustered);
     s.number_format = "General".into();
-    s.point_labels = vec![PointLabelData { index: 1, text: None, show_value: Some(false), show_category: Some(true), ..PointLabelData::default() }];
-    let d = ChartData { categories: vec!["A".into(), "B".into(), "C".into()], series: vec![s], ..ChartData::default() };
+    s.point_labels =
+        vec![PointLabelData { font: None, index: 1, text: None, show_value: Some(false), show_category: Some(true), ..PointLabelData::default() }];
+    let d = ChartData { label_font: None, categories: vec!["A".into(), "B".into(), "C".into()], series: vec![s], ..ChartData::default() };
     let prims = render(&c, &d, 640.0, 400.0, &ApproxMeasure);
     let t = texts(&prims);
     // The overridden point shows its category instead of its value; the others keep the value.
@@ -1750,4 +1804,41 @@ fn a_hostile_click_is_outside_every_region() {
         assert_eq!(hit_at(&drawing.hits, x, y), None, "({x}, {y}) is outside every region");
     }
     assert_eq!(draw(&chart(ChartKind::Pie), &ChartData::default(), 0.0, 0.0, &m), Drawing::default(), "no size, no drawing");
+}
+
+#[test]
+fn a_label_font_sets_its_size_weight_and_colour() {
+    let m = ApproxMeasure;
+    let red = [0xFFu8, 0x00, 0x00, 0xFF];
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.data_labels = true;
+    c.labels = LabelOptions { font: None, show_value: true, ..LabelOptions::default() };
+    let mut d = sample(ChartKind::ColumnClustered);
+    // The chart's labels: 14 pt, bold.
+    d.label_font = Some(LabelStyle { size: Some(14.0), bold: Some(true), ..LabelStyle::default() });
+    // Series 1 overrides the size only; its weight still comes from the chart.
+    d.series[1].label_font = Some(LabelStyle { size: Some(6.0), ..LabelStyle::default() });
+    // Point 0 of series 0 is its own label: red, and the chart's size is replaced.
+    d.series[0].point_labels = vec![PointLabelData {
+        index: 0,
+        font: Some(LabelStyle { size: Some(20.0), color: Some(red), ..LabelStyle::default() }),
+        ..PointLabelData::default()
+    }];
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let labels: Vec<(f32, bool, Rgba)> = prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Text { size, bold, color, text, .. } if text.contains(',') || text.contains("000") => Some((*size, *bold, *color)),
+            _ => None,
+        })
+        .collect();
+    // The point sets a size and a colour; its weight still comes from the chart.
+    assert!(labels.iter().any(|(s, b, col)| *s == 20.0 && *b && *col == red), "the point's own label is 20 pt, bold and red: {labels:?}");
+    assert!(labels.iter().any(|(s, b, _)| *s == 14.0 && *b), "the chart's labels are 14 pt bold: {labels:?}");
+    assert!(labels.iter().any(|(s, b, _)| *s == 6.0 && *b), "the series takes the chart's weight with its own size: {labels:?}");
+
+    // A hostile size in a file is not drawn: it is clamped to a drawable one.
+    d.series[0].point_labels[0].font = Some(LabelStyle { size: Some(1e30), ..LabelStyle::default() });
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    assert!(prims.iter().all(|p| !matches!(p, Prim::Text { size, .. } if !size.is_finite() || *size > 400.0)), "no absurd text");
 }

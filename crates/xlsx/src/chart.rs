@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 use gridcraft_core::{RangeRef, Value, category_levels};
 use gridcraft_formula::{Expr, SheetSel};
 use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DefinedName, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions,
-    LabelPosition, LegendPos, LineDash, PointFormat, PointLabel, Series, Trendline, TrendlineKind, Workbook,
+    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DefinedName, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont,
+    LabelOptions, LabelPosition, LegendPos, LineDash, PointFormat, PointLabel, Series, Trendline, TrendlineKind, Workbook,
 };
 
 use crate::drawing::{dml_color, srgb};
@@ -231,6 +231,7 @@ fn read_dlbl(dl: &El, index: u32) -> PointLabel {
         show_category: dl.child("showCatName").map(|c| c.flag("val", true)),
         show_percentage: dl.child("showPercent").map(|c| c.flag("val", true)),
         position: dl.child_val("dLblPos").and_then(label_position).unwrap_or_default(),
+        font: read_label_font(dl),
     }
 }
 
@@ -264,9 +265,23 @@ pub(crate) fn label_position_file(p: LabelPosition) -> &'static str {
     }
 }
 
+/// A label's own text formatting (`c:txPr/a:p/a:pPr/a:defRPr`): size, bold and colour. A label
+/// without one follows the chart's size and the contrast colour of what it sits on.
+pub(crate) fn read_label_font(e: &El) -> Option<LabelFont> {
+    let def = e.path(&["txPr", "p", "pPr", "defRPr"])?;
+    let font = LabelFont {
+        // `sz` is hundredths of a point; a hostile or absurd value is not a size.
+        size: def.attr("sz").and_then(|v| v.trim().parse::<f32>().ok()).map(|v| v / 100.0).filter(|v| (1.0..=400.0).contains(v)),
+        bold: def.attr_bool("b"),
+        color: def.child("solidFill").and_then(dml_color),
+    };
+    font.is_set().then_some(font)
+}
+
 /// A `CT_DLbls`: what the labels show, where and with which separator.
 fn read_labels(d: &El) -> LabelOptions {
     LabelOptions {
+        font: read_label_font(d),
         show_value: bool_val(d, "showVal"),
         show_percentage: bool_val(d, "showPercent"),
         show_series: bool_val(d, "showSerName"),
@@ -981,6 +996,21 @@ pub(crate) fn label_tx_xml(t: &str, wb: &Workbook, si: usize) -> String {
     format!("<c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>{}</a:t></a:r></a:p></c:rich></c:tx>", esc(lit))
 }
 
+/// `<c:txPr>` for a label font, in CT_TextBody order: body properties, the paragraph and its
+/// default run properties (size in hundredths of a point, bold, colour).
+pub(crate) fn label_tx_pr_xml(f: &LabelFont, wb: &Workbook) -> String {
+    let f = f.sane();
+    let mut attrs = String::new();
+    if let Some(size) = f.size {
+        let _ = write!(attrs, " sz=\"{}\"", (size * 100.0).round().clamp(100.0, 40_000.0) as i64);
+    }
+    if let Some(b) = f.bold {
+        let _ = write!(attrs, " b=\"{}\"", b as u8);
+    }
+    let fill = f.color.as_ref().and_then(|c| srgb(c, &wb.theme)).map(|c| format!("<a:solidFill>{c}</a:solidFill>")).unwrap_or_default();
+    format!("<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr{attrs}>{fill}</a:defRPr></a:pPr><a:endParaRPr lang=\"en-US\"/></a:p></c:txPr>")
+}
+
 /// `<c:dLbl>` in CT_DLbl order: idx, delete, tx, dLblPos, the show flags.
 pub(crate) fn dlbl_xml(index: u32, no_label: bool, label: Option<&PointLabel>, wb: &Workbook, si: usize) -> String {
     let index = index.min(MAX_POINTS as u32);
@@ -990,6 +1020,9 @@ pub(crate) fn dlbl_xml(index: u32, no_label: bool, label: Option<&PointLabel>, w
     } else if let Some(l) = label {
         if let Some(t) = l.text.as_deref().filter(|t| !t.trim().is_empty()) {
             x.push_str(&label_tx_xml(t, wb, si));
+        }
+        if let Some(f) = l.font.filter(|f| f.is_set()) {
+            x.push_str(&label_tx_pr_xml(&f, wb));
         }
         if l.position != LabelPosition::Auto {
             let _ = write!(x, "<c:dLblPos val=\"{}\"/>", label_position_file(l.position));
@@ -1022,7 +1055,7 @@ pub(crate) fn dlbls_xml(labels: Option<&LabelOptions>, deleted: &[u32], point_la
         x.push_str(&dlbl_xml(idx, no_label, label, wb, si));
     }
     if let Some(l) = labels {
-        for (_, text) in label_children(l) {
+        for (_, text) in label_children(l, wb) {
             if let Some(t) = text {
                 x.push_str(&t);
             }
@@ -1180,7 +1213,7 @@ pub(crate) fn legend_pos_file(p: LegendPos) -> Option<&'static str> {
 /// show flags, the separator. The writer emits them all; the patcher changes only those an edit
 /// touched, and leaves the rest of the element (per-point labels, leader lines, text formatting)
 /// alone.
-pub(crate) fn label_children(l: &LabelOptions) -> Vec<(&'static str, Option<String>)> {
+pub(crate) fn label_children(l: &LabelOptions, wb: &Workbook) -> Vec<(&'static str, Option<String>)> {
     if l.hidden {
         return vec![("delete", Some("<c:delete val=\"1\"/>".into()))];
     }
@@ -1195,6 +1228,7 @@ pub(crate) fn label_children(l: &LabelOptions) -> Vec<(&'static str, Option<Stri
                 .filter(|c| !c.is_empty())
                 .map(|code| format!("<c:numFmt formatCode=\"{}\" sourceLinked=\"0\"/>", esc_attr(code))),
         ),
+        ("txPr", l.font.as_ref().filter(|f| f.is_set()).map(|f| label_tx_pr_xml(f, wb))),
         ("dLblPos", (l.position != LabelPosition::Auto).then(|| format!("<c:dLblPos val=\"{}\"/>", label_position_file(l.position)))),
         ("showLegendKey", Some(format!("<c:showLegendKey val=\"{}\"/>", l.show_legend_key as u8))),
         ("showVal", Some(format!("<c:showVal val=\"{}\"/>", show_value as u8))),

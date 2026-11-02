@@ -5,7 +5,7 @@ use gridcraft_core::{CellRef, RangeRef, Value, category_levels, number_to_text};
 use gridcraft_model::{Chart, ChartKind, ErrorBars, PointFormat, PointLabel, Theme, Workbook, style::apply_tint};
 use gridcraft_numfmt::{NumberFormat, format_value};
 
-use crate::{ChartData, ErrorBarsData, PointLabelData, PointStyle, Rgba, SeriesData, TrendlineData};
+use crate::{ChartData, ErrorBarsData, LabelFont, LabelStyle, PointLabelData, PointStyle, Rgba, SeriesData, TrendlineData};
 
 /// Cap on points per series (keeps whole-column references from exploding).
 pub(crate) const MAX_POINTS: usize = 100_000;
@@ -150,7 +150,7 @@ const MAX_LABEL_CHARS: usize = 1024;
 
 /// A point's own label, its text resolved: a literal as it is, a reference as the first value of
 /// the cell it names.
-fn point_labels(wb: &Workbook, sheet: usize, labels: &[PointLabel]) -> Vec<PointLabelData> {
+fn point_labels(wb: &Workbook, sheet: usize, labels: &[PointLabel], theme: &Theme) -> Vec<PointLabelData> {
     let text = |l: &PointLabel| -> Option<String> {
         let t = l.text.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
         let plain = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(t);
@@ -174,11 +174,19 @@ fn point_labels(wb: &Workbook, sheet: usize, labels: &[PointLabel]) -> Vec<Point
                 show_series: l.show_series,
                 show_category: l.show_category,
                 show_percentage: l.show_percentage,
+                font: label_font(l.font, theme),
             })
         })
         .collect();
     out.sort_by_key(|l| l.index);
     out
+}
+
+/// A label font with its colour resolved against the theme; `None` when it sets nothing.
+fn label_font(f: Option<LabelFont>, theme: &Theme) -> Option<LabelStyle> {
+    let f = f?.sane();
+    let style = LabelStyle { size: f.size, bold: f.bold, color: f.color.as_ref().and_then(|c| c.resolve(theme)).map(|[r, g, b]| [r, g, b, 0xFF]) };
+    style.is_set().then_some(style)
 }
 
 /// A custom error bar's amounts: references and array constants are evaluated like a series.
@@ -348,11 +356,12 @@ pub fn resolve(wb: &Workbook, sheet: usize, chart: &Chart) -> ChartData {
             labels: s.labels.clone(),
             error_bars: s.error_bars.as_ref().map(|e| error_bars(wb, sheet, e)),
             points: point_styles(&s.points, &wb.theme),
-            point_labels: point_labels(wb, sheet, &s.point_labels),
+            point_labels: point_labels(wb, sheet, &s.point_labels, &wb.theme),
+            label_font: label_font(s.labels.as_ref().and_then(|l| l.font), &wb.theme),
         });
     }
     let n = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
     let categories = categories.unwrap_or_else(|| (1..=n).map(|i| i.to_string()).collect());
     let palette = default_palette(&wb.theme, n.min(PALETTE_CYCLE));
-    ChartData { categories, category_levels, series, palette }
+    ChartData { categories, category_levels, series, palette, label_font: label_font(chart.labels.font, &wb.theme) }
 }

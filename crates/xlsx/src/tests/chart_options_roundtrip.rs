@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use gridcraft_core::CellRef;
 use gridcraft_model::{
-    Anchor, AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions,
+    Anchor, AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont, LabelOptions,
     LabelPosition, LegendPos, PointFormat, PointLabel, Series, Sheet, Workbook,
 };
 
@@ -64,8 +64,22 @@ fn full_chart() -> Chart {
         separator: Some(" / ".into()),
         number_format: Some("0.0".into()),
         hidden: false,
+        font: Some(LabelFont { size: Some(11.0), bold: Some(true), color: Some(Color::Rgb(0xC00000)) }),
     };
-    c.series[0].labels = Some(LabelOptions { show_value: false, show_category: true, position: LabelPosition::Center, ..LabelOptions::default() });
+    c.series[0].labels = Some(LabelOptions {
+        show_value: false,
+        show_category: true,
+        position: LabelPosition::Center,
+        font: Some(LabelFont { size: Some(8.0), ..LabelFont::default() }),
+        ..LabelOptions::default()
+    });
+    c.series[0].point_labels = vec![PointLabel {
+        index: 2,
+        text: Some("Check".into()),
+        position: LabelPosition::Top,
+        font: Some(LabelFont { bold: Some(true), color: Some(Color::Rgb(0x0070C0)), ..LabelFont::default() }),
+        ..PointLabel::default()
+    }];
     c.series[0].error_bars = Some(ErrorBars { direction: ErrorBarDirection::Plus, kind: ErrorBarKind::Fixed(3.5), no_end_cap: true });
     let mut second = series("Cost", "Data!$C$2:$C$5");
     second.labels = Some(LabelOptions { hidden: true, ..LabelOptions::default() });
@@ -125,6 +139,7 @@ fn every_axis_label_error_and_point_option_round_trips() {
         assert_eq!(a.labels, b.labels, "{}: labels", b.name.as_deref().unwrap_or(""));
         assert_eq!(a.error_bars, b.error_bars, "{}: error bars", b.name.as_deref().unwrap_or(""));
         assert_eq!(a.points, b.points, "{}: point formats", b.name.as_deref().unwrap_or(""));
+        assert_eq!(a.point_labels, b.point_labels, "{}: point labels", b.name.as_deref().unwrap_or(""));
     }
     // A series that hides its labels is written as the format spells it: a deleted series dLbls.
     let part = chart_part(&bytes, "xl/charts/chart1.xml");
@@ -274,6 +289,7 @@ fn excel_style_labels_and_error_bars_are_read() {
             separator: Some(" | ".into()),
             number_format: Some("0.0\"%\"".into()),
             hidden: false,
+            font: None,
         }),
         "series-level labels"
     );

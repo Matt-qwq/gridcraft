@@ -4,8 +4,8 @@
 //! saves it, so an option that survives a save is the same one the UI draws.
 
 use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions, LabelPosition,
-    PointFormat, PointLabel, Series,
+    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont, LabelOptions,
+    LabelPosition, PointFormat, PointLabel, Series,
 };
 use serde_json::{Value as Json, json};
 
@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Format Data Labels",
             ["Chart Design", "Chart Layouts"],
             None,
-            "{chart?, series?: index (default every series), point?: index (needs series: that point's own label), text?: reference or text for the point's label, on?: bool (default true), value?, percentage?, seriesName?, categoryName?, legendKey?, position?: auto|center|insideEnd|insideBase|outsideEnd|bestFit|left|right|top|bottom, separator?, numberFormat?, deletePoint?: index (hides that label), showPoint?: index}",
+            "{chart?, series?: index (default every series), point?: index (needs series: that point's own label), text?: reference or text for the point's label, on?: bool (default true), value?, percentage?, seriesName?, categoryName?, legendKey?, position?: auto|center|insideEnd|insideBase|outsideEnd|bestFit|left|right|top|bottom, separator?, numberFormat?, deletePoint?: index (hides that label), showPoint?: index, fontSize?: 1..400 (the label's own size), bold?: bool, color?: hex or none}",
             has_doc,
             set_data_labels
         ),
@@ -207,13 +207,18 @@ fn position_param(v: &Json) -> Result<LabelPosition> {
 }
 
 /// A colour param: a hex string, or `none`/`""` to clear it.
-fn color_param(v: &Json, key: &str) -> Result<Option<Color>> {
+fn color_param_for(cmd: &str, v: &Json, key: &str) -> Result<Option<Color>> {
     match v.as_str() {
         Some(s) if !s.is_empty() && !s.eq_ignore_ascii_case("none") => {
-            Color::from_hex(s).map(Some).ok_or_else(|| bad("chart.formatPoint", format!("`{key}` is not a colour")))
+            Color::from_hex(s).map(Some).ok_or_else(|| bad(cmd, format!("`{key}` is not a colour")))
         }
         _ => Ok(None),
     }
+}
+
+/// [`color_param_for`] for `chart.formatPoint`.
+fn color_param(v: &Json, key: &str) -> Result<Option<Color>> {
+    color_param_for("chart.formatPoint", v, key)
 }
 
 fn set_axis(s: &mut Session, p: &Json) -> Result<Json> {
@@ -399,10 +404,26 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
     let number_format = p.get("numberFormat").and_then(Json::as_str).map(str::to_string);
     let delete = u32_param(p, "deletePoint");
     let show = u32_param(p, "showPoint");
+    // The label's own font: size in points, weight and colour.
+    let font_size = match f64_param(p, "fontSize") {
+        Some(s) if s.is_finite() && (1.0..=400.0).contains(&s) => Some(s as f32),
+        Some(_) => return Err(bad(cmd, "`fontSize` must be between 1 and 400 points")),
+        None => None,
+    };
+    let font_bold = bool_param(p, "bold");
+    let font_color = p.get("color").map(|v| color_param_for(cmd, v, "color")).transpose()?.flatten();
+    let font_given = font_size.is_some() || font_bold.is_some() || p.get("color").is_some();
+    let font = font_given.then_some(LabelFont { size: font_size, bold: font_bold, color: font_color });
     let flags = ["value", "percentage", "seriesName", "categoryName", "legendKey"].iter().map(|k| (*k, bool_param(p, k))).collect::<Vec<_>>();
     let any_flag = flags.iter().any(|(_, v)| v.is_some());
-    let other_options =
-        position.is_some() || separator.is_some() || number_format.is_some() || any_flag || delete.is_some() || show.is_some() || text.is_some();
+    let other_options = position.is_some()
+        || separator.is_some()
+        || number_format.is_some()
+        || any_flag
+        || delete.is_some()
+        || show.is_some()
+        || text.is_some()
+        || font_given;
     if !on && other_options {
         return Err(bad(cmd, "`on: false` turns labels off; remove the other options"));
     }
@@ -435,10 +456,13 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
             if delete.is_some() || show.is_some() {
                 return Err(bad(cmd, "a chartex chart has no per-point labels GridCraft can save"));
             }
+            if font_given {
+                return Err(bad(cmd, "a chartex chart keeps its label font in a part GridCraft does not model"));
+            }
             return set_chartex_labels(c, cmd, on, series, point, &flags, position, separator.clone(), number_format.clone());
         }
         if let (Some(i), Some(pi)) = (series, point) {
-            set_one_point_label(c, i, pi, on, text, position, &flags, any_flag);
+            set_one_point_label(c, i, pi, on, text, position, &flags, any_flag, font);
             return Ok(());
         }
         // A series can hide its labels while the chart keeps them: `on: false` with a series.
@@ -454,7 +478,10 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
             let mut o = c.series.get(i).and_then(|se| se.labels.clone()).unwrap_or_default();
             o.hidden = false;
             apply_label_options(&mut o, &flags, position, separator, number_format);
-            if !o.shows_anything() && !any_flag {
+            if let Some(f) = font {
+                o.font = Some(merge_font(o.font, f));
+            }
+            if !o.shows_anything() && !any_flag && !font_given {
                 o = LabelOptions::values();
             }
             if let Some(se) = c.series.get_mut(i) {
@@ -483,7 +510,10 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
             o.hidden = false;
         }
         apply_label_options(&mut o, &flags, position, separator, number_format);
-        if on && !o.shows_anything() && !any_flag {
+        if let Some(f) = font {
+            o.font = Some(merge_font(o.font, f));
+        }
+        if on && !o.shows_anything() && !any_flag && !font_given {
             // No part asked for: the plain value label, as the on/off flag alone meant.
             o = LabelOptions::values();
         }
@@ -520,6 +550,7 @@ fn set_one_point_label(
     position: Option<LabelPosition>,
     flags: &[(&str, Option<bool>)],
     any_flag: bool,
+    font: Option<LabelFont>,
 ) {
     let Some(se) = c.series.get_mut(series) else { return };
     if !on {
@@ -538,6 +569,9 @@ fn set_one_point_label(
     if let Some(v) = position {
         label.position = v;
     }
+    if let Some(f) = font {
+        label.font = Some(merge_font(label.font, f));
+    }
     for (key, value) in flags {
         let Some(v) = value else { continue };
         match *key {
@@ -548,7 +582,7 @@ fn set_one_point_label(
             _ => {}
         }
     }
-    let given = any_flag || label.text.is_some() || label.position != LabelPosition::Auto;
+    let given = any_flag || label.text.is_some() || label.position != LabelPosition::Auto || label.font.is_some();
     if !given {
         // Nothing asked for: the point's label shows again (the way `showPoint` does).
         if let Some(pt) = se.point(pi as usize).copied()
@@ -625,6 +659,13 @@ fn set_chartex_labels(
 }
 
 /// Applies the show flags, position, separator and format to one label options record.
+/// A label font with `now` applied over `old`: a field the caller left out keeps what the label
+/// had (setting a colour alone does not clear its size).
+fn merge_font(old: Option<LabelFont>, now: LabelFont) -> LabelFont {
+    let old = old.unwrap_or_default();
+    LabelFont { size: now.size.or(old.size), bold: now.bold.or(old.bold), color: now.color.or(old.color) }.sane()
+}
+
 fn apply_label_options(
     o: &mut LabelOptions,
     flags: &[(&str, Option<bool>)],

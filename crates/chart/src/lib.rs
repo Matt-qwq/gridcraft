@@ -21,8 +21,8 @@ mod trend;
 mod tests;
 
 pub use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelOptions, LabelPosition, LegendPos,
-    PointFormat, SparklineKind, Trendline, TrendlineKind,
+    AxisCrossing, AxisOptions, Chart, ChartKind, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont, LabelOptions, LabelPosition,
+    LegendPos, PointFormat, SparklineKind, Trendline, TrendlineKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -235,6 +235,9 @@ pub struct ChartData {
     /// Workbook-theme colours for the points of pie-like charts, repeating (point `j` uses entry `j % len`); empty uses the default theme.
     #[serde(default)]
     pub palette: Vec<Rgba>,
+    /// The chart's label font, with its colour resolved; a series or a point can override it.
+    #[serde(default)]
+    pub label_font: Option<LabelStyle>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -265,6 +268,27 @@ pub struct SeriesData {
     /// Per-point data labels (text, position, what they show), by point index.
     #[serde(default)]
     pub point_labels: Vec<PointLabelData>,
+    /// This series' label font, overriding the chart's.
+    #[serde(default)]
+    pub label_font: Option<LabelStyle>,
+}
+
+/// A label font with its colour resolved against the workbook's theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LabelStyle {
+    /// Size in points; `None` draws at the chart's label size.
+    pub size: Option<f32>,
+    pub bold: Option<bool>,
+    /// `None` keeps the contrast colour the label is drawn in.
+    pub color: Option<Rgba>,
+}
+
+impl LabelStyle {
+    /// Whether the style says anything (a style with nothing set is no style).
+    pub fn is_set(&self) -> bool {
+        self.size.is_some() || self.bold.is_some() || self.color.is_some()
+    }
 }
 
 /// One point's own data label, with a cell reference already resolved to its text.
@@ -281,6 +305,8 @@ pub struct PointLabelData {
     pub show_series: Option<bool>,
     pub show_category: Option<bool>,
     pub show_percentage: Option<bool>,
+    /// This label's own font, overriding the series' or the chart's.
+    pub font: Option<LabelStyle>,
 }
 
 impl PointLabelData {
@@ -343,6 +369,7 @@ impl Default for SeriesData {
             error_bars: None,
             points: vec![],
             point_labels: vec![],
+            label_font: None,
         }
     }
 }

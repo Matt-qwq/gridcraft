@@ -12,7 +12,9 @@ use std::ops::RangeInclusive;
 
 use egui::{RichText, Ui, vec2};
 use gridcraft_chart::ChartKind;
-use gridcraft_engine::model::{AxisCrossing, AxisOptions, Chart, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, LabelOptions, LabelPosition};
+use gridcraft_engine::model::{
+    AxisCrossing, AxisOptions, Chart, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, LabelFont, LabelOptions, LabelPosition,
+};
 use serde_json::{Map, Value as Json, json};
 
 use crate::SheetApp;
@@ -768,6 +770,7 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
                     run_labels(app, id, series, json!({"numberFormat": text}));
                 }
             });
+            label_font_controls(app, ui, id, series, None, o.font);
         });
     });
 }
@@ -992,6 +995,7 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
             m.insert("deleteLabel".into(), json!(no_label));
             app.run_or_alert("chart.formatPoint", Json::Object(m));
         }
+        label_font_controls(app, ui, id, Some(scope), Some(index as u32), s.point_label(index).and_then(|l| l.font));
         if ui.button("Clear point formatting").clicked() {
             let mut m = Map::new();
             m.insert("chart".into(), json!(id));
@@ -1014,16 +1018,17 @@ fn colour_of(pt: &gridcraft_engine::model::PointFormat, key: &str) -> Option<Col
 /// One point colour row: the current swatch (or "Automatic") and a palette menu. The palette has no
 /// "No Fill" entry: `chart.formatPoint` can clear the whole point, not one colour.
 #[allow(clippy::too_many_arguments)]
-fn point_colour(
+/// A colour row: the current colour (or Automatic) and a palette menu that runs `cmd` with
+/// `params` plus the chosen colour under `key`.
+fn colour_row(
     app: &mut SheetApp,
     ui: &mut Ui,
     wb_theme: &gridcraft_engine::model::Theme,
-    id: u32,
-    series: usize,
-    point: usize,
     label: &str,
-    key: &str,
     current: Option<Color>,
+    cmd: &str,
+    params: &Map<String, Json>,
+    key: &str,
 ) {
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
@@ -1035,21 +1040,72 @@ fn point_colour(
                 ui.painter().rect_stroke(r, 1.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
             }
             None => {
-                ui.label(RichText::new("Automatic").small().color(t.text_dim));
+                // Not "Automatic": that word is the position combo's own value in this pane.
+                ui.label(RichText::new("Automatic colour").small().color(t.text_dim));
             }
         }
         ui.menu_button("Colour…", |ui| {
             if let Some(c) = crate::widgets::color_palette_fixed(ui, &wb_theme.colors, "") {
                 ui.close();
-                let mut m = Map::new();
-                m.insert("chart".into(), json!(id));
-                m.insert("series".into(), json!(series));
-                m.insert("point".into(), json!(point));
+                let mut m = params.clone();
                 m.insert(key.into(), json!(c));
-                app.run_or_alert("chart.formatPoint", Json::Object(m));
+                app.run_or_alert(cmd, Json::Object(m));
             }
         });
     });
+}
+
+/// A point's fill, line or marker colour through `chart.formatPoint`.
+#[allow(clippy::too_many_arguments)]
+fn point_colour(
+    app: &mut SheetApp,
+    ui: &mut Ui,
+    wb_theme: &gridcraft_engine::model::Theme,
+    id: u32,
+    series: usize,
+    point: usize,
+    label: &str,
+    key: &str,
+    current: Option<Color>,
+) {
+    let mut m = Map::new();
+    m.insert("chart".into(), json!(id));
+    m.insert("series".into(), json!(series));
+    m.insert("point".into(), json!(point));
+    // `chart.formatPoint` keys its colour by the option's own name (fill, line, marker).
+    colour_row(app, ui, wb_theme, label, current, "chart.formatPoint", &m, key);
+}
+
+/// A label's own font — size, weight and colour — for the chart's, a series' or one point's
+/// labels, through `chart.setDataLabels`.
+fn label_font_controls(app: &mut SheetApp, ui: &mut Ui, id: u32, series: Option<usize>, point: Option<u32>, font: Option<LabelFont>) {
+    let f = font.unwrap_or_default();
+    let mut params = Map::new();
+    params.insert("chart".into(), json!(id));
+    if let Some(s) = series {
+        params.insert("series".into(), json!(s));
+    }
+    if let Some(p) = point {
+        params.insert("point".into(), json!(p));
+    }
+    ui.horizontal(|ui| {
+        ui.label("Label size");
+        let field = egui::Id::new(("gridcraft.chart_label_font_size", id, series, point));
+        if let Some(v) = number(ui, field, f64::from(f.size.unwrap_or(9.0)), 1.0..=400.0, "") {
+            let mut m = params.clone();
+            m.insert("fontSize".into(), json!(v));
+            app.run_or_alert("chart.setDataLabels", Json::Object(m));
+        }
+        ui.label(RichText::new("pt").small().color(Tokens::get(ui.ctx()).text_dim));
+    });
+    let mut bold = f.bold.unwrap_or(false);
+    if ui.checkbox(&mut bold, "Bold label").changed() {
+        let mut m = params.clone();
+        m.insert("bold".into(), json!(bold));
+        app.run_or_alert("chart.setDataLabels", Json::Object(m));
+    }
+    let theme = app.session.active().map(|d| d.wb.theme.clone()).unwrap_or_default();
+    colour_row(app, ui, &theme, "Label colour", f.color, "chart.setDataLabels", &params, "color");
 }
 
 /// The series a chart-level section works on, remembered per chart.

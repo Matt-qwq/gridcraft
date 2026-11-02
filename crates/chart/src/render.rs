@@ -12,7 +12,8 @@ use crate::axis::{Fmt, Scale, axis_scale, clean, fixed_scale, format_number};
 use crate::resolve::{MAX_POINTS, MAX_SERIES, MAX_TRENDLINES, series_color};
 use crate::trend::{auto_name, fit_trendline, moving_average};
 use crate::{
-    ChartData, Drawing, ErrorBarsData, HAlign, Hit, HitRegion, HitShape, Measure, PointLabelData, PointStyle, Prim, Rgba, SeriesData, VAlign,
+    ChartData, Drawing, ErrorBarsData, HAlign, Hit, HitRegion, HitShape, LabelStyle, Measure, PointLabelData, PointStyle, Prim, Rgba, SeriesData,
+    VAlign,
 };
 
 pub(crate) const TEXT: Rgba = [0x59, 0x59, 0x59, 0xFF];
@@ -108,12 +109,15 @@ impl Ctx<'_> {
         }
         String::new()
     }
-    #[allow(clippy::too_many_arguments)]
     fn text(&mut self, x: f32, y: f32, s: &str, size: f32, color: Rgba, align: HAlign, valign: VAlign) {
+        self.text_styled(x, y, s, size, color, false, align, valign);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn text_styled(&mut self, x: f32, y: f32, s: &str, size: f32, color: Rgba, bold: bool, align: HAlign, valign: VAlign) {
         if s.is_empty() {
             return;
         }
-        self.out.push(Prim::Text { x, y, text: s.to_string(), size, color, bold: false, align, valign, rotation: 0.0 });
+        self.out.push(Prim::Text { x, y, text: s.to_string(), size, color, bold, align, valign, rotation: 0.0 });
     }
     fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, fill: Rgba, stroke: Option<(Rgba, f32)>) {
         self.out.push(Prim::Rect { x, y, w, h, fill: Some(fill), stroke, radius: 0.0 });
@@ -255,29 +259,59 @@ fn label_text(chart: &Chart, data: &ChartData, s: &SeriesData, j: usize, total: 
     if parts.is_empty() { None } else { Some(parts.join(sep)) }
 }
 
+/// The font a point's label is drawn with, field by field: the point's own setting, else its
+/// series', else the chart's (a point that sets only a size keeps the chart's weight and colour).
+fn label_style(s: &SeriesData, j: usize, data: &ChartData) -> Option<LabelStyle> {
+    let mut out = LabelStyle::default();
+    for f in [data.label_font, s.label_font, s.point_label(j).and_then(|l| l.font)].into_iter().flatten() {
+        out.size = f.size.or(out.size);
+        out.bold = f.bold.or(out.bold);
+        out.color = f.color.or(out.color);
+    }
+    out.is_set().then_some(out)
+}
+
 /// Draws a data label, with a small legend-key square before it when the options ask for one.
-fn draw_label(ctx: &mut Ctx, o: &LabelOptions, x: f32, y: f32, text: &str, key: Rgba, align: HAlign, valign: VAlign) {
-    draw_label_colored(ctx, o, x, y, text, key, TEXT, align, valign);
+fn draw_label(ctx: &mut Ctx, o: &LabelOptions, x: f32, y: f32, text: &str, key: Rgba, font: Option<LabelStyle>, align: HAlign, valign: VAlign) {
+    draw_label_colored(ctx, o, x, y, text, key, TEXT, font, align, valign);
 }
 
 /// [`draw_label`] in a given text colour (labels inside a bar are painted in the readable colour).
-fn draw_label_colored(ctx: &mut Ctx, o: &LabelOptions, x: f32, y: f32, text: &str, key: Rgba, color: Rgba, align: HAlign, valign: VAlign) {
+/// A font on the options or in `font` supplies the size, weight and colour the user set; an unset
+/// colour keeps the colour the call site chose for contrast.
+#[allow(clippy::too_many_arguments)]
+fn draw_label_colored(
+    ctx: &mut Ctx,
+    o: &LabelOptions,
+    x: f32,
+    y: f32,
+    text: &str,
+    key: Rgba,
+    color: Rgba,
+    font: Option<LabelStyle>,
+    align: HAlign,
+    valign: VAlign,
+) {
     if text.is_empty() {
         return;
     }
+    let font = font.unwrap_or_default();
+    let size = font.size.unwrap_or(LABEL_SIZE).clamp(4.0, 400.0);
+    let color = font.color.unwrap_or(color);
+    let bold = font.bold.unwrap_or(false);
     if !o.show_legend_key {
-        ctx.text(x, y, text, LABEL_SIZE, color, align, valign);
+        ctx.text_styled(x, y, text, size, color, bold, align, valign);
         return;
     }
-    let s = LABEL_SIZE * 0.65;
-    let tw = ctx.tw(text, LABEL_SIZE);
+    let s = size * 0.65;
+    let tw = ctx.tw(text, size);
     let (kx, tx) = match align {
         HAlign::Left => (x, x + s + 2.0),
         HAlign::Right => (x - tw - s - 2.0, x),
         HAlign::Center => (x - (tw + s + 2.0) / 2.0, x + (s + 2.0) / 2.0),
     };
     ctx.rect(kx, y - s / 2.0, s, s, key, None);
-    ctx.text(tx, y, text, LABEL_SIZE, color, align, valign);
+    ctx.text_styled(tx, y, text, size, color, bold, align, valign);
 }
 
 /// The formatting override of point `j`, if any. The list is sorted by index (resolve sorts it).
@@ -425,6 +459,7 @@ fn sanitize_vals(v: &[Option<f64>]) -> Vec<Option<f64>> {
 
 fn sanitize(d: &ChartData) -> ChartData {
     ChartData {
+        label_font: d.label_font,
         palette: d.palette.iter().take(MAX_POINTS).copied().collect(),
         categories: d.categories.iter().take(MAX_POINTS).cloned().collect(),
         category_levels: d.category_levels.iter().take(3).map(|l| l.iter().take(MAX_POINTS).cloned().collect()).collect(),
@@ -444,6 +479,7 @@ fn sanitize(d: &ChartData) -> ChartData {
                 trendlines: s.trendlines.iter().take(MAX_TRENDLINES).cloned().collect(),
                 number_format: s.number_format.clone(),
                 labels: s.labels.clone(),
+                label_font: s.label_font,
                 error_bars: s.error_bars.as_ref().map(|e| ErrorBarsData {
                     spec: e.spec.clone(),
                     plus: e.plus.iter().take(MAX_POINTS).copied().collect(),
@@ -1500,7 +1536,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                             let o = series_labels(chart, s);
                             let below = point_position(chart, s, j, o) == LabelPosition::Bottom;
                             let (y, va) = if below { (vpos(t, &sc) + 5.0, VAlign::Top) } else { (vpos(t, &sc) - 5.0, VAlign::Bottom) };
-                            area_labels.push((c, y, text, point_fill(s, j), va));
+                            area_labels.push((c, y, text, point_fill(s, j), va, label_style(s, j, data)));
                         }
                     }
                     if top.len() == 1 {
@@ -1549,7 +1585,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                                     _ => (if v >= 0.0 { pb.max(pt) + 3.0 } else { lo - 3.0 }, if v >= 0.0 { HAlign::Left } else { HAlign::Right }),
                                 };
                                 let color = if inside { on(fill) } else { TEXT };
-                                draw_label_colored(ctx, o, x, yc, &text, fill, color, ha, VAlign::Middle);
+                                draw_label_colored(ctx, o, x, yc, &text, fill, color, label_style(s, j, data), ha, VAlign::Middle);
                             }
                         } else {
                             let x = c - nslots * bw / 2.0 + k * bw;
@@ -1585,7 +1621,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                                     }
                                 };
                                 let color = if inside { on(fill) } else { TEXT };
-                                draw_label_colored(ctx, o, xc, y, &text, fill, color, ha, va);
+                                draw_label_colored(ctx, o, xc, y, &text, fill, color, label_style(s, j, data), ha, va);
                             }
                         }
                     }
@@ -1619,14 +1655,14 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                                 LabelPosition::Center => (p[0], p[1], HAlign::Center, VAlign::Middle),
                                 _ => (p[0], p[1] - 5.0, HAlign::Center, VAlign::Bottom),
                             };
-                            draw_label(ctx, o, x, y, &text, point_marker(s, j), ha, va);
+                            draw_label(ctx, o, x, y, &text, point_marker(s, j), label_style(s, j, data), ha, va);
                         }
                     }
                 }
             }
         }
-        for (x, y, t, key, va) in area_labels.drain(..) {
-            draw_label_colored(ctx, &chart.labels, x, y, &t, key, TEXT, HAlign::Center, va);
+        for (x, y, t, key, va, font) in area_labels.drain(..) {
+            draw_label_colored(ctx, &chart.labels, x, y, &t, key, TEXT, font, HAlign::Center, va);
         }
     }
     // Error bars over the marks: in the series' colour, with Excel's end caps.
@@ -1770,7 +1806,7 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                     LabelPosition::Center => (p[0], p[1], HAlign::Center, VAlign::Middle),
                     _ => (p[0], p[1] - 6.0, HAlign::Center, VAlign::Bottom),
                 };
-                draw_label(ctx, o, x, y, &text, point_marker(s, j), ha, va);
+                draw_label(ctx, o, x, y, &text, point_marker(s, j), label_style(s, j, data), ha, va);
             }
         }
         // Error bars run along the value (vertical) axis.
@@ -1925,7 +1961,18 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         if ncat <= MAX_LABELS {
             let o = series_labels(chart, s);
             if let Some(text) = label_text(chart, data, s, j, None) {
-                draw_label_colored(ctx, o, x + bw / 2.0, yb.min(yt) - 2.0, &text, s.color, TEXT, HAlign::Center, VAlign::Bottom);
+                draw_label_colored(
+                    ctx,
+                    o,
+                    x + bw / 2.0,
+                    yb.min(yt) - 2.0,
+                    &text,
+                    s.color,
+                    TEXT,
+                    label_style(s, j, data),
+                    HAlign::Center,
+                    VAlign::Bottom,
+                );
             }
         }
     }
@@ -1967,7 +2014,7 @@ fn funnel(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
             let o = series_labels(chart, s);
             if let Some(t) = label_text(chart, data, s, j, Some(total)) {
                 let color = if ctx.tw(&t, LABEL_SIZE) + 4.0 <= bw { on(s.color) } else { TEXT };
-                draw_label_colored(ctx, o, plot.cx(), yc, &t, s.color, color, HAlign::Center, VAlign::Middle);
+                draw_label_colored(ctx, o, plot.cx(), yc, &t, s.color, color, label_style(s, j, data), HAlign::Center, VAlign::Middle);
             }
             let l = ctx.fit(labels.get(j).map(String::as_str).unwrap_or(""), LABEL_SIZE, lw - 8.0);
             ctx.text(plot.x - 6.0, yc, &l, LABEL_SIZE, TEXT, HAlign::Right, VAlign::Middle);
@@ -2029,7 +2076,7 @@ fn pie(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, inner: f32, nam
                             (HAlign::Center, VAlign::Middle)
                         };
                         let color = if outside { TEXT } else { on(fill) };
-                        draw_label_colored(ctx, o, cx + rr * mid.sin(), cy - rr * mid.cos(), &t, fill, color, ha, va);
+                        draw_label_colored(ctx, o, cx + rr * mid.sin(), cy - rr * mid.cos(), &t, fill, color, label_style(s, j, data), ha, va);
                     }
                 }
             }

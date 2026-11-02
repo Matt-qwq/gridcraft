@@ -99,6 +99,17 @@ fn the_series_sections_drive_the_label_and_error_bar_commands() {
     choose(&mut h, "Automatic", "Outside End");
     assert_eq!(chart(&h, id).series[0].labels.as_ref().unwrap().position, LabelPosition::OutsideEnd);
 
+    // The labels' own font: a size and a weight, through the same command.
+    let label = h.get_by_label("Label size").rect();
+    let field =
+        h.get_all_by_role(Role::SpinButton).map(|n| n.rect()).find(|r| (r.center().y - label.center().y).abs() < 6.0).expect("a label size field");
+    type_number(&mut h, field, "12");
+    let font = chart(&h, id).series[0].labels.as_ref().unwrap().font.expect("a label font");
+    assert_eq!(font.size, Some(12.0), "the series' labels take the size");
+    click(&mut h, "Bold label");
+    let font = chart(&h, id).series[0].labels.as_ref().unwrap().font.expect("a label font");
+    assert_eq!((font.size, font.bold), (Some(12.0), Some(true)), "and keep the size when the weight changes");
+
     expand(&mut h, "Error Bars");
     choose(&mut h, "None", "Standard deviation");
     let c = chart(&h, id);
@@ -224,4 +235,9 @@ fn the_point_section_sets_a_point_marker_size() {
     type_number(&mut h, field, "9");
     let pts = chart(&h, id).series[0].points.clone();
     assert_eq!(pts.first().and_then(|p| p.marker_size), Some(9), "the point took the size: {pts:?}");
+
+    // The point's own label font is set from the same section.
+    click(&mut h, "Bold label");
+    let font = chart(&h, id).series[0].point_label(0).and_then(|l| l.font);
+    assert_eq!(font.and_then(|f| f.bold), Some(true), "the point's label is bold");
 }
