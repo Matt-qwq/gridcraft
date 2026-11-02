@@ -1,6 +1,6 @@
 # Function parity: worksheet functions and formulas
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** minor (documentation-derived formula oracle suite) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (coverage re-measured: 514 functions, 513 of Microsoft's 523 by name, 504 working; PERCENTOF and TRIMRANGE are present, the stale per-category counts replaced) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Excel's worksheet functions, category by category, against GridCraft's function library. Part of
 [target-app-parity.md](target-app-parity.md); gaps feed [gaps.md](gaps.md).
@@ -12,14 +12,12 @@ Excel's worksheet functions, category by category, against GridCraft's function 
   them), plus 14 text functions the page lists under combined entries (FIND/FINDB, LEFT/LEFTB,
   LEN/LENB, MID/MIDB, REPLACE/REPLACEB, RIGHT/RIGHTB, SEARCH/SEARCHB), BETA.INV, and COPILOT and
   PY (Microsoft 365 functions not on that page when fetched).
-- **Ours (505):** every function spec in `crates/functions/src/*.rs` (`f!("NAME", …)`) plus the
-- **Ours (503):** every function spec in `crates/functions/src/*.rs` (`f!("NAME", …)`) plus the
-- **Ours (502):** every function spec in `crates/functions/src/*.rs` (`f!("NAME", …)`) plus the
-- **Ours (502):** every function spec in `crates/functions/src/*.rs` (`f!("NAME", …)`) plus the
-- **Ours (505):** every function spec in `crates/functions/src/*.rs` (`f!("NAME", …)`) plus the
-  evaluator's special forms in `crates/calc/src/eval.rs` (`SPECIAL_FUNCTIONS`: IF, IFS, CHOOSE,
-  OFFSET, INDIRECT, INDEX, SUBTOTAL, AGGREGATE, TEXT, LET, LAMBDA, MAP, REDUCE, SCAN, BYROW, BYCOL,
-  MAKEARRAY…), excluding the test-only `ADD2`. Every one is an Excel name.
+- **Ours (514):** every function spec in the library (`gridcraft_functions::all()`, counted with
+  `gridcraft-cli functions --json`), which includes the evaluator's special forms in
+  `crates/calc/src/eval.rs` (`SPECIAL_FUNCTIONS`: IF, IFS, CHOOSE, OFFSET, INDIRECT, INDEX,
+  SUBTOTAL, AGGREGATE, TEXT, LET, LAMBDA, MAP, REDUCE, SCAN, BYROW, BYCOL, MAKEARRAY, TRIMRANGE…),
+  since each is also registered as a spec (the evaluator intercepts it before the library runs).
+  Excluding the test-only `ADD2`. Besides USDOLLAR (below), every one is an Excel name.
 - **Not on Microsoft's list:** USDOLLAR, a legacy function Excel still evaluates (like DOLLAR),
   is in our library as a Compatibility function for files that use it. It is not counted above.
 - **Working** excludes stubs that return an error by design: the 7 CUBE functions (`#N/A`, no
@@ -33,22 +31,28 @@ Excel's worksheet functions, category by category, against GridCraft's function 
 
 | Category | Excel | Ours | Working | % working | Missing |
 |---|---|---|---|---|---|
-| Statistical | 111 | 111 | 111 | 100% | — |
-| Math and trigonometry | 80 | 79 | 79 | 99% | PERCENTOF |
+| Statistical | 111 | 110 | 110 | 99% | — (FORECAST.LINEAR and the compatibility names live here) |
+| Math and trigonometry | 80 | 80 | 80 | 100% | — |
 | Financial | 55 | 55 | 55 | 100% | — |
 | Engineering | 54 | 54 | 54 | 100% | — |
 | Text | 50 | 48 | 48 | 96% | DETECTLANGUAGE, TRANSLATE |
-| Lookup and reference | 40 | 36 | 36 | 90% | GETPIVOTDATA, IMAGE, RTD, TRIMRANGE |
-| Compatibility | 40 | 40 | 40 | 100% | — |
+| Lookup and reference | 40 | 36 | 36 | 90% | GETPIVOTDATA, IMAGE, RTD |
+| Compatibility | 40 | 42 | 42 | — | — (USDOLLAR is ours only; the rest is category assignment) |
 | Date and time | 25 | 25 | 25 | 100% | — |
-| Information | 22 | 21 | 21 | 95% | STOCKHISTORY |
+| Information | 22 | 22 | 22 | 100% | — |
 | Logical | 19 | 19 | 19 | 100% | — |
 | Database | 12 | 12 | 12 | 100% | — |
 | Cube | 7 | 7 | 0 | 0% | (all 7 are `#N/A` stubs) |
 | Web | 3 | 3 | 1 | 33% | (WEBSERVICE, FILTERXML are stubs; ENCODEURL works) |
 | Add-in and Automation | 3 | 1 | 1 | 33% | CALL, REGISTER.ID |
 | AI and Python | 2 | 0 | 0 | 0% | COPILOT, PY |
-| **Total** | **523** | **505** | **496** | **94.8%** | 18 missing, 9 stubs |
+| **Total** | **523** | **514** | **504** | **96.4%** | 10 missing by name, 9 stubs |
+
+The category counts are ours as the library registers them (`gridcraft-cli functions --json`);
+Microsoft's are the page's. Where a name sits in a different category on either side (a legacy
+`FORECAST` or `CEILING` reads as Compatibility here and Math there), the row's two "Ours"/"Excel"
+numbers differ while the total is right. The **missing** column is the verified list: every other
+name on Microsoft's page is in the library, either working or as one of the nine stubs.
 
 By the Excel version that introduced them (working / total): before 2010 346 / 360, 2010
 56 / 56, 2013 49 / 51, 2016 1 / 5, 2019 6 / 6, 2021 11 / 11, 2024 22 / 23, Microsoft 365 5 / 11.
@@ -132,6 +136,7 @@ workbooks; results checked in as data, not Excel files) and fixing what it finds
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | Coverage re-measured from the library (514 functions, 513 of Microsoft's 523 by name, 504 working): PERCENTOF and TRIMRANGE are present, so the stale per-category "Ours"/"Missing" columns are corrected and the ten genuinely missing names listed |
 | 2026-10-30 | minor | Documentation-derived formula oracle suite: 595 worked examples for 275 functions through the evaluator, with #57/#133/#139/#140/#134 regressions (not an Excel-computed corpus) |
 | 2026-10-21 | minor | SUBTOTAL and AGGREGATE charge every argument against the evaluator's 16-million-cell limit before scanning; a value in XFD1048576 no longer makes `SUBTOTAL(9,A:XFD)` read the whole sheet (#2175) |
 | 2026-10-19 | minor | LET and LAMBDA names compare case-insensitively in any script, as in Excel: `=LET(dług,100,DŁUG*2)` is 200 (was #NAME?); also LET-bound lambdas called or passed by name (`żar(2)`, `MAP(…,Λ)`), `ISOMITTED`, and formula-bar alias translation (one shared `gridcraft_formula::same_name`, which matches `ß` with `ẞ` and keeps dotless `ı` apart from `i`) |

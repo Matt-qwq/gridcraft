@@ -572,11 +572,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Margins are dragged on the rulers (#792). Remaining: pictures in headers/footers, Different First Page / Odd & Even pages. Desktop now submits directly through craft-print with printer choice, copies, duplex and grayscale; browser printing stays available. Print ranges and driver tray/options UI remain. **Estimate:** 5–10 h.
 
 ### 15. Remaining functions and an oracle suite (F)
-- 18 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 16–26 h.
-- 20 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 17–29 h.
-- 21 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 18–30 h.
-- 18 missing, 9 stubs; no Excel-computed oracle corpus; #137, #138. **Estimate:** 18–30 h.
-  [function-parity.md](function-parity.md)
+- **10 missing by name** (513 of Microsoft's 523 present, 504 working): DETECTLANGUAGE, TRANSLATE,
+  GETPIVOTDATA, IMAGE, RTD, STOCKHISTORY, CALL, REGISTER.ID, COPILOT and PY; nine stubs (7 CUBE,
+  WEBSERVICE, FILTERXML). Measured 11-02 with `gridcraft-cli functions --json` (514 specs, one of
+  them USDOLLAR, which is not on Microsoft's list). No Excel-computed oracle corpus; #137, #138.
+  **Estimate:** 16–26 h. [function-parity.md](function-parity.md)
 
 ### 16. Collaboration and review (F)
 - No co-authoring, Show Changes, comment navigation, notes ↔ comments
