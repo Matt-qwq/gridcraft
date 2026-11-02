@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** minor (a table slicer follows its table's and column's names, so a rename neither empties its tiles nor stops its filter; `insert.slicer` applies the documented `caption`; a filter changed on the PivotTable itself mirrors onto a connected slicer when every report agrees and the labels are tiles — §8's remaining items are the timeline handles' drag, calculated items, value/label filters and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (a timeline's selected range handles now drag on the sheet — resize either end or slide the band, one undo step, the field's date axis cached per revision — so §8's remaining items are calculated items, value/label filters and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -426,7 +426,14 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   report agrees on the selection and every label names a tile**. A grouped date label or a
   number-format label has no tile, so the widget keeps its state rather than showing a filter the
   model does not hold; a slicer whose reports disagree is left alone; timelines keep their own range.
-- **Missing:** the timeline handles' drag in the UI; a filter on a field outside Rows/Columns is drawn as an extra page-filter row
+- **Landed 11-02 (timeline drag):** a timeline's selected range is now edited on the sheet. The
+  track is the field's own date axis (`cmd::slicer::timeline_axis` scans the report's source once
+  per document revision, and the grid caches it), the range draws as a band with its own handles,
+  and dragging a handle resizes it while dragging the band slides it without changing its length.
+  Both ends snap to whole days, stay inside the axis and never cross; each drag runs
+  `slicer.setRange` and coalesces into one undo step, and Esc puts the range back. A timeline whose
+  report is gone has no axis, so its handles stay decoration rather than inventing a date.
+- **Missing:** a filter on a field outside Rows/Columns is drawn as an extra page-filter row
   (`PivotFilter` has no flag to distinguish it); calculated items, value/label filters,
   number grouping, GETPIVOTDATA and data-model pivots. (`insert.pivotChart` landed 10-11 and is in
   the catalog, so PivotCharts are no longer part of this gap.)
@@ -435,7 +442,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
   never been opened in Excel — gate #1.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 6–11 h for beta (22–35 h full).
+- **Estimate:** 4–9 h for beta (22–35 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
