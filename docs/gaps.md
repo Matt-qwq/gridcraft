@@ -459,9 +459,15 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Both ends snap to whole days, stay inside the axis and never cross; each drag runs
   `slicer.setRange` and coalesces into one undo step, and Esc puts the range back. A timeline whose
   report is gone has no axis, so its handles stay decoration rather than inventing a date.
-- **Missing:** a filter on a field outside Rows/Columns is drawn as an extra page-filter row
-  (`PivotFilter` has no flag to distinguish it); calculated items, value/label filters,
-  number grouping, GETPIVOTDATA and data-model pivots. (`insert.pivotChart` landed 10-11 and is in
+- **Landed 11-02 (a filter's area):** a field can sit in the Filters area and on an axis at once (a
+  file says so with a `pageFields` entry), but a filter carried no area, so the writer and the
+  refresh guessed it from whether the field was in Rows/Columns — a page filter on an axis field
+  collapsed into hidden items and lost its row. `PivotFilter` now records its area (`Auto` for
+  documents written before it existed, `Page` for the Filters area, `Axis` for hidden items), the
+  reader sets it (`pageFields` vs `item/@h`), the writer and the refresh honour it, and moving a
+  filtered field onto an axis turns a page filter into an axis filter.
+- **Missing:** calculated items, value/label filters, number grouping, GETPIVOTDATA and data-model
+  pivots; the PivotTable gate's Excel verification. (`insert.pivotChart` landed 10-11 and is in
   the catalog, so PivotCharts are no longer part of this gap.)
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
