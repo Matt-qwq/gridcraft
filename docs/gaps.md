@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (a timeline's selected range handles now drag on the sheet — resize either end or slide the band, one undo step, the field's date axis cached per revision — so §8's remaining items are calculated items, value/label filters and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (a timeline's selected range handles now drag on the sheet, and a chart series can move to the secondary axis by command and from the Format pane; a combo chart's series keep their order across save/reopen — §8's remaining items are calculated items, value/label filters and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -224,14 +224,19 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   `separator`, and chartex's `cx:dataLabel` has **no text element at all**. A fixed rich text replaces the
   composed label, which is exactly what `PointLabel::text` already does, so the claim is retired rather
   than faked.
+- **Landed 11-02 (secondary axis and series order):** `chart.setSeriesAxis {series, secondary?,
+  type?, subtype?}` moves one series to the secondary value axis and optionally changes its kind
+  (the model side of Change Chart Type → Secondary Axis), turning the chart into a combo; the
+  Format pane's Series Options carries the checkbox. Reading a combo chart back used to return its
+  series in the writer's **group order** (primary bars, primary lines, secondary), so a series
+  index from before a save pointed at another series after reopen — the reader now sorts by
+  `c:order`/`c:idx`, and a secondary line group keeps its markers when written.
 - **Missing:** per-point label formatting (font/fill/callout shape) and per-point marker size are not
   modelled;
   date-axis units are kept but not editable; custom error-bar references are carried by the command
   but not wired in the pane; a chart element cannot be selected by clicking it (the selection is a
-  dropdown); no command moves a series onto the secondary axis (so it applies to charts read from
-  files, and `insert.chart "combo"` puts every series on the primary axis); from-cells labels,
-  callouts added through the UI, chart templates and an element-level pane for shapes/pictures are
-  not there.
+  dropdown); from-cells labels, callouts added through the UI, chart templates and an element-level
+  pane for shapes/pictures are not there.
 - **Evidence:** `Chart` (`crates/model/src/features.rs`) holds the option families above;
   `chart_options_roundtrip` and `chart_unmodelled_kinds` pin build → save → reopen → second save
   byte equality; the patch path is pinned per chart kind; `ui-egui` `chart_format_pane` and
@@ -582,6 +587,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | `chart.setSeriesAxis` moves a series to the secondary axis (and optionally changes its kind); the Format pane has the checkbox; combo series are read back in `c:order`, not group order |
 | 2026-10-30 | minor | §8: a table slicer follows a table and column rename, `insert.slicer` applies `caption`, and a report-side `pivot.filter` mirrors onto a connected slicer; corrected the stale "widget UI / timeline range / PivotCharts missing" list (`insert.pivotChart` landed 10-11) and dropped the stale "table slicer is not written" line |
 | 2026-10-28 | minor | §2: a finished band drops its text pointer index (rebuilt on the first edit); the 100M-cell export falls from 2,411 to 1,911 MiB live (texts 640 → 301, number tables 679 → 519) and a text past the u16 slots keeps its own slot |
 | 2026-10-28 | minor | §2: bulk changes scan blocked arrays once for the union of the changed cells and data commands cap at 12M cells: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill Down 1.45 s; 1M×20 refused in 1.3 s |
