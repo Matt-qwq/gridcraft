@@ -511,10 +511,7 @@ fn a_timeline_without_a_source_axis_does_not_start_a_range_drag() {
 #[test]
 fn the_selected_bands_own_start_handle_is_grabbable() {
     let (mut h, _, timeline) = fixture();
-    h.state_mut()
-        .session
-        .run("slicer.setRange", json!({"slicer": timeline, "start": "2025-02-01", "end": "2025-02-28"}))
-        .unwrap();
+    h.state_mut().session.run("slicer.setRange", json!({"slicer": timeline, "start": "2025-02-01", "end": "2025-02-28"})).unwrap();
     h.run_steps(2);
     let lay = timeline_layout(&h, timeline);
     let track = lay.track;
