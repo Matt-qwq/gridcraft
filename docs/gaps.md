@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** minor (a table slicer follows its table's and column's names, so a rename neither empties its tiles nor stops its filter; `insert.slicer` applies the documented `caption`; a filter changed on the PivotTable itself mirrors onto a connected slicer when every report agrees and the labels are tiles — §8's remaining items are the timeline drag, calculated items, PivotCharts and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-10-11 · **Last updated:** 2026-10-30 · **Change:** minor (a table slicer follows its table's and column's names, so a rename neither empties its tiles nor stops its filter; `insert.slicer` applies the documented `caption`; a filter changed on the PivotTable itself mirrors onto a connected slicer when every report agrees and the labels are tiles — §8's remaining items are the timeline handles' drag, calculated items, value/label filters and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -381,7 +381,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 7–16 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, RC4 write 1,
   an Excel run over a `.xls` 1–6). [file-format-parity.md](file-format-parity.md)
 
-### 8. PivotTables: timeline handles, calculated items, PivotCharts; unverified in Excel (F)
+### 8. PivotTables: timeline handles, calculated items, value/label filters; unverified in Excel (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
   field, the PivotTables they filter, item values with their selected flags, name, caption, style,
   column count, timeline unit and anchor — read into the model and written once from it, so
@@ -427,8 +427,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   number-format label has no tile, so the widget keeps its state rather than showing a filter the
   model does not hold; a slicer whose reports disagree is left alone; timelines keep their own range.
 - **Missing:** the timeline handles' drag in the UI; a filter on a field outside Rows/Columns is drawn as an extra page-filter row
-  (`PivotFilter` has no flag to distinguish it); calculated items, PivotCharts, value/label filters,
-  number grouping, GETPIVOTDATA and data-model pivots.
+  (`PivotFilter` has no flag to distinguish it); calculated items, value/label filters,
+  number grouping, GETPIVOTDATA and data-model pivots. (`insert.pivotChart` landed 10-11 and is in
+  the catalog, so PivotCharts are no longer part of this gap.)
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
@@ -574,6 +575,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-30 | minor | §8: a table slicer follows a table and column rename, `insert.slicer` applies `caption`, and a report-side `pivot.filter` mirrors onto a connected slicer; corrected the stale "widget UI / timeline range / PivotCharts missing" list (`insert.pivotChart` landed 10-11) and dropped the stale "table slicer is not written" line |
 | 2026-10-28 | minor | §2: a finished band drops its text pointer index (rebuilt on the first edit); the 100M-cell export falls from 2,411 to 1,911 MiB live (texts 640 → 301, number tables 679 → 519) and a text past the u16 slots keeps its own slot |
 | 2026-10-28 | minor | §2: bulk changes scan blocked arrays once for the union of the changed cells and data commands cap at 12M cells: Remove Duplicates 1M×10 91 → 12 s, Sort 3.2 s, Fill Down 1.45 s; 1M×20 refused in 1.3 s |
 | 2026-10-27 | minor | §2: independent formulas recalculate on up to eight threads (leaves wave by wave; arrays/volatile/iterative sequential): 100k end-to-end 65–75 → 20–25 ms, 1M calc 517–843 → 208–277 ms; §10 next step is bounded whole-sheet work and paging |

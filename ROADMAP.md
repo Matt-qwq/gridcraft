@@ -135,7 +135,7 @@ The detailed queue with dependencies and the parallel plan is in
 | **2b** | All-script text (#5) | 6–12 | **PDF half landed 10-29** (subset TrueType embedding, `pdftotext`-verified); shaping and bidi remain. |
 | **2c** | Keyboard/key tips (#9) | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects. |
 | **3** | `.xls` + password-protected books (#7) | 12–24 | **Encryption write and `.xls` styles/comments landed 10-29**; DV/CF records, BIFF5 and crypto hardening remain. |
-| **3b** | Pivot slicers/PivotCharts, Excel verification (#8) | 20–30 | After #1's Excel loop. |
+| **3b** | PivotTable timeline drag, calculated items, Excel verification (#8) | 6–11 | Slicers and timelines landed 10-30 (model, XLSX, drawn, a selection filters the pivot, a timeline range through `slicer.setRange`); the timeline handles' drag, calculated items and value/label filters remain, plus the Excel check. |
 | **4** | **Beta exit**: gates green, full `cargo xtask ci`, corpus re-run, release | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read/linked tables (20–30) · M17 zone maps (8–12) · localization (100–165) · Get & Transform/data model (60–100) · full charts/collaboration/mobile/AI · M22 only on a measured trigger | — | Not beta blockers. |
 
@@ -284,7 +284,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (caption too while it still shows the old name), and a report-side `pivot.filter` mirrors onto a connected slicer when every connected report agrees and the labels are tiles; `insert.slicer` applies the documented `caption`. #8 stays 6–11 h (the timeline drag, calculated items and PivotCharts are the rest) |
+| 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (caption too while it still shows the old name), and a report-side `pivot.filter` mirrors onto a connected slicer when every connected report agrees and the labels are tiles; `insert.slicer` applies the documented `caption`. #8 stays 6–11 h (the timeline drag, calculated items and value/label filters are the rest; `insert.pivotChart` has been in since 10-11) |
 | 2026-10-30 | major | A whole-column/row fill narrows to its own lines' content instead of the sheet's used-range box (one stray far cell made a two-column `Ctrl+D` write 2.1M cells; a soak seed went 415 s → 5 s), and `pasteSpecial`'s moved-cell lookup is a map instead of a scan (O(cells²) → linear). Three time regressions with 10× budgets |
 | 2026-10-30 | minor | A chart's `styleN.xml`/`colorsN.xml` are kept byte-identically across a save and a field patch, for chartex and classic parts alike (classic parts with style/colour relationships are now keepable); a per-point label prefix/suffix is proven not to exist in the schema and the claim retired. #4 → 0–2 h, beta ~75–134 h |
 | 2026-10-30 | trivial | The soak harness reports its **wall clock**, budgets a single seed (`GRIDCRAFT_FUZZ_SEED_BUDGET_MS`, reported as its own `slow` kind rather than stalling), writes the **whole** failing sequence to a file and replays it with `GRIDCRAFT_FUZZ_REPLAY` — a seed's sequence depends on the registered command set, so the file is the durable artefact |
