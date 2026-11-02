@@ -244,7 +244,15 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   selects the chart, the next picks the element (Excel's two-step gesture), and a click on the
   frame's padding goes back to the chart area. The Data Point section follows the clicked point, so
   a bar can be formatted without touching the point number.
-- **Missing:** per-point label formatting (font/fill/callout shape) is not modelled; date-axis units
+- **Landed 11-02 (label font):** a data label's own **font** — size, bold and colour — is modelled
+  at the chart, series and point level (`c:txPr` on `c:dLbls` and on `c:dLbl`), read, written,
+  patched, drawn and settable from `chart.setDataLabels {fontSize, bold, color}` and the Format
+  pane's Data Labels and Data Point sections. Levels combine **field by field**: a point that sets
+  only a colour keeps its series' size and the chart's weight, and the renderer draws the size,
+  weight and colour it ends up with. A chartex chart's label font is refused with the reason rather
+  than stored and dropped. The typeface, italic and the label's own fill/callout stay unmodelled
+  (kept while their element is untouched, lost when that label's font is edited).
+- **Missing:** a label's typeface, italic, fill and callout shape are not modelled; date-axis units
   are kept but not editable; from-cells labels, callouts added through the UI, chart templates and
   an element-level pane for shapes/pictures are not there.
 - **Evidence:** `Chart` (`crates/model/src/features.rs`) holds the option families above;

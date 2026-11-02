@@ -40,7 +40,7 @@ edit into a kept part), the option matrix below, merged PRs #62, #116,
 | Move and resize the chart object | yes | yes (#190): eight handles (corners and edge midpoints) work on charts, pictures, shapes and slicers; a left/top drag carries the anchor, Shift keeps the aspect ratio, a 20-point minimum size holds, Esc cancels the drag and arrow keys nudge (Shift+arrow resizes); the Format Chart Area Size fields stay. Dragging stops at the sheet's top-left |
 | Chart title, axis titles | text, linked to cells, full formatting | text only |
 | Legend | position, overlay, formatting, per-entry delete | position only |
-| Data labels | value, category, series, percentage, from cells, callouts, position | value, percentage, series, category and legend key; position, separator, number format; per series; per point shown/deleted. No from-cells or callouts. The Format pane's Data Labels section sets all of it through `chart.setDataLabels` |
+| Data labels | value, category, series, percentage, from cells, callouts, position, font | value, percentage, series, category and legend key; position, separator, number format; per series; per point shown/deleted. A label's own **font** (size, bold, colour) is modelled at the chart, series and point level (`c:dLbls/c:txPr`, `c:dLbl/c:txPr`), read, written, patched and drawn, with the point's field winning over the series' and the chart's field by field. No from-cells, callouts, the typeface or italic. The Format pane's Data Labels and Data Point sections set all of it through `chart.setDataLabels` |
 | Gridlines | major/minor per axis, formatting | one on/off flag (major, value axis) |
 | Axis options | min/max/units, log scale, reverse order, crossing point, display units, date axis, number format | min/max, major unit, log base, reverse order, crossing point, display units (nine built-ins) and number format; read, written and drawn on the value axis, the category axis and the secondary axis. The Format pane's Format Axis section drives all of it (`chart.setAxis`), showing **Auto** per field, and offers only the fields the axis kind can store |
 | Secondary axis | any series | any series through `chart.setSeriesAxis` (the model side of Change Chart Type → Secondary Axis) and the Format pane's Series Options checkbox; the chart becomes a combo and the series can keep or change its kind. Its own bounds, unit, log scale, reverse, crossing, display units and number format are modelled (`y2_axis`; `chart.setAxis` `axis: "y2"`), written and drawn. A combo chart reads its series back in `c:order`, not the file's group order |
@@ -102,9 +102,9 @@ amount, or a re-coloured series rewrites that one element from the model, so for
 *inside* it (rich title runs, legend entry layout, a trendline label's formatting, an error bar's
 line style) goes with it. A change the part cannot express — a different chart kind, a different set
 of series, or a chartex chart's data reference — regenerates the whole part, which is where
-unmodelled XML is still lost. Per-point label formatting (font, fill,
-callout shape) is not modelled: they are kept while their element is untouched and are lost when
-that point's label is edited. A per-point label *prefix/suffix* is not expressible in either
+unmodelled XML is still lost. A label's typeface, italic, fill and callout
+shape are not modelled: they are kept while their element is untouched and are lost when that
+label's font is edited (the size, weight and colour that are modelled are written back). A per-point label *prefix/suffix* is not expressible in either
 format, so it is not modelled: `c:dLbl` carries a text (a cell reference or rich text, CT_Tx), not
 a prefix field, and chartex's `cx:dataLabel` has no text element at all — a custom label is the
 point's own text (`PointLabel::text`), as Excel writes one. A kept chartex part's own `cx:chartSpace`
@@ -188,6 +188,7 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | a label's own font (size, bold, colour) is modelled at the chart, series and point level (`c:txPr` on `dLbls`/`dLbl`), read, written, patched and drawn field by field from the point outward; `chart.setDataLabels {fontSize, bold, color}` sets it and the Data Labels and Data Point sections carry the controls; the typeface, italic and the label's fill stay unmodelled and a chartex label font is refused with its reason |
 | 2026-11-02 | minor | a chart element is selected by clicking it: the renderer returns the boxes a click can land on (`Drawing`), so a bar, area, slice (an exact wedge region), marker, data point, legend entry or axis label names its series and point; the first click selects the chart, the next the element, and the Data Point section follows the clicked point |
 | 2026-11-02 | minor | per-point marker size (2–72 pt) is modelled on `PointFormat`, read from `c:dPt/c:marker/c:size`, written, patched, drawn at that radius and settable from `chart.formatPoint {markerSize}` and the Format pane; custom error-bar references are editable in the pane, so that item is closed |
 | 2026-11-02 | minor | `chart.setSeriesAxis` moves one series to the secondary axis and can change its kind; the Format pane has the checkbox; a secondary line group keeps its markers; combo series are read back in `c:order`, so an index from before a save names the same series after reopen |
