@@ -49,7 +49,7 @@ edit into a kept part), the option matrix below, merged PRs #62, #116,
 | Error bars | fixed, %, standard deviation/error, custom | each series: fixed, percentage, standard deviation, standard error and custom (plus/minus references or array constants), both/plus/minus directions, end caps on/off; read, written and drawn on 2-D column/bar/line/area/scatter/bubble. The Format pane's Error Bars section sets the four numeric kinds, amount, direction and caps; custom bars need the command. Line colour/width is not modelled (drawn in the series colour) |
 | Up/down bars, high-low lines, drop lines, series lines | yes | **missing** |
 | Data table under the chart | yes | **missing** |
-| Per-series / per-point fill, line, marker, effects | Format pane for every element | series colour; per-point fill, line and marker colour plus label deletion, read, written and drawn (pie, doughnut, treemap, sunburst, column, bar, line, scatter, bubble). The Format pane's Data Point section sets a point's fill, line and marker (markers only where they are drawn) and clears the point, disabled on chartex charts. No effects, pattern fills or a per-element Format pane |
+| Per-series / per-point fill, line, marker, effects | Format pane for every element | series colour; per-point fill, line, marker colour and marker size plus label deletion, read, written and drawn (pie, doughnut, treemap, sunburst, column, bar, line, scatter, bubble). The Format pane's Data Point section sets a point's fill, line, marker and marker size (markers only where they are drawn) and clears the point, disabled on chartex charts. No effects, pattern fills or a per-element Format pane |
 | Chart styles and colour palettes | ~16 styles × colour sets | style number stored, own palettes |
 | Chart sheets | yes | **kept, not editable**: not shown, and written back unchanged in their place on save (#727); left out when a sheet they plot is deleted or renamed. No F11 / Move Chart > New sheet |
 | Chart templates (`.crtx`) | yes | **missing** |
@@ -91,7 +91,7 @@ reopen gives the same option (`crates/xlsx/src/tests/chart_options_roundtrip.rs`
 | Error bars: kind | fixed, percentage, standard deviation (sample, n−1), standard error, custom | yes | `c:errBars/c:errValType`, `c:val`, `c:plus`, `c:minus` | yes | custom refs and `{…}` constants are resolved like series values |
 | Error bars: direction, caps | both / plus / minus, `no_end_cap` | yes | `c:errBarType`, `c:noEndCap` | yes | |
 | Error bars: scope | per series | yes | on that series | yes | column, bar, line, area, scatter, bubble (as Excel allows) |
-| Per-point fill / line / marker | `fill`, `line`, `marker` | yes | `c:dPt/c:spPr`, `c:marker` | yes | the right slice, bar or marker takes the colour; markers only on line/scatter/bubble/radar points, as the format stores them |
+| Per-point fill / line / marker | `fill`, `line`, `marker`, `marker_size` | yes | `c:dPt/c:spPr`, `c:marker` (`c:symbol`, `c:size`, `c:spPr`) | yes | the right slice, bar or marker takes the colour and the marker its size in points (2–72, default 5); markers only on line/scatter/bubble/radar points, as the format stores them; a point's own marker writes even when the series marker is off |
 | Unmodelled chart XML | — | kept whole | patched: only the elements an edit touched are rewritten (`crates/xlsx/src/chart_patch.rs`) | — | leader lines, manual layout, title run formatting, date-axis units, minor units and gridline formatting, `extLst`, `printSettings`, `dTable` and error-bar line styles survive an edit as well as an open → save |
 | Unmodelled chartex XML | — | kept whole (`Chart::part`, with the hidden `_xlchart.v1.N` names it refers to) | patched: title, legend, gridlines, value-axis scaling, series fill, series data labels and box & whisker quartiles are rewritten in place; every other byte is the file's (`crates/xlsx/src/chartex_patch.rs`) | — | `cx:units`, `cx:binning`, `cx:subtotals`, per-point `cx:dataLabel` formatting, tick-label formatting, `cx:extLst` and the plot layout survive an edit; a chartex option with no element (percentage labels, a crossing, display units, a value-axis number format, a category-axis option, per-point labels) is refused by the command with a reason |
 | Unmodelled chart kinds | 3-D column/bar/line/area/pie, surface, pie of pie, bar of pie, Pareto, filled map | kept whole (`Sheet::kept_charts`) | the part byte for byte, with its drawing frame | no (the frame is kept, the plot is not drawn) | rebuilding one from the 2-D model would silently lose it; opening warns |
@@ -102,8 +102,8 @@ amount, or a re-coloured series rewrites that one element from the model, so for
 *inside* it (rich title runs, legend entry layout, a trendline label's formatting, an error bar's
 line style) goes with it. A change the part cannot express — a different chart kind, a different set
 of series, or a chartex chart's data reference — regenerates the whole part, which is where
-unmodelled XML is still lost. Per-point marker size and per-point label formatting (font, fill,
-callout shape) are not modelled: they are kept while their element is untouched and are lost when
+unmodelled XML is still lost. Per-point label formatting (font, fill,
+callout shape) is not modelled: they are kept while their element is untouched and are lost when
 that point's label is edited. A per-point label *prefix/suffix* is not expressible in either
 format, so it is not modelled: `c:dLbl` carries a text (a cell reference or rich text, CT_Tx), not
 a prefix field, and chartex's `cx:dataLabel` has no text element at all — a custom label is the
@@ -176,9 +176,8 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
    Format Axis, Format Data Labels, Error Bars and Data Point, all through the commands, with the
    reason shown where a control cannot apply.
 4. Remaining axis and label work: date-axis units as an option, minor units and gridlines, gridline
-   and tick-label formatting, callout shapes: 4–6 h.
-5. Error-bar line formatting, custom error-bar references in the pane (the references themselves do
-   survive read → patch → save), Format Trendline pane: 2–4 h.
+   and tick-label formatting, callout shapes, per-point label formatting: 4–6 h.
+5. Error-bar line formatting, Format Trendline pane: 2–4 h.
 6. Per-element Format pane parity (shapes, pictures, slicers, clicking a chart element), smoothed
    lines, exploded pie, pie/bar of pie, 100% variants: 8–12 h.
 7. 3-D column/bar/pie/area, surface and contour, Pareto: 8–12 h.
@@ -189,6 +188,7 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | per-point marker size (2–72 pt) is modelled on `PointFormat`, read from `c:dPt/c:marker/c:size`, written, patched, drawn at that radius and settable from `chart.formatPoint {markerSize}` and the Format pane; custom error-bar references are editable in the pane, so that item is closed |
 | 2026-11-02 | minor | `chart.setSeriesAxis` moves one series to the secondary axis and can change its kind; the Format pane has the checkbox; a secondary line group keeps its markers; combo series are read back in `c:order`, so an index from before a save names the same series after reopen |
 | 2026-10-30 | minor | a chart's own `styleN.xml`/`colorsN.xml` are read, kept on its chart part and written back byte for byte — chartex and classic parts, and kept unmodelled chartex kinds — so a style applied in Excel survives an open → save and a patched edit; a part regenerated because the chart's kind or series changed drops them and gets the defaults; per-point label prefix/suffix recorded as not expressible (`c:dLbl`/`cx:dataLabel` carry text, not a prefix), closing that work item |
 | 2026-10-30 | minor | chartex parts read from a file are kept and patched element by element (title, legend, gridlines, value-axis scaling, series fill, series data labels, box & whisker quartiles), with their hidden `_xlchart` names written again, so `cx:units`, `cx:binning`, per-point `cx:dataLabel` formatting and `cx:extLst` survive an edit; per-point data-label text (rich text or a `strRef`), position and show flags modelled, read, written, patched and drawn, with `chart.setDataLabels` `point`/`text`; custom error-bar references read from a file verified through read → patch → save (they already survived) |

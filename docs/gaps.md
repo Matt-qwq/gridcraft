@@ -231,10 +231,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   series in the writer's **group order** (primary bars, primary lines, secondary), so a series
   index from before a save pointed at another series after reopen — the reader now sorts by
   `c:order`/`c:idx`, and a secondary line group keeps its markers when written.
-- **Missing:** per-point label formatting (font/fill/callout shape) and per-point marker size are not
-  modelled;
-  date-axis units are kept but not editable; custom error-bar references are carried by the command
-  but not wired in the pane; a chart element cannot be selected by clicking it (the selection is a
+- **Landed 11-02 (per-point marker size):** `PointFormat::marker_size` (2–72 points) is read from
+  `c:dPt/c:marker/c:size/@val`, written, patched, drawn at that radius and settable from
+  `chart.formatPoint {markerSize}` and the Format pane's Data Point section (default 5). A point's
+  own marker now writes even when the series marker is switched off.
+- **Missing:** per-point label formatting (font/fill/callout shape) is not modelled; date-axis units
+  are kept but not editable; a chart element cannot be selected by clicking it (the selection is a
   dropdown); from-cells labels, callouts added through the UI, chart templates and an element-level
   pane for shapes/pictures are not there.
 - **Evidence:** `Chart` (`crates/model/src/features.rs`) holds the option families above;
