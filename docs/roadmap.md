@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (a PivotTable filter records its area, so a page filter on an axis field keeps its row; a data label's own font — size, bold, colour — is modelled at the chart, series and point level; a click on a chart element selects it; a chart point carries its own marker size; custom error-bar references are editable in the pane; a timeline's range handles drag on the sheet; a chart series moves to the secondary axis; **gate #4 met**, so gates #7 7–16 h and #8 4–9 h remain; beta total ~73–130) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (alternative text for charts and shapes with a checker that navigates to each issue; a PivotTable filter records its area, so a page filter on an axis field keeps its row; a data label's own font — size, bold, colour — is modelled at the chart, series and point level; a click on a chart element selects it; a chart point carries its own marker size; custom error-bar references are editable in the pane; a timeline's range handles drag on the sheet; a chart series moves to the secondary axis; **gate #4 met**, so gates #7 7–16 h and #8 4–9 h remain; beta total ~73–130) · **Target:** Microsoft Excel (Microsoft 365)
 
 Forward-looking plan. The one-page summary is [`ROADMAP.md`](../ROADMAP.md); the ranked work
 list is [`gaps.md`](gaps.md); numbers and method are in
@@ -818,6 +818,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | Alternative text for charts and shapes written to `xdr:cNvPr/@descr` (escaped) and set by `object.setAltText`; the accessibility check covers charts, pictures, shapes, pictures in cells and tables without a header row, and its dialog goes to each issue and sets alt text inline. Not a beta gate; #18 drops to 8–12 h |
 | 2026-11-02 | minor | A PivotTable filter records its area (`PivotFilterArea`), so a page filter on a field that is also on an axis keeps its row and a field moved onto an axis becomes an axis filter. #8 → 4–8 h, beta ~73–129 h |
 | 2026-11-02 | minor | A data label's own font (size, bold, colour) is modelled at the chart, series and point level and combines field by field from the point outward; read, written, patched, drawn, settable from `chart.setDataLabels` and the pane, and a chartex label font is refused with its reason. **Gate #4 is met** (chartex granularity and a shape/picture pane are outside it); beta ~73–130 h |
 | 2026-11-02 | minor | Clicking a bar, area, slice, marker, data point, legend entry or axis label selects it in the Format pane: the renderer returns its click regions (`Drawing`) so the hit test cannot drift, the first click selects the chart and the next the element, and a clicked point is the Data Point section's point. #4 stays 0–2 h |
