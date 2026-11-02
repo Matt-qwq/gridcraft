@@ -952,7 +952,7 @@ fn patch_series_color(plan: &mut Plan, xml: &str, ser: &Node, now: &Series, wb: 
 /// A point format that the part records (`dPt`): one with a colour. A format-less entry is how a
 /// deleted label is stored, and belongs to the series' `dLbls` instead.
 fn has_format(p: &PointFormat) -> bool {
-    p.fill.is_some() || p.line.is_some() || p.marker.is_some()
+    p.fill.is_some() || p.line.is_some() || p.marker.is_some() || p.marker_size.is_some()
 }
 
 fn point_sp_pr(p: &PointFormat, wb: &Workbook) -> Option<String> {
@@ -1020,8 +1020,9 @@ fn patch_points(plan: &mut Plan, xml: &str, ser: &Node, then: &[PointFormat], no
                 }
             }
         }
-        if before.marker != after.marker {
-            plan.set(n, DPT_ORDER, "marker", after.marker.filter(|_| marker_capable).and_then(|_| point_marker(after, wb)));
+        if before.marker != after.marker || before.marker_size != after.marker_size {
+            let marker = point_marker(after, wb).filter(|_| marker_capable);
+            plan.set(n, DPT_ORDER, "marker", marker);
         }
     }
     for p in now.iter().filter(|p| has_format(p)) {
@@ -1056,8 +1057,13 @@ fn patch_err_bars(plan: &mut Plan, ser: &Node, then: &Series, now: &Series, wb: 
 }
 
 fn point_marker(p: &PointFormat, wb: &Workbook) -> Option<String> {
-    let c = p.marker.as_ref().and_then(|c| srgb(c, &wb.theme))?;
-    Some(format!("<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/><c:spPr><a:solidFill>{c}</a:solidFill></c:spPr></c:marker>"))
+    let c = p.marker.as_ref().and_then(|c| srgb(c, &wb.theme));
+    if c.is_none() && p.marker_size.is_none() {
+        return None;
+    }
+    let size = p.marker_size.unwrap_or(5).clamp(2, 72);
+    let sp = c.map(|c| format!("<c:spPr><a:solidFill>{c}</a:solidFill></c:spPr>")).unwrap_or_default();
+    Some(format!("<c:marker><c:symbol val=\"circle\"/><c:size val=\"{size}\"/>{sp}</c:marker>"))
 }
 
 fn patch_trendlines(plan: &mut Plan, xml: &str, ser: &Node, then: &Series, now: &Series, wb: &Workbook) {

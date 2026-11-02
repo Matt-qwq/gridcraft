@@ -131,7 +131,14 @@ fn point_styles(points: &[PointFormat], theme: &Theme) -> Vec<PointStyle> {
         .iter()
         .take(MAX_POINT_STYLES)
         .filter_map(|p| usize::try_from(p.index).ok().map(|index| (index, p)))
-        .map(|(index, p)| PointStyle { index, fill: rgba(&p.fill), line: rgba(&p.line), marker: rgba(&p.marker), no_label: p.no_label })
+        .map(|(index, p)| PointStyle {
+            index,
+            fill: rgba(&p.fill),
+            line: rgba(&p.line),
+            marker: rgba(&p.marker),
+            marker_size: p.marker_size,
+            no_label: p.no_label,
+        })
         .collect();
     // Sorted by index, so a lookup is a binary search: a file may list its points in any order.
     out.sort_by_key(|p| p.index);

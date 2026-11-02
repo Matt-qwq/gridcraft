@@ -1375,7 +1375,7 @@ fn per_point_fill_colours_the_right_point() {
     d.series[0].points =
         vec![gridcraft_model::PointFormat { index: 1, fill: Some(gridcraft_model::Color::Rgb(0xC00000)), ..gridcraft_model::PointFormat::default() }]
             .into_iter()
-            .map(|p| PointStyle { index: p.index as usize, fill: Some(red), line: None, marker: None, no_label: false })
+            .map(|p| PointStyle { index: p.index as usize, fill: Some(red), line: None, marker: None, marker_size: None, no_label: false })
             .collect();
     let prims = render(&c, &d, 640.0, 400.0, &m);
     let reds = prims.iter().filter(|p| matches!(p, Prim::Rect { fill: Some(f), .. } if *f == red)).count();
@@ -1443,6 +1443,7 @@ fn every_kind_renders_sanely_with_every_option_set() {
                 fill: Some([0xC0, 0x00, 0x00, 0xFF]),
                 line: Some([0x00, 0xB0, 0x50, 0xFF]),
                 marker: Some([0x00, 0x70, 0xC0, 0xFF]),
+                marker_size: Some(9),
                 no_label: i % 2 == 0,
             }];
         }

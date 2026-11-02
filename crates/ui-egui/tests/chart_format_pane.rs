@@ -10,15 +10,17 @@ use serde_json::json;
 
 type Harness = egui_kittest::Harness<'static, SheetApp>;
 
-/// A workbook with one two-column block and a chart of it on the active sheet.
+/// A workbook with one two-column block and a chart of it on the active sheet. A kind with a space
+/// is a type and a subtype (`"line markers"`).
 fn fixture(kind: &str) -> (Harness, u32) {
+    let (kind, subtype) = kind.split_once(' ').unwrap_or((kind, ""));
     let mut session = Session::new();
     session.new_workbook();
     session
         .execute("range.setValues", json!({"range": "A1", "values": [["Region", "Q1"], ["North", 48], ["South", 39], ["East", 55], ["West", 61]]}))
         .unwrap();
     session.execute("selection.set", json!({"range": "A1:B5"})).unwrap();
-    let chart = session.execute("insert.chart", json!({"type": kind, "at": "D2", "width": 420, "height": 260})).unwrap();
+    let chart = session.execute("insert.chart", json!({"type": kind, "subtype": subtype, "at": "D2", "width": 420, "height": 260})).unwrap();
     let id = chart["chart"].as_u64().unwrap() as u32;
     let mut h = egui_kittest::Harness::builder().with_size(vec2(1300.0, 1000.0)).build_ui_state(
         |ui, app: &mut SheetApp| {
@@ -205,4 +207,21 @@ fn the_series_pane_moves_a_series_to_the_secondary_axis_and_back() {
     assert_eq!(c.kind, ChartKind::Combo, "a per-series axis makes a combo chart");
     click(&mut h, "Plot on secondary axis");
     assert!(!chart(&h, id).series[0].secondary, "the checkbox moves it back");
+}
+
+#[test]
+fn the_point_section_sets_a_point_marker_size() {
+    let (mut h, id) = fixture("line markers");
+    select(&mut h, Selection::Series(0));
+    expand(&mut h, "Data Point");
+    // The size shares its row with its label; the section's other number field picks the point.
+    let label = h.get_by_label("Marker size").rect();
+    let field = h
+        .get_all_by_role(Role::SpinButton)
+        .map(|n| n.rect())
+        .find(|r| (r.center().y - label.center().y).abs() < 6.0)
+        .expect("a marker size field beside its label");
+    type_number(&mut h, field, "9");
+    let pts = chart(&h, id).series[0].points.clone();
+    assert_eq!(pts.first().and_then(|p| p.marker_size), Some(9), "the point took the size: {pts:?}");
 }

@@ -213,6 +213,8 @@ pub struct PointStyle {
     pub fill: Option<Rgba>,
     pub line: Option<Rgba>,
     pub marker: Option<Rgba>,
+    /// The point's own marker size in points; `None` uses the series default.
+    pub marker_size: Option<u8>,
     /// The point's data label is deleted.
     pub no_label: bool,
 }

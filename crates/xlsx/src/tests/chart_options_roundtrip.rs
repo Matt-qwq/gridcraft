@@ -78,7 +78,14 @@ fn full_chart() -> Chart {
         kind: ErrorBarKind::Custom { plus: Some("{1,2,3,4}".into()), minus: Some("{4,3,2,1}".into()) },
         no_end_cap: false,
     });
-    fourth.points = vec![PointFormat { index: 1, fill: Some(Color::Rgb(0xC00000)), line: Some(Color::Rgb(0x00B050)), marker: None, no_label: true }];
+    fourth.points = vec![PointFormat {
+        index: 1,
+        fill: Some(Color::Rgb(0xC00000)),
+        line: Some(Color::Rgb(0x00B050)),
+        marker: None,
+        marker_size: None,
+        no_label: true,
+    }];
     c.series.extend([second, third, fourth]);
     c
 }
@@ -135,7 +142,7 @@ fn a_log_axis_and_a_reversed_value_axis_round_trip() {
     sheet.charts[0].y_axis.display_units = None;
     // A marker override only exists on line and scatter points; keep one here to prove it too.
     let mut line = chart(2, ChartKind::LineMarkers);
-    line.series[0].points = vec![PointFormat { index: 2, marker: Some(Color::Rgb(0x4472C4)), ..PointFormat::default() }];
+    line.series[0].points = vec![PointFormat { index: 2, marker: Some(Color::Rgb(0x4472C4)), marker_size: Some(9), ..PointFormat::default() }];
     sheet.charts.push(line);
     wb.sheets = vec![Arc::new(sheet)];
     let (back, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
@@ -145,7 +152,7 @@ fn a_log_axis_and_a_reversed_value_axis_round_trip() {
     assert_eq!(y.crosses, AxisCrossing::Max);
     assert_eq!(
         back.sheets[0].charts[1].series[0].points,
-        vec![PointFormat { index: 2, marker: Some(Color::Rgb(0x4472C4)), ..PointFormat::default() }]
+        vec![PointFormat { index: 2, marker: Some(Color::Rgb(0x4472C4)), marker_size: Some(9), ..PointFormat::default() }]
     );
 }
 
@@ -278,6 +285,7 @@ fn excel_style_labels_and_error_bars_are_read() {
             fill: Some(Color::Rgb(0x00FF00)),
             line: Some(Color::Rgb(0x0000FF)),
             marker: Some(Color::Rgb(0xFF0000)),
+            marker_size: None,
             no_label: false,
         }]
     );

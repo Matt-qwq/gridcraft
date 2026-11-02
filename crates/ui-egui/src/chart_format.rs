@@ -937,6 +937,24 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
         let marker = marker_reason(chart, scope);
         ui.add_enabled_ui(marker.is_none(), |ui| {
             point_colour(app, ui, &theme, id, scope, index, "Marker", "marker", pt.marker);
+            ui.horizontal(|ui| {
+                ui.label("Marker size");
+                if let Some(v) = number(
+                    ui,
+                    egui::Id::new(("gridcraft.chart_point_marker_size", id, scope, index)),
+                    f64::from(pt.marker_size.unwrap_or(5)),
+                    2.0..=72.0,
+                    "",
+                ) {
+                    let mut m = Map::new();
+                    m.insert("chart".into(), json!(id));
+                    m.insert("series".into(), json!(scope));
+                    m.insert("point".into(), json!(index));
+                    m.insert("markerSize".into(), json!(v.round() as u32));
+                    app.run_or_alert("chart.formatPoint", Json::Object(m));
+                }
+                ui.label(RichText::new("pt").small().color(t.text_dim));
+            });
         });
         if let Some(r) = marker {
             ui.label(RichText::new(r).small().color(t.text_dim));

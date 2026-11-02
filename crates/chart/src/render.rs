@@ -270,6 +270,12 @@ fn point_marker(s: &SeriesData, j: usize) -> Rgba {
     point_style(s, j).and_then(|p| p.marker.or(p.line).or(p.fill)).unwrap_or(s.color)
 }
 
+/// The radius of point `j`'s marker: its own size in points (Excel's 2–72 scale, drawn at 0.7 px
+/// per point so the default 5 is the 3.5 radius the charts have always used), else the default.
+fn point_marker_radius(s: &SeriesData, j: usize) -> f32 {
+    point_style(s, j).and_then(|p| p.marker_size).map_or(3.5, |n| (f32::from(n) * 0.7).clamp(1.4, 50.4))
+}
+
 fn point_line(s: &SeriesData, j: usize) -> Option<Rgba> {
     point_style(s, j).and_then(|p| p.line)
 }
@@ -977,9 +983,9 @@ fn catmull(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f
 }
 
 /// Markers with a colour each (per-point formatting overrides).
-fn draw_markers_colored(ctx: &mut Ctx, pts: impl Iterator<Item = ([f32; 2], Rgba)>, r: f32) {
+fn draw_markers_colored(ctx: &mut Ctx, pts: impl Iterator<Item = ([f32; 2], Rgba, f32)>) {
     let mut seen = HashSet::new();
-    for (p, color) in pts {
+    for (p, color, r) in pts {
         if seen.len() >= MAX_MARKERS {
             break;
         }
@@ -1498,7 +1504,10 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                     draw_runs(ctx, &pts, s.color, 2.25, s.smooth.then_some(plot));
                     let k = kinds.get(i).copied().unwrap_or(ChartKind::Line);
                     if k == ChartKind::LineMarkers && cw >= 3.0 {
-                        draw_markers_colored(ctx, pts.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j)))), 3.5);
+                        draw_markers_colored(
+                            ctx,
+                            pts.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j), point_marker_radius(s, j)))),
+                        );
                     }
                     if labels_on {
                         let o = series_labels(chart, s);
@@ -1642,7 +1651,7 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                 draw_runs(ctx, &px, s.color, 2.0, s.smooth.then_some(plot));
             }
             if !lines || px.len() <= 500 {
-                draw_markers_colored(ctx, px.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j)))), 3.5);
+                draw_markers_colored(ctx, px.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j), point_marker_radius(s, j)))));
             }
         }
         if chart.data_labels && pts.len() <= MAX_LABELS {

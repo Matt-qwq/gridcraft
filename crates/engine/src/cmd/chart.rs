@@ -45,7 +45,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Format Data Point",
             ["Format", "Current Selection"],
             None,
-            "{chart?, series: index, point: index, fill?: hex|\"none\", line?: hex|\"none\", marker?: hex|\"none\", deleteLabel?: bool, clear?: bool}",
+            "{chart?, series: index, point: index, fill?: hex|\"none\", line?: hex|\"none\", marker?: hex|\"none\", markerSize?: 2..72, deleteLabel?: bool, clear?: bool}",
             has_doc,
             format_point
         ),
@@ -717,18 +717,23 @@ fn format_point(s: &mut Session, p: &Json) -> Result<Json> {
     let fill = p.get("fill").map(|v| color_param(v, "fill")).transpose()?.flatten();
     let line = p.get("line").map(|v| color_param(v, "line")).transpose()?.flatten();
     let marker = p.get("marker").map(|v| color_param(v, "marker")).transpose()?.flatten();
+    let marker_size = match u32_param(p, "markerSize") {
+        Some(n) if (2..=72).contains(&n) => Some(n as u8),
+        Some(_) => return Err(bad(cmd, "`markerSize` must be between 2 and 72 points")),
+        None => None,
+    };
     let delete_label = bool_param(p, "deleteLabel");
-    let given = clear || fill.is_some() || line.is_some() || marker.is_some() || delete_label.is_some();
+    let given = clear || fill.is_some() || line.is_some() || marker.is_some() || marker_size.is_some() || delete_label.is_some();
     if !given {
-        return Err(bad(cmd, "give a fill, line, marker colour, deleteLabel or clear"));
+        return Err(bad(cmd, "give a fill, line, marker colour, markerSize, deleteLabel or clear"));
     }
     with_chart(s, p, |c| {
         require_classic(c, cmd)?;
-        if marker.is_some() {
+        if marker.is_some() || marker_size.is_some() {
             use ChartKind::*;
             let plot = gridcraft_chart::series_plot_kind(c, si);
             if !matches!(plot, Line | LineMarkers | LineStacked | Scatter | ScatterLines | Bubble | Radar) {
-                return Err(bad(cmd, "a marker colour applies to line, scatter, bubble and radar points only"));
+                return Err(bad(cmd, "a marker colour or size applies to line, scatter, bubble and radar points only"));
             }
         }
         let se: &mut Series = c.series.get_mut(si).ok_or_else(|| bad(cmd, "no such series"))?;
@@ -746,6 +751,9 @@ fn format_point(s: &mut Session, p: &Json) -> Result<Json> {
         }
         if let Some(c) = marker {
             p.marker = Some(c);
+        }
+        if let Some(n) = marker_size {
+            p.marker_size = Some(n);
         }
         if let Some(v) = delete_label {
             p.no_label = v;

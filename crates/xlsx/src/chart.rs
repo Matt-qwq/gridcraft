@@ -305,6 +305,11 @@ fn read_point(e: &El) -> Option<PointFormat> {
         fill: sp.and_then(|p| p.child("solidFill")).and_then(dml_color),
         line: sp.and_then(|p| p.path(&["ln", "solidFill"])).and_then(dml_color),
         marker: e.path(&["marker", "spPr", "solidFill"]).and_then(dml_color),
+        marker_size: e
+            .path(&["marker", "size"])
+            .and_then(|n| n.attr("val"))
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|n| (2..=72).contains(n)),
         no_label: e.child("dLbl").is_some_and(|d| bool_val(d, "delete")),
     })
 }
@@ -1030,8 +1035,15 @@ pub(crate) fn dlbls_xml(labels: Option<&LabelOptions>, deleted: &[u32], point_la
 /// `<c:dPt>` in CT_DPt order: idx, marker?, spPr?.
 pub(crate) fn point_xml(p: &PointFormat, marker: bool, wb: &Workbook) -> String {
     let mut x = format!("<c:dPt><c:idx val=\"{}\"/>", p.index.min(MAX_POINTS as u32));
-    if marker && let Some(c) = p.marker.as_ref().and_then(|c: &Color| srgb(c, &wb.theme)) {
-        let _ = write!(x, "<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/><c:spPr><a:solidFill>{c}</a:solidFill></c:spPr></c:marker>");
+    if marker && (p.marker.is_some() || p.marker_size.is_some()) {
+        let size = p.marker_size.unwrap_or(5).clamp(2, 72);
+        let sp = p
+            .marker
+            .as_ref()
+            .and_then(|c: &Color| srgb(c, &wb.theme))
+            .map(|c| format!("<c:spPr><a:solidFill>{c}</a:solidFill></c:spPr>"))
+            .unwrap_or_default();
+        let _ = write!(x, "<c:marker><c:symbol val=\"circle\"/><c:size val=\"{size}\"/>{sp}</c:marker>");
     }
     let fill = p.fill.as_ref().and_then(|c: &Color| srgb(c, &wb.theme));
     let line = p.line.as_ref().and_then(|c: &Color| srgb(c, &wb.theme));

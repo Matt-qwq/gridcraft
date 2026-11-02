@@ -625,6 +625,8 @@ pub struct PointFormat {
     pub line: Option<Color>,
     /// The point's marker colour (line and scatter series).
     pub marker: Option<Color>,
+    /// The point's own marker size in points (2–72); `None` follows the series default (5).
+    pub marker_size: Option<u8>,
     /// The point's data label is deleted (`c:dLbl` with `delete`).
     pub no_label: bool,
 }

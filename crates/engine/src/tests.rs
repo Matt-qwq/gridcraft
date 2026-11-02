@@ -5612,11 +5612,14 @@ fn chart_formatting_commands_set_every_modelled_option() {
     assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 0, "fill": "not a colour"})).is_err());
     assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 0})).is_err(), "nothing to change");
 
-    // A line point does have a marker: the colour is stored with it.
+    // A line point does have a marker: the colour and its own size are stored with it.
     s.execute("insert.chart", json!({"type": "line", "range": "A1:E7"})).unwrap();
-    s.execute("chart.formatPoint", json!({"series": 0, "point": 1, "marker": "0070C0"})).unwrap();
+    s.execute("chart.formatPoint", json!({"series": 0, "point": 1, "marker": "0070C0", "markerSize": 9})).unwrap();
     let line = s.doc().unwrap().wb.active().unwrap().charts[1].series[0].point(1).copied().unwrap();
     assert_eq!(line.marker, Some(gridcraft_model::Color::Rgb(0x0070C0)));
+    assert_eq!(line.marker_size, Some(9));
+    assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 1, "markerSize": 1})).is_err(), "too small");
+    assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 1, "markerSize": 73})).is_err(), "too large");
 
     // Everything above survives a save and reopen.
     let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
@@ -5632,6 +5635,10 @@ fn chart_formatting_commands_set_every_modelled_option() {
     assert_eq!(c.series[1].labels, None);
     assert_eq!(c.series[1].error_bars.as_ref().unwrap().kind, ErrorBarKind::Fixed(2.5));
     assert!(c.series[0].error_bars.is_none());
+    // The line chart's point kept its own marker size through the save.
+    let line = s.doc().unwrap().wb.active().unwrap().charts[1].series[0].point(1).copied().unwrap();
+    assert_eq!(line.marker, Some(gridcraft_model::Color::Rgb(0x0070C0)));
+    assert_eq!(line.marker_size, Some(9));
 }
 
 #[test]
