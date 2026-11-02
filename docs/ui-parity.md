@@ -308,8 +308,11 @@ address and formula in the description, row/column indexes, the active cell sele
 the grid's active descendant, and the grid labelled with the sheet, the active cell and the
 selection count. The tree covers frozen rows/columns, follows scrolling and is rebuilt only while
 a reader is attached (capped at 2,000 cells a frame), and the header row and column are
-`ColumnHeader`/`RowHeader` nodes with their letters, numbers and indexes. What is missing: a
-high-contrast theme, a status-bar accessibility entry. 3–5 h.
+`ColumnHeader`/`RowHeader` nodes with their letters, numbers and indexes. **High contrast**
+(View ▸ Show, `view.highContrast`) paints the chrome black, white and yellow — with a yellow
+selection and cyan accents, white sheet page and black cell text — and sends egui's own widgets dark
+with it; the choice is remembered across restarts. What is missing: a status-bar accessibility
+entry. 1–2 h.
 
 ## Feel
 
@@ -331,6 +334,7 @@ scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 | 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (its caption too while it still shows the old name), and a filter changed on the PivotTable mirrors onto a connected slicer when every connected report agrees; the timeline's range handles remain the one unfinished interaction |
 | 2026-10-30 | minor | PivotTable slicers and timelines on the sheet: a slicer's caption band and value tiles (grid of `columns` columns, selected tiles tinted and checked, clear-filter button, elided text, wheel-scrolled tiles with an `N of M` line, eight-handle selection frame), a timeline's caption, unit and full-range track with two handles, the same object drag/nudge/Delete/menu/Selection-pane wiring as charts and pictures through `slicer.toggle`/`slicer.move`/`slicer.delete`/`slicer.selectAll`/`slicer.clear`/`slicer.setStyle`, Tab/Enter tile focus, and tests for tile clicks, one-step drag undo, Delete, hostile anchors, empty items, Tab/Enter, the timeline drawing, the Selection pane and the right-click menu |
 | 2026-10-30 | minor | Grid and in-cell editor text is shaped and bidi-ordered through one `gridcraft_core::text` engine per app (`crates/ui-egui/src/text.rs`): Arabic joins, Devanagari reorders and merges clusters, Thai marks position, mixed left-to-right and right-to-left runs draw in visual order with digits keeping their reading order, general right-to-left text aligns right, and the editor's caret and selection move through visual clusters while the buffer stays logical. A `sys-devanagari` fallback face (Nirmala UI / Kohinoor / Noto Sans Devanagari) joins the other script fallbacks, so Hindi cells draw instead of boxes. Printable ASCII keeps the unshaped path bit for bit |
+| 2026-11-02 | minor | High contrast (View ▸ Show, `view.highContrast`, keytip WVI): a black/white/yellow chrome with a yellow selection and cyan accents, egui's widgets darkened to match, the sheet keeping its own white page, and the choice remembered across restarts |
 | 2026-11-02 | minor | The sheet is walkable by a screen reader: the visible cells become an AccessKit grid (`GridCell` nodes with value, address, formula, row/column index, the active cell selected and named as the grid's active descendant; frozen panes included, rebuilt only with a reader attached) |
 | 2026-11-02 | minor | Alternative text for charts and shapes (`Chart::alt`, `Shape::alt`, `xdr:cNvPr/@descr`, escaped) with `object.setAltText`; Review ▸ Check Accessibility covers charts, pictures, shapes, pictures in cells, tables without a header row, merged cells and default sheet names, and its dialog goes to each issue and sets alt text inline |
 | 2026-11-02 | minor | The Format Chart pane's Data Labels and Data Point sections set a label's own font (size, weight, colour) through `chart.setDataLabels`, at the chart, series or point level |

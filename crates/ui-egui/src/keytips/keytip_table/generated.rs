@@ -50,13 +50,14 @@ pub const SEQUENCES: &[(&str, Entry)] = &[
     ("HOI", Entry::Finish(Action::Command("home.autofitColumnWidth"))),
     ("OCA", Entry::Finish(Action::Command("home.autofitColumnWidth"))), // Legacy Format menu.
     ("WVG", Entry::Finish(Action::Command("view.gridlines"))),
+    ("WVI", Entry::Finish(Action::Control("view.highContrast"))), // GridCraft's own: Excel takes high contrast from the OS.
     ("H0", Entry::Finish(Action::Command("home.increaseDecimal"))), // Excel: Increase Decimals; containment(Increase Decimal)
-    ("H1", Entry::Finish(Action::Command("home.bold"))),            // Excel: Bold
-    ("H2", Entry::Finish(Action::Command("home.italic"))),          // Excel: Italic
-    ("H3", Entry::Finish(Action::Command("home.underline"))),       // Excel: Excel: Underline; fires immediately (not a menu)
-    ("H4", Entry::Finish(Action::Command("home.strikethrough"))),   // Excel: Strikethrough
-    ("H5", Entry::Finish(Action::Command("home.decreaseIndent"))),  // Excel: Decrease Indent
-    ("H6", Entry::Finish(Action::Command("home.increaseIndent"))),  // Excel: Increase Indent
+    ("H1", Entry::Finish(Action::Command("home.bold"))),          // Excel: Bold
+    ("H2", Entry::Finish(Action::Command("home.italic"))),        // Excel: Italic
+    ("H3", Entry::Finish(Action::Command("home.underline"))),     // Excel: Excel: Underline; fires immediately (not a menu)
+    ("H4", Entry::Finish(Action::Command("home.strikethrough"))), // Excel: Strikethrough
+    ("H5", Entry::Finish(Action::Command("home.decreaseIndent"))), // Excel: Decrease Indent
+    ("H6", Entry::Finish(Action::Command("home.increaseIndent"))), // Excel: Increase Indent
     ("H9", Entry::Finish(Action::Command("home.decreaseDecimal"))), // Excel: Decrease Decimals; containment(Decrease Decimal)
     ("HAN", Entry::Finish(Action::Command("home.accounting"))), // Excel: Accounting Format; fires immediately in Excel; deeper aliases dropped as unreachable
     ("HAS", Entry::Finish(Action::Command("home.addIns"))),     // Excel: Add-ins; containment(Add-ins)

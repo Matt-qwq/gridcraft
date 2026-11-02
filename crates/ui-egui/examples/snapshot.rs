@@ -1,7 +1,7 @@
 //! Renders the whole GridCraft window offscreen (wgpu, no window) to a PNG.
 //!
 //! `cargo run --release -p gridcraft-ui-egui --example snapshot -- [--sample sales] [--in file.xlsx]
-//!  [--size 1440x900] [--scale 2] [--cmd 'id={json}']... [--tab Insert] [--dark] [--language en|es|zh|ja|ko|ru|pt|de|cs|fr|tr]
+//!  [--size 1440x900] [--scale 2] [--cmd 'id={json}']... [--tab Insert] [--dark] [--high-contrast] [--language en|es|zh|ja|ko|ru|pt|de|cs|fr|tr]
 //!  [--dialog 'name={json}'] [--hf-edit header|footer] [--pane formatChart] [--chart <id>|last]
 //!  [--drag se=120x60] [--format chart|axisX|axisY|seriesN] [--expand 'Axis Options'] out.png
 //!
@@ -21,6 +21,7 @@ fn main() {
     let mut cmds: Vec<String> = vec![];
     let mut tab = None;
     let mut dark = false;
+    let mut high_contrast = false;
     let mut pane: Option<String> = None;
     let mut chart: Option<u32> = None;
     let mut chart_last = false;
@@ -63,6 +64,7 @@ fn main() {
                 tab = args.get(i).cloned();
             }
             "--dark" => dark = true,
+            "--high-contrast" => high_contrast = true,
             "--pane" => {
                 i += 1;
                 pane = args.get(i).cloned();
@@ -128,6 +130,7 @@ fn main() {
             {
                 let mut app = SheetApp::new(session, Default::default());
                 app.ui.dark = dark;
+                app.ui.high_contrast = high_contrast;
                 if let Some(code) = &language
                     && let Some(l) = gridcraft_ui_egui::i18n::Language::parse(code)
                 {

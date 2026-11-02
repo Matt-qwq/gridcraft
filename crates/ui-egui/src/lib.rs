@@ -55,6 +55,10 @@ pub struct UiState {
     /// The manual preference, retained when following the system appearance.
     pub dark: bool,
     pub system_theme: bool,
+    /// High-contrast chrome (black, white and yellow) for people who need stronger contrast; the
+    /// sheet itself keeps its own colours. A preference, kept across restarts like the theme.
+    #[serde(default)]
+    pub high_contrast: bool,
     pub ribbon_tab: String,
     pub ribbon_collapsed: bool,
     pub formula_bar_expanded: bool,
@@ -102,6 +106,7 @@ impl Default for UiState {
         UiState {
             dark: false,
             system_theme: false,
+            high_contrast: false,
             ribbon_tab: "Home".into(),
             ribbon_collapsed: false,
             formula_bar_expanded: false,
@@ -631,6 +636,12 @@ impl SheetApp {
             "view.collapseRibbon" => {
                 self.ui.ribbon_collapsed = !self.ui.ribbon_collapsed;
                 Ok(Json::Null)
+            }
+            // The palette is published from `logic` each frame, so the switch takes effect on the
+            // next one.
+            "view.highContrast" => {
+                self.ui.high_contrast = p.get("on").and_then(Json::as_bool).unwrap_or(!self.ui.high_contrast);
+                Ok(json!({"on": self.ui.high_contrast}))
             }
             "view.darkMode" => {
                 let current = if self.ui.system_theme { self.effective_dark } else { self.ui.dark };
@@ -1200,19 +1211,27 @@ impl SheetApp {
         if let Some(answer) = self.desktop_theme.take_change() {
             self.desktop_dark = Some(answer);
         }
-        let preference = match (
-            self.ui.system_theme,
-            ctx.system_theme().or_else(|| self.desktop_dark.map(|d| if d { egui::Theme::Dark } else { egui::Theme::Light })),
-        ) {
-            (true, Some(egui::Theme::Dark)) => egui::ThemePreference::Dark,
-            (true, Some(egui::Theme::Light)) => egui::ThemePreference::Light,
-            _ => self.ui.theme_preference(),
+        let preference = if self.ui.high_contrast {
+            // High contrast is a black chrome: egui's own widgets (menus, dialogs, tooltips) go
+            // dark with it so their text stays readable on it.
+            egui::ThemePreference::Dark
+        } else {
+            match (
+                self.ui.system_theme,
+                ctx.system_theme().or_else(|| self.desktop_dark.map(|d| if d { egui::Theme::Dark } else { egui::Theme::Light })),
+            ) {
+                (true, Some(egui::Theme::Dark)) => egui::ThemePreference::Dark,
+                (true, Some(egui::Theme::Light)) => egui::ThemePreference::Light,
+                _ => self.ui.theme_preference(),
+            }
         };
         if ctx.options(|o| o.theme_preference) != preference {
             ctx.set_theme(preference);
             ctx.request_repaint();
         }
         self.effective_dark = ctx.theme() == egui::Theme::Dark;
+        // The palette lookups only get a context, so the preference is published for the frame.
+        crate::theme::set_high_contrast(ctx, self.ui.high_contrast);
         // Interface size: the preference owns the zoom factor, so egui's own Ctrl/Cmd +/-/0 zoom
         // keys stay off (they would also swallow GridCraft's shortcuts).
         if ctx.options(|o| o.zoom_with_keyboard) {

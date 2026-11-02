@@ -269,6 +269,12 @@
    "target": "view.gridlines"
   },
   {
+   "seq": "WVI",
+   "kind": "control",
+   "target": "view.highContrast",
+   "note": "GridCraft's own: Excel takes high contrast from the OS."
+  },
+  {
    "seq": "H0",
    "kind": "command",
    "target": "home.increaseDecimal",

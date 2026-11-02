@@ -389,6 +389,14 @@ fn keytip_wvg_() {
 }
 
 #[test]
+fn keytip_wvi_() {
+    let mut h = harness(blank());
+    sequence(&mut h, "WVI", false);
+    assert!(h.state().message.is_none() && h.state().toast.is_none(), "WVI must route to its control without an error box");
+    assert_eq!(h.state().keytips.prefix(), None);
+}
+
+#[test]
 fn keytip_h0_() {
     let mut h = harness(blank());
     sequence(&mut h, "H0", false);
@@ -3148,7 +3156,7 @@ fn keytip_q_() {
 
 #[test]
 fn generated_test_count_matches_the_table() {
-    const EXPECTED: usize = 417;
+    const EXPECTED: usize = 418;
     assert_eq!(gridcraft_ui_egui::keytips::keytip_table::SEQUENCES.len(), EXPECTED);
 }
 

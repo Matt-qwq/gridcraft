@@ -604,8 +604,14 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   with a `ColumnHeader`/`RowHeader` node per visible header (its letters or number and its index). Frozen rows and columns are
   included and the tree follows scrolling; nothing is built when no reader is attached (one branch
   a frame) and the walk is capped at 2,000 cells a frame, so a reader scrolls for the rest as a
-  sighted user does. Remaining: high contrast and an accessibility entry in the status bar.
-  **Estimate:** 3–5 h. [ui-parity.md](ui-parity.md#accessibility)
+  sighted user does.
+- **Landed 11-02 (high contrast):** View ▸ Show ▸ **High Contrast** (`view.highContrast`, keytip
+  WVI — GridCraft's own, Excel takes it from the OS) turns the chrome into a black, white and
+  yellow palette: black window, ribbon, tabs and status bar with white text and yellow separators,
+  a yellow selection border and header highlight, cyan accents, and a white sheet page that keeps
+  its own black text (as Excel's high-contrast themes do — the document is not the chrome). egui's
+  own widgets go dark with it so menus and dialogs stay readable. The preference is kept across
+  restarts (`ui.json`). Remaining: an accessibility entry in the status bar. **Estimate:** 1–2 h. [ui-parity.md](ui-parity.md#accessibility)
 
 ### 19. XLSB/ODS beyond values; minor formats (FF)
 - XLSB and ODS import values only, no write; no `.prn`, `.dif`, `.slk`, XML Spreadsheet 2003; CSV

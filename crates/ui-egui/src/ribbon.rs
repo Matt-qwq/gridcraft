@@ -2313,6 +2313,13 @@ fn view(app: &mut SheetApp, ui: &mut Ui) {
         if resp.changed() {
             act(app, "view.gridlines", json!({"on": g}));
         }
+        // High-contrast chrome: black, white and yellow, for readers who need stronger contrast.
+        let mut hc = app.ui.high_contrast;
+        let resp = ui.checkbox(&mut hc, lang.tr("High Contrast")).on_hover_text(lang.tr("Stronger colours for the window; the sheet keeps its own"));
+        control_keytip(app, ui, &resp, "view.highContrast");
+        if resp.changed() || invoke(app, "view.highContrast") {
+            act(app, "view.highContrast", json!({"on": hc}));
+        }
     });
     ui.add_space(6.0);
     ui.vertical(|ui| {

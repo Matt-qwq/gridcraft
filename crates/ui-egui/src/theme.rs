@@ -148,8 +148,78 @@ impl Tokens {
     }
 
     pub fn get(ctx: &egui::Context) -> Tokens {
-        if ctx.global_style().visuals.dark_mode { Tokens::dark() } else { Tokens::light() }
+        if high_contrast(ctx) {
+            Tokens::high_contrast()
+        } else if ctx.global_style().visuals.dark_mode {
+            Tokens::dark()
+        } else {
+            Tokens::light()
+        }
     }
+
+    /// Excel-class high contrast: black chrome, white text, yellow accents and separators, and a
+    /// yellow selection. The sheet keeps its white cells and black text (Excel's high-contrast
+    /// themes do the same): the page is the document, not the chrome.
+    pub fn high_contrast() -> Tokens {
+        Tokens {
+            dark: true,
+            window: Color32::BLACK,
+            ribbon: Color32::BLACK,
+            ribbon_border: Color32::from_rgb(0xFF, 0xFF, 0x00),
+            text: Color32::WHITE,
+            text_dim: Color32::from_rgb(0xFF, 0xFF, 0x00),
+            text_disabled: Color32::from_rgb(0x9E, 0x9E, 0x9E),
+            accent: Color32::from_rgb(0x00, 0xFF, 0xFF),
+            accent_dark: Color32::from_rgb(0x00, 0xC8, 0xC8),
+            accent_soft: Color32::from_rgb(0x00, 0x3F, 0x3F),
+            hover: Color32::from_rgb(0x26, 0x26, 0x26),
+            pressed: Color32::from_rgb(0x3D, 0x3D, 0x3D),
+            separator: Color32::WHITE,
+            grid_bg: Color32::WHITE,
+            desk: Color32::from_rgb(0x33, 0x33, 0x33),
+            gridline: Color32::from_rgb(0x80, 0x80, 0x80),
+            header_bg: Color32::BLACK,
+            header_text: Color32::WHITE,
+            header_line: Color32::WHITE,
+            header_sel_bg: Color32::from_rgb(0xFF, 0xFF, 0x00),
+            header_sel_text: Color32::BLACK,
+            header_all_bg: Color32::from_rgb(0xFF, 0xFF, 0x00),
+            sel_fill: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0x00, 0x40),
+            sel_border: Color32::from_rgb(0xFF, 0xFF, 0x00),
+            input_bg: Color32::BLACK,
+            input_border: Color32::WHITE,
+            tab_bar: Color32::BLACK,
+            tab_active: Color32::from_rgb(0x26, 0x26, 0x26),
+            status_bar: Color32::BLACK,
+            cell_text: Color32::BLACK,
+            menu_bg: Color32::BLACK,
+            shadow: Color32::from_black_alpha(200),
+            danger: Color32::from_rgb(0xFF, 0x7A, 0x7A),
+            error_check_green: Color32::from_rgb(0x00, 0xFF, 0x00),
+            warning_fill: Color32::from_rgb(0xFF, 0xFF, 0x00),
+            warning_ink: Color32::BLACK,
+            notice_warn_bg: Color32::BLACK,
+            notice_warn_border: Color32::from_rgb(0xFF, 0xFF, 0x00),
+            notice_info_bg: Color32::BLACK,
+            notice_info_border: Color32::from_rgb(0x00, 0xFF, 0xFF),
+        }
+    }
+}
+
+/// The egui-memory key the app sets each frame and [`Tokens::get`] reads: the app owns the
+/// preference, the palette lookups (which only get a context) follow it.
+fn high_contrast_key() -> egui::Id {
+    egui::Id::new("gridcraft.high_contrast")
+}
+
+/// Whether the app asked for the high-contrast palette this frame.
+pub fn high_contrast(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(high_contrast_key())).unwrap_or(false)
+}
+
+/// Records the preference for this frame's palette lookups (called once a frame by the app).
+pub fn set_high_contrast(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(high_contrast_key(), on));
 }
 
 pub const UI: &str = "ui";
@@ -932,6 +1002,29 @@ mod font_binding_tests {
 mod tests {
     use super::*;
     use crate::i18n::Language;
+
+    #[test]
+    fn the_high_contrast_palette_is_black_white_and_yellow() {
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::ThemePreference::Light);
+        ctx.set_visuals(egui::Visuals::light());
+        // Light and dark stay as they were until the app asks for high contrast.
+        set_high_contrast(&ctx, false);
+        assert_eq!(Tokens::get(&ctx).window, Tokens::light().window, "light by default");
+        set_high_contrast(&ctx, true);
+        let t = Tokens::get(&ctx);
+        assert_eq!(t.window, Color32::BLACK, "black chrome");
+        assert_eq!(t.text, Color32::WHITE, "white text");
+        assert_eq!(t.separator, Color32::WHITE, "strong separators");
+        assert_eq!(t.sel_border, Color32::from_rgb(0xFF, 0xFF, 0x00), "a yellow selection");
+        assert_eq!(t.grid_bg, Color32::WHITE, "the sheet keeps its own white page");
+        assert_eq!(t.cell_text, Color32::BLACK, "and its black text");
+        // Every colour is opaque or a deliberate wash: nothing is left transparent by accident.
+        for (name, c) in [("window", t.window), ("ribbon", t.ribbon), ("text", t.text), ("grid_bg", t.grid_bg)] {
+            assert_eq!(c.a(), 255, "{name} is opaque");
+        }
+        set_high_contrast(&ctx, false);
+    }
 
     #[test]
     fn fallback_faces_are_appended_to_every_family() {
