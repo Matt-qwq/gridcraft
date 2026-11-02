@@ -235,10 +235,18 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   `c:dPt/c:marker/c:size/@val`, written, patched, drawn at that radius and settable from
   `chart.formatPoint {markerSize}` and the Format pane's Data Point section (default 5). A point's
   own marker now writes even when the series marker is switched off.
+- **Landed 11-02 (click-select):** a chart element is selected by clicking it, with the pane's
+  dropdown reaching the same elements: the chart is laid out into its primitives **and the boxes a
+  click can land on** (`gridcraft_chart::draw` → `Drawing { prims, hits }`), so the hit test is the
+  drawing's own geometry and cannot drift from it. A bar, area band, marker, a line's data point,
+  a pie/doughnut/sunburst slice (an exact wedge region), a legend entry or an axis label band names
+  the series and, when one point was hit, that point; the first click on an unselected chart
+  selects the chart, the next picks the element (Excel's two-step gesture), and a click on the
+  frame's padding goes back to the chart area. The Data Point section follows the clicked point, so
+  a bar can be formatted without touching the point number.
 - **Missing:** per-point label formatting (font/fill/callout shape) is not modelled; date-axis units
-  are kept but not editable; a chart element cannot be selected by clicking it (the selection is a
-  dropdown); from-cells labels, callouts added through the UI, chart templates and an element-level
-  pane for shapes/pictures are not there.
+  are kept but not editable; from-cells labels, callouts added through the UI, chart templates and
+  an element-level pane for shapes/pictures are not there.
 - **Evidence:** `Chart` (`crates/model/src/features.rs`) holds the option families above;
   `chart_options_roundtrip` and `chart_unmodelled_kinds` pin build → save → reopen → second save
   byte equality; the patch path is pinned per chart kind; `ui-egui` `chart_format_pane` and

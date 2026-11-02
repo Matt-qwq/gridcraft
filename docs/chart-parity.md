@@ -49,7 +49,7 @@ edit into a kept part), the option matrix below, merged PRs #62, #116,
 | Error bars | fixed, %, standard deviation/error, custom | each series: fixed, percentage, standard deviation, standard error and custom (plus/minus references or array constants), both/plus/minus directions, end caps on/off; read, written and drawn on 2-D column/bar/line/area/scatter/bubble. The Format pane's Error Bars section sets the four numeric kinds, amount, direction and caps; custom bars need the command. Line colour/width is not modelled (drawn in the series colour) |
 | Up/down bars, high-low lines, drop lines, series lines | yes | **missing** |
 | Data table under the chart | yes | **missing** |
-| Per-series / per-point fill, line, marker, effects | Format pane for every element | series colour; per-point fill, line, marker colour and marker size plus label deletion, read, written and drawn (pie, doughnut, treemap, sunburst, column, bar, line, scatter, bubble). The Format pane's Data Point section sets a point's fill, line, marker and marker size (markers only where they are drawn) and clears the point, disabled on chartex charts. No effects, pattern fills or a per-element Format pane |
+| Per-series / per-point fill, line, marker, effects | Format pane for every element | series colour; per-point fill, line, marker colour and marker size plus label deletion, read, written and drawn (pie, doughnut, treemap, sunburst, column, bar, line, scatter, bubble). The Format pane's Data Point section sets a point's fill, line, marker and marker size (markers only where they are drawn) and clears the point, disabled on chartex charts; clicking a bar, area, slice, marker, data point, legend entry or axis label **on the sheet** selects it in the pane, with Excel's two-step gesture (the first click selects the chart). No effects, pattern fills or a pane for shapes/pictures/slicers |
 | Chart styles and colour palettes | ~16 styles × colour sets | style number stored, own palettes |
 | Chart sheets | yes | **kept, not editable**: not shown, and written back unchanged in their place on save (#727); left out when a sheet they plot is deleted or renamed. No F11 / Move Chart > New sheet |
 | Chart templates (`.crtx`) | yes | **missing** |
@@ -178,8 +178,8 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
 4. Remaining axis and label work: date-axis units as an option, minor units and gridlines, gridline
    and tick-label formatting, callout shapes, per-point label formatting: 4–6 h.
 5. Error-bar line formatting, Format Trendline pane: 2–4 h.
-6. Per-element Format pane parity (shapes, pictures, slicers, clicking a chart element), smoothed
-   lines, exploded pie, pie/bar of pie, 100% variants: 8–12 h.
+6. Per-element Format pane parity (shapes, pictures, slicers), smoothed lines, exploded pie,
+   pie/bar of pie, 100% variants: 8–12 h.
 7. 3-D column/bar/pie/area, surface and contour, Pareto: 8–12 h.
 8. Chart sheets, templates and PivotChart field buttons: 5–8 h. Filled map: owner decision on
    boundary data.
@@ -188,6 +188,7 @@ are (#1686). Such series get no `numCache`/`strCache` on save (#1690).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | a chart element is selected by clicking it: the renderer returns the boxes a click can land on (`Drawing`), so a bar, area, slice (an exact wedge region), marker, data point, legend entry or axis label names its series and point; the first click selects the chart, the next the element, and the Data Point section follows the clicked point |
 | 2026-11-02 | minor | per-point marker size (2–72 pt) is modelled on `PointFormat`, read from `c:dPt/c:marker/c:size`, written, patched, drawn at that radius and settable from `chart.formatPoint {markerSize}` and the Format pane; custom error-bar references are editable in the pane, so that item is closed |
 | 2026-11-02 | minor | `chart.setSeriesAxis` moves one series to the secondary axis and can change its kind; the Format pane has the checkbox; a secondary line group keeps its markers; combo series are read back in `c:order`, so an index from before a save names the same series after reopen |
 | 2026-10-30 | minor | a chart's own `styleN.xml`/`colorsN.xml` are read, kept on its chart part and written back byte for byte — chartex and classic parts, and kept unmodelled chartex kinds — so a style applied in Excel survives an open → save and a patched edit; a part regenerated because the chart's kind or series changed drops them and gets the defaults; per-point label prefix/suffix recorded as not expressible (`c:dLbl`/`cx:dataLabel` carry text, not a prefix), closing that work item |
