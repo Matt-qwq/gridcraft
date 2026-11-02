@@ -793,6 +793,10 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
     };
     let direction = bars.as_ref().map_or(ErrorBarDirection::Both, |b| b.direction);
     let caps = bars.as_ref().is_none_or(|b| !b.no_end_cap);
+    let (mut plus_ref, mut minus_ref) = match bars.as_ref().map(|b| &b.kind) {
+        Some(ErrorBarKind::Custom { plus, minus }) => (plus.clone().unwrap_or_default(), minus.clone().unwrap_or_default()),
+        _ => (String::new(), String::new()),
+    };
     section(ui, "Error Bars", error_bar_reason(chart), |ui| {
         ui.horizontal(|ui| {
             ui.label("Type");
@@ -816,16 +820,17 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                         run_error_bars(app, id, series, params);
                     }
                 }
-                // Custom bars need plus/minus references, which only the command carries.
-                ui.add_enabled(false, egui::Button::new("Custom")).on_disabled_hover_text(
-                    "Custom error bars need a plus or minus reference; set them with chart.setErrorBars {type: custom, plus, minus}.",
-                );
+                // Custom bars need a plus or minus reference; the fields below supply them.
+                if plus_ref.trim().is_empty() && minus_ref.trim().is_empty() {
+                    ui.add_enabled(false, egui::Button::new("Custom"))
+                        .on_disabled_hover_text("Custom error bars need a plus or minus reference; type one below (a range or an array constant).");
+                } else if ui.selectable_label(current == "Custom", "Custom").clicked() {
+                    run_error_bars(app, id, series, json!({"type": "custom", "plus": plus_ref, "minus": minus_ref}));
+                }
             });
         });
         if kind_name == "custom" {
-            ui.label(
-                RichText::new("Custom bars were set from a file or a command; their references are not editable here.").small().color(t.text_dim),
-            );
+            ui.label(RichText::new("Custom amounts come from these references.").small().color(t.text_dim));
         }
         ui.add_enabled_ui(kind_name != "none" && kind_name != "custom", |ui| {
             if let Some(amount) = amount {
@@ -860,6 +865,26 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                     series,
                     json!({"type": kind_name, "value": amount.unwrap_or(1.0), "direction": direction_name(direction), "noEndCap": !caps_on}),
                 );
+            }
+        });
+        ui.separator();
+        ui.label(RichText::new("Custom references (a range or an array constant)").small().color(t.text_dim));
+        ui.horizontal(|ui| {
+            ui.label("Plus reference");
+            if let Some(v) = crate::widgets::committed_text(ui, egui::Id::new(("chart_errbars_ref", id, series, "plus")), &plus_ref, None) {
+                plus_ref = v;
+                if !plus_ref.trim().is_empty() || !minus_ref.trim().is_empty() {
+                    run_error_bars(app, id, series, json!({"type": "custom", "plus": plus_ref, "minus": minus_ref}));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Minus reference");
+            if let Some(v) = crate::widgets::committed_text(ui, egui::Id::new(("chart_errbars_ref", id, series, "minus")), &minus_ref, None) {
+                minus_ref = v;
+                if !plus_ref.trim().is_empty() || !minus_ref.trim().is_empty() {
+                    run_error_bars(app, id, series, json!({"type": "custom", "plus": plus_ref, "minus": minus_ref}));
+                }
             }
         });
     });
