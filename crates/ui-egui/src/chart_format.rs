@@ -302,6 +302,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
         Selection::AxisX => axis(app, ui, &chart, id, false),
         Selection::AxisY => axis(app, ui, &chart, id, true),
         Selection::Series(i) => {
+            series_axis(app, ui, &chart, id, i);
             series_fill(app, ui, &chart, id, i);
             data_labels(app, ui, &chart, id, Some(i));
             error_bars(app, ui, &chart, id, Some(i));
@@ -320,6 +321,22 @@ fn section(ui: &mut Ui, title: &str, reason: Option<&'static str>, body: impl Fn
             return;
         }
         body(ui);
+    });
+}
+
+/// One series' axis: the pane side of `chart.setSeriesAxis` (Change Chart Type → Secondary Axis).
+fn series_axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, i: usize) {
+    let Some(ser) = chart.series.get(i) else { return };
+    ui.collapsing("Series Options", |ui| {
+        let mut secondary = ser.secondary;
+        if ui.checkbox(&mut secondary, "Plot on secondary axis").changed()
+            && let Err(e) = app.run("chart.setSeriesAxis", json!({"chart": id, "series": i, "secondary": secondary}))
+        {
+            app.message = Some(("GridCraft".into(), crate::clean_error(&e)));
+        }
+        if secondary {
+            ui.label(RichText::new("On the right-hand value axis; the chart becomes a combo chart.").small().color(Tokens::get(ui.ctx()).text_dim));
+        }
     });
 }
 

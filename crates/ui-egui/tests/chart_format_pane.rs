@@ -3,7 +3,7 @@
 use egui::{Event, Key, Modifiers, PointerButton, Rect, accesskit::Role, vec2};
 use egui_kittest::kittest::Queryable as _;
 use gridcraft_engine::Session;
-use gridcraft_engine::model::{AxisCrossing, Chart, ErrorBarDirection, ErrorBarKind, LabelPosition};
+use gridcraft_engine::model::{AxisCrossing, Chart, ChartKind, ErrorBarDirection, ErrorBarKind, LabelPosition};
 use gridcraft_ui_egui::SheetApp;
 use gridcraft_ui_egui::chart_format::Selection;
 use serde_json::json;
@@ -191,4 +191,18 @@ fn what_the_chart_kind_cannot_store_is_disabled_with_its_reason() {
     assert!(h.query_all_by_label_contains("chartex part").count() >= 2, "each open section says why");
     assert!(h.query_by_label("Hide this point's label").is_none());
     assert!(chart(&h, id).kind.is_chartex());
+}
+
+#[test]
+fn the_series_pane_moves_a_series_to_the_secondary_axis_and_back() {
+    let (mut h, id) = fixture("column");
+    select(&mut h, Selection::Series(0));
+    expand(&mut h, "Series Options");
+    assert!(!chart(&h, id).series[0].secondary);
+    click(&mut h, "Plot on secondary axis");
+    let c = chart(&h, id);
+    assert!(c.series[0].secondary, "the series is on the secondary axis");
+    assert_eq!(c.kind, ChartKind::Combo, "a per-series axis makes a combo chart");
+    click(&mut h, "Plot on secondary axis");
+    assert!(!chart(&h, id).series[0].secondary, "the checkbox moves it back");
 }

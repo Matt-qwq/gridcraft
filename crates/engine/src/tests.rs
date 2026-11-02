@@ -5642,14 +5642,20 @@ fn a_combo_charts_secondary_axis_and_category_bounds_are_commands() {
     s.execute("insert.chart", json!({"type": "column", "range": "A1:E7"})).unwrap();
     // A secondary axis only exists when a series is plotted against one.
     assert!(s.execute("chart.setAxis", json!({"axis": "y2", "min": 1})).is_err(), "no secondary axis yet");
+    // The command moves one series onto it, changing its kind to a line (Change Chart Type).
+    let r = s.execute("chart.setSeriesAxis", json!({"series": 1, "type": "line", "subtype": "markers"})).unwrap();
+    assert_eq!(r["series"], json!(1));
+    assert_eq!(r["secondary"], json!(true));
     {
-        let d = s.doc_mut().unwrap();
-        let wb = std::sync::Arc::make_mut(&mut d.wb);
-        let sheet = std::sync::Arc::make_mut(&mut wb.sheets[0]);
-        let c = &mut sheet.charts[0];
-        c.kind = ChartKind::Combo;
-        c.series[1].secondary = true;
+        let c = &s.doc().unwrap().wb.active().unwrap().charts[0];
+        assert!(c.series[1].secondary);
+        assert_eq!(c.series[1].kind, Some(ChartKind::LineMarkers));
+        assert!(!c.series[0].secondary, "the other series stays on the primary axis");
+        assert_eq!(c.kind, ChartKind::Combo, "a per-series kind makes it a combo chart");
     }
+    assert!(s.execute("chart.setSeriesAxis", json!({"series": 9})).is_err(), "no such series");
+    assert!(s.execute("chart.setSeriesAxis", json!({"series": 1, "secondary": "yes"})).is_err());
+    assert!(s.execute("chart.setSeriesAxis", json!({"series": 1, "type": "stock"})).is_err(), "a stock chart cannot be one series of a combo");
     s.execute("chart.setAxis", json!({"axis": "y2", "min": 0, "max": 50, "majorUnit": 10, "displayUnits": "thousands", "numberFormat": "0.0"}))
         .unwrap();
     let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
@@ -5674,16 +5680,24 @@ fn a_combo_charts_secondary_axis_and_category_bounds_are_commands() {
     assert!(s.execute("chart.setAxis", json!({"axis": "x", "logBase": 10})).is_err(), "a label axis has no log scale");
     assert!(s.execute("chart.setAxis", json!({"axis": "x", "displayUnits": "millions"})).is_err());
 
-    // Both survive a save and reopen.
+    // Both survive a save and reopen, and moving the series back to the primary axis writes a
+    // single-axis chart again.
     let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
     let b64 = r["base64"].as_str().unwrap().to_string();
     s.execute("file.open", json!({"name": "axes.xlsx", "base64": b64})).unwrap();
     let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    assert!(c.series[1].secondary, "the series is still on the secondary axis");
+    assert_eq!(c.series[1].kind, Some(ChartKind::LineMarkers));
     assert_eq!((c.x_axis.min, c.x_axis.max, c.x_axis.major_unit), (Some(2.0), Some(5.0), Some(2.0)));
     assert_eq!(c.x_axis.crosses, AxisCrossing::At(3.0));
     // Reset before the save: what comes back is Excel's own automatic crossing for a secondary
     // value axis (it keeps the hidden secondary category axis on the right).
     assert_eq!(c.y2_axis, gridcraft_model::AxisOptions { crosses: AxisCrossing::Max, ..gridcraft_model::AxisOptions::default() });
+    s.execute("chart.setSeriesAxis", json!({"series": 1, "secondary": false, "type": "column"})).unwrap();
+    let c = &s.doc().unwrap().wb.active().unwrap().charts[0];
+    assert!(!c.series[1].secondary);
+    assert_eq!(c.series[1].kind, Some(ChartKind::ColumnClustered));
+    assert!(s.execute("chart.setAxis", json!({"axis": "y2", "min": 1})).is_err(), "no series is on the secondary axis any more");
 }
 
 #[test]

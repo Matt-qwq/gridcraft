@@ -44,3 +44,28 @@ fn line_first_group_stays_a_line() {
     assert!(matches!(k[0], Some(ChartKind::Line | ChartKind::LineMarkers)));
     assert_eq!(k[1], Some(ChartKind::ColumnClustered));
 }
+
+fn named(i: usize) -> String {
+    format!(
+        "<c:ser><c:idx val=\"{i}\"/><c:order val=\"{i}\"/><c:tx><c:v>s{i}</c:v></c:tx>\
+         <c:val><c:numRef><c:f>Data!$A$1:$A$5</c:f></c:numRef></c:val></c:ser>"
+    )
+}
+
+#[test]
+fn series_keep_their_order_when_the_groups_are_written_out_of_order() {
+    // The writer emits a combo chart's groups in drawing order (primary bars, primary lines,
+    // secondary), so the file's group order is not the chart's series order. `c:order` is; reading
+    // it back must keep every series-indexed command pointing at the same series after reopen.
+    let bar = bar(&named(0));
+    let lines = line(&(named(2) + &named(3)));
+    let secondary = line(&named(1));
+    let xml = format!(
+        "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">\
+         <c:chart><c:plotArea>{bar}{lines}{secondary}</c:plotArea></c:chart></c:chartSpace>"
+    );
+    let root = parse(xml.as_bytes()).unwrap();
+    let ch = read_chart(&root).unwrap();
+    let names: Vec<&str> = ch.series.iter().filter_map(|s| s.name.as_deref()).collect();
+    assert_eq!(names, ["s0", "s1", "s2", "s3"], "series are read in c:order, not group order");
+}

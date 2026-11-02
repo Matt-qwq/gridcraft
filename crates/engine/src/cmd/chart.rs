@@ -49,6 +49,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             format_point
         ),
+        cmd!(
+            "chart.setSeriesAxis",
+            "Secondary Axis",
+            ["Chart Design", "Type"],
+            None,
+            "{chart?, series: index, secondary?: bool (default true), type?: chart type, subtype?: stacked|stacked100|markers|lines} (moves one series to the secondary value axis, optionally changing its kind, as Change Chart Type does) → {chart, series, secondary}",
+            has_doc,
+            set_series_axis
+        ),
     ]
 }
 
@@ -62,6 +71,46 @@ fn find_chart(s: &Session, p: &Json) -> Result<(usize, usize)> {
         None => sh.charts.len().checked_sub(1),
     };
     idx.map(|i| (si, i)).ok_or_else(|| bad("chart", "no chart on this sheet"))
+}
+
+/// Moves one series to the secondary value axis (and optionally changes its kind), the model side
+/// of Excel's Change Chart Type → Secondary Axis. The chart writer already groups series by kind
+/// and axis, so this is the missing command, not new drawing.
+fn set_series_axis(s: &mut Session, p: &Json) -> Result<Json> {
+    const C: &str = "chart.setSeriesAxis";
+    let (si, ci) = find_chart(s, p)?;
+    let index = usize::try_from(u32_param(p, "series").ok_or_else(|| bad(C, "pass `series` (the index from 0)"))?)
+        .map_err(|_| bad(C, "`series` is too large"))?;
+    let secondary = match p.get("secondary") {
+        None => true,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => return Err(bad(C, "`secondary` must be true or false")),
+    };
+    let kind = match str_param(p, "type") {
+        None => None,
+        Some(t) => {
+            let k = super::insert::chart_kind(t, str_param(p, "subtype").unwrap_or(""));
+            if k == ChartKind::Stock {
+                return Err(bad(C, "a stock chart cannot be one series of a combo chart"));
+            }
+            Some(k)
+        }
+    };
+    edit(s, |cx| {
+        let c = cx.sheet_mut(si)?.charts.get_mut(ci).ok_or_else(|| bad(C, "no such chart"))?;
+        let count = c.series.len();
+        let ser = c.series.get_mut(index).ok_or_else(|| bad(C, format!("no series {index}: the chart has {count}")))?;
+        ser.secondary = secondary;
+        if let Some(k) = kind {
+            ser.kind = Some(k);
+        }
+        // A chart with a per-series kind or a secondary axis is a combo chart; the writer (and the
+        // renderer's per-series kind lookup) only reads `secondary` for one.
+        if secondary || kind.is_some() {
+            c.kind = ChartKind::Combo;
+        }
+        Ok(json!({"chart": c.id, "series": index, "secondary": ser.secondary}))
+    })
 }
 
 fn with_chart(s: &mut Session, p: &Json, f: impl FnOnce(&mut Chart) -> Result<()>) -> Result<Json> {

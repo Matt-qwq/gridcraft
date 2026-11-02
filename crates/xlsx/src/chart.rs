@@ -462,9 +462,13 @@ pub fn read_chart(root: &El) -> Option<Chart> {
     let groups: Vec<(&El, ChartKind)> = plot.children.iter().filter_map(|g| group_kind(g).map(|k| (g, k))).collect();
     let (first, first_kind) = *groups.first()?;
     let first_axes = axis_ids(first);
-    let mut series = vec![];
+    // A combo chart's series are split across plot groups, and the groups are written in drawing
+    // order (bars, lines, secondary), not in the chart's series order. `c:order` (or `c:idx` on
+    // older files) is the order the model and every series-indexed command use, so read it back and
+    // sort; without this a save/reopen renamed which series a secondary-axis or point command hit.
+    let mut series: Vec<(u32, Series)> = vec![];
     for (gi, (g, k)) in groups.iter().enumerate() {
-        for s in g.kids("ser") {
+        for (position, s) in g.kids("ser").enumerate() {
             let mut ser = read_series(s);
             if groups.len() > 1 {
                 // Every series of a combo chart keeps its own group's kind, the first group's included.
@@ -473,9 +477,12 @@ pub fn read_chart(root: &El) -> Option<Chart> {
             if gi > 0 {
                 ser.secondary = axis_ids(g) != first_axes;
             }
-            series.push(ser);
+            let order = s.child_val("order").or_else(|| s.child_val("idx")).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(position as u32);
+            series.push((order, ser));
         }
     }
+    series.sort_by_key(|(order, _)| *order);
+    let mut series: Vec<Series> = series.into_iter().map(|(_, s)| s).collect();
     let kind = if groups.len() > 1 { ChartKind::Combo } else { first_kind };
     let group_labels = groups.iter().find_map(|(g, _)| g.child("dLbls")).map(read_labels);
     // Labels are on when any group or series shows any part of them.
@@ -1348,7 +1355,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
         }
         if !sec.is_empty() {
             let g = match sec.first().and_then(|(_, x)| x.kind).map(group_for) {
-                Some(b @ G::Bar { .. }) => b,
+                Some(g @ (G::Bar { .. } | G::Line { .. } | G::Area { .. } | G::Scatter { .. } | G::Radar)) => g,
                 _ => G::Line { stacked: false, markers: false },
             };
             s.push_str(&group_xml(g, &sec, ch, (3, 4), wb, si));
