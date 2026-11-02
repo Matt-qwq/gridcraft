@@ -72,3 +72,16 @@ fn the_grid_follows_the_selection_and_the_scroll() {
     let grid = h.get_by_role(Role::Grid).accesskit_node();
     assert!(grid.description().is_some_and(|d| d.contains("active cell A400")), "the grid follows the selection");
 }
+
+#[test]
+fn the_headers_say_which_row_and_column_a_cell_is_in() {
+    let h = fixture();
+    let headers: Vec<String> = h.get_all_by_role(Role::ColumnHeader).map(|n| n.accesskit_node()).filter_map(|n| n.label()).collect();
+    assert!(headers.iter().any(|h| h == "A"), "the column headers name their letters: {headers:?}");
+    assert!(headers.iter().any(|h| h == "B"), "{headers:?}");
+    let rows: Vec<String> = h.get_all_by_role(Role::RowHeader).map(|n| n.accesskit_node()).filter_map(|n| n.label()).collect();
+    assert!(rows.iter().any(|r| r == "1") && rows.iter().any(|r| r == "2"), "the row headers name their numbers: {rows:?}");
+    // A cell sits under the grid, and the grid is under the window: the tree is not flat.
+    let grid = h.get_by_role(Role::Grid).accesskit_node();
+    assert!(grid.children().count() > 5, "the grid owns its headers and cells: {}", grid.children().count());
+}

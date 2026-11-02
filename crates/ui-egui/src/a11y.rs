@@ -18,6 +18,9 @@ use gridcraft_engine::model::{Sheet, Workbook};
 
 use crate::grid::Geo;
 
+/// Most header nodes exposed (a viewport never has more rows than cells).
+const MAX_HEADERS: usize = 200;
+
 /// Most cells exposed at once: about a 70 × 30 window at 100 % zoom, which is what a large monitor
 /// shows. A reader reaches the rest of a sheet by scrolling it, as a sighted user does — walking
 /// more than this per frame would cost more than it is worth.
@@ -49,6 +52,15 @@ pub(crate) fn expose_grid(ui: &mut egui::Ui, wb: &Workbook, si: usize, sh: &Shee
         range.count(),
         if range.count() == 1 { "" } else { "s" }
     );
+    // Physical pixels for the node's bounds. (Anything that reads the context must happen before
+    // `accesskit_node_builder`: it holds the context lock while its closure runs.)
+    let ppp = ctx.pixels_per_point();
+    let bounds = egui::accesskit::Rect {
+        x0: f64::from(geo.cells.left() * ppp),
+        y0: f64::from(geo.cells.top() * ppp),
+        x1: f64::from(geo.cells.right() * ppp),
+        y1: f64::from(geo.cells.bottom() * ppp),
+    };
     // Creating this node is also the probe: with no reader attached the builder is absent and no
     // cell nodes are made at all.
     let enabled = ctx
@@ -58,10 +70,42 @@ pub(crate) fn expose_grid(ui: &mut egui::Ui, wb: &Workbook, si: usize, sh: &Shee
             n.set_row_count(used.map(|r| r.end.row as usize + 1).unwrap_or(0));
             n.set_column_count(used.map(|r| r.end.col as usize + 1).unwrap_or(0));
             n.set_description(description);
+            n.set_bounds(bounds);
         })
         .is_some();
     if !enabled {
         return;
+    }
+
+    // The header row and column, so a reader can name where a cell is.
+    for &c in cols.iter().take(MAX_HEADERS) {
+        let x0 = geo.x(sh, c);
+        let rect = egui::Rect::from_min_size(egui::pos2(x0, geo.cells.top()), egui::vec2(sh.col_width(c) * geo.z, geo.header_h));
+        if !rect.intersects(geo.cells) {
+            continue;
+        }
+        let id = Id::new(("gridcraft.a11y.col", si, c));
+        let _ = grid.interact(rect, id, Sense::hover());
+        let name = gridcraft_engine::core::col_to_letters(c);
+        ctx.accesskit_node_builder(id, |n| {
+            n.set_role(Role::ColumnHeader);
+            n.set_label(name);
+            n.set_column_index(c as usize);
+        });
+    }
+    for &r in rows.iter().take(MAX_HEADERS) {
+        let y0 = geo.y(sh, r);
+        let rect = egui::Rect::from_min_size(egui::pos2(geo.cells.left(), y0), egui::vec2(geo.header_w, sh.row_height(r) * geo.z));
+        if !rect.intersects(geo.cells) {
+            continue;
+        }
+        let id = Id::new(("gridcraft.a11y.row", si, r));
+        let _ = grid.interact(rect, id, Sense::hover());
+        ctx.accesskit_node_builder(id, |n| {
+            n.set_role(Role::RowHeader);
+            n.set_label((r + 1).to_string());
+            n.set_row_index(r as usize);
+        });
     }
 
     let mut shown = 0usize;

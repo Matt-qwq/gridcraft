@@ -307,8 +307,9 @@ walkable**: the visible cells become an AccessKit grid — a `GridCell` per cell
 address and formula in the description, row/column indexes, the active cell selected and named as
 the grid's active descendant, and the grid labelled with the sheet, the active cell and the
 selection count. The tree covers frozen rows/columns, follows scrolling and is rebuilt only while
-a reader is attached (capped at 2,000 cells a frame). What is missing: row/column header nodes, a
-high-contrast theme, a status-bar accessibility entry. 4–6 h.
+a reader is attached (capped at 2,000 cells a frame), and the header row and column are
+`ColumnHeader`/`RowHeader` nodes with their letters, numbers and indexes. What is missing: a
+high-contrast theme, a status-bar accessibility entry. 3–5 h.
 
 ## Feel
 

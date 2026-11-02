@@ -600,11 +600,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   an **AccessKit grid** — one `GridCell` node per visible cell, with the displayed value as its
   value, its address (and formula) as its description, its row and column indexes, and the active
   cell marked selected and named as the grid's active descendant; the grid itself is labelled with
-  the sheet and says which cell is active and how many are selected. Frozen rows and columns are
+  the sheet, says which cell is active and how many are selected, and carries bounds of its own,
+  with a `ColumnHeader`/`RowHeader` node per visible header (its letters or number and its index). Frozen rows and columns are
   included and the tree follows scrolling; nothing is built when no reader is attached (one branch
   a frame) and the walk is capped at 2,000 cells a frame, so a reader scrolls for the rest as a
-  sighted user does. Remaining: row and column header nodes, high contrast, an accessibility entry
-  in the status bar. **Estimate:** 4–6 h. [ui-parity.md](ui-parity.md#accessibility)
+  sighted user does. Remaining: high contrast and an accessibility entry in the status bar.
+  **Estimate:** 3–5 h. [ui-parity.md](ui-parity.md#accessibility)
 
 ### 19. XLSB/ODS beyond values; minor formats (FF)
 - XLSB and ODS import values only, no write; no `.prn`, `.dif`, `.slk`, XML Spreadsheet 2003; CSV
