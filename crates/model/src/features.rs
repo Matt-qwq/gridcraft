@@ -746,6 +746,8 @@ pub struct KeptChart {
     /// with it byte for byte.
     pub style: Option<std::sync::Arc<str>>,
     pub colors: Option<std::sync::Arc<str>>,
+    /// Alternative text a screen reader reads for the chart (`xdr:cNvPr/@descr`).
+    pub alt: Option<String>,
 }
 
 impl std::fmt::Debug for KeptChart {
@@ -934,6 +936,10 @@ pub struct Chart {
     /// whenever the PivotTable is refreshed or its layout changes.
     #[serde(default)]
     pub pivot: Option<String>,
+    /// Alternative text a screen reader reads for the chart (`xdr:cNvPr/@descr`); empty is what
+    /// the accessibility check reports.
+    #[serde(default)]
+    pub alt: Option<String>,
     /// Category axis scaling and labels.
     #[serde(default)]
     pub x_axis: AxisOptions,
@@ -1060,6 +1066,10 @@ pub struct Shape {
     pub fill: Color,
     pub line: Color,
     pub text: String,
+    /// Alternative text a screen reader reads for the shape (`xdr:cNvPr/@descr`); a shape with
+    /// text of its own needs none.
+    #[serde(default)]
+    pub alt: Option<String>,
     /// Outline visibility and text formatting (DrawingML `a:ln`, `a:bodyPr`, `a:pPr`, `a:rPr`).
     #[serde(default)]
     pub format: ShapeFormat,

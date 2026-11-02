@@ -1208,7 +1208,8 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                     });
                 }
                 "macros" => macros(app, ui, &mut d),
-                "statistics" | "accessibility" | "errorChecking" | "evaluateFormula" | "comments" => {
+                "accessibility" => accessibility(app, ui, &mut d),
+                "statistics" | "errorChecking" | "evaluateFormula" | "comments" => {
                     let r = if d.name == "comments" {
                         app.session.active().and_then(|doc| doc.wb.active().map(|s| json!(s.comments.iter().map(|(c, m)| json!({"cell": c.a1(), "author": m.author, "text": m.text})).collect::<Vec<_>>())))
                     } else {
@@ -1753,6 +1754,75 @@ fn about(ui: &mut egui::Ui, d: &mut Dialog) {
 /// The Macros dialog: lists GridCraft's own recorded scripts and (if the file carries one) the
 /// preserved VBA project. Mirrors Excel's Developer ▸ Macros list, but is honest that VBA is
 /// preserved and not executed.
+/// Review ▸ Check Accessibility: each issue where it is, a button that goes there and — for an
+/// object without alternative text — a field that sets it (`object.setAltText`).
+fn accessibility(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
+    ui.label("What a screen reader reads: alternative text on charts, pictures and shapes, header rows on tables, merged cells and sheet names.");
+    ui.add_space(6.0);
+    let items: Vec<Json> = d.result.as_ref().and_then(Json::as_array).cloned().unwrap_or_default();
+    if items.is_empty() {
+        ui.weak("No accessibility issues found.");
+        return;
+    }
+    let mut refresh = false;
+    let mut go = None;
+    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+        for issue in &items {
+            let sheet = issue["sheet"].as_str().unwrap_or_default();
+            let sheet_index = issue["sheetIndex"].as_u64().unwrap_or(0);
+            let what = issue["object"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| issue["range"].as_str().map(|r| format!("{sheet}!{r}")))
+                .unwrap_or_else(|| sheet.to_string());
+            ui.horizontal(|ui| {
+                ui.label(format!("{} — {what}", issue["issue"].as_str().unwrap_or("")));
+                if ui.button("Go to").clicked() {
+                    go = Some(issue.clone());
+                }
+            });
+            let kind = issue["kind"].as_str().unwrap_or("");
+            if kind.is_empty() || kind == "cellPicture" {
+                continue;
+            }
+            let key = format!("alt:{kind}:{}", issue["id"]);
+            let mut text = d.values.get(&key).and_then(Json::as_str).unwrap_or("").to_string();
+            ui.horizontal(|ui| {
+                ui.label("Alt text");
+                if ui.add(egui::TextEdit::singleline(&mut text).desired_width(220.0)).changed() {
+                    d.values.insert(key.clone(), json!(text));
+                }
+                if ui.button("Set").on_hover_text("Describe this object for a screen reader").clicked() {
+                    let _ = app.session.run("sheet.activate", json!({"sheet": sheet_index}));
+                    if let Some(id) = issue["id"].as_u64() {
+                        let _ = app.session.run("object.setAltText", json!({"kind": kind, "id": id, "text": text}));
+                        refresh = true;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(issue) = go {
+        let sheet_index = issue["sheetIndex"].as_u64().unwrap_or(0);
+        let _ = app.session.run("sheet.activate", json!({"sheet": sheet_index}));
+        match issue["kind"].as_str() {
+            Some("chart" | "image" | "shape") => {
+                if let Some(id) = issue["id"].as_u64().and_then(|id| u32::try_from(id).ok()) {
+                    app.selected_chart = Some(id);
+                }
+            }
+            _ => {
+                if let Some(range) = issue["range"].as_str() {
+                    let _ = app.session.run("selection.set", json!({"range": range}));
+                }
+            }
+        }
+    }
+    if refresh {
+        d.result = app.session.run("review.checkAccessibility", json!({})).ok();
+    }
+}
+
 fn macros(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
     ui.label("Automation in this workbook. GridCraft runs its own scripts; a file's VBA project is preserved but not executed.");
     ui.add_space(6.0);

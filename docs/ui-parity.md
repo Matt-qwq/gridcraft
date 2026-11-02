@@ -298,9 +298,13 @@ title bar, keeping its place while it is open (#1250).
 
 ## Accessibility
 
-AccessKit is enabled, but the grid, ribbon and dialogs are not exposed as an accessible tree with
-cell addresses and values, so screen readers can't navigate a sheet; there is no high-contrast
-theme or accessibility checker. Excel is strong here. 12–18 h.
+AccessKit is enabled; the ribbon, dialogs and panes carry labels, checked states and key tips, and
+**Review ▸ Check Accessibility** lists objects without alternative text (charts, pictures, shapes
+with no text of their own, pictures in cells), tables without a header row, merged cells and
+default sheet names — each row goes to its sheet/object/range and takes alt text inline through
+`object.setAltText` (written to `xdr:cNvPr/@descr`). What is missing: the **grid** is one painted
+surface with a single node, so a screen reader cannot walk cells, hear the selection or read a
+cell's formula; no high-contrast theme. 8–12 h.
 
 ## Feel
 
@@ -322,6 +326,7 @@ scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 | 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (its caption too while it still shows the old name), and a filter changed on the PivotTable mirrors onto a connected slicer when every connected report agrees; the timeline's range handles remain the one unfinished interaction |
 | 2026-10-30 | minor | PivotTable slicers and timelines on the sheet: a slicer's caption band and value tiles (grid of `columns` columns, selected tiles tinted and checked, clear-filter button, elided text, wheel-scrolled tiles with an `N of M` line, eight-handle selection frame), a timeline's caption, unit and full-range track with two handles, the same object drag/nudge/Delete/menu/Selection-pane wiring as charts and pictures through `slicer.toggle`/`slicer.move`/`slicer.delete`/`slicer.selectAll`/`slicer.clear`/`slicer.setStyle`, Tab/Enter tile focus, and tests for tile clicks, one-step drag undo, Delete, hostile anchors, empty items, Tab/Enter, the timeline drawing, the Selection pane and the right-click menu |
 | 2026-10-30 | minor | Grid and in-cell editor text is shaped and bidi-ordered through one `gridcraft_core::text` engine per app (`crates/ui-egui/src/text.rs`): Arabic joins, Devanagari reorders and merges clusters, Thai marks position, mixed left-to-right and right-to-left runs draw in visual order with digits keeping their reading order, general right-to-left text aligns right, and the editor's caret and selection move through visual clusters while the buffer stays logical. A `sys-devanagari` fallback face (Nirmala UI / Kohinoor / Noto Sans Devanagari) joins the other script fallbacks, so Hindi cells draw instead of boxes. Printable ASCII keeps the unshaped path bit for bit |
+| 2026-11-02 | minor | Alternative text for charts and shapes (`Chart::alt`, `Shape::alt`, `xdr:cNvPr/@descr`, escaped) with `object.setAltText`; Review ▸ Check Accessibility covers charts, pictures, shapes, pictures in cells, tables without a header row, merged cells and default sheet names, and its dialog goes to each issue and sets alt text inline |
 | 2026-11-02 | minor | The Format Chart pane's Data Labels and Data Point sections set a label's own font (size, weight, colour) through `chart.setDataLabels`, at the chart, series or point level |
 | 2026-11-02 | minor | Clicking a chart element selects it in the Format Chart pane: the renderer returns its click regions with its primitives, so a bar, area, slice, marker, data point, legend entry or axis label is hit exactly where it was drawn; the first click selects the chart and the next the element, and a clicked point becomes the Data Point section's point |
 | 2026-10-30 | minor | The Format Chart pane drives axes, data labels, error bars and data points through the engine's four chart commands, with a Chart Elements selection list; options the chart kind cannot store are missing from the pane and the section says why |

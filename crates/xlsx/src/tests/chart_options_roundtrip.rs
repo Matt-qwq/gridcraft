@@ -1260,3 +1260,35 @@ fn a_chartex_kind_change_drops_the_custom_style_and_colour_parts() {
     let (again, _rep) = read_xlsx(&back).unwrap();
     assert_eq!(again.sheets[0].charts[0].kind, ChartKind::Histogram);
 }
+
+#[test]
+fn a_charts_alt_text_round_trips_and_is_escaped() {
+    let mut wb = bar_workbook();
+    let mut sheet = (*wb.sheets[0]).clone();
+    // A quote, an angle bracket and an ampersand live in an XML attribute: they must be escaped
+    // and come back exactly as written.
+    let tricky = "Sales by \"region\" <chart> & totals";
+    sheet.charts[0].alt = Some(tricky.into());
+    sheet.shapes.push(gridcraft_model::Shape {
+        id: 7,
+        kind: gridcraft_model::ShapeKind::Rectangle,
+        anchor: Anchor::default(),
+        fill: Color::default(),
+        line: Color::default(),
+        text: String::new(),
+        alt: Some("Blue status box".into()),
+        format: Default::default(),
+    });
+    wb.sheets = vec![Arc::new(sheet)];
+    let bytes = write_xlsx(&wb).unwrap();
+    let part = chart_part(&bytes, "xl/drawings/drawing1.xml");
+    assert!(part.contains("descr=\"Sales by &quot;region&quot; &lt;chart&gt; &amp; totals\""), "{part}");
+    assert!(part.contains("descr=\"Blue status box\""), "{part}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    let sh = back.sheets[0].as_ref();
+    assert_eq!(sh.charts[0].alt.as_deref(), Some(tricky));
+    assert_eq!(sh.shapes.first().and_then(|s| s.alt.as_deref()), Some("Blue status box"));
+    // A second save writes the same drawing: nothing drifts on the way round.
+    let again = write_xlsx(&back).unwrap();
+    assert_eq!(chart_part(&again, "xl/drawings/drawing1.xml"), part);
+}

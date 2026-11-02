@@ -337,20 +337,49 @@ fn stats(s: &mut Session, _: &Json) -> Result<Json> {
     }))
 }
 
+/// Review › Check Accessibility: what a screen reader would struggle with, per sheet — objects
+/// without alternative text (charts, pictures, shapes with no text of their own, pictures in
+/// cells), merged cells, a table without a header row and a sheet still on its default name.
+/// Each issue carries where it is (`sheet`, `sheetIndex` and either `kind` + `id` or `range`), so
+/// the UI can go to it and fix it.
 fn accessibility(s: &mut Session, _: &Json) -> Result<Json> {
     let d = s.doc()?;
     let mut issues = Vec::new();
-    for sh in &d.wb.sheets {
-        for im in &sh.images {
-            if im.alt.is_empty() {
-                issues.push(json!({"sheet": sh.name, "issue": "Missing alternative text", "object": format!("Picture {}", im.id)}));
+    for (si, sh) in d.wb.sheets.iter().enumerate() {
+        let mut missing = |kind: &str, id: u32, what: String| {
+            issues.push(json!({"sheet": sh.name, "sheetIndex": si, "issue": "Missing alternative text", "kind": kind, "id": id, "object": what}));
+        };
+        for ch in &sh.charts {
+            if ch.alt.as_deref().unwrap_or("").trim().is_empty() {
+                missing("chart", ch.id, format!("Chart {}", ch.id));
             }
         }
+        for im in &sh.images {
+            if im.alt.trim().is_empty() {
+                missing("image", im.id, format!("Picture {}", im.id));
+            }
+        }
+        for sp in &sh.shapes {
+            // A shape whose text is the content (a label, a callout) is already readable; one with
+            // no text at all is what a screen reader cannot describe.
+            if sp.alt.as_deref().unwrap_or("").trim().is_empty() && sp.text.trim().is_empty() && sp.kind != gridcraft_model::ShapeKind::Ink {
+                missing("shape", sp.id, format!("Shape {}", sp.id));
+            }
+        }
+        for (cell, pic) in &sh.cell_pictures {
+            if pic.alt.trim().is_empty() {
+                issues.push(json!({"sheet": sh.name, "sheetIndex": si, "issue": "Missing alternative text", "kind": "cellPicture", "cell": cell.a1(), "object": format!("Picture in {}", cell.a1())}));
+            }
+        }
+        for table in sh.tables.iter().filter(|t| !t.header_row) {
+            issues.push(json!({"sheet": sh.name, "sheetIndex": si, "issue": "Missing table header", "table": table.name, "range": table.range.a1()}));
+        }
         if !sh.merges.is_empty() {
-            issues.push(json!({"sheet": sh.name, "issue": "Merged cells", "count": sh.merges.len()}));
+            let first = sh.merges.first().map(RangeRef::a1).unwrap_or_default();
+            issues.push(json!({"sheet": sh.name, "sheetIndex": si, "issue": "Merged cells", "count": sh.merges.len(), "range": first}));
         }
         if sh.name.starts_with("Sheet") {
-            issues.push(json!({"sheet": sh.name, "issue": "Default sheet name"}));
+            issues.push(json!({"sheet": sh.name, "sheetIndex": si, "issue": "Default sheet name"}));
         }
     }
     Ok(Json::Array(issues))
@@ -375,6 +404,64 @@ mod tests {
     fn at(s: &Session) -> (usize, String) {
         let d = s.doc().unwrap();
         (d.wb.active_sheet, d.selection.active.a1())
+    }
+
+    /// A 1×1 PNG, so a picture can be inserted from code (no binary fixture in the repo).
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn the_accessibility_check_finds_what_a_screen_reader_cannot_read() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Sales"], ["North", 10], ["South", 20]]})).unwrap();
+        s.execute("selection.set", json!({"range": "A1:B3"})).unwrap();
+        let chart = s.execute("insert.chart", json!({"type": "column", "at": "D2", "width": 300, "height": 200})).unwrap();
+        let chart_id = chart["chart"].as_u64().unwrap();
+        // A shape with no text of its own needs alt text; one carrying its text does not.
+        let blank = s.execute("insert.shape", json!({"kind": "rectangle", "at": "A6"})).unwrap();
+        let blank_id = blank["shape"].as_u64().unwrap();
+        s.execute("insert.shape", json!({"kind": "rectangle", "at": "A8", "text": "Total"})).unwrap();
+        let picture = s.execute("insert.picture", json!({"base64": PNG, "mime": "image/png", "at": "A10"})).unwrap();
+        let picture_id = picture["image"].as_u64().unwrap();
+        s.execute("selection.set", json!({"range": "D2:D4"})).unwrap();
+        s.execute("home.mergeCells", json!({})).unwrap();
+        let issues = s.execute("review.checkAccessibility", json!({})).unwrap();
+        let list = issues.as_array().cloned().unwrap_or_default();
+        let has = |what: &str| list.iter().any(|i| i["issue"] == json!(what));
+        assert!(has("Missing alternative text"), "{list:?}");
+        assert!(has("Merged cells"), "{list:?}");
+        assert!(has("Default sheet name"), "{list:?}");
+        // Two objects lack alt text (the chart and the blank shape); the third shape and the
+        // picture's own alt (its file name was not given, so it is empty too) are counted apart.
+        let missing = list.iter().filter(|i| i["issue"] == json!("Missing alternative text")).count();
+        assert_eq!(missing, 3, "chart, blank shape and picture: {list:?}");
+        assert!(list.iter().any(|i| i["kind"] == json!("chart") && i["id"] == json!(chart_id)), "{list:?}");
+        assert!(list.iter().any(|i| i["kind"] == json!("shape") && i["id"] == json!(blank_id)), "{list:?}");
+
+        // Setting the text clears the issue and reports what was stored.
+        let r = s.execute("object.setAltText", json!({"kind": "chart", "id": chart_id, "text": "  Sales by region  "})).unwrap();
+        assert_eq!(r["text"], json!("Sales by region"), "trimmed");
+        let r = s.execute("object.setAltText", json!({"kind": "shape", "id": blank_id, "text": "Quarterly summary"})).unwrap();
+        assert_eq!(r["text"], json!("Quarterly summary"));
+        s.execute("object.setAltText", json!({"kind": "image", "id": picture_id, "text": "Logo"})).unwrap();
+        let list = s.execute("review.checkAccessibility", json!({})).unwrap().as_array().cloned().unwrap_or_default();
+        assert!(!list.iter().any(|i| i["issue"] == json!("Missing alternative text")), "{list:?}");
+        // Empty text clears alt text again (an object that is decorative still has to say so in
+        // the file), and a wrong kind is refused.
+        assert_eq!(s.execute("object.setAltText", json!({"kind": "chart", "id": chart_id, "text": ""})).unwrap()["text"], json!(""));
+        assert!(s.execute("object.setAltText", json!({"kind": "slicer", "id": 1, "text": "x"})).is_err());
+        assert!(s.execute("object.setAltText", json!({"kind": "chart", "id": 999, "text": "x"})).is_err());
+
+        // Alt text is part of the file: it survives a save and reopen.
+        s.execute("object.setAltText", json!({"kind": "chart", "id": chart_id, "text": "Sales by region"})).unwrap();
+        let bytes = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap()["base64"].as_str().unwrap().to_string();
+        s.execute("file.open", json!({"name": "alt.xlsx", "base64": bytes})).unwrap();
+        let d = s.doc().unwrap();
+        let sh = d.wb.active().unwrap();
+        // A reopened object takes the id its drawing gives it, so the text is what is checked.
+        assert!(sh.charts.iter().any(|c| c.alt.as_deref() == Some("Sales by region")), "the chart keeps its alt text");
+        assert!(sh.shapes.iter().any(|c| c.alt.as_deref() == Some("Quarterly summary")), "the shape keeps its alt text");
+        assert!(sh.images.iter().any(|im| im.alt == "Logo"), "the picture keeps its alt text");
     }
 
     #[test]

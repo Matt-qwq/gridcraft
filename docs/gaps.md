@@ -589,8 +589,17 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   ~170; pictures in cells (#61, PR #105). **Estimate:** 25–40 h.
 
 ### 18. Accessibility (U)
-- AccessKit on, but no accessible grid/ribbon tree, no high contrast, no checker. **Estimate:** 12–18 h.
-  [ui-parity.md](ui-parity.md#accessibility)
+- **Landed 11-02 (alt text + checker):** charts and shapes carry alternative text now — the model
+  (`Chart::alt`, `Shape::alt`), the file (`xdr:cNvPr/@descr`, escaped, read back on charts, kept
+  charts, pictures and shapes), the command `object.setAltText` and a check that notices when it
+  is missing. Review ▸ Check Accessibility reports charts, pictures, shapes with no text of their
+  own and pictures in cells without alt text, tables without a header row, merged cells and sheets
+  still on their default name, each with its sheet and object/range, and the dialog **goes to**
+  each one and takes the alt text inline. AccessKit is on and the ribbon, dialogs and panes are
+  exposed (buttons carry labels, checked states and key tips), but the **grid** is still painted as
+  one surface: cells are not nodes yet, so a screen reader cannot walk a sheet. Remaining: an
+  accessible grid tree (cells, headers, the selection), high contrast and an a11y checker entry in
+  the status bar. **Estimate:** 8–12 h. [ui-parity.md](ui-parity.md#accessibility)
 
 ### 19. XLSB/ODS beyond values; minor formats (FF)
 - XLSB and ODS import values only, no write; no `.prn`, `.dif`, `.slk`, XML Spreadsheet 2003; CSV

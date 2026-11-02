@@ -151,6 +151,15 @@ pub fn specs() -> Vec<CommandSpec> {
             set_anchor_mode
         ),
         cmd!(
+            "object.setAltText",
+            "Alt Text",
+            ["Review", "Accessibility"],
+            None,
+            "{kind: chart|image|shape, id, text?: string (empty clears it)}",
+            has_doc,
+            set_alt_text
+        ),
+        cmd!(
             "insert.link",
             "Link",
             ["Insert", "Links"],
@@ -1153,6 +1162,7 @@ fn insert_shape(s: &mut Session, p: &Json) -> Result<Json> {
         Color::Theme(4, -250)
     });
     let shape = Shape {
+        alt: None,
         id,
         kind,
         anchor: Anchor {
@@ -1277,6 +1287,40 @@ fn set_anchor_mode(s: &mut Session, p: &Json) -> Result<Json> {
         let Some(a) = anchor else { return Err(bad("object.setAnchorMode", "no such object")) };
         a.mode = mode;
         Ok(json!({"mode": anchor_mode_name(mode)}))
+    })
+}
+
+/// Sets an object's alternative text — what a screen reader reads for a chart, picture or shape
+/// (DrawingML `xdr:cNvPr/@descr`) — and reports what the object now holds.
+fn set_alt_text(s: &mut Session, p: &Json) -> Result<Json> {
+    let id = u32_param(p, "id").ok_or_else(|| bad("object.setAltText", "missing `id`"))?;
+    let kind = str_param(p, "kind").unwrap_or("").to_string();
+    if !matches!(kind.as_str(), "chart" | "image" | "shape") {
+        return Err(bad("object.setAltText", "kind must be chart, image or shape"));
+    }
+    // 1,024 characters is what a screen reader's description field holds in Excel's Alt Text pane.
+    let text: Option<String> = str_param(p, "text").map(str::trim).filter(|t| !t.is_empty()).map(|t| t.chars().take(1024).collect());
+    let sheet = s.doc()?.wb.active_sheet;
+    edit(s, |cx| {
+        let sh = cx.sheet_mut(sheet)?;
+        let stored = match kind.as_str() {
+            "chart" => {
+                let ch = sh.charts.iter_mut().find(|c| c.id == id).ok_or_else(|| bad("object.setAltText", "no such chart"))?;
+                ch.alt = text.clone();
+                ch.alt.clone().unwrap_or_default()
+            }
+            "image" => {
+                let im = sh.images.iter_mut().find(|c| c.id == id).ok_or_else(|| bad("object.setAltText", "no such picture"))?;
+                im.alt = text.clone().unwrap_or_default();
+                im.alt.clone()
+            }
+            _ => {
+                let sp = sh.shapes.iter_mut().find(|c| c.id == id).ok_or_else(|| bad("object.setAltText", "no such shape"))?;
+                sp.alt = text.clone();
+                sp.alt.clone().unwrap_or_default()
+            }
+        };
+        Ok(json!({"kind": kind, "id": id, "text": stored}))
     })
 }
 
@@ -1756,6 +1800,7 @@ fn insert_icon(s: &mut Session, p: &Json) -> Result<Json> {
     let at = cell_param(s, p, "at")?.unwrap_or(d.selection.active);
     let color = super::format::color_param(p.get("color")).unwrap_or(Color::Theme(1, 0));
     let shape = Shape {
+        alt: None,
         id,
         kind: ShapeKind::Icon,
         anchor: Anchor { cell: at, dx: 4.0, dy: 4.0, width: size, height: size, mode: anchor_mode_param(p).unwrap_or_default() },

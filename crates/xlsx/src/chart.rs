@@ -576,6 +576,7 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         y2_axis: y2_ax.map(read_axis).unwrap_or_default(),
         labels,
         part: None,
+        alt: None,
     })
 }
 
