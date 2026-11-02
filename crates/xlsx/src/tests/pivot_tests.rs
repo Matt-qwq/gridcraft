@@ -104,7 +104,7 @@ fn workbook() -> Workbook {
                 ..PivotValue::default()
             },
         ],
-        filters: vec![PivotFilter { source_col: "Channel".into(), selected: Some(vec!["Online".into()]) }],
+        filters: vec![PivotFilter { source_col: "Channel".into(), selected: Some(vec!["Online".into()]), area: PivotFilterArea::Page }],
         layout: PivotLayout::Tabular,
         grand_totals_rows: false,
         grand_totals_cols: true,
@@ -161,8 +161,8 @@ fn workbook() -> Workbook {
             },
         ],
         filters: vec![
-            PivotFilter { source_col: "Region".into(), selected: Some(vec!["East".into(), "North".into()]) },
-            PivotFilter { source_col: "Product".into(), selected: Some(vec!["A".into(), "B".into()]) },
+            PivotFilter { source_col: "Region".into(), selected: Some(vec!["East".into(), "North".into()]), area: PivotFilterArea::Page },
+            PivotFilter { source_col: "Product".into(), selected: Some(vec!["A".into(), "B".into()]), area: PivotFilterArea::Axis },
         ],
         layout: PivotLayout::Outline,
         grand_totals_rows: true,
@@ -184,7 +184,7 @@ fn workbook() -> Workbook {
         anchor: at("AB1"),
         rows: vec![field("Product")],
         values: vec![PivotValue { source_col: "Units".into(), func: PivotFunc::Product, name: "Product of Units".into(), ..PivotValue::default() }],
-        filters: vec![PivotFilter { source_col: "Channel".into(), selected: None }],
+        filters: vec![PivotFilter { source_col: "Channel".into(), selected: None, area: PivotFilterArea::Page }],
         last_range: Some(rr("AB1:AC6")),
         ..PivotTable::default()
     };
@@ -723,4 +723,37 @@ fn two_value_fields_without_columns_hide_the_values_row() {
     let t = &one["xl/pivotTables/pivotTable1.xml"];
     assert!(t.contains("firstHeaderRow=\"1\""), "{t}");
     assert!(!t.contains("hideValuesRow"), "{t}");
+}
+
+#[test]
+fn a_page_filter_on_an_axis_field_keeps_its_page_row() {
+    // A field can sit in the Filters area and on an axis at once (Excel allows it): the file says
+    // so with a `pageFields` entry, and the filter must stay a report filter rather than collapse
+    // into the axis' hidden items.
+    let mut wb = workbook();
+    {
+        let s = wb.sheet_mut(1).unwrap();
+        s.pivots[0].filters = vec![PivotFilter { source_col: "Product".into(), selected: Some(vec!["A".into()]), area: PivotFilterArea::Page }];
+    }
+    let bytes = write_xlsx(&wb).unwrap();
+    let parts = unzip(&bytes);
+    let t1 = String::from_utf8(parts.get("xl/pivotTables/pivotTable1.xml").unwrap().clone()).unwrap();
+    assert!(t1.contains("<pageFields count=\"1\"><pageField fld="), "the page field is written: {t1}");
+    assert!(t1.contains("rowPageCount=\"1\""), "the layout counts the page row: {t1}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    let f = &back.sheet(1).unwrap().pivots[0].filters[0];
+    assert_eq!(f.area, PivotFilterArea::Page, "the area comes back as the file said");
+    assert_eq!(f.selected.as_deref(), Some(&["A".to_string()][..]));
+
+    // An axis filter stays an axis filter (no report-filter row).
+    let mut wb = workbook();
+    {
+        let s = wb.sheet_mut(1).unwrap();
+        s.pivots[0].filters = vec![PivotFilter { source_col: "Product".into(), selected: Some(vec!["A".into()]), area: PivotFilterArea::Axis }];
+    }
+    let bytes = write_xlsx(&wb).unwrap();
+    let t1 = String::from_utf8(unzip(&bytes).get("xl/pivotTables/pivotTable1.xml").unwrap().clone()).unwrap();
+    assert!(!t1.contains("<pageFields"), "no page field for an axis filter: {t1}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    assert_eq!(back.sheet(1).unwrap().pivots[0].filters[0].area, PivotFilterArea::Axis);
 }

@@ -504,7 +504,9 @@ fn filter_pivot_field(wb: &mut Workbook, si: usize, pi: usize, field: &str, labe
                     f.selected = Some(sel.clone());
                 }
             }
-            (Some(sel), None) => p.filters.push(PivotFilter { source_col: field.to_string(), selected: Some(sel.clone()) }),
+            (Some(sel), None) => {
+                p.filters.push(PivotFilter { source_col: field.to_string(), selected: Some(sel.clone()), area: PivotFilterArea::Auto })
+            }
             (None, Some(i)) => {
                 p.filters.remove(i);
             }

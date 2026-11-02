@@ -451,8 +451,12 @@ fn add_to_area(
             }
             let existing = take_from_axes(pt, &field).unwrap_or_else(|| PivotField { source_col: field.clone(), ..Default::default() });
             // A report filter that selects nothing in particular goes away; a selection stays
-            // as the field's hidden items.
+            // as the field's hidden items (a field is in one area at a time, so it is no longer
+            // drawn as a report-filter row).
             pt.filters.retain(|f| !(f.source_col.eq_ignore_ascii_case(&field) && f.selected.is_none()));
+            for f in pt.filters.iter_mut().filter(|f| f.source_col.eq_ignore_ascii_case(&field)) {
+                f.area = PivotFilterArea::Axis;
+            }
             insert_axis_field(pt, area == "rows", existing, position);
         }
         "values" => {
@@ -480,7 +484,7 @@ fn add_to_area(
             let existing = pt.filters.iter().position(|f| f.source_col.eq_ignore_ascii_case(&field));
             let entry = match existing {
                 Some(i) => pt.filters.remove(i),
-                None => PivotFilter { source_col: field, selected: None },
+                None => PivotFilter { source_col: field, selected: None, area: PivotFilterArea::Page },
             };
             let at = position.unwrap_or(pt.filters.len()).min(pt.filters.len());
             pt.filters.insert(at, entry);
@@ -1131,7 +1135,7 @@ fn filter(s: &mut Session, p: &Json) -> Result<Json> {
                     f.selected = Some(sel);
                 }
             }
-            (None, Some(sel)) => pt.filters.push(PivotFilter { source_col: field.clone(), selected: Some(sel) }),
+            (None, Some(sel)) => pt.filters.push(PivotFilter { source_col: field.clone(), selected: Some(sel), area: PivotFilterArea::Auto }),
             (None, None) => {}
         }
         Ok(json!({"field": field}))
@@ -1729,6 +1733,42 @@ mod tests {
         assert_eq!(text(&s, "A5"), "Grand Total");
         assert_eq!(val(&s, "B5"), Value::Number(420.0));
         assert!(s.execute("pivot.filter", json!({"field": "Product", "selected": []})).is_err());
+    }
+
+    #[test]
+    fn a_page_filter_on_an_axis_field_draws_its_row() {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Product"], "values": ["Sales"]})).unwrap();
+        // A file can hold a field in the Filters area *and* on an axis; the filter record then says
+        // it is a report filter, and it keeps its row above the table.
+        {
+            let sh = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb).sheet_mut(0).unwrap();
+            sh.pivots[0].filters = vec![gridcraft_model::PivotFilter {
+                source_col: "Product".into(),
+                selected: Some(vec!["Apples".into()]),
+                area: gridcraft_model::PivotFilterArea::Page,
+            }];
+        }
+        s.execute("pivot.refresh", json!({})).unwrap();
+        assert_eq!(text(&s, "A1"), "Product", "the report filter's row");
+        assert_eq!(text(&s, "B1"), "Apples");
+        assert_eq!(text(&s, "A3"), "Row Labels", "the body moved down by the page row");
+        // The same record as an axis filter draws no row: it only hides items.
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Product"], "values": ["Sales"]})).unwrap();
+        {
+            let sh = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb).sheet_mut(0).unwrap();
+            sh.pivots[0].filters = vec![gridcraft_model::PivotFilter {
+                source_col: "Product".into(),
+                selected: Some(vec!["Apples".into()]),
+                area: gridcraft_model::PivotFilterArea::Axis,
+            }];
+        }
+        s.execute("pivot.refresh", json!({})).unwrap();
+        assert_eq!(text(&s, "A1"), "", "no page row for an axis filter");
+        assert_eq!(text(&s, "A3"), "Row Labels");
+        assert_eq!(text(&s, "A4"), "Apples");
+        assert_eq!(text(&s, "A5"), "Grand Total");
     }
 
     #[test]

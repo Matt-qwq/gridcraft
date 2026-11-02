@@ -18,7 +18,8 @@ use gridcraft_core::date::datetime_from_serial;
 use gridcraft_core::{CellRef, DateSystem, RangeRef, Value, number_to_text};
 use gridcraft_formula::quote_sheet;
 use gridcraft_model::{
-    PivotCalcField, PivotDateGroup, PivotField, PivotFilter, PivotFunc, PivotLayout, PivotShowAs, PivotSort, PivotTable, PivotValue, Workbook,
+    PivotCalcField, PivotDateGroup, PivotField, PivotFilter, PivotFilterArea, PivotFunc, PivotLayout, PivotShowAs, PivotSort, PivotTable, PivotValue,
+    Workbook,
 };
 
 use crate::IoError;
@@ -864,20 +865,15 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
     let mut pages: Vec<(usize, &PivotFilter)> = Vec::new();
     for f in &pt.filters {
         let axis_pos = pt.rows.iter().chain(pt.columns.iter()).position(|a| same(&a.source_col, &f.source_col));
-        match axis_pos {
-            Some(p) => {
-                if let Some(Some(i)) = c.axis_map.get(p) {
-                    hidden.insert(*i, f);
-                }
+        if f.is_page(axis_pos.is_some()) {
+            if let Some(i) = find_db(&f.source_col)
+                && !pages.iter().any(|(j, _)| *j == i)
+            {
+                pages.push((i, f));
+                hidden.insert(i, f);
             }
-            None => {
-                if let Some(i) = find_db(&f.source_col)
-                    && !pages.iter().any(|(j, _)| *j == i)
-                {
-                    pages.push((i, f));
-                    hidden.insert(i, f);
-                }
-            }
+        } else if let Some(Some(i)) = axis_pos.and_then(|p| c.axis_map.get(p)) {
+            hidden.insert(*i, f);
         }
     }
     let find_calc = |name: &str| c.fields.iter().position(|f| f.formula.is_some() && same(&f.name, name));
@@ -1407,7 +1403,7 @@ fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<Pivo
                 if items.iter().any(|it| it.flag("h", false)) {
                     let shown: Vec<String> = items.iter().filter(|it| !it.flag("h", false)).filter_map(|it| lab(it)).collect();
                     if !filters.iter().any(|ff| same(&ff.source_col, &name)) {
-                        filters.push(PivotFilter { source_col: name.clone(), selected: Some(shown) });
+                        filters.push(PivotFilter { source_col: name.clone(), selected: Some(shown), area: PivotFilterArea::Axis });
                     }
                 }
             }
@@ -1434,7 +1430,7 @@ fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<Pivo
                 })
             })
         };
-        page_filters.push(PivotFilter { source_col: name, selected });
+        page_filters.push(PivotFilter { source_col: name, selected, area: PivotFilterArea::Page });
     }
     let mut axis_filters = Vec::new();
     let (rows, rows_values) = axis(cx, &row_x, &mut axis_filters);

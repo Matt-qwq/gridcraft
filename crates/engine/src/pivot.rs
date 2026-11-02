@@ -845,7 +845,10 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
         .filter_map(|f| {
             let c = src.col(&f.source_col)?;
             let g = axis_group(&f.source_col);
-            Some((c, f, g.unwrap_or_default(), g.is_none()))
+            // A report filter draws its own row; a filter on an axis only hides items (the file's
+            // own answer wins over the guess, so a field in both the Filters and Rows areas keeps
+            // its row).
+            Some((c, f, g.unwrap_or_default(), f.is_page(g.is_some())))
         })
         .collect();
     let shown_filters: Vec<&(usize, &PivotFilter, PivotDateGroup, bool)> = filters.iter().filter(|f| f.3).collect();

@@ -1487,6 +1487,20 @@ pub struct PivotValue {
     pub number_format: Option<String>,
 }
 
+/// Where a filter's field sits, which decides how the filter is shown and written: a report filter
+/// gets a row above the table and a `pageFields` entry, an axis filter only hides items.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PivotFilterArea {
+    /// Not recorded (a document from before the area was modelled): a field on an axis filters
+    /// that axis, any other field is a report filter.
+    #[default]
+    Auto,
+    /// The Filters area: drawn as its own row above the table (`c:pageFields`).
+    Page,
+    /// Hidden items on a field that is on an axis (`c:pivotField/item/@h`).
+    Axis,
+}
+
 /// A report filter (or, for a field also in Rows/Columns, its hidden-items filter).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1494,6 +1508,19 @@ pub struct PivotFilter {
     pub source_col: String,
     /// Item labels shown; `None` = all.
     pub selected: Option<Vec<String>>,
+    pub area: PivotFilterArea,
+}
+
+impl PivotFilter {
+    /// Whether the filter is drawn as a report-filter row: what the file said, else a field that is
+    /// not on an axis.
+    pub fn is_page(&self, on_axis: bool) -> bool {
+        match self.area {
+            PivotFilterArea::Page => true,
+            PivotFilterArea::Axis => false,
+            PivotFilterArea::Auto => !on_axis,
+        }
+    }
 }
 
 /// A PivotTable: its definition plus where its output was last written. The output itself is
