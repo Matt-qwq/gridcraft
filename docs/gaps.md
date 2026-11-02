@@ -595,11 +595,16 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   is missing. Review ▸ Check Accessibility reports charts, pictures, shapes with no text of their
   own and pictures in cells without alt text, tables without a header row, merged cells and sheets
   still on their default name, each with its sheet and object/range, and the dialog **goes to**
-  each one and takes the alt text inline. AccessKit is on and the ribbon, dialogs and panes are
-  exposed (buttons carry labels, checked states and key tips), but the **grid** is still painted as
-  one surface: cells are not nodes yet, so a screen reader cannot walk a sheet. Remaining: an
-  accessible grid tree (cells, headers, the selection), high contrast and an a11y checker entry in
-  the status bar. **Estimate:** 8–12 h. [ui-parity.md](ui-parity.md#accessibility)
+  each one and takes the alt text inline.
+- **Landed 11-02 (the grid is walkable):** while a screen reader is attached the visible cells are
+  an **AccessKit grid** — one `GridCell` node per visible cell, with the displayed value as its
+  value, its address (and formula) as its description, its row and column indexes, and the active
+  cell marked selected and named as the grid's active descendant; the grid itself is labelled with
+  the sheet and says which cell is active and how many are selected. Frozen rows and columns are
+  included and the tree follows scrolling; nothing is built when no reader is attached (one branch
+  a frame) and the walk is capped at 2,000 cells a frame, so a reader scrolls for the rest as a
+  sighted user does. Remaining: row and column header nodes, high contrast, an accessibility entry
+  in the status bar. **Estimate:** 4–6 h. [ui-parity.md](ui-parity.md#accessibility)
 
 ### 19. XLSB/ODS beyond values; minor formats (FF)
 - XLSB and ODS import values only, no write; no `.prn`, `.dif`, `.slk`, XML Spreadsheet 2003; CSV

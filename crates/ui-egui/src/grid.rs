@@ -481,13 +481,13 @@ impl Geo {
         CellRef::new(self.row_at(sh, p.y), self.col_at(sh, p.x))
     }
     /// Visible scrolled rows (from the first visible row after the frozen ones).
-    fn scroll_rows(&self, _sh: &Sheet) -> (u32, u32) {
+    pub(crate) fn scroll_rows(&self, _sh: &Sheet) -> (u32, u32) {
         let top = self.ri.start(self.fr) + self.scroll.y as f64;
         let r0 = self.ri.at(top).max(self.fr);
         let r1 = self.ri.at(top + ((self.cells.height() - self.frozen_h) / self.z) as f64).min(MAX_ROWS - 1);
         (r0, r1)
     }
-    fn scroll_cols(&self, _sh: &Sheet) -> (u32, u32) {
+    pub(crate) fn scroll_cols(&self, _sh: &Sheet) -> (u32, u32) {
         let left = self.ci.start(self.fc) + self.scroll.x as f64;
         let c0 = self.ci.at(left).max(self.fc);
         let c1 = self.ci.at(left + ((self.cells.width() - self.frozen_w) / self.z) as f64).min(MAX_COLS - 1);
@@ -813,6 +813,8 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     }
     app.grid.cells_rect = Some(geo.mirror_rect(geo.cells));
     app.grid.geo = Some(geo.clone());
+    // Screen readers walk the cells that are on screen (nothing is built without one).
+    crate::a11y::expose_grid(ui, &wb, si, sh, &geo, sel.active, sel.current());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, t.grid_bg);
     // Everything up to the headers is painted in logical (left-to-right) coordinates.
