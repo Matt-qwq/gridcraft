@@ -6200,3 +6200,21 @@ fn a_timeline_range_refuses_what_it_cannot_show_and_clamps_what_it_can() {
     let e = s.execute("slicer.setRange", json!({"slicer": "ByDate", "start": "2025-01-01", "end": "2025-02-01"})).unwrap_err();
     assert!(e.to_string().contains("dates"), "{e}");
 }
+
+#[test]
+fn a_timeline_axis_is_its_reports_own_date_bounds() {
+    let mut s = timeline_session();
+    s.execute("insert.timeline", json!({"field": "Date", "name": "ByDate"})).unwrap();
+    let d = s.doc().unwrap();
+    let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+    // The source's first and last date become the axis the grid maps a drag onto.
+    assert_eq!(crate::cmd::slicer::timeline_axis(&d.wb, &sh.pivot_timelines[0]), Some((45_658.0, 45_800.0)));
+    // No report left, or a field that is not a date column: no axis, so no drag.
+    let mut wb = (*d.wb).clone();
+    let si = wb.sheet_index("Report").unwrap();
+    let mut orphan = sh.pivot_timelines[0].clone();
+    orphan.pivot_tables.clear();
+    assert_eq!(crate::cmd::slicer::timeline_axis(&wb, &orphan), None);
+    wb.sheet_mut(si).unwrap().pivot_timelines[0].field = "Region".into();
+    assert_eq!(crate::cmd::slicer::timeline_axis(&wb, &wb.sheet(si).unwrap().pivot_timelines[0]), None);
+}

@@ -411,3 +411,126 @@ fn right_click_opens_the_slicer_menu() {
         assert!(texts.iter().any(|t| t == item), "{item} is in the menu: {texts:?}");
     }
 }
+
+// ------------------------------------------------------------ timeline range drag
+
+fn timeline_frame(h: &Harness, id: u32) -> egui::Rect {
+    let app = h.state();
+    let sh = app.session.active().unwrap().wb.active().unwrap();
+    let tl = sh.pivot_timelines.iter().find(|t| t.id == id).unwrap();
+    widget_rect(&geo(h), sh, &tl.anchor)
+}
+
+fn timeline_layout(h: &Harness, id: u32) -> gridcraft_ui_egui::slicer_view::TimelineChrome {
+    timeline_chrome(&geo(h), timeline_frame(h, id))
+}
+
+fn timeline_range(h: &Harness, id: u32) -> Option<gridcraft_engine::model::TimelineRange> {
+    h.state().session.active().unwrap().wb.active().unwrap().pivot_timelines.iter().find(|t| t.id == id).and_then(|t| t.range)
+}
+
+#[test]
+fn dragging_the_end_handle_sets_a_range_filters_the_report_and_is_one_undo_step() {
+    let (mut h, _, timeline) = fixture();
+    let lay = timeline_layout(&h, timeline);
+    let start = lay.handles[1].center();
+    let to = egui::pos2(lay.track.left() + lay.track.width() * 0.3, lay.track.center().y);
+    let undo_before = h.state().session.active().unwrap().undo.len();
+
+    move_to(&mut h, start);
+    button(&mut h, start, true);
+    move_to(&mut h, egui::pos2((start.x + to.x) / 2.0, start.y));
+    move_to(&mut h, to);
+    button(&mut h, to, false);
+
+    let range = timeline_range(&h, timeline).expect("the drag stores a range");
+    assert_eq!(range.start, 45_658.0, "the other end stayed at the first date");
+    assert!(range.end > 45_658.0 && range.end < 45_750.0, "the end moved into the axis: {range:?}");
+    // East's January row is inside the range; North's May row is after it and drops out.
+    let shown = report_texts(&h);
+    assert!(shown.iter().any(|t| t == "East"), "{shown:?}");
+    assert!(!shown.iter().any(|t| t == "North"), "the report is filtered by date: {shown:?}");
+    assert_eq!(h.state().session.active().unwrap().undo.len(), undo_before + 1, "one drag is one undo step");
+
+    key(&mut h, Key::Z, Modifiers::COMMAND);
+    assert_eq!(timeline_range(&h, timeline), None, "undo restores every date");
+    let shown = report_texts(&h);
+    assert!(shown.iter().any(|t| t == "East") && shown.iter().any(|t| t == "North"), "{shown:?}");
+}
+
+#[test]
+fn dragging_the_selected_band_slides_it_without_changing_its_length() {
+    let (mut h, _, timeline) = fixture();
+    let start_serial = 45_658.0;
+    let end_serial = 45_716.0;
+    h.state_mut().session.run("slicer.setRange", json!({"slicer": timeline, "start": "2025-01-01", "end": "2025-02-28"})).unwrap();
+    h.run_steps(2);
+    let lay = timeline_layout(&h, timeline);
+    let band = lay.track;
+    let day_x = |d: f64| band.left() + (((d - start_serial) / (45_800.0 - start_serial)) as f32) * band.width();
+    let grab = egui::pos2(day_x(45_687.0), band.center().y);
+    let to = egui::pos2(grab.x + band.width() * 0.25, grab.y);
+    let undo_before = h.state().session.active().unwrap().undo.len();
+
+    move_to(&mut h, grab);
+    button(&mut h, grab, true);
+    move_to(&mut h, to);
+    button(&mut h, to, false);
+
+    let range = timeline_range(&h, timeline).expect("the band still has a range");
+    assert!((range.end - range.start - (end_serial - start_serial)).abs() < 0.01, "the length is unchanged: {range:?}");
+    assert!(range.start > start_serial && range.end > end_serial, "the band moved right: {range:?}");
+    assert_eq!(h.state().session.active().unwrap().undo.len(), undo_before + 1, "one drag is one undo step");
+}
+
+#[test]
+fn a_timeline_without_a_source_axis_does_not_start_a_range_drag() {
+    let (mut h, _, timeline) = fixture();
+    {
+        let d = h.state_mut().session.doc_mut().unwrap();
+        let wb = Arc::make_mut(&mut d.wb);
+        let si = wb.active_sheet;
+        if let Some(tl) = wb.sheet_mut(si).unwrap().pivot_timelines.iter_mut().find(|t| t.id == timeline) {
+            tl.pivot_tables.clear();
+        }
+    }
+    // A real edit bumps the revision, so the grid recomputes the axis (and finds none).
+    h.state_mut().session.run("cell.set", json!({"cell": "E1", "input": "x"})).unwrap();
+    h.run_steps(3);
+    let lay = timeline_layout(&h, timeline);
+    let start = lay.handles[0].center();
+    let undo_before = h.state().session.active().unwrap().undo.len();
+    move_to(&mut h, start);
+    button(&mut h, start, true);
+    move_to(&mut h, egui::pos2(start.x + 40.0, start.y));
+    button(&mut h, egui::pos2(start.x + 40.0, start.y), false);
+    assert_eq!(timeline_range(&h, timeline), None, "no axis, no range");
+    assert_eq!(h.state().session.active().unwrap().undo.len(), undo_before, "and no empty undo step");
+}
+
+#[test]
+fn the_selected_bands_own_start_handle_is_grabbable() {
+    let (mut h, _, timeline) = fixture();
+    h.state_mut()
+        .session
+        .run("slicer.setRange", json!({"slicer": timeline, "start": "2025-02-01", "end": "2025-02-28"}))
+        .unwrap();
+    h.run_steps(2);
+    let lay = timeline_layout(&h, timeline);
+    let track = lay.track;
+    let x_of = |day: f64| track.left() + (((day - 45_658.0) / (45_800.0 - 45_658.0)) as f32) * track.width();
+    // The band starts inside the track, not at its left end: that is where its handle is drawn,
+    // so that is where a press must take hold of the range.
+    let handle = egui::pos2(x_of(45_689.0), track.center().y);
+    let to = egui::pos2(x_of(45_700.0), track.center().y);
+    assert!(handle.x > track.left() + 20.0, "the band handle is not the track's end: {handle:?} {track:?}");
+
+    move_to(&mut h, handle);
+    button(&mut h, handle, true);
+    move_to(&mut h, to);
+    button(&mut h, to, false);
+
+    let range = timeline_range(&h, timeline).expect("the range is still set");
+    assert_eq!(range.end, 45_716.0, "the end did not move");
+    assert!(range.start > 45_689.0 && range.start <= 45_700.0, "the start followed the band handle: {range:?}");
+}

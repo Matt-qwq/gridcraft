@@ -838,6 +838,30 @@ fn field_bounds(wb: &Workbook, src: &pv::Source, col: usize) -> Option<(f64, f64
     (lo <= hi).then_some((lo, hi))
 }
 
+/// The field's own date axis for `tl`: its first and last date as serial days, found through the
+/// reports the timeline filters. The UI draws the selected range on this axis and maps a dragged
+/// handle back to a date; `slicer.setRange` clamps to the same bounds. `None` when no report is
+/// left, the field is gone, or it holds no dates.
+///
+/// One scan per call: the grid caches the answer per document revision, because the source can be
+/// large and a timeline does not move between edits.
+pub fn timeline_axis(wb: &Workbook, tl: &PivotTimeline) -> Option<(f64, f64)> {
+    for name in &tl.pivot_tables {
+        let Some((si, pi)) =
+            wb.sheets.iter().enumerate().find_map(|(si, s)| s.pivots.iter().position(|p| p.name.eq_ignore_ascii_case(name)).map(|pi| (si, pi)))
+        else {
+            continue;
+        };
+        let Some(pt) = wb.sheet(si).and_then(|s| s.pivots.get(pi)) else { continue };
+        let Ok(src) = pv::read_source(wb, &pt.source, si) else { continue };
+        let Some(col) = src.col(&tl.field) else { continue };
+        if let Some(bounds) = field_bounds(wb, &src, col) {
+            return Some(bounds);
+        }
+    }
+    None
+}
+
 /// The dates a timeline shows. One undo step: the model's range, the bound reports' filters and
 /// their cells move together.
 ///

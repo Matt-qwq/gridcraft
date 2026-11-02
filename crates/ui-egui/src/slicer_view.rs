@@ -6,10 +6,11 @@
 //! commands (`slicer.toggle`, `slicer.clear`, `slicer.move`, `slicer.delete`, `slicer.setStyle`)
 //! live in the engine, and the grid calls them in one undo step.
 //!
-//! A timeline's selected date *range* is not modelled yet (the model comment says so), so the
-//! track is always the full range and its two handles are drawn, not draggable: dragging them
-//! would have nowhere to store the result. The handles are still drawn because that is what the
-//! widget looks like, not to fake a state.
+//! A timeline's selected date *range* is stored on the model ([`TimelineRange`], the cache's
+//! `<state><selection>`), so its two handles are draggable and the widget draws the selected band
+//! on the field's own date axis. The axis (the field's first and last date) comes from the report's
+//! source once per revision ([`ensure_timeline_axes`]); a drag maps a pointer position back to a
+//! whole day and runs `slicer.setRange`, one undo step per drag.
 //!
 //! Tiles are drawn in code from [`crate::theme::Tokens`]; no image assets are involved. The
 //! slicer style *names* are file-format identifiers, and each family (light / other / dark) picks
@@ -20,9 +21,9 @@
 //! [`widget_rect`] clamps the frame, text is elided before it is laid out, and only the visible
 //! tiles are laid out and painted (never one rect per item).
 
-use egui::{Align2, Color32, Painter, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
+use egui::{Align2, Color32, CursorIcon, Painter, Pos2, Rect, Stroke, StrokeKind, pos2, vec2};
 use gridcraft_engine::core::{MAX_COLS, MAX_ROWS};
-use gridcraft_engine::model::{Anchor, PivotSlicer, PivotTimeline, Sheet, TimeUnit, Workbook};
+use gridcraft_engine::model::{Anchor, PivotSlicer, PivotTimeline, Sheet, TimeUnit, TimelineRange, Workbook};
 
 use crate::SheetApp;
 use crate::grid::Geo;
@@ -207,7 +208,7 @@ pub struct TimelineChrome {
     pub unit: Rect,
     /// The horizontal range track.
     pub track: Rect,
-    /// The two (drawn, not draggable) range handles at the track's ends.
+    /// The two range handles at the track's ends (the full axis; a selected range moves them).
     pub handles: [Rect; 2],
 }
 
@@ -231,6 +232,203 @@ pub fn timeline_chrome(geo: &Geo, frame: Rect) -> TimelineChrome {
     let track = Rect::from_min_size(pos2(left, track_top), vec2(right - left, track_h));
     let at = |x: f32| Rect::from_center_size(pos2(x, track.center().y), vec2(handle_w, handle_h));
     TimelineChrome { frame, header, unit, track, handles: [at(track.left()), at(track.right())] }
+}
+
+/// The screen x's of a timeline's selected band on its track: the range's two ends mapped onto
+/// the field's date axis. `None` when the axis has no span, so the band cannot be placed honestly.
+pub(crate) fn band_xs(track: Rect, axis: Option<(f64, f64)>, range: Option<TimelineRange>) -> Option<(f32, f32)> {
+    let (lo, hi) = axis?;
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo || !track.width().is_finite() {
+        return None;
+    }
+    let r = range.unwrap_or(TimelineRange::new(lo, hi));
+    let x = |day: f64| track.left() + (((day - lo) / (hi - lo)).clamp(0.0, 1.0) as f32) * track.width();
+    let (a, b) = (x(r.start), x(r.end));
+    Some((a.min(b), a.max(b)))
+}
+
+/// The handles a timeline draws and hit-tests: at the selected band's ends when the axis can place
+/// them, otherwise at the track's own ends.
+pub(crate) fn timeline_handles(lay: &TimelineChrome, axis: Option<(f64, f64)>, range: Option<TimelineRange>) -> [Rect; 2] {
+    let at = |x: f32| Rect::from_center_size(pos2(x, lay.track.center().y), vec2(lay.handles[0].width(), lay.handles[0].height()));
+    match band_xs(lay.track, axis, range) {
+        Some((a, b)) => [at(a), at(b)],
+        None => [at(lay.track.left()), at(lay.track.right())],
+    }
+}
+
+/// Which part of a timeline a drag took hold of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineGrab {
+    Start,
+    End,
+    /// The selected band itself: slides the whole range, keeping its length.
+    Move,
+}
+
+/// A timeline range drag in progress: the axis it maps onto and the range it started from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimelineDrag {
+    pub id: u32,
+    pub grab: TimelineGrab,
+    /// The press position, in the logical screen points `timeline_chrome` works in.
+    pub start: Pos2,
+    /// The full-range track when the drag began, in screen points.
+    pub track: Rect,
+    /// The range when the drag began; `None` = every date.
+    pub orig: Option<TimelineRange>,
+    /// The field's first and last date, as serial days.
+    pub bounds: (f64, f64),
+    /// Undo entries this drag has recorded, so only its first one starts a new entry.
+    pub steps: u32,
+}
+
+/// The day at screen `x` on `track`: clamped to the axis and rounded to a whole day. A track too
+/// narrow to divide, or an axis with no span, puts every position on the first day.
+fn day_at(track: Rect, bounds: (f64, f64), x: f32) -> f64 {
+    let (lo, hi) = bounds;
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo || !track.width().is_finite() || track.width() <= 0.0 {
+        return lo;
+    }
+    let t = f64::from(((x - track.left()) / track.width()).clamp(0.0, 1.0));
+    (lo + (hi - lo) * t).round().clamp(lo, hi)
+}
+
+/// The range a timeline drag shows for pointer `p`. A grabbed end follows the pointer one whole
+/// day at a time; the body slides by the days the pointer crossed, keeping its length and never
+/// leaving the axis. A range keeps at least one day, so a handle cannot pass the other one.
+pub(crate) fn dragged_range(d: &TimelineDrag, p: Pos2) -> TimelineRange {
+    let (lo, hi) = d.bounds;
+    let orig = d.orig.unwrap_or(TimelineRange::new(lo, hi));
+    let day = day_at(d.track, d.bounds, p.x);
+    match d.grab {
+        TimelineGrab::Start => TimelineRange::new(day.min(orig.end), orig.end),
+        TimelineGrab::End => TimelineRange::new(orig.start, day.max(orig.start)),
+        TimelineGrab::Move => {
+            let len = orig.end - orig.start;
+            if !lo.is_finite() || !hi.is_finite() || hi <= lo || !len.is_finite() || len >= hi - lo {
+                return TimelineRange::new(lo, hi);
+            }
+            let from = day_at(d.track, d.bounds, d.start.x);
+            let mut start = orig.start + (day - from);
+            if start < lo {
+                start = lo;
+            }
+            if start + len > hi {
+                start = hi - len;
+            }
+            TimelineRange::new(start, start + len)
+        }
+    }
+}
+
+/// The date axis of a timeline, from the grid's per-revision cache.
+fn axis_of(app: &SheetApp, id: u32) -> Option<(f64, f64)> {
+    let uid = app.session.active().map_or(0, |d| d.uid);
+    app.grid.timeline_axes.get(&(uid, id)).and_then(|(_, b)| *b)
+}
+
+/// Fills the grid's timeline-axis cache for `sh`, recomputing only entries whose document revision
+/// changed. Bounds come from a scan of the report's source, so they are not computed per frame.
+/// A drag changes the revision without changing the source, so the axis a drag started on stays.
+pub(crate) fn ensure_timeline_axes(app: &mut SheetApp, wb: &Workbook, sh: &Sheet) {
+    let (uid, rev) = app.session.active().map_or((0, 0), |d| (d.uid, d.revision));
+    for tl in &sh.pivot_timelines {
+        if matches!(&app.grid.drag, crate::grid::Drag::Timeline(d) if d.id == tl.id) {
+            continue;
+        }
+        if app.grid.timeline_axes.get(&(uid, tl.id)).is_some_and(|(cached, _)| *cached == rev) {
+            continue;
+        }
+        let axis = gridcraft_engine::cmd::slicer::timeline_axis(wb, tl);
+        app.grid.timeline_axes.insert((uid, tl.id), (rev, axis));
+    }
+    // Timelines deleted from the sheet, and documents switched away from, must not pile up.
+    if app.grid.timeline_axes.len() > 256 {
+        app.grid.timeline_axes.retain(|(cached, _), _| *cached == uid);
+    }
+}
+
+/// The part of a timeline under `p` on this sheet, if any, and the axis a drag would map onto.
+/// Used when a primary drag starts; a press on a handle wins over the band and the band over the
+/// rest of the frame (the caption and the unit do not move anything).
+pub(crate) fn begin_timeline_drag(app: &SheetApp, geo: &Geo, sh: &Sheet, wb: &Workbook, p: Pos2) -> Option<TimelineDrag> {
+    if !geo.cells.contains(p) || crate::chartview::objects_hidden(wb) {
+        return None;
+    }
+    let z = finite(geo.z, 1.0).clamp(0.01, 64.0);
+    for tl in sh.pivot_timelines.iter().rev() {
+        let frame = widget_rect(geo, sh, &tl.anchor);
+        if !frame.contains(p) {
+            continue;
+        }
+        let bounds = axis_of(app, tl.id).or_else(|| gridcraft_engine::cmd::slicer::timeline_axis(wb, tl))?;
+        if !bounds.0.is_finite() || !bounds.1.is_finite() || bounds.1 <= bounds.0 {
+            return None;
+        }
+        let lay = timeline_chrome(geo, frame);
+        let handles = timeline_handles(&lay, Some(bounds), tl.range);
+        let reach = 3.0 * z;
+        let grab = if handles[0].expand(reach).contains(p) {
+            TimelineGrab::Start
+        } else if handles[1].expand(reach).contains(p) {
+            TimelineGrab::End
+        } else if lay.track.expand(4.0 * z).contains(p) {
+            TimelineGrab::Move
+        } else {
+            return None;
+        };
+        return Some(TimelineDrag { id: tl.id, grab, start: p, track: lay.track, orig: tl.range, bounds, steps: 0 });
+    }
+    None
+}
+
+/// The cursor over a draggable part of a timeline: resize on a handle, move on a selected band.
+/// `None` everywhere else, so the cell cursor keeps its meaning over the caption and the unit.
+pub(crate) fn timeline_cursor(app: &SheetApp, geo: &Geo, sh: &Sheet, wb: &Workbook, p: Pos2) -> Option<CursorIcon> {
+    if !geo.cells.contains(p) || crate::chartview::objects_hidden(wb) {
+        return None;
+    }
+    let z = finite(geo.z, 1.0).clamp(0.01, 64.0);
+    for tl in sh.pivot_timelines.iter().rev() {
+        let frame = widget_rect(geo, sh, &tl.anchor);
+        if !frame.contains(p) {
+            continue;
+        }
+        // Without an axis the handles are only decoration: no resize cursor, no drag.
+        let axis = axis_of(app, tl.id)?;
+        let lay = timeline_chrome(geo, frame);
+        let handles = timeline_handles(&lay, Some(axis), tl.range);
+        if handles[0].expand(3.0 * z).contains(p) || handles[1].expand(3.0 * z).contains(p) {
+            return Some(CursorIcon::ResizeHorizontal);
+        }
+        if tl.range.is_some() && lay.track.expand(4.0 * z).contains(p) {
+            return Some(CursorIcon::Move);
+        }
+        return None;
+    }
+    None
+}
+
+/// A serial day as the ISO text `slicer.setRange` accepts.
+fn iso_date(wb: &Workbook, serial: f64) -> Option<String> {
+    let d = gridcraft_engine::core::date::datetime_from_serial(wb.date_system, serial)?;
+    Some(format!("{:04}-{:02}-{:02}", d.year, d.month, d.day))
+}
+
+/// The command params for a dragged range.
+pub(crate) fn range_params(wb: &Workbook, id: u32, range: TimelineRange) -> Option<serde_json::Value> {
+    let start = iso_date(wb, range.start)?;
+    let end = iso_date(wb, range.end)?;
+    Some(serde_json::json!({"slicer": id, "start": start, "end": end}))
+}
+
+/// The toast text while a range is dragged: its two end dates.
+pub(crate) fn range_toast(wb: &Workbook, range: TimelineRange) -> String {
+    match (iso_date(wb, range.start), iso_date(wb, range.end)) {
+        (Some(a), Some(b)) => format!("{a} – {b}"),
+        _ => String::new(),
+    }
 }
 
 fn unit_name(u: TimeUnit) -> &'static str {
@@ -377,21 +575,29 @@ fn paint_timeline(app: &SheetApp, p: &Painter, geo: &Geo, t: &theme::Tokens, tl:
     // The time unit the timeline groups by ("Months", "Quarters", …).
     let up = fp.with_clip_rect(lay.unit.intersect(fp.clip_rect()));
     up.text(lay.unit.left_center(), Align2::LEFT_CENTER, unit_name(tl.unit), theme::ui_font(11.0 * z), t.text_dim);
-    // The range track: the model has no selected date range, so this is the full range and the two
-    // handles are drawn at its ends. Dragging them is out of scope until the range is modelled.
-    let track_rect = Rect::from_min_max(lay.track.min, lay.track.max);
+    // The track is the field's full date axis; the selected range is a band on it. A band is only
+    // drawn when the axis is known (the grid's per-revision cache), because without it its place
+    // would be made up.
+    let track_rect = lay.track;
     fp.rect_filled(track_rect, track_rect.height() / 2.0, t.hover);
     fp.rect_stroke(track_rect, track_rect.height() / 2.0, Stroke::new(1.0, t.separator), StrokeKind::Inside);
-    for h in lay.handles.iter() {
+    let axis = axis_of(app, tl.id);
+    let band = band_xs(track_rect, axis, tl.range);
+    let handles = timeline_handles(&lay, axis, tl.range);
+    if let Some((a, b)) = band {
+        let band_rect = Rect::from_min_max(pos2(a, track_rect.top()), pos2(b, track_rect.bottom()));
+        let radius = band_rect.height() / 2.0;
+        fp.rect_filled(band_rect, radius, t.accent_soft);
+        fp.rect_stroke(band_rect, radius, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+    }
+    for h in handles {
         if !h.is_finite() {
             continue;
         }
-        fp.rect_filled(*h, h.width() / 2.0, t.accent);
-        fp.rect_stroke(*h, h.width() / 2.0, Stroke::new(1.0, t.window), StrokeKind::Inside);
+        fp.rect_filled(h, h.width() / 2.0, t.accent);
+        fp.rect_stroke(h, h.width() / 2.0, Stroke::new(1.0, t.window), StrokeKind::Inside);
     }
     if app.selected_chart == Some(tl.id) {
-        // Selected, but without handles: the model stores an anchor the move command cannot write
-        // for a timeline yet, and the range handles are not draggable (no selected range exists).
         crate::chartview::selection_outline(p, frame);
     }
 }
@@ -531,4 +737,73 @@ pub(crate) fn wheel(app: &mut SheetApp, sh: &Sheet, geo: &Geo, p: Pos2, delta: e
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track() -> Rect {
+        Rect::from_min_max(pos2(100.0, 50.0), pos2(300.0, 60.0))
+    }
+
+    fn drag(grab: TimelineGrab, start_x: f32, orig: Option<TimelineRange>, bounds: (f64, f64)) -> TimelineDrag {
+        TimelineDrag { id: 7, grab, start: pos2(start_x, 55.0), track: track(), orig, bounds, steps: 0 }
+    }
+
+    #[test]
+    fn a_start_handle_follows_the_pointer_and_cannot_pass_the_end() {
+        // 200 screen points span 100 days: two points a day.
+        let mut d = drag(TimelineGrab::Start, 100.0, Some(TimelineRange::new(10.0, 50.0)), (0.0, 100.0));
+        assert_eq!(dragged_range(&d, pos2(150.0, 55.0)), TimelineRange::new(25.0, 50.0));
+        // Past the axis's right end the start lands on the other end: one day is still a range.
+        assert_eq!(dragged_range(&d, pos2(400.0, 55.0)), TimelineRange::new(50.0, 50.0));
+        // Left of the axis it stops at the first day.
+        d.orig = Some(TimelineRange::new(10.0, 50.0));
+        assert_eq!(dragged_range(&d, pos2(0.0, 55.0)), TimelineRange::new(0.0, 50.0));
+    }
+
+    #[test]
+    fn an_end_handle_clamps_to_the_start() {
+        let d = drag(TimelineGrab::End, 300.0, Some(TimelineRange::new(10.0, 50.0)), (0.0, 100.0));
+        assert_eq!(dragged_range(&d, pos2(200.0, 55.0)), TimelineRange::new(10.0, 50.0));
+        assert_eq!(dragged_range(&d, pos2(100.0, 55.0)), TimelineRange::new(10.0, 10.0));
+        assert_eq!(dragged_range(&d, pos2(400.0, 55.0)), TimelineRange::new(10.0, 100.0));
+    }
+
+    #[test]
+    fn the_band_slides_without_changing_length_or_leaving_the_axis() {
+        // A 20-day band grabbed at day 20 and carried to day 90 would end past the axis: it stops
+        // at the last date and keeps its length.
+        let d = drag(TimelineGrab::Move, 140.0, Some(TimelineRange::new(10.0, 30.0)), (0.0, 100.0));
+        assert_eq!(dragged_range(&d, pos2(280.0, 55.0)), TimelineRange::new(80.0, 100.0));
+        // Carried left it stops at the first date.
+        assert_eq!(dragged_range(&d, pos2(0.0, 55.0)), TimelineRange::new(0.0, 20.0));
+        // A band exactly as wide as the axis has nowhere to go.
+        let full = drag(TimelineGrab::Move, 140.0, Some(TimelineRange::new(0.0, 100.0)), (0.0, 100.0));
+        assert_eq!(dragged_range(&full, pos2(260.0, 55.0)), TimelineRange::new(0.0, 100.0));
+        // With no stored range the band is the whole axis and cannot slide either.
+        let none = drag(TimelineGrab::Move, 140.0, None, (0.0, 100.0));
+        assert_eq!(dragged_range(&none, pos2(260.0, 55.0)), TimelineRange::new(0.0, 100.0));
+    }
+
+    #[test]
+    fn handles_on_an_axis_with_no_span_stay_on_its_one_day() {
+        let d = drag(TimelineGrab::End, 100.0, None, (45658.0, 45658.0));
+        assert_eq!(dragged_range(&d, pos2(300.0, 55.0)), TimelineRange::new(45_658.0, 45_658.0));
+        // A zero-width track cannot divide the axis; the first day is the answer, not NaN.
+        let mut flat = drag(TimelineGrab::Start, 100.0, None, (10.0, 20.0));
+        flat.track = Rect::from_min_max(pos2(100.0, 50.0), pos2(100.0, 60.0));
+        assert_eq!(dragged_range(&flat, pos2(150.0, 55.0)), TimelineRange::new(10.0, 20.0));
+    }
+
+    #[test]
+    fn a_dragged_range_writes_iso_dates_for_the_command() {
+        let wb = Workbook::default();
+        let params = range_params(&wb, 3, TimelineRange::new(45_658.0, 45_716.0)).unwrap();
+        assert_eq!(params["slicer"], 3);
+        assert_eq!(params["start"], "2025-01-01");
+        assert_eq!(params["end"], "2025-02-28");
+        assert_eq!(range_toast(&wb, TimelineRange::new(45_658.0, 45_716.0)), "2025-01-01 – 2025-02-28");
+    }
 }

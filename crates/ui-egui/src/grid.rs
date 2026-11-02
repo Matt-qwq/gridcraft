@@ -84,6 +84,8 @@ pub enum Drag {
     /// when the drag began, `handle` the edge grabbed (`None` moves the whole object), and `steps`
     /// the drag's own undo entries so far (`0`: the first move is about to be recorded).
     Object(ObjectDrag),
+    /// Dragging one end of a timeline's selected date range, or sliding the range itself.
+    Timeline(crate::slicer_view::TimelineDrag),
 }
 
 /// A drag of a floating object in progress.
@@ -105,6 +107,22 @@ impl ObjectDrag {
     }
     fn edges(&self) -> crate::chartview::Edges {
         self.handle.map_or(crate::chartview::Edges::MOVE, |h| h.edges())
+    }
+}
+
+impl Drag {
+    /// Whether this drag holds a floating object or a timeline range: both coalesce their moves
+    /// into one undo entry and both are cancelled by Esc.
+    fn is_object(&self) -> bool {
+        matches!(self, Drag::Object(_) | Drag::Timeline(_))
+    }
+    /// Undo entries this drag has recorded so far.
+    fn steps(&self) -> u32 {
+        match self {
+            Drag::Object(d) => d.steps,
+            Drag::Timeline(d) => d.steps,
+            _ => 0,
+        }
     }
 }
 
@@ -164,6 +182,9 @@ pub struct GridState {
     /// Pivot slicer tile scroll offsets, by (document uid, slicer id): the first tile row shown.
     /// The widget elides tiles that do not fit; the wheel over a slicer moves this instead of the sheet.
     pub slicer_scroll: std::collections::HashMap<(u64, u32), usize>,
+    /// The date axis of each timeline, by (document uid, timeline id), with the revision it was
+    /// computed at: a scan of the report's source, cached until the document changes.
+    pub timeline_axes: std::collections::HashMap<(u64, u32), (u64, Option<(f64, f64)>)>,
     /// The tile of the selected pivot slicer that Tab last focused, if any.
     pub slicer_focus: Option<(u32, usize)>,
     /// The grid geometry of the last frame (hit-testing for agents and tests).
@@ -647,6 +668,8 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     let place = (d.uid, si);
     // The line geometry changes only with the document: the revision is part of its cache key.
     let line_key = (d.uid, d.revision, si);
+    // The timeline axis is a source scan; the grid caches it per revision before painting.
+    crate::slicer_view::ensure_timeline_axes(app, &wb, sh);
     let mut view = app.view();
     // Page Layout view: pages on a desk, rulers above and left of the headings.
     let paper = sh.view == gridcraft_engine::model::SheetViewMode::PageLayout;
@@ -842,7 +865,7 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         crate::paper_view::interact(app, ui, &resp, &geo, sh, &wb);
         interact(app, ui, &resp, &geo, sh, &wb);
     }
-    update_cursor(app, ui, &resp, &geo, sh);
+    update_cursor(app, ui, &resp, &geo, sh, &wb);
     crate::text_box::show(app, ui, &geo, sh);
     if app.editor.as_ref().is_some_and(|e| !e.from_formula_bar) {
         in_cell_editor(app, ui, &geo, sh, &wb);
@@ -2039,7 +2062,7 @@ fn object_name(kind: &str) -> &'static str {
 }
 
 /// Decide after interaction so drag start and release use the new state in the same frame.
-fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: &Geo, sh: &Sheet) {
+fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: &Geo, sh: &Sheet, wb: &Workbook) {
     if app.text_box_editor.is_some() || app.grid.hf_edit.is_some() {
         return;
     }
@@ -2075,6 +2098,9 @@ fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: 
             Drag::ResizeRow { .. } => Some(CursorIcon::ResizeRow),
             Drag::Freeze { cols, .. } => Some(if cols { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical }),
             Drag::Object(ref d) => Some(d.handle.map_or(CursorIcon::Move, |h| h.cursor(geo.rtl))),
+            Drag::Timeline(ref d) => {
+                Some(if d.grab == crate::slicer_view::TimelineGrab::Move { CursorIcon::Move } else { CursorIcon::ResizeHorizontal })
+            }
         };
         if let Some(cursor) = cursor {
             ctx.set_cursor_icon(cursor);
@@ -2085,6 +2111,14 @@ fn update_cursor(app: &mut SheetApp, ui: &egui::Ui, resp: &egui::Response, geo: 
         return;
     }
     let Some(p) = pos else { return };
+    // A timeline's handles and selected band are draggable and say so with their cursor; the
+    // caption, the unit and the rest of the frame stay cell cursor.
+    if app.grid.drag == Drag::None
+        && let Some(icon) = crate::slicer_view::timeline_cursor(app, geo, sh, wb, p)
+    {
+        ctx.set_cursor_icon(icon);
+        return;
+    }
     if freeze_cols.contains(p) || freeze_rows.contains(p) {
         let cols = freeze_cols.contains(p);
         ctx.set_cursor_icon(if cols { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical });
@@ -2268,14 +2302,16 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             }
             if primary_drag {
                 // A handle belongs to the object that was selected before this press: the first
-                // press on an object selects it, the next one moves or resizes it. A timeline has
-                // no move or resize command (`slicer.move` handles slicers only), so it selects
-                // but never starts a drag.
-                if app.grid.drag == Drag::None
-                    && let Some(a) = object_anchor(sh, kind, id)
-                    && kind != "timeline"
-                {
-                    app.grid.drag = Drag::Object(ObjectDrag::new(kind, id, p, crate::chartview::frame_of(sh, &a), handle));
+                // press on an object selects it, the next one moves or resizes it. A timeline is
+                // grabbed by its range handles or selected band instead of being moved itself.
+                if app.grid.drag == Drag::None {
+                    if kind == "timeline" {
+                        if let Some(d) = crate::slicer_view::begin_timeline_drag(app, geo, sh, wb, p) {
+                            app.grid.drag = Drag::Timeline(d);
+                        }
+                    } else if let Some(a) = object_anchor(sh, kind, id) {
+                        app.grid.drag = Drag::Object(ObjectDrag::new(kind, id, p, crate::chartview::frame_of(sh, &a), handle));
+                    }
                 }
             }
             return;
@@ -2547,10 +2583,9 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         );
         // Esc ends an object drag where it started. The drag records one undo entry, so one undo
         // puts the object back and the workbook is not left dirty by a cancelled drag.
-        if matches!(app.grid.drag, Drag::Object(_)) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            if let Drag::Object(d) = std::mem::take(&mut app.grid.drag)
-                && d.steps > 0
-            {
+        if app.grid.drag.is_object() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            let steps = std::mem::take(&mut app.grid.drag).steps();
+            if steps > 0 {
                 let _ = app.session.run("edit.undo", json!({}));
             }
             app.toast = None;
@@ -2661,6 +2696,30 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 scroll_by(app, auto);
             }
             Drag::None => {}
+            Drag::Timeline(d) => {
+                let range = crate::slicer_view::dragged_range(&d, p);
+                let current = sh.pivot_timelines.iter().find(|t| t.id == d.id).and_then(|t| t.range);
+                // A handle dragged back to the axis's own end on a timeline that shows every date
+                // says nothing new: no command, no empty undo entry.
+                let full = range.start == d.bounds.0 && range.end == d.bounds.1;
+                if current != Some(range)
+                    && !(current.is_none() && full)
+                    && let Some(params) = crate::slicer_view::range_params(wb, d.id, range)
+                {
+                    let before = app.session.active().map(|x| x.revision).unwrap_or(0);
+                    let _ = app.session.run("slicer.setRange", params);
+                    let changed = app.session.active().map(|x| x.revision).unwrap_or(0) != before;
+                    let mut d = d;
+                    if changed {
+                        if d.steps > 0 {
+                            coalesce_last_undo(app);
+                        }
+                        d.steps = d.steps.saturating_add(1);
+                    }
+                    app.toast = Some((crate::slicer_view::range_toast(wb, range), crate::now_ms()));
+                    app.grid.drag = Drag::Timeline(d);
+                }
+            }
         }
     }
 
@@ -2668,10 +2727,9 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
     if resp.drag_stopped() || (!pointer.any_down() && app.grid.drag != Drag::None && !resp.dragged()) {
         // Esc mid-drag (egui ends the drag on Esc too): the object goes back, and the drag's own
         // undo entry is dropped with it, so a cancelled drag leaves no step behind.
-        if matches!(app.grid.drag, Drag::Object(_)) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            if let Drag::Object(d) = std::mem::take(&mut app.grid.drag)
-                && d.steps > 0
-            {
+        if app.grid.drag.is_object() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            let steps = std::mem::take(&mut app.grid.drag).steps();
+            if steps > 0 {
                 let _ = app.session.run("edit.undo", json!({}));
             }
             app.toast = None;
