@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (a timeline's selected range handles now drag on the sheet, and a chart series can move to the secondary axis by command and from the Format pane; a combo chart's series keep their order across save/reopen — §8's remaining items are calculated items, value/label filters and the Excel check) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (a timeline's range handles drag on the sheet, a chart series moves to the secondary axis by command and from the Format pane, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green; a WPS-authored `.xls` cannot resolve the CF12 layout, so gate #1 remains the only way) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -370,7 +370,10 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   scales/data bars/icon sets (the specification's diagram and its field text disagree on
   `rgbTemplateParms`' length, so the tail's offset is undetermined — a guessed offset would be
   invention), and BIFF5, whose record layouts are simply **not in [MS-XLS]** (§1.6 specifies BIFF8
-  only), so a second reader would be ~1,000–1,500 lines from a source we do not have.
+  only), so a second reader would be ~1,000–1,500 lines from a source we do not have. An 11-02
+  attempt to settle the layout from a **WPS-authored** `.xls` did not help: WPS 12.0 writes its own
+  `0x087C`/`0x087D` extension records for a colour scale, data bar and icon set instead of Excel's
+  `CF12`, so an **Excel-authored** `.xls` (gate #1) is still the only source that can resolve it.
 - **Still missing:** `.xls` conditional formats of the **CF12** kinds (colour scales, data bars, icon
   sets) — everything older is read now; BIFF5 is refused with a clear message; hyperlinks and
   freeze panes; charts, pictures, OLE objects and PivotTables are dropped with a warning; `.xls` is
@@ -504,10 +507,16 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   `#VALUE!`, following the claim that Excel refuses those error codes; **needs verification on a
   licensed Excel**) or `#CIRC!` (written as 0). A *literal* `#SPILL!` pasted as a value therefore
   comes back `#VALUE!`; formulas and spilled values are recalculated and agree.
+- **Re-run 11-02 after the timeline/secondary-axis work:** 100 seeds × 200 steps (20,000 commands)
+  in the debug build, 68.3 s wall, **0 invariant failures, 0 slow seeds** (`soak: 100 seeds × 200
+  steps, 68.3 s wall, 0 invariant failures, 0 slow seeds, slowest seed 7 (6620 ms)`). The three
+  samples were exercised against undo/redo, XLSX round-trip and full recalc.
 - **Next:** the trust track's soak is closed; the 100k-dependent gate is met, independent formulas
   recalculate on up to eight threads (20–25 ms at 100k, 208–277 ms at 1M) and the bulk data
   commands are bounded (12M cells; Remove Duplicates 1M×10 in 12 s, Sort in 3.2 s, gaps §2). Cold
-  paging (M19) is the next large-workbook task. Replays and details in `plan/HANDOVER.md`.
+  paging (M19) is the next large-workbook task. Replays and details in `plan/HANDOVER.md`. The
+  Windows GPU/driver reports (#120, #76) and the macOS close/open reports (#117, #166) still need
+  the hardware they were reported on; they cannot be closed here.
 - **Estimate:** 12–16 h for this soak and its fixes; done.
 ## After beta
 
@@ -587,6 +596,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | 100 seeds × 200 steps (20,000 commands) command-sequence soak green in 68.3 s, 0 invariant failures; the hardware reports still need their machines. A WPS-authored `.xls` writes proprietary `0x087C`/`0x087D` records, not Excel `CF12`, so CF12 still needs gate #1 |
 | 2026-11-02 | minor | `chart.setSeriesAxis` moves a series to the secondary axis (and optionally changes its kind); the Format pane has the checkbox; combo series are read back in `c:order`, not group order |
 | 2026-10-30 | minor | §8: a table slicer follows a table and column rename, `insert.slicer` applies `caption`, and a report-side `pivot.filter` mirrors onto a connected slicer; corrected the stale "widget UI / timeline range / PivotCharts missing" list (`insert.pivotChart` landed 10-11) and dropped the stale "table slicer is not written" line |
 | 2026-10-28 | minor | §2: a finished band drops its text pointer index (rebuilt on the first edit); the 100M-cell export falls from 2,411 to 1,911 MiB live (texts 640 → 301, number tables 679 → 519) and a text past the u16 slots keeps its own slot |

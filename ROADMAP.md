@@ -286,6 +286,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | 100 seeds × 200 steps (20,000 commands) soak green in 68.3 s after the timeline/chart work; the hardware reports remain external. A WPS-authored `.xls` writes proprietary extension records, not Excel `CF12`, so CF12 still needs gate #1 |
 | 2026-11-02 | minor | `chart.setSeriesAxis` moves a series to the secondary axis (and can change its kind), with a Format pane checkbox; combo series are read back in `c:order`, so a series index survives save/reopen; a secondary line group keeps its markers |
 | 2026-11-02 | minor | A timeline's range handles drag on the sheet: either end resizes, the band slides without changing its length, days snap, one undo step, the field's date axis cached per revision. #8 → 4–9 h, beta ~73–132 h |
 | 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (caption too while it still shows the old name), and a report-side `pivot.filter` mirrors onto a connected slicer when every connected report agrees and the labels are tiles; `insert.slicer` applies the documented `caption`. #8 stays 6–11 h (the timeline drag, calculated items and value/label filters are the rest; `insert.pivotChart` has been in since 10-11) |
