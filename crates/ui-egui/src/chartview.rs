@@ -42,6 +42,31 @@ pub fn paint_chart(p: &Painter, rect: Rect, wb: &Workbook, sheet: usize, chart: 
     paint_prims(&p.with_clip_rect(rect.intersect(p.clip_rect())), origin, &prims, z);
 }
 
+/// What a click at `at` (screen coordinates) inside a chart's on-screen `rect` lands on, in the
+/// Format pane's vocabulary. The chart is laid out at its anchor size and painted scaled, so the
+/// click maps back by the same scale; the regions come from the same layout that painted it.
+pub fn element_at(
+    p: &Painter,
+    wb: &Workbook,
+    sheet: usize,
+    chart: &gridcraft_engine::model::Chart,
+    rect: Rect,
+    at: Pos2,
+) -> Option<gridcraft_chart::Hit> {
+    if !rect.contains(at) {
+        return None;
+    }
+    let (w, h) = (chart.anchor.width.max(1.0), chart.anchor.height.max(1.0));
+    let z = rect.width() / w;
+    if !(w.is_finite() && h.is_finite() && z.is_finite() && z > 0.0) {
+        return None;
+    }
+    let data = gridcraft_chart::resolve(wb, sheet, chart);
+    let m = EguiMeasure { painter: p, z };
+    let hits = gridcraft_chart::render_hits(chart, &data, w, h, &m);
+    gridcraft_chart::hit_at(&hits, (at.x - rect.left()) / z, (at.y - rect.top()) / z)
+}
+
 /// Paints chart primitives at `origin`, scaled by `z`.
 pub fn paint_prims(p: &Painter, origin: Pos2, prims: &[Prim], z: f32) {
     let pt = |x: f32, y: f32| pos2(origin.x + x * z, origin.y + y * z);

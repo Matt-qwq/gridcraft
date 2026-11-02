@@ -1623,3 +1623,131 @@ fn a_point_flag_overrides_the_series_labels() {
     assert!(!t.contains(&"9"), "the point's value is switched off: {t:?}");
     assert!(t.contains(&"7") && t.contains(&"11"), "{t:?}");
 }
+
+// ---------------------------------------------------------------- click targets
+
+/// Every region is sane and inside the canvas, and the whole canvas is the chart area.
+fn assert_hits_sane(d: &Drawing, w: f32, h: f32) {
+    let (w, h) = (f64::from(w), f64::from(h));
+    let inside = |x: f64, y: f64| x >= -1.0 && x <= w + 1.0 && y >= -1.0 && y <= h + 1.0;
+    for r in &d.hits {
+        match r.shape {
+            HitShape::Rect { x, y, w: rw, h: rh } => {
+                assert!(f64::from(x).is_finite() && f64::from(rw).is_finite(), "non-finite rect: {:?}", r.shape);
+                assert!(rw > 0.0 && rh > 0.0, "empty rect: {:?}", r.shape);
+                assert!(inside(f64::from(x), f64::from(y)) && inside(f64::from(x + rw), f64::from(y + rh)), "{:?}", r.shape);
+            }
+            HitShape::Circle { cx, cy, r: rr } => {
+                assert!(rr > 0.0 && rr.is_finite());
+                assert!(inside(f64::from(cx), f64::from(cy)), "{:?}", r.shape);
+            }
+            HitShape::Wedge { cx, cy, r_outer, r_inner, a0, a1 } => {
+                assert!(r_outer > 0.0 && r_inner >= 0.0 && a1 >= a0 && a1.is_finite(), "{:?}", r.shape);
+                assert!(inside(f64::from(cx), f64::from(cy)), "{:?}", r.shape);
+            }
+        }
+    }
+    // The background is always the chart area, whatever the kind.
+    assert_eq!(hit_at(&d.hits, 1.0, 1.0), Some(Hit::ChartArea), "the corner is the chart area");
+}
+
+#[test]
+fn every_kind_records_sane_click_regions() {
+    let m = ApproxMeasure;
+    for kind in ALL_KINDS {
+        let c = chart(kind);
+        let d = sample(kind);
+        let (w, h) = (640.0, 400.0);
+        let drawing = draw(&c, &d, w, h, &m);
+        assert_hits_sane(&drawing, w, h);
+        assert_eq!(drawing.prims, render(&c, &d, w, h, &m), "{kind:?}: the primitives are the same either way");
+    }
+}
+
+#[test]
+fn a_bar_click_names_its_series_and_point() {
+    let m = ApproxMeasure;
+    let (w, h) = (640.0, 400.0);
+    let c = chart(ChartKind::ColumnClustered);
+    let d = sample(ChartKind::ColumnClustered);
+    let drawing = draw(&c, &d, w, h, &m);
+    // A bar's own region: clicking its middle must name that series and that point.
+    let bars: Vec<(Hit, f32, f32)> = drawing
+        .hits
+        .iter()
+        .filter(|r| matches!(r.hit, Hit::Series { point: Some(_), .. }))
+        .filter_map(|r| match r.shape {
+            HitShape::Rect { x, y, w: rw, h: rh } => Some((r.hit, x + rw / 2.0, y + rh / 2.0)),
+            _ => None,
+        })
+        .collect();
+    assert!(bars.len() >= 3, "one region per bar: {} regions", bars.len());
+    for (hit, x, y) in &bars {
+        assert_eq!(hit_at(&drawing.hits, *x, *y), Some(*hit), "a click on a bar at ({x}, {y})");
+    }
+    // The bars of two different series are told apart.
+    let hits: Vec<Hit> = bars.iter().map(|(h, _, _)| *h).collect();
+    assert!(hits.contains(&(Hit::Series { index: 0, point: Some(0) })), "{hits:?}");
+    assert!(hits.contains(&(Hit::Series { index: 1, point: Some(0) })), "{hits:?}");
+}
+
+#[test]
+fn the_axes_and_the_pie_slices_are_where_they_are_drawn() {
+    let m = ApproxMeasure;
+    let (w, h) = (640.0, 400.0);
+    // The category labels sit under the plot: a click on them is the horizontal axis.
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.legend = LegendPos::None;
+    let d = sample(ChartKind::ColumnClustered);
+    let drawing = draw(&c, &d, w, h, &m);
+    let plot_bottom = drawing
+        .hits
+        .iter()
+        .filter_map(|r| match (r.hit, r.shape) {
+            (Hit::AxisX, HitShape::Rect { y, h: rh, .. }) => Some(y + rh),
+            _ => None,
+        })
+        .fold(0.0f32, f32::max);
+    assert!(plot_bottom < h, "the label band ends before the canvas does: {plot_bottom}");
+    assert_eq!(hit_at(&drawing.hits, w / 2.0, plot_bottom - 1.0), Some(Hit::AxisX), "the label band is the category axis");
+    // The value axis' label band (past the rotated title) is the vertical axis.
+    let band = drawing
+        .hits
+        .iter()
+        .find_map(|r| match (r.hit, r.shape) {
+            (Hit::AxisY, HitShape::Rect { x, y, h: rh, .. }) if rh > 50.0 => Some((x, y, rh)),
+            _ => None,
+        })
+        .expect("a value axis label band");
+    assert_eq!(hit_at(&drawing.hits, band.0 + 2.0, band.1 + band.2 / 2.0), Some(Hit::AxisY), "the label band is the value axis");
+
+    // A pie's slice region is the wedge the renderer drew: its bisector at half the radius hits it.
+    let mut c = chart(ChartKind::Pie);
+    c.legend = LegendPos::Right;
+    let d = sample(ChartKind::Pie);
+    let drawing = draw(&c, &d, w, h, &m);
+    let wedges: Vec<(f32, f32, f32, f32, f32)> = drawing
+        .prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Wedge { cx, cy, r_outer, a0, a1, .. } => Some((*cx, *cy, *r_outer, *a0, *a1)),
+            _ => None,
+        })
+        .collect();
+    assert!(wedges.len() >= 3, "a slice per value: {}", wedges.len());
+    for (j, &(cx, cy, r, a0, a1)) in wedges.iter().enumerate().take(6) {
+        let mid = (a0 + a1) / 2.0;
+        let (x, y) = (cx + r * 0.5 * mid.sin(), cy - r * 0.5 * mid.cos());
+        assert_eq!(hit_at(&drawing.hits, x, y), Some(Hit::Series { index: 0, point: Some(j) }), "slice {j}");
+    }
+}
+
+#[test]
+fn a_hostile_click_is_outside_every_region() {
+    let m = ApproxMeasure;
+    let drawing = draw(&chart(ChartKind::ColumnClustered), &sample(ChartKind::ColumnClustered), 640.0, 400.0, &m);
+    for (x, y) in [(f32::NAN, 10.0), (10.0, f32::NAN), (f32::INFINITY, 0.0), (-1e9, -1e9), (1e9, 1e9)] {
+        assert_eq!(hit_at(&drawing.hits, x, y), None, "({x}, {y}) is outside every region");
+    }
+    assert_eq!(draw(&chart(ChartKind::Pie), &ChartData::default(), 0.0, 0.0, &m), Drawing::default(), "no size, no drawing");
+}

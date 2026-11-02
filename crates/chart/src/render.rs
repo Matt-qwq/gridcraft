@@ -11,7 +11,9 @@ use gridcraft_model::{
 use crate::axis::{Fmt, Scale, axis_scale, clean, fixed_scale, format_number};
 use crate::resolve::{MAX_POINTS, MAX_SERIES, MAX_TRENDLINES, series_color};
 use crate::trend::{auto_name, fit_trendline, moving_average};
-use crate::{ChartData, ErrorBarsData, HAlign, Measure, PointLabelData, PointStyle, Prim, Rgba, SeriesData, VAlign};
+use crate::{
+    ChartData, Drawing, ErrorBarsData, HAlign, Hit, HitRegion, HitShape, Measure, PointLabelData, PointStyle, Prim, Rgba, SeriesData, VAlign,
+};
 
 pub(crate) const TEXT: Rgba = [0x59, 0x59, 0x59, 0xFF];
 const DARK_TEXT: Rgba = [0x26, 0x26, 0x26, 0xFF];
@@ -62,10 +64,31 @@ impl Bx {
 
 struct Ctx<'a> {
     out: Vec<Prim>,
+    hits: Vec<HitRegion>,
     m: &'a dyn Measure,
 }
 
+/// Most clickable regions a drawing records: a chart with more points than this is not edited by
+/// clicking them, and the cap keeps a hostile workbook from growing the list without bound.
+const MAX_HITS: usize = 4096;
+
 impl Ctx<'_> {
+    /// Records that a click inside `shape` (drawn now) selects `hit`.
+    fn hit(&mut self, hit: Hit, shape: HitShape) {
+        if self.hits.len() < MAX_HITS {
+            self.hits.push(HitRegion { hit, shape });
+        }
+    }
+    fn hit_rect(&mut self, hit: Hit, x: f32, y: f32, w: f32, h: f32) {
+        if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 {
+            self.hit(hit, HitShape::Rect { x, y, w, h });
+        }
+    }
+    fn hit_circle(&mut self, hit: Hit, cx: f32, cy: f32, r: f32) {
+        if cx.is_finite() && cy.is_finite() && r.is_finite() && r > 0.0 {
+            self.hit(hit, HitShape::Circle { cx, cy, r });
+        }
+    }
     fn tw(&self, s: &str, size: f32) -> f32 {
         let w = self.m.text_width(s, size, false);
         if w.is_finite() { w.max(0.0) } else { 0.0 }
@@ -441,14 +464,17 @@ fn chart_title(chart: &Chart, data: &ChartData) -> Option<String> {
     }
 }
 
-/// Lays out and draws a chart into a `w`×`h` box at the origin. Empty for a degenerate box.
-pub fn render(chart: &Chart, data: &ChartData, w: f32, h: f32, m: &dyn Measure) -> Vec<Prim> {
+/// Lays `chart` out into a `w`×`h` box at the origin: its primitives and the boxes a click on it
+/// can land on, in draw order. Empty for a degenerate box.
+pub fn draw(chart: &Chart, data: &ChartData, w: f32, h: f32, m: &dyn Measure) -> Drawing {
     if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 || w > 1e7 || h > 1e7 {
-        return vec![];
+        return Drawing::default();
     }
     let data = sanitize(data);
-    let mut ctx = Ctx { out: Vec::new(), m };
+    let mut ctx = Ctx { out: Vec::new(), hits: Vec::new(), m };
     ctx.out.push(Prim::Rect { x: 0.0, y: 0.0, w, h, fill: Some(WHITE), stroke: Some((GRID, 1.0)), radius: 0.0 });
+    // Everything not claimed by an axis, a legend entry or a point is the chart area.
+    ctx.hit_rect(Hit::ChartArea, 0.0, 0.0, w, h);
     let pad = (w.min(h) * 0.04).clamp(2.0, 10.0);
     let mut area = Bx { x: pad, y: pad, w: w - 2.0 * pad, h: h - 2.0 * pad };
     if let Some(t) = chart_title(chart, &data) {
@@ -461,12 +487,22 @@ pub fn render(chart: &Chart, data: &ChartData, w: f32, h: f32, m: &dyn Measure) 
     }
     let entries = legend_entries(chart, &data);
     if !entries.is_empty() && area.ok() {
-        area = draw_legend(&mut ctx, &entries, chart.legend, area);
+        let targets = legend_hits(chart, &data, entries.len());
+        area = draw_legend(&mut ctx, &entries, &targets, chart.legend, area);
     }
     if area.ok() && !data.series.is_empty() {
         draw_kind(&mut ctx, chart, &data, area);
     }
-    finalize(ctx.out, w, h)
+    Drawing { prims: finalize(ctx.out, w, h), hits: ctx.hits }
+}
+
+/// The regions a click on `chart` lands on when it is drawn `w` × `h` (chart coordinates).
+pub fn render_hits(chart: &Chart, data: &ChartData, w: f32, h: f32, m: &dyn Measure) -> Vec<HitRegion> {
+    draw(chart, data, w, h, m).hits
+}
+
+pub fn render(chart: &Chart, data: &ChartData, w: f32, h: f32, m: &dyn Measure) -> Vec<Prim> {
+    draw(chart, data, w, h, m).prims
 }
 
 fn draw_kind(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
@@ -542,7 +578,7 @@ fn draw_swatch(ctx: &mut Ctx, sw: Swatch, x: f32, yc: f32, s: f32, color: Rgba) 
     }
 }
 
-fn draw_legend(ctx: &mut Ctx, entries: &[(String, Rgba, Swatch)], pos: LegendPos, area: Bx) -> Bx {
+fn draw_legend(ctx: &mut Ctx, entries: &[(String, Rgba, Swatch)], targets: &[Hit], pos: LegendPos, area: Bx) -> Bx {
     let size = LABEL_SIZE;
     let row_h = size * 1.6;
     let s = size * 0.8;
@@ -582,6 +618,9 @@ fn draw_legend(ctx: &mut Ctx, entries: &[(String, Rgba, Swatch)], pos: LegendPos
                         let sx = swatch_w(e.2, s) + gap;
                         let t = ctx.fit(&e.0, size, (iw - sx).max(0.0) + 0.5);
                         ctx.text(x + sx, yc, &t, size, TEXT, HAlign::Left, VAlign::Middle);
+                        if let Some(hit) = targets.get(i) {
+                            ctx.hit_rect(*hit, x, yc - row_h / 2.0, iw, row_h);
+                        }
                     }
                     x += iw + spacing;
                 }
@@ -602,11 +641,41 @@ fn draw_legend(ctx: &mut Ctx, entries: &[(String, Rgba, Swatch)], pos: LegendPos
                 let sx = swatch_w(e.2, s) + gap;
                 let t = ctx.fit(&e.0, size, (colw - sx).max(0.0) + 0.5);
                 ctx.text(x0 + sx, yc, &t, size, TEXT, HAlign::Left, VAlign::Middle);
+                if let Some(hit) = targets.get(i) {
+                    ctx.hit_rect(*hit, x0, yc - row_h / 2.0, colw, row_h);
+                }
             }
             let used = colw + 8.0;
             if pos == LegendPos::Right { Bx { w: area.w - used, ..area } } else { Bx { x: area.x + used, w: area.w - used, ..area } }
         }
     }
+}
+
+/// What each legend entry selects, in the order [`legend_entries`] returns them: a pie-like
+/// chart's entries are its slices, a cartesian chart's are its series followed by their
+/// trendlines, and a waterfall's three entries all belong to its only series.
+fn legend_hits(chart: &Chart, data: &ChartData, n: usize) -> Vec<Hit> {
+    let mut out: Vec<Hit> = match chart.kind {
+        ChartKind::Pie | ChartKind::Doughnut | ChartKind::Treemap | ChartKind::Sunburst => {
+            (0..n).map(|j| Hit::Series { index: 0, point: Some(j) }).collect()
+        }
+        ChartKind::Histogram | ChartKind::Funnel | ChartKind::Stock => vec![],
+        ChartKind::Waterfall => vec![Hit::Series { index: 0, point: None }; n],
+        _ => {
+            let series: Vec<usize> = (0..data.series.len().min(MAX_SERIES)).collect();
+            let mut v: Vec<Hit> = series.iter().map(|i| Hit::Series { index: *i, point: None }).collect();
+            for (i, s) in data.series.iter().take(MAX_SERIES).enumerate() {
+                if supports_trendline(plot_kind(chart, s)) {
+                    for _ in s.trendlines.iter().take(MAX_TRENDLINES) {
+                        v.push(Hit::Series { index: i, point: None });
+                    }
+                }
+            }
+            v
+        }
+    };
+    out.truncate(n);
+    out
 }
 
 // ---------------------------------------------------------------- axes frame
@@ -717,6 +786,13 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         if !plot.ok() {
             return plot;
         }
+        // The label bands beside and below the plot are the axes; the series are drawn later, so a
+        // bar or a marker on the edge still wins the click.
+        ctx.hit_rect(Hit::AxisY, area.x, plot.y, plot.x - area.x, plot.h);
+        if right > 4.0 {
+            ctx.hit_rect(Hit::AxisY, plot.right(), plot.y, area.right() - plot.right(), plot.h);
+        }
+        ctx.hit_rect(Hit::AxisX, plot.x, plot.bottom(), plot.w, area.bottom() - plot.bottom());
         for (v, t) in &ylabels {
             let yy = plot.bottom() - y.scale.frac(*v) * plot.h;
             if grid {
@@ -736,6 +812,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         }
         let y0 = plot.bottom() - y.scale.frac(y.crossing()) * plot.h;
         ctx.hline(plot.x, plot.right(), y0, AXIS, 0.75);
+        ctx.hit_rect(Hit::AxisY, plot.x, y0 - 2.5, plot.w, 5.0);
         if let Some(u) = y.units {
             ctx.text(plot.x - 4.0, plot.y, u.label(), ls * 0.9, TEXT, HAlign::Right, VAlign::Bottom);
         }
@@ -770,6 +847,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                 if let Some(at) = category_crossing(crosses, n) {
                     let xx = plot.x + (at + 0.5) * cw;
                     ctx.vline(xx, plot.y, plot.bottom(), AXIS, 0.75);
+                    ctx.hit_rect(Hit::AxisX, xx - 2.5, plot.y, 5.0, plot.h);
                 }
             }
             CatAxis::Numeric(s, f, crosses, units) => {
@@ -797,6 +875,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
                 };
                 let xx = plot.x + s.frac(at) * plot.w;
                 ctx.vline(xx, plot.y, plot.bottom(), AXIS, 0.75);
+                ctx.hit_rect(Hit::AxisX, xx - 2.5, plot.y, 5.0, plot.h);
             }
         }
         plot
@@ -815,6 +894,8 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         if !plot.ok() {
             return plot;
         }
+        ctx.hit_rect(Hit::AxisX, area.x, plot.y, plot.x - area.x, plot.h);
+        ctx.hit_rect(Hit::AxisY, plot.x, plot.bottom(), plot.w, area.bottom() - plot.bottom());
         let vw = maxw(ctx, &ylabels);
         let slot = plot.w / ylabels.len().max(1) as f32;
         let k = (((vw + 6.0) / slot.max(1e-3)).ceil() as usize).max(1);
@@ -829,6 +910,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         }
         let x0 = plot.x + y.scale.frac(y.crossing()) * plot.w;
         ctx.vline(x0, plot.y, plot.bottom(), AXIS, 0.75);
+        ctx.hit_rect(Hit::AxisY, x0 - 2.5, plot.y, 5.0, plot.h);
         if let Some(u) = y.units {
             ctx.text(plot.right(), plot.bottom() + lh, u.label(), ls * 0.9, TEXT, HAlign::Right, VAlign::Top);
         }
@@ -842,6 +924,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         if let Some(at) = category_crossing(crosses, n) {
             let yy = plot.bottom() - (at + 0.5) * ch;
             ctx.hline(plot.x, plot.right(), yy, AXIS, 0.75);
+            ctx.hit_rect(Hit::AxisX, plot.x, yy - 2.5, plot.w, 5.0);
         }
         // Outer levels: a group's name centred beside its categories, separators at the
         // boundaries running right to the axis.
@@ -982,15 +1065,18 @@ fn catmull(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f
     o
 }
 
-/// Markers with a colour each (per-point formatting overrides).
-fn draw_markers_colored(ctx: &mut Ctx, pts: impl Iterator<Item = ([f32; 2], Rgba, f32)>) {
+/// Markers with a colour each (per-point formatting overrides). Each drawn marker is also a click
+/// target for its series and point.
+fn draw_markers_colored(ctx: &mut Ctx, series: usize, pts: impl Iterator<Item = ([f32; 2], Rgba, f32, usize)>) {
     let mut seen = HashSet::new();
-    for (p, color, r) in pts {
+    for (p, color, r, j) in pts {
         if seen.len() >= MAX_MARKERS {
             break;
         }
         if seen.insert(((p[0] * 0.5) as i32, (p[1] * 0.5) as i32)) {
             ctx.out.push(Prim::Circle { cx: p[0], cy: p[1], r, fill: Some(color), stroke: Some((WHITE, 0.75)) });
+            // A little larger than the dot, so a click does not have to land on three pixels.
+            ctx.hit_circle(Hit::Series { index: series, point: Some(j) }, p[0], p[1], r.max(4.0));
         }
     }
 }
@@ -1400,8 +1486,12 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                     for (j, sp) in row.iter().enumerate().filter(|(j, _)| in_window(*j)) {
                         let (b, t) = sp.unwrap_or((0.0, 0.0));
                         let c = center(j);
-                        top.push([c, vpos(t, &sc)]);
-                        base.push([c, vpos(b, &sc)]);
+                        let (pb, pt) = (vpos(b, &sc), vpos(t, &sc));
+                        top.push([c, pt]);
+                        base.push([c, pb]);
+                        if sp.is_some() {
+                            ctx.hit_rect(Hit::Series { index: i, point: Some(j) }, c - cw / 2.0, pb.min(pt), cw, (pb - pt).abs());
+                        }
                         // Source values (not stack totals), just above the top edge like the line labels.
                         if labels_on
                             && sp.is_some()
@@ -1446,6 +1536,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                         if horizontal {
                             let y = c + nslots * bw / 2.0 - (k + 1.0) * bw;
                             ctx.rect(lo, y, len, bw, fill, edge);
+                            ctx.hit_rect(Hit::Series { index: i, point: Some(j) }, lo, y, len, bw);
                             if labels_on && let Some(text) = label_text(chart, data, s, j, None) {
                                 let yc = c + nslots * bw / 2.0 - (k + 0.5) * bw;
                                 let (x, ha) = match pos {
@@ -1463,6 +1554,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                         } else {
                             let x = c - nslots * bw / 2.0 + k * bw;
                             ctx.rect(x, lo, bw, len, fill, edge);
+                            ctx.hit_rect(Hit::Series { index: i, point: Some(j) }, x, lo, bw, len);
                             if labels_on && let Some(text) = label_text(chart, data, s, j, None) {
                                 let xc = c - nslots * bw / 2.0 + (k + 0.5) * bw;
                                 let (y, va, ha) = match pos {
@@ -1503,11 +1595,18 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
                         row.iter().enumerate().map(|(j, sp)| sp.filter(|_| in_window(j)).map(|(_, t)| [center(j), vpos(t, &sc)])).collect();
                     draw_runs(ctx, &pts, s.color, 2.25, s.smooth.then_some(plot));
                     let k = kinds.get(i).copied().unwrap_or(ChartKind::Line);
-                    if k == ChartKind::LineMarkers && cw >= 3.0 {
+                    let drawn = k == ChartKind::LineMarkers && cw >= 3.0;
+                    if drawn {
                         draw_markers_colored(
                             ctx,
-                            pts.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j), point_marker_radius(s, j)))),
+                            i,
+                            pts.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j), point_marker_radius(s, j), j))),
                         );
+                    } else if pts.len() <= MAX_MARKERS {
+                        // A line without markers: the data points are still click targets.
+                        for (j, p) in pts.iter().enumerate().filter_map(|(j, p)| p.map(|p| (j, p))) {
+                            ctx.hit_circle(Hit::Series { index: i, point: Some(j) }, p[0], p[1], 4.0);
+                        }
                     }
                     if labels_on {
                         let o = series_labels(chart, s);
@@ -1620,7 +1719,7 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let map = |(x, y): (f64, f64)| [plot.x + xs.frac(x) * plot.w, plot.bottom() - ys.frac(y) * plot.h];
     let bubble = chart.kind == ChartKind::Bubble;
     let rmax = plot.w.min(plot.h) * 0.12;
-    for (s, pts) in data.series.iter().zip(&all) {
+    for (i, (s, pts)) in data.series.iter().zip(&all).enumerate() {
         let px: Vec<Option<[f32; 2]>> = pts.iter().map(|p| p.map(map)).collect();
         if bubble {
             let sizes = s.sizes.as_deref().unwrap_or(&[]);
@@ -1644,6 +1743,7 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                 let fill = [base[0], base[1], base[2], 0xC0];
                 let r = ((sz / smax).sqrt() as f32 * rmax).max(1.0);
                 ctx.out.push(Prim::Circle { cx: p[0], cy: p[1], r, fill: Some(fill), stroke: Some((WHITE, 0.75)) });
+                ctx.hit_circle(Hit::Series { index: i, point: Some(j) }, p[0], p[1], r.max(4.0));
             }
         } else {
             let lines = chart.kind == ChartKind::ScatterLines || s.kind == ChartKind::ScatterLines;
@@ -1651,7 +1751,11 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                 draw_runs(ctx, &px, s.color, 2.0, s.smooth.then_some(plot));
             }
             if !lines || px.len() <= 500 {
-                draw_markers_colored(ctx, px.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j), point_marker_radius(s, j)))));
+                draw_markers_colored(
+                    ctx,
+                    i,
+                    px.iter().enumerate().filter_map(|(j, p)| p.map(|p| (p, point_marker(s, j), point_marker_radius(s, j), j))),
+                );
             }
         }
         if chart.data_labels && pts.len() <= MAX_LABELS {
@@ -1746,6 +1850,7 @@ fn histogram(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         let top = plot.bottom() - ys.frac(*c as f64) * plot.h;
         let x = plot.x + b as f32 * cw;
         ctx.rect(x, top, cw, plot.bottom() - top, s.color, Some((WHITE, 0.75)));
+        ctx.hit_rect(Hit::Series { index: 0, point: Some(b) }, x, top, cw, plot.bottom() - top);
         if chart.data_labels {
             ctx.text(x + cw / 2.0, top - 2.0, &c.to_string(), LABEL_SIZE, TEXT, HAlign::Center, VAlign::Bottom);
         }
@@ -1813,6 +1918,7 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         let x = plot.x + (j as f32 + 0.5) * cw - bw / 2.0;
         let (yb, yt) = (vy(*b), vy(*t));
         ctx.rect(x, yb.min(yt), bw, (yb - yt).abs().max(0.5), color, None);
+        ctx.hit_rect(Hit::Series { index: 0, point: Some(j) }, x, yb.min(yt), bw, (yb - yt).abs().max(0.5));
         if j + 1 < bars.len() && ncat <= 500 {
             ctx.out.push(Prim::Line { pts: vec![[x + bw, yt], [x + cw, yt]], color: AXIS, width: 0.75, dash: true });
         }
@@ -1854,6 +1960,7 @@ fn funnel(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         let y = plot.y + j as f32 * slot + (slot - bh) / 2.0;
         if bw > 0.0 {
             ctx.rect(x, y, bw, bh, s.color, None);
+            ctx.hit_rect(Hit::Series { index: 0, point: Some(j) }, x, y, bw, bh);
         }
         if show {
             let yc = y + bh / 2.0;
@@ -1889,6 +1996,7 @@ fn pie(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, inner: f32, nam
         if sweep > 1e-4 {
             let fill = point_color(data, j);
             ctx.out.push(Prim::Wedge { cx, cy, r_outer: r, r_inner: ri, a0: a, a1: (a + sweep).min(TAU), fill, stroke: Some((WHITE, 1.5)) });
+            ctx.hit(Hit::Series { index: 0, point: Some(j) }, HitShape::Wedge { cx, cy, r_outer: r, r_inner: ri, a0: a, a1: (a + sweep).min(TAU) });
             let deleted = s.points.iter().any(|p| p.index == j && p.no_label);
             if !deleted && vals.len() <= MAX_LABELS {
                 let o = series_labels(chart, s);
@@ -2011,6 +2119,7 @@ fn treemap(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     for (j, b) in squarify(&items, area) {
         let fill = point_color(data, j);
         ctx.rect(b.x, b.y, b.w, b.h, fill, Some((WHITE, 1.5)));
+        ctx.hit_rect(Hit::Series { index: 0, point: Some(j) }, b.x, b.y, b.w, b.h);
         if b.w > 24.0 && b.h > LABEL_SIZE * 1.6 {
             let name = ctx.fit(&cat_label(data, j), LABEL_SIZE, b.w - 8.0);
             ctx.text(b.x + 4.0, b.y + 4.0, &name, LABEL_SIZE, on(fill), HAlign::Left, VAlign::Top);
@@ -2087,10 +2196,13 @@ fn radar(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         let t = ctx.fit(labels.get(j).map(String::as_str).unwrap_or(""), LABEL_SIZE, lw.max(20.0));
         ctx.text(p[0], p[1], &t, LABEL_SIZE, TEXT, align, valign);
     }
-    for s in &data.series {
+    for (i, s) in data.series.iter().enumerate() {
         let mut pts: Vec<[f32; 2]> = (0..ncat).map(|j| pt(ang(j), sc.frac(s.values.get(j).copied().flatten().unwrap_or(sc.min)) * r)).collect();
         if let Some(p) = pts.first().copied() {
             pts.push(p);
+        }
+        for (j, p) in pts.iter().enumerate().take(ncat) {
+            ctx.hit_circle(Hit::Series { index: i, point: Some(j) }, p[0], p[1], 4.0);
         }
         ctx.line(pts, s.color, 2.0);
     }
@@ -2156,6 +2268,7 @@ fn box_whisker(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         ctx.hline(c - bw / 4.0, c + bw / 4.0, vy(wlo), s.color, 1.25);
         let (yt, yb) = (vy(q3), vy(q1));
         ctx.rect(c - bw / 2.0, yt, bw, (yb - yt).max(0.5), s.color, None);
+        ctx.hit_rect(Hit::Series { index: i, point: None }, c - bw / 2.0, yt, bw, (yb - yt).max(0.5));
         ctx.hline(c - bw / 2.0, c + bw / 2.0, vy(med), WHITE, 1.5);
         let (mx, my, d) = (c, vy(mean), 3.0);
         ctx.line(vec![[mx - d, my - d], [mx + d, my + d]], WHITE, 1.25);
@@ -2212,6 +2325,7 @@ fn stock(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                 let bw = (cw * 0.5).max(1.0);
                 let fill = if cl >= o { WHITE } else { STOCK };
                 ctx.rect(c - bw / 2.0, yo.min(yc), bw, (yo - yc).abs().max(0.75), fill, Some((STOCK, 1.0)));
+                ctx.hit_rect(Hit::Series { index: 0, point: Some(j) }, c - bw / 2.0, yo.min(yc), bw, (yo - yc).abs().max(0.75));
             }
             (None, Some(cl)) => {
                 if high.is_some() {

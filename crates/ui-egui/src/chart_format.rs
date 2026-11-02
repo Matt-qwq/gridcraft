@@ -69,6 +69,30 @@ impl Selection {
     }
 }
 
+/// The `Data Point` section's selected point for `series`, kept in the UI's temporary store so a
+/// click on a bar, slice or marker can point the section at it.
+fn point_key(chart: u32, series: usize) -> egui::Id {
+    egui::Id::new(("gridcraft.chart_point", chart, series))
+}
+
+/// Points the pane at what a click on the chart landed on: an axis, a series, or a bar/slice/marker
+/// of a series (which also selects that point in the Data Point section). A click on the chart's
+/// title, legend blank space or background selects the chart area, as Excel does.
+pub fn select_element(app: &mut SheetApp, ui: &mut Ui, chart: u32, hit: gridcraft_chart::Hit) {
+    use gridcraft_chart::Hit;
+    app.format_selection = match hit {
+        Hit::ChartArea => Selection::Chart,
+        Hit::AxisX => Selection::AxisX,
+        Hit::AxisY => Selection::AxisY,
+        Hit::Series { index, point } => {
+            if let Some(j) = point {
+                ui.data_mut(|d| d.insert_temp(point_key(chart, index), j));
+            }
+            Selection::Series(index)
+        }
+    };
+}
+
 /// Why the whole axis-scaling group (bounds, log scale, display units, crossing) is unavailable,
 /// when one reason covers them all. Individual options report their own reason through
 /// [`axis_reason`].
@@ -919,7 +943,7 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
         let scope = series.unwrap_or_else(|| chart_scope(ui, chart, id));
         let Some(s) = chart.series.get(scope) else { return };
         let count = point_count(app, chart, scope);
-        let key = egui::Id::new(("gridcraft.chart_point", id, scope));
+        let key = point_key(id, scope);
         let index = ui.data(|d| d.get_temp::<usize>(key)).unwrap_or(0).min(count.saturating_sub(1));
         ui.horizontal(|ui| {
             ui.label("Point");

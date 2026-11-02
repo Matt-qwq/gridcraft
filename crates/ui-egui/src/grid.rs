@@ -2288,7 +2288,8 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         if let Some(p) = at
             && let Some((kind, id, rect)) = crate::chartview::hit(app, geo, sh, p)
         {
-            let handle = if app.selected_chart == Some(id) { crate::chartview::handle_at(rect, p) } else { None };
+            let already = app.selected_chart == Some(id);
+            let handle = if already { crate::chartview::handle_at(rect, p) } else { None };
             app.selected_chart = Some(id);
             if kind == "shape"
                 && resp.double_clicked()
@@ -2299,6 +2300,20 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             }
             if kind == "chart" && resp.double_clicked() {
                 app.grid.pane = Some("formatChart".into());
+            }
+            // A fresh click starts at the chart area, then a click on a selected chart picks the
+            // element under the pointer (Excel: the first click selects the chart, the next one
+            // the axis, series, point or chart area).
+            if kind == "chart" && primary_clicked && !already {
+                app.format_selection = crate::chart_format::Selection::Chart;
+            }
+            if kind == "chart"
+                && primary_clicked
+                && already
+                && let Some(ch) = sh.charts.iter().find(|c| c.id == id)
+                && let Some(hit) = crate::chartview::element_at(ui.painter(), wb, wb.active_sheet, ch, rect, p)
+            {
+                crate::chart_format::select_element(app, ui, id, hit);
             }
             if primary_drag {
                 // A handle belongs to the object that was selected before this press: the first

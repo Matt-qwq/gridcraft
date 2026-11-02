@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 pub use axis::{Scale, format_number, nice_scale};
 pub use raster::rasterize;
-pub use render::{Swatch, legend_entries, render, supports_trendline};
+pub use render::{Swatch, draw, legend_entries, render, render_hits, supports_trendline};
 pub use resolve::{default_palette, resolve, series_color, series_plot_kind};
 pub use sparkline::render_sparkline;
 
@@ -104,6 +104,106 @@ pub enum Prim {
         valign: VAlign,
         rotation: f32,
     },
+}
+
+/// What a click on a drawn chart lands on, in the Format pane's vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// The chart itself: the background, the title, an empty part of the plot, a legend's blank
+    /// space.
+    ChartArea,
+    /// The horizontal axis: its labels or its line (the category axis, or a numeric X axis).
+    AxisX,
+    /// The vertical (value) axis: its labels or its line.
+    AxisY,
+    /// One series, from a bar, slice, marker or legend entry; `point` is the index when a single
+    /// point (a bar, a slice, a marker) was hit rather than the series as a whole.
+    Series { index: usize, point: Option<usize> },
+}
+
+/// The shape of one clickable box, in chart coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HitShape {
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    Circle {
+        cx: f32,
+        cy: f32,
+        r: f32,
+    },
+    /// A pie/doughnut sector, angles in radians (0 = 12 o'clock, clockwise), as [`Prim::Wedge`].
+    Wedge {
+        cx: f32,
+        cy: f32,
+        r_outer: f32,
+        r_inner: f32,
+        a0: f32,
+        a1: f32,
+    },
+}
+
+impl HitShape {
+    /// Whether `(x, y)` falls inside the shape. Hostile (non-finite) input is outside everything.
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        if !(x.is_finite() && y.is_finite()) {
+            return false;
+        }
+        match *self {
+            HitShape::Rect { x: rx, y: ry, w, h } => {
+                let (w, h) = (w.max(0.0), h.max(0.0));
+                x >= rx && x <= rx + w && y >= ry && y <= ry + h
+            }
+            HitShape::Circle { cx, cy, r } => {
+                let r = r.max(0.0);
+                let (dx, dy) = (x - cx, y - cy);
+                dx * dx + dy * dy <= r * r
+            }
+            HitShape::Wedge { cx, cy, r_outer, r_inner, a0, a1 } => {
+                let (dx, dy) = (x - cx, y - cy);
+                let d = (dx * dx + dy * dy).sqrt();
+                if !(d.is_finite() && d >= r_inner.max(0.0) && d <= r_outer.max(0.0)) {
+                    return false;
+                }
+                let sweep = (a1 - a0).max(0.0);
+                if sweep >= TAU_HIT {
+                    return true;
+                }
+                // The angle in the drawing's own convention: 0 at 12 o'clock, clockwise.
+                let mut ang = dx.atan2(-dy);
+                while ang < a0 {
+                    ang += TAU_HIT;
+                }
+                ang <= a1
+            }
+        }
+    }
+}
+
+/// Full turn; a sector at least this wide contains every angle.
+const TAU_HIT: f32 = std::f32::consts::TAU;
+
+/// One region a click can land on, with what it selects.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HitRegion {
+    pub hit: Hit,
+    pub shape: HitShape,
+}
+
+/// Everything a chart draws, plus the boxes a click on it can land on **in draw order** (a later
+/// region is drawn over an earlier one, so the topmost match is the one a click hits).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Drawing {
+    pub prims: Vec<Prim>,
+    pub hits: Vec<HitRegion>,
+}
+
+/// What a click at `(x, y)` in chart coordinates lands on: the last (topmost) region containing it.
+pub fn hit_at(hits: &[HitRegion], x: f32, y: f32) -> Option<Hit> {
+    hits.iter().rev().find(|r| r.shape.contains(x, y)).map(|r| r.hit)
 }
 
 /// Measures text width (the UI passes real font metrics; tests use a fixed-width approximation).
