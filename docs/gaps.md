@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (PivotTable label and value filters keep the items whose captions or aggregates match; PivotTable number grouping buckets a number field into ranges, the way the Group Field dialog does; GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (the corpus half of gate #1 is recorded as impossible on this machine — no corpus URL, no checkout, no network; a fresh 100 × 200 soak after the PivotTable changes is green; PivotTable label and value filters keep the items whose captions or aggregates match; PivotTable number grouping buckets a number field into ranges, the way the Group Field dialog does; GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -21,7 +21,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   with no repair prompt (PivotTables, charts, CF, validation, dynamic arrays, tables).
 - **Evidence:** round-trip tests cover our own files only (`crates/xlsx/src/tests/`); PivotTable
   round-trip noted as "unverified in real Excel" since 10-07; #64 (dynamic-array flag) shows the
-  class of bug.
+  class of bug. The non-Excel half now runs through [`cargo xtask oracle`](oracle.md) (openpyxl and
+  WPS) and `gridcraft-cli check`. **The corpus half cannot start on this machine (11-02):** the repo
+  records no corpus URL, `craftrules` is not checked out next to the repo, and there is no network
+  (github.com timed out), so the pinned corpus cannot be fetched here — 3–6 h still, on a machine
+  with the corpus and network.
 - **Impact:** the main format; a repair prompt or silent loss destroys trust.
 - **Estimate:** 15–25 h, plus owner time in Excel. [file-format-parity.md](file-format-parity.md)
 
@@ -571,6 +575,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   in the debug build, 68.3 s wall, **0 invariant failures, 0 slow seeds** (`soak: 100 seeds × 200
   steps, 68.3 s wall, 0 invariant failures, 0 slow seeds, slowest seed 7 (6620 ms)`). The three
   samples were exercised against undo/redo, XLSX round-trip and full recalc.
+- **Re-run 11-02 after the three PivotTable changes (GETPIVOTDATA, number grouping, label/value
+  filters):** 100 seeds × 200 steps at commit `3574f5d2`, debug test profile, **131 s wall, 3 tests
+  passed, 0 invariant failures**. Seeds are only valid at the commit that generated them, so this
+  line records that commit.
+  
 - **Next:** the trust track's soak is closed; the 100k-dependent gate is met, independent formulas
   recalculate on up to eight threads (20–25 ms at 100k, 208–277 ms at 1M) and the bulk data
   commands are bounded (12M cells; Remove Duplicates 1M×10 in 12 s, Sort in 3.2 s, gaps §2). Cold
@@ -677,6 +686,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §1: the corpus half cannot start on this machine — no corpus URL in the repo, no `craftrules` checkout, no network (github.com timed out) — so it is recorded instead of attempted; §10: a fresh 100 seeds × 200 steps soak at `3574f5d2` (after the three PivotTable changes) is green, 131 s, 0 failures |
 | 2026-11-02 | minor | §8: label and value filters landed (`pivot.filterByLabel`/`pivot.filterByValue`, evaluated when set and stored as the field's hidden items, so the report/reopen/refresh agree; the rule stays in the model and is not written as Excel's `<filters>`); calculated items and the Excel check are what remain |
 | 2026-11-02 | minor | §8: number grouping landed (`PivotNumberGroup`, `pivot.group` start/end/interval, `<start`/`>end` items, `rangePr` + `groupBy="range"` in the cache, round-trips through save/reopen); calculated items, value/label filters and the Excel check are what remain |
 | 2026-11-02 | minor | §8: GETPIVOTDATA reads a report cell by its field items (every layout, Σ Values in Rows, subtotals, page filters, numbers and grand totals), depends on the report's written area so a refresh recalculates it, and is in the Insert Function list; calculated items, value/label filters and number grouping are what remain |
