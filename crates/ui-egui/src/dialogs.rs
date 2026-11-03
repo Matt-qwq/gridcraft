@@ -2836,6 +2836,17 @@ fn toolpak_fields(tool: &str) -> Vec<Field> {
             v.extend([labels(), Text { key: "alpha", label: "Alpha:" }]);
             v
         }
+        "zTest" => {
+            let mut v = two();
+            v.extend([
+                Text { key: "variance1", label: "Variable 1 Variance (known):" },
+                Text { key: "variance2", label: "Variable 2 Variance (known):" },
+                Text { key: "hypothesizedDifference", label: "Hypothesized Mean Difference:" },
+                labels(),
+                Text { key: "alpha", label: "Alpha:" },
+            ]);
+            v
+        }
         _ => {
             let mut v = two();
             v.extend([
@@ -2853,7 +2864,7 @@ fn toolpak_defaults(sel: &str, tool: &str) -> Map<String, Json> {
     let mut v = json!({
         "tool": tool, "range": sel, "inputY": "", "inputX": "", "range1": sel, "range2": "", "bins": "",
         "groupedBy": "columns", "labels": false, "summary": true, "confidence": "", "kthLargest": "", "kthSmallest": "",
-        "interval": "3", "damping": "0.3", "alpha": "0.05", "hypothesizedDifference": "0",
+        "interval": "3", "damping": "0.3", "alpha": "0.05", "hypothesizedDifference": "0", "variance1": "", "variance2": "",
         "outputTo": "newSheet", "output": "", "newSheet": "",
     });
     if tool == "regression" {

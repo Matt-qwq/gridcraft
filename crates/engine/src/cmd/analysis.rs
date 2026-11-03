@@ -47,6 +47,7 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("tTestPaired", "t-Test: Paired Two Sample for Means"),
     ("tTestEqual", "t-Test: Two-Sample Assuming Equal Variances"),
     ("tTestUnequal", "t-Test: Two-Sample Assuming Unequal Variances"),
+    ("zTest", "z-Test: Two Sample for Means"),
 ];
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -55,7 +56,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Data Analysis…",
         ["Data", "Analysis"],
         None,
-        "{tool: anovaSingle|correlation|covariance|descriptive|exponentialSmoothing|fTest|histogram|movingAverage|rankPercentile|regression|tTestPaired|tTestEqual|tTestUnequal (or the tool's label), output?: \"E1\" (top-left of the report; default a new sheet), newSheet?: name, outputTo?: range|newSheet (picks between the two), overwrite?: bool (else non-empty output cells are refused), labels?: bool (first row/column holds names), groupedBy?: columns|rows, …tool params} — range tools take `range`; descriptive: summary? (default true), confidence?: 95, kthLargest?, kthSmallest?; histogram: bins?: range (default evenly spaced), pareto?, cumulative?; regression: inputY, inputX, constantZero?, confidence?: 95, residuals?, standardizedResiduals?, normalProbability?; movingAverage: interval? (3), standardErrors?; exponentialSmoothing: damping? (0.3), standardErrors?; t-tests and fTest: range1, range2, alpha? (0.05), hypothesizedDifference? (0); anovaSingle: alpha?. Writes static values. No `tool` → {tools} (the menu opens the dialog).",
+        "{tool: anovaSingle|correlation|covariance|descriptive|exponentialSmoothing|fTest|histogram|movingAverage|rankPercentile|regression|tTestPaired|tTestEqual|tTestUnequal (or the tool's label), output?: \"E1\" (top-left of the report; default a new sheet), newSheet?: name, outputTo?: range|newSheet (picks between the two), overwrite?: bool (else non-empty output cells are refused), labels?: bool (first row/column holds names), groupedBy?: columns|rows, …tool params} — range tools take `range`; descriptive: summary? (default true), confidence?: 95, kthLargest?, kthSmallest?; histogram: bins?: range (default evenly spaced), pareto?, cumulative?; regression: inputY, inputX, constantZero?, confidence?: 95, residuals?, standardizedResiduals?, normalProbability?; movingAverage: interval? (3), standardErrors?; exponentialSmoothing: damping? (0.3), standardErrors?; t-tests and fTest: range1, range2, alpha? (0.05), hypothesizedDifference? (0); zTest: range1, range2, variance1, variance2 (the known variances), alpha? (0.05), hypothesizedDifference? (0); anovaSingle: alpha?. Writes static values. No `tool` → {tools} (the menu opens the dialog).",
         has_doc,
         run
     )]
@@ -999,6 +1000,60 @@ fn f_test(s: &Session, p: &Json) -> Result<Grid> {
     Ok(g)
 }
 
+/// The known variance a z-Test takes from its parameters (`variance1`/`variance2`, or the
+/// spelled-out `knownVariance1`/`knownVariance2`). A variance of exactly zero would divide by
+/// zero; Excel refuses it too.
+fn known_variance(p: &Json, which: usize) -> Result<f64> {
+    let key = if which == 1 { "variance1" } else { "variance2" };
+    let alt = if which == 1 { "knownVariance1" } else { "knownVariance2" };
+    let v = num(p, key).or_else(|| num(p, alt)).ok_or_else(|| bad(CMD, format!("z-Test needs `{key}`, the known variance of variable {which}")))?;
+    if v <= 0.0 || !v.is_finite() {
+        return Err(bad(CMD, format!("`{key}` must be a number past zero")));
+    }
+    Ok(v)
+}
+
+fn z_test(s: &Session, p: &Json) -> Result<Grid> {
+    let alpha = alpha(p)?;
+    let hmd = num(p, "hypothesizedDifference").or_else(|| num(p, "difference")).unwrap_or(0.0);
+    let v1 = known_variance(p, 1)?;
+    let v2 = known_variance(p, 2)?;
+    let (a, b, x, y) = two_samples(s, p, true)?;
+    let (n1, n2) = (x.len() as f64, y.len() as f64);
+    let (m1, m2) = (mean(&x), mean(&y));
+    let mut g = Grid::default();
+    let mut row = test_head(&mut g, "z-Test: Two Sample for Means", &a.name, &b.name);
+    pair_row(&mut g, row, "Mean", Value::number(m1), Value::number(m2));
+    pair_row(&mut g, row + 1, "Known Variance", Value::number(v1), Value::number(v2));
+    pair_row(&mut g, row + 2, "Observations", Value::number(n1), Value::number(n2));
+    row += 3;
+    pair_row(&mut g, row, "Hypothesized Mean Difference", Value::number(hmd), Value::Empty);
+    // z = (mean1 - mean2 - difference) / sqrt(var1/n1 + var2/n2), as Excel computes it.
+    let se = (v1 / n1 + v2 / n2).sqrt();
+    let z = (m1 - m2 - hmd) / se;
+    let za = z.abs();
+    // The one-tail p is 1 - Phi(|z|), so it never exceeds 0.5; the two-tail p is twice it.
+    let p1 = call("NORM.S.DIST", &[Value::Number(-za), Value::Bool(true)]);
+    let p2 = match p1 {
+        Value::Number(p) => Value::number(2.0 * p),
+        Value::Error(e) => Value::Error(e),
+        _ => div0(),
+    };
+    let lines: [(&str, Value); 5] = [
+        ("z", n_or_div0(z)),
+        ("P(Z<=z) one-tail", p1),
+        ("z Critical one-tail", callf("NORM.S.INV", &[1.0 - alpha])),
+        ("P(Z<=z) two-tail", p2),
+        ("z Critical two-tail", callf("NORM.S.INV", &[1.0 - alpha / 2.0])),
+    ];
+    for (label, v) in lines {
+        g.txt(row + 1, 0, label);
+        g.put(row + 1, 1, v);
+        row += 1;
+    }
+    Ok(g)
+}
+
 fn anova_single(s: &Session, p: &Json) -> Result<Grid> {
     let alpha = alpha(p)?;
     let (si, r) = input_range(s, p, &["range", "input"])?;
@@ -1160,6 +1215,7 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
         "exponentialSmoothing" => exponential_smoothing(s, p)?,
         "rankPercentile" => rank_percentile(s, p)?,
         "tTestPaired" | "tTestEqual" | "tTestUnequal" => t_test(s, p, tool)?,
+        "zTest" => z_test(s, p)?,
         "fTest" => f_test(s, p)?,
         "anovaSingle" => anova_single(s, p)?,
         _ => return Err(bad(CMD, format!("unknown tool `{t}`"))),
@@ -1409,5 +1465,101 @@ mod tests {
         s.execute("range.setValues", json!({"range": "H1", "values": [[4], [4], [4]]})).unwrap();
         s.execute("data.analysisToolPak", json!({"tool": "descriptive", "range": "H1:H3", "output": "J1"})).unwrap();
         assert_eq!(v(&s, "K9"), Value::Error(gridcraft_core::CellError::Div0));
+    }
+}
+
+#[cfg(test)]
+mod z_test_tests {
+    use gridcraft_core::Value;
+    use serde_json::{Value as Json, json};
+
+    use crate::Session;
+
+    fn session() -> Session {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[12, 10], [15, 14], [11, 9], [18, 15], [14, 13], [16, 12]]})).unwrap();
+        s
+    }
+    fn value(s: &Session, a: &str) -> Value {
+        let d = s.doc().unwrap();
+        let (sh, body) = crate::cmd::split_sheet(a);
+        let si = sh.map(|n| d.wb.sheet_index(&n).unwrap()).unwrap_or(d.wb.active_sheet);
+        d.wb.sheet(si).unwrap().value(gridcraft_core::CellRef::parse(body).unwrap())
+    }
+    fn num(s: &Session, a: &str) -> f64 {
+        value(s, a).as_f64().unwrap_or(f64::NAN)
+    }
+    fn eval(s: &mut Session, f: &str) -> f64 {
+        s.execute("cell.set", json!({"cell": "Z1000", "input": f})).unwrap();
+        let x = num(s, "Z1000");
+        s.execute("cell.set", json!({"cell": "Z1000", "input": ""})).unwrap();
+        x
+    }
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-9
+    }
+
+    #[test]
+    fn a_z_test_reports_the_same_numbers_as_the_worksheet_functions() {
+        let mut s = session();
+        let v1 = 6.266_666_666_666_667;
+        let v2 = 5.366_666_666_666_666;
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "zTest", "range1": "A1:A6", "range2": "B1:B6", "variance1": v1, "variance2": v2, "output": "D1"}),
+        )
+        .unwrap();
+        // The layout is the t-tests': title, the two variable names, then paired rows and the
+        // statistic rows under Variable 1.
+        assert_eq!(value(&s, "D1"), Value::text("z-Test: Two Sample for Means"));
+        assert_eq!((value(&s, "E3"), value(&s, "F3")), (Value::text("Variable 1"), Value::text("Variable 2")));
+        assert!((num(&s, "E4") - eval(&mut s, "=AVERAGE(A1:A6)")).abs() < 1e-12);
+        assert!((num(&s, "F4") - eval(&mut s, "=AVERAGE(B1:B6)")).abs() < 1e-12);
+        assert_eq!((num(&s, "E5"), num(&s, "F5")), (v1, v2));
+        assert_eq!((num(&s, "E6"), num(&s, "F6")), (6.0, 6.0));
+        assert_eq!(value(&s, "D7"), Value::text("Hypothesized Mean Difference"));
+        assert_eq!(num(&s, "E7"), 0.0);
+        // z = (mean1 - mean2 - difference) / sqrt(v1/n1 + v2/n2).
+        let z = eval(&mut s, "=(AVERAGE(A1:A6)-AVERAGE(B1:B6))/SQRT(E5/6+F5/6)");
+        assert!(close(num(&s, "E8"), z), "z {} vs {z}", num(&s, "E8"));
+        assert_eq!(value(&s, "D8"), Value::text("z"));
+        // The one-tail p is 1 - Phi(|z|); the two-tail p is twice it, and the critical values are
+        // the normal inverses at 1-alpha and 1-alpha/2.
+        let p1 = eval(&mut s, "=1-NORM.S.DIST(ABS(E8),TRUE)");
+        assert!(close(num(&s, "E9"), p1));
+        assert_eq!(value(&s, "D9"), Value::text("P(Z<=z) one-tail"));
+        assert!(close(num(&s, "E10"), eval(&mut s, "=NORM.S.INV(0.95)")));
+        assert!(close(num(&s, "E11"), 2.0 * p1));
+        assert!(close(num(&s, "E12"), eval(&mut s, "=NORM.S.INV(0.975)")));
+        // A non-zero hypothesized difference shifts z.
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "zTest", "range1": "A1:A6", "range2": "B1:B6", "variance1": v1, "variance2": v2, "hypothesizedDifference": 1, "output": "H1"}),
+        )
+        .unwrap();
+        assert!(close(num(&s, "I8"), (z * (v1 / 6.0 + v2 / 6.0).sqrt() - 1.0) / (v1 / 6.0 + v2 / 6.0).sqrt()));
+    }
+
+    #[test]
+    fn a_z_test_refuses_missing_or_unusable_variances() {
+        fn err(s: &mut Session, p: Json) -> String {
+            s.execute("data.analysisToolPak", p).unwrap_err().to_string()
+        }
+        let mut s = session();
+        assert!(err(&mut s, json!({"tool": "zTest", "range1": "A1:A6", "range2": "B1:B6", "variance2": 1, "output": "H1"})).contains("variance1"));
+        assert!(err(&mut s, json!({"tool": "zTest", "range1": "A1:A6", "range2": "B1:B6", "variance1": 1, "output": "H1"})).contains("variance2"));
+        assert!(
+            err(&mut s, json!({"tool": "zTest", "range1": "A1:A6", "range2": "B1:B6", "variance1": 0, "variance2": 1, "output": "H1"}))
+                .contains("past zero")
+        );
+        assert!(
+            err(&mut s, json!({"tool": "zTest", "range1": "A1:A6", "range2": "B1:B6", "variance1": -2, "variance2": 1, "output": "H1"}))
+                .contains("past zero")
+        );
+        assert!(err(&mut s, json!({"tool": "zTest", "range1": "A1:A6", "variance1": 1, "variance2": 1, "output": "H1"})).contains("range2"));
+        // The tool list names it (the dialog lists what the command reports).
+        let tools = s.execute("data.analysisToolPak", json!({})).unwrap();
+        assert!(tools["tools"].as_array().is_some_and(|a| a.iter().any(|t| t["id"] == "zTest")));
     }
 }

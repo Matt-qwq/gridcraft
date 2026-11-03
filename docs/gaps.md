@@ -675,8 +675,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   successful solve and its reports share one Undo step (#1050). AllDifferent constraints,
   the Solver Options dialog, the Sensitivity and Population reports and Load/Save Model remain.
   The Analysis ToolPak
-  (`data.analysisToolPak`) has 13 of 19 tools. Forecast Sheet (`data.forecastSheet`) and the
-  FORECAST.ETS family are in; the sheet has no Forecast Start (hindcast) option yet. **Estimate:** 12–20 h.
+  (`data.analysisToolPak`) has 14 of 19 tools: the **z-Test: Two Sample for Means** landed 11-02
+  (known variances `variance1`/`variance2`, hypothesized difference, the standard z / one-tail /
+  critical-value rows; the p-values come from `NORM.S.DIST`/`NORM.S.INV`, so the report agrees with
+  the worksheet formulas). Still missing: Fourier Analysis, Random Number Generation, Sampling and
+  the two two-factor ANOVAs. Forecast Sheet (`data.forecastSheet`) and the FORECAST.ETS family are
+  in; the sheet has no Forecast Start (hindcast) option yet. **Estimate:** 10–17 h.
 
 ### 14. Page Layout view and print polish (U, F)
 - Page Layout view landed (#329): paper view with rulers and in-place header/footer editing.
@@ -752,6 +756,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §13: Analysis ToolPak **z-Test: Two Sample for Means** landed (known variances, hypothesized difference, z / P(Z<=z) one-tail / z critical one-tail / two-tail rows through `NORM.S.DIST`/`NORM.S.INV`, in the t-tests' layout; dialog fields added). 14 of 19 tools; Fourier, Random Number Generation, Sampling and the two two-factor ANOVAs remain |
 | 2026-11-02 | minor | §5: word-wrapped cells and chart labels are shaped — each paragraph measured once, broken at spaces/hyphens/CJK boundaries and shaped line by line (bidi per line, Arabic joining, marks), with right-aligned RTL General text and per-line alignment; printable ASCII keeps the unshaped wrap bit for bit. Chart layout measures labels with the shaped width. Text boxes and the PDF's `text_width` remain |
 | 2026-11-02 | minor | §18: `Shift+F10` on a selected chart, picture, shape or slicer opens the object's own context menu at its frame (the right-click menu), while a cell selection keeps the cell menu; model helper + dispatch test. The accessibility/keyboard tail on the sheet is closed |
 | 2026-11-02 | minor | §18: the status bar has an Accessibility entry with the issue count from `review.checkAccessibility` (cached per document revision), opening the same Check Accessibility dialog as the Review tab; what remains of the section is keyboard access to the sheet's object context menus |
