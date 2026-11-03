@@ -187,6 +187,12 @@ pub fn function_list() -> Vec<Json> {
         ("COLUMNS", "Lookup", "COLUMNS(array)", "Number of columns in a reference or array."),
         ("OFFSET", "Lookup", "OFFSET(reference, rows, cols, [height], [width])", "A reference shifted from a starting point."),
         ("INDIRECT", "Lookup", "INDIRECT(ref_text, [a1])", "The reference named by a text string."),
+        (
+            "GETPIVOTDATA",
+            "Lookup",
+            "GETPIVOTDATA(data_field, pivot_table, [field1, item1], ...)",
+            "A value from a PivotTable report, named by its field items.",
+        ),
         ("INDEX", "Lookup", "INDEX(array, row_num, [column_num], [area_num])", "The value or reference at a position."),
         ("SUBTOTAL", "MathTrig", "SUBTOTAL(function_num, ref1, ...)", "A subtotal that can skip hidden rows."),
         ("AGGREGATE", "MathTrig", "AGGREGATE(function_num, options, ref1, ...)", "An aggregate that can skip hidden rows and errors."),

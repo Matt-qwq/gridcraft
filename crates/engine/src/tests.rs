@@ -5971,6 +5971,176 @@ fn pivot_slicer_selection_filters_the_report_and_survives_undo_save_and_reopen()
     assert!(e.to_string().contains("Nowhere"), "{e}");
 }
 
+/// Data on Sheet1; a PivotTable on "Report" at A3 with rows Region, columns Month, and both
+/// measures in Values.
+fn pivot_months_session() -> Session {
+    let mut s = s();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["Region", "Month", "Sales", "Cost"],
+            ["East", "Jan", 100.0, 40.0],
+            ["East", "Feb", 150.0, 50.0],
+            ["West", "Jan", 200.0, 70.0],
+            ["West", "Feb", 250.0, 80.0],
+        ]}),
+    )
+    .unwrap();
+    s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
+    s.execute(
+        "insert.pivotTable",
+        json!({"source": "Sheet1!A1:D5", "destination": "Report!A3", "name": "P1",
+               "rows": ["Region"], "columns": ["Month"], "values": ["Sales", "Cost"]}),
+    )
+    .unwrap();
+    s
+}
+
+/// Enters `formula` on Sheet1 and returns what it evaluated to.
+fn gpd(s: &mut Session, formula: &str) -> Value {
+    s.execute("cell.set", json!({"sheet": "Sheet1", "cell": "A20", "input": formula})).unwrap();
+    let d = s.doc().unwrap();
+    d.wb.sheet(d.wb.sheet_index("Sheet1").unwrap()).unwrap().value(CellRef::parse("A20").unwrap())
+}
+
+#[test]
+fn getpivotdata_reads_the_cell_the_field_items_name() {
+    let mut s = pivot_months_session();
+    let ref_to = "Report!$A$3";
+    // A pair per axis: the value caption, or the source column when only one field comes from it.
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {ref_to}, "Region", "East", "Month", "Jan")"#)), Value::Number(100.0));
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sales", {ref_to}, "Region", "West", "Month", "Feb")"#)), Value::Number(250.0));
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Cost", {ref_to}, "Region", "East", "Month", "Feb")"#)), Value::Number(50.0));
+    // Item and field names are case-insensitive, as the report merges them.
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("sum of sales", {ref_to}, "region", "east", "month", "jan")"#)), Value::Number(100.0));
+    // No pairs is the grand total; "Grand Total" names a total on either axis.
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {ref_to})"#)), Value::Number(700.0));
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {ref_to}, "Region", "East", "Month", "Grand Total")"#)), Value::Number(250.0));
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {ref_to}, "Region", "Grand Total", "Month", "Jan")"#)), Value::Number(300.0));
+    // Any cell of the report names it, not only its corner.
+    let inside = gpd(&mut s, r#"=GETPIVOTDATA("Sum of Cost", Report!$D$6)"#);
+    assert_eq!(inside, Value::Number(240.0), "the grand total of Cost");
+}
+
+#[test]
+fn getpivotdata_refuses_a_lookup_that_names_no_single_cell() {
+    use gridcraft_core::CellError;
+    let mut s = pivot_months_session();
+    let r = "Report!$A$3";
+    let err = |s: &mut Session, f: String| gpd(s, &f);
+    // Unknown item, unknown field, unknown data field.
+    assert_eq!(err(&mut s, format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Region", "Nowhere", "Month", "Jan")"#)), Value::Error(CellError::Ref));
+    assert_eq!(err(&mut s, format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Nope", "East")"#)), Value::Error(CellError::Ref));
+    assert_eq!(err(&mut s, format!(r#"=GETPIVOTDATA("Sum of Profit", {r}, "Region", "East")"#)), Value::Error(CellError::Ref));
+    // Only one pair on a two-axis report leaves several cells.
+    assert_eq!(err(&mut s, format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Region", "East")"#)), Value::Error(CellError::Ref));
+    // A reference outside every report, text where a reference is required, an odd pair.
+    assert_eq!(err(&mut s, r#"=GETPIVOTDATA("Sum of Sales", Sheet1!$A$1)"#.into()), Value::Error(CellError::Ref));
+    assert_eq!(err(&mut s, format!(r#"=GETPIVOTDATA("Sum of Sales", "{r}")"#)), Value::Error(CellError::Ref));
+    assert_eq!(err(&mut s, format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Region")"#)), Value::Error(CellError::Value));
+}
+
+#[test]
+fn getpivotdata_follows_a_refresh_every_layout_and_a_reopen() {
+    let mut s = pivot_months_session();
+    let r = "Report!$A$3";
+    let sales = |s: &mut Session| gpd(s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Region", "West", "Month", "Feb")"#));
+    let cost = |s: &mut Session| gpd(s, &format!(r#"=GETPIVOTDATA("Sum of Cost", {r}, "Region", "West", "Month", "Feb")"#));
+    assert_eq!(sales(&mut s), Value::Number(250.0));
+    // Editing the source and refreshing recalculates the formula from the rewritten report.
+    s.execute("cell.set", json!({"sheet": "Sheet1", "cell": "C5", "input": "500"})).unwrap();
+    s.execute("pivot.refresh", json!({"pivot": "P1"})).unwrap();
+    assert_eq!(sales(&mut s), Value::Number(500.0));
+    // The lookup reads the labels, so a layout change does not move it.
+    for layout in ["outline", "tabular", "compact"] {
+        s.execute("pivot.layout", json!({"pivot": "P1", "layout": layout})).unwrap();
+        assert_eq!(sales(&mut s), Value::Number(500.0), "{layout}");
+    }
+    // Σ Values in Rows shifts the row levels; the value field is named on the line.
+    s.execute("pivot.moveField", json!({"pivot": "P1", "field": "Σ Values", "from": "columns", "to": "rows", "position": 0})).unwrap();
+    assert_eq!(sales(&mut s), Value::Number(500.0), "values on rows");
+    assert_eq!(cost(&mut s), Value::Number(80.0), "values on rows");
+    s.execute("pivot.moveField", json!({"pivot": "P1", "field": "Σ Values", "from": "rows", "to": "columns"})).unwrap();
+    assert_eq!(sales(&mut s), Value::Number(500.0));
+    // A saved file keeps the report cells and the range that holds them.
+    reopen(&mut s);
+    assert_eq!(sales(&mut s), Value::Number(500.0), "after reopening");
+}
+
+#[test]
+fn getpivotdata_matches_a_number_item_and_a_page_filter_by_what_the_report_shows() {
+    use gridcraft_core::CellError;
+    let mut s = s();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["Year", "Region", "Sales"],
+            [2024, "East", 10.0],
+            [2025, "East", 20.0],
+            [2024, "West", 30.0],
+        ]}),
+    )
+    .unwrap();
+    s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
+    s.execute(
+        "insert.pivotTable",
+        json!({"source": "Sheet1!A1:C4", "destination": "Report!A3", "name": "P1",
+               "rows": ["Year"], "filters": ["Region"], "values": ["Sales"]}),
+    )
+    .unwrap();
+    let r = "Report!$A$3";
+    // A numeric item matches by value (items are labels only when grouped).
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Year", "2024")"#)), Value::Number(40.0));
+    // The page filter shows (All) until an item is chosen.
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Year", "2025", "Region", "(All)")"#)), Value::Number(20.0));
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Year", "2024", "Region", "East")"#)), Value::Error(CellError::Ref));
+    // Selecting one item filters the body: that item names it, (All) no longer does.
+    s.execute("pivot.filter", json!({"pivot": "P1", "field": "Region", "selected": ["East"]})).unwrap();
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Year", "2024", "Region", "East")"#)), Value::Number(10.0));
+    assert_eq!(gpd(&mut s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Year", "2024", "Region", "(All)")"#)), Value::Error(CellError::Ref));
+}
+
+#[test]
+fn getpivotdata_walks_nested_row_items_in_every_layout() {
+    use gridcraft_core::CellError;
+    let mut s = s();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["Region", "Month", "Sales"],
+            ["East", "Jan", 100.0],
+            ["East", "Feb", 150.0],
+            ["West", "Jan", 200.0],
+            ["West", "Feb", 250.0],
+        ]}),
+    )
+    .unwrap();
+    s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
+    s.execute(
+        "insert.pivotTable",
+        json!({"source": "Sheet1!A1:C5", "destination": "Report!A3", "name": "P1",
+               "rows": ["Region", "Month"], "values": ["Sales"]}),
+    )
+    .unwrap();
+    let r = "Report!$A$3";
+    let leaf = |s: &mut Session, region: &str| gpd(s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Region", "{region}", "Month", "Jan")"#));
+    let parent = |s: &mut Session| gpd(s, &format!(r#"=GETPIVOTDATA("Sum of Sales", {r}, "Region", "West")"#));
+    // Compact writes one label column with the depth in the indent; outline and tabular give each
+    // level its own column. The lookup has to read the same path either way.
+    for layout in ["compact", "outline", "tabular"] {
+        s.execute("pivot.layout", json!({"pivot": "P1", "layout": layout})).unwrap();
+        assert_eq!(leaf(&mut s, "East"), Value::Number(100.0), "{layout}");
+        assert_eq!(leaf(&mut s, "West"), Value::Number(200.0), "{layout}");
+        // The parent's own row holds its subtotal (subtotals on top).
+        assert_eq!(parent(&mut s), Value::Number(450.0), "{layout}");
+        // Turned off, the parent row holds no figure and its items do not name one cell.
+        s.execute("pivot.layout", json!({"pivot": "P1", "subtotals": "none"})).unwrap();
+        assert_eq!(leaf(&mut s, "West"), Value::Number(200.0), "{layout}, no subtotals");
+        assert_eq!(parent(&mut s), Value::Error(CellError::Ref), "{layout}, no subtotals");
+        s.execute("pivot.layout", json!({"pivot": "P1", "subtotals": "top"})).unwrap();
+    }
+}
+
 #[test]
 fn every_label_of_a_pivot_slicer_comes_from_the_selected_tiles() {
     // Nothing selected is a filter that hides every row (Excel's "clear all buttons"), not "no

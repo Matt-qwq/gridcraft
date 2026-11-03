@@ -1,6 +1,6 @@
 # Function parity: worksheet functions and formulas
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (coverage re-measured: 514 functions, 513 of Microsoft's 523 by name, 504 working; PERCENTOF and TRIMRANGE are present, the stale per-category counts replaced) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (GETPIVOTDATA added: 515 functions, 514 of Microsoft's 523 by name, 505 working) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 Excel's worksheet functions, category by category, against GridCraft's function library. Part of
 [target-app-parity.md](target-app-parity.md); gaps feed [gaps.md](gaps.md).
@@ -12,10 +12,11 @@ Excel's worksheet functions, category by category, against GridCraft's function 
   them), plus 14 text functions the page lists under combined entries (FIND/FINDB, LEFT/LEFTB,
   LEN/LENB, MID/MIDB, REPLACE/REPLACEB, RIGHT/RIGHTB, SEARCH/SEARCHB), BETA.INV, and COPILOT and
   PY (Microsoft 365 functions not on that page when fetched).
-- **Ours (514):** every function spec in the library (`gridcraft_functions::all()`, counted with
+- **Ours (515):** every function spec in the library (`gridcraft_functions::all()`, counted with
   `gridcraft-cli functions --json`), which includes the evaluator's special forms in
-  `crates/calc/src/eval.rs` (`SPECIAL_FUNCTIONS`: IF, IFS, CHOOSE, OFFSET, INDIRECT, INDEX,
-  SUBTOTAL, AGGREGATE, TEXT, LET, LAMBDA, MAP, REDUCE, SCAN, BYROW, BYCOL, MAKEARRAY, TRIMRANGE…),
+  `crates/calc/src/eval.rs` (`SPECIAL_FUNCTIONS`: IF, IFS, CHOOSE, OFFSET, INDIRECT,
+  GETPIVOTDATA, INDEX, SUBTOTAL, AGGREGATE, TEXT, LET, LAMBDA, MAP, REDUCE, SCAN, BYROW, BYCOL,
+  MAKEARRAY, TRIMRANGE…),
   since each is also registered as a spec (the evaluator intercepts it before the library runs).
   Excluding the test-only `ADD2`. Besides USDOLLAR (below), every one is an Excel name.
 - **Not on Microsoft's list:** USDOLLAR, a legacy function Excel still evaluates (like DOLLAR),
@@ -27,7 +28,7 @@ Excel's worksheet functions, category by category, against GridCraft's function 
 
 ## Coverage
 
-**Measured: 513 / 523 by name (98.1%); 504 / 523 working (96.4%).**
+**Measured: 514 / 523 by name (98.3%); 505 / 523 working (96.6%).**
 
 | Category | Excel | Ours | Working | % working | Missing |
 |---|---|---|---|---|---|
@@ -36,7 +37,7 @@ Excel's worksheet functions, category by category, against GridCraft's function 
 | Financial | 55 | 55 | 55 | 100% | — |
 | Engineering | 54 | 54 | 54 | 100% | — |
 | Text | 50 | 48 | 48 | 96% | DETECTLANGUAGE, TRANSLATE |
-| Lookup and reference | 40 | 36 | 36 | 90% | GETPIVOTDATA, IMAGE, RTD |
+| Lookup and reference | 40 | 37 | 37 | 93% | IMAGE, RTD |
 | Compatibility | 40 | 42 | 42 | — | — (USDOLLAR is ours only; the rest is category assignment) |
 | Date and time | 25 | 25 | 25 | 100% | — |
 | Information | 22 | 22 | 22 | 100% | — |
@@ -46,7 +47,7 @@ Excel's worksheet functions, category by category, against GridCraft's function 
 | Web | 3 | 3 | 1 | 33% | (WEBSERVICE, FILTERXML are stubs; ENCODEURL works) |
 | Add-in and Automation | 3 | 1 | 1 | 33% | CALL, REGISTER.ID |
 | AI and Python | 2 | 0 | 0 | 0% | COPILOT, PY |
-| **Total** | **523** | **514** | **504** | **96.4%** | 10 missing by name, 9 stubs |
+| **Total** | **523** | **515** | **505** | **96.6%** | 9 missing by name, 9 stubs |
 
 The category counts are ours as the library registers them (`gridcraft-cli functions --json`);
 Microsoft's are the page's. Where a name sits in a different category on either side (a legacy
@@ -70,7 +71,6 @@ This improves series preparation; it does not change the model-fitting or season
 |---|---|---|---|
 | FORECAST.ETS family (4) | yes | 4–6 h | AAA exponential smoothing with seasonality detection; needed for Forecast Sheet too |
 | ODDFPRICE, ODDFYIELD, ODDLPRICE, ODDLYIELD | yes | 2–4 h | Odd first/last period bond maths |
-| GETPIVOTDATA | yes | 2–3 h | Needs the pivot engine's result cache; also the "Generate GetPivotData" option |
 | IMAGE | yes | 3–5 h | Pictures in cells (see PR #105); fetching URLs needs a privacy decision |
 | CUBE* (7), WEBSERVICE, FILTERXML | partly | 4–8 h | FILTERXML can work offline; CUBE needs an OLAP/data-model source |
 | TRANSLATE, DETECTLANGUAGE, STOCKHISTORY, COPILOT, PY | no (cloud) | — | Microsoft cloud services; open equivalents only by owner decision |
@@ -128,7 +128,7 @@ inputs, so large finite middle values do not become `#NUM!` merely because their
 Sorting, argument coercion and error propagation are unchanged; this is a numerical correction
 under the documented median rule, not an extreme-value comparison against desktop Excel.
 
-Work to close (16–26 h in total): the in-scope missing functions (10–16 h with the table above),
+Work to close (16–26 h in total): the in-scope missing functions (7–14 h with the table above),
 an oracle corpus of Excel-computed results per function (owner runs Excel on generated
 workbooks; results checked in as data, not Excel files) and fixing what it finds (6–10 h).
 
@@ -136,6 +136,7 @@ workbooks; results checked in as data, not Excel files) and fixing what it finds
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | GETPIVOTDATA works: the evaluator reads the report's own labels (a cell depends on its PivotTable's written area, so a refresh recalculates it) and it is in the Insert Function list. 515 functions, 514 of Microsoft's 523 by name, 505 working; the "Generate GetPivotData" click option is still missing |
 | 2026-11-02 | minor | Coverage re-measured from the library (514 functions, 513 of Microsoft's 523 by name, 504 working): PERCENTOF and TRIMRANGE are present, so the stale per-category "Ours"/"Missing" columns are corrected and the ten genuinely missing names listed |
 | 2026-10-30 | minor | Documentation-derived formula oracle suite: 595 worked examples for 275 functions through the evaluator, with #57/#133/#139/#140/#134 regressions (not an Excel-computed corpus) |
 | 2026-10-21 | minor | SUBTOTAL and AGGREGATE charge every argument against the evaluator's 16-million-cell limit before scanning; a value in XFD1048576 no longer makes `SUBTOTAL(9,A:XFD)` read the whole sheet (#2175) |

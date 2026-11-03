@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -466,9 +466,21 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   documents written before it existed, `Page` for the Filters area, `Axis` for hidden items), the
   reader sets it (`pageFields` vs `item/@h`), the writer and the refresh honour it, and moving a
   filtered field onto an axis turns a page filter into an axis filter.
-- **Missing:** calculated items, value/label filters, number grouping, GETPIVOTDATA and data-model
-  pivots; the PivotTable gate's Excel verification. (`insert.pivotChart` landed 10-11 and is in
-  the catalog, so PivotCharts are no longer part of this gap.)
+- **Landed 11-02 (GETPIVOTDATA):** `GETPIVOTDATA(data_field, pivot_table, field, item…)` reads the
+  cell the pairs name out of the report's own labels — so it works on a file opened without a
+  refresh, where no PivotTable cache exists to recompute from. Text matches case-insensitively, a
+  number by value or by its formatted text, `"Grand Total"` names either total axis, and no pairs
+  returns the grand total. The formula depends on the report's whole written area, so a refresh
+  recalculates it; the function is in the Insert Function list. Each layout is covered (compact
+  indentation, outline/tabular columns, Σ Values in Rows, subtotals on top or off) and the lookup
+  survives save/reopen; the file-format side is unchanged (it reads cells the report already
+  wrote). Differences kept: a report whose grand totals are turned off has no total cell to return
+  (`#REF!`; Excel reads its cache), and a subtotal drawn on its own line below the group is named
+  by the parent item only in the layouts that put the subtotal on the item's row.
+- **Missing:** calculated items, value/label filters, number grouping and data-model pivots; the
+  PivotTable gate's Excel verification. (`insert.pivotChart` landed 10-11 and is in the catalog, so
+  PivotCharts are no longer part of this gap.) The "Generate GetPivotData" click option (Excel
+  writes a `GETPIVOTDATA` formula when a pivot cell is clicked) is not wired into the grid yet.
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
@@ -572,11 +584,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Margins are dragged on the rulers (#792). Remaining: pictures in headers/footers, Different First Page / Odd & Even pages. Desktop now submits directly through craft-print with printer choice, copies, duplex and grayscale; browser printing stays available. Print ranges and driver tray/options UI remain. **Estimate:** 5–10 h.
 
 ### 15. Remaining functions and an oracle suite (F)
-- **10 missing by name** (513 of Microsoft's 523 present, 504 working): DETECTLANGUAGE, TRANSLATE,
-  GETPIVOTDATA, IMAGE, RTD, STOCKHISTORY, CALL, REGISTER.ID, COPILOT and PY; nine stubs (7 CUBE,
-  WEBSERVICE, FILTERXML). Measured 11-02 with `gridcraft-cli functions --json` (514 specs, one of
-  them USDOLLAR, which is not on Microsoft's list). No Excel-computed oracle corpus; #137, #138.
-  **Estimate:** 16–26 h. [function-parity.md](function-parity.md)
+- **9 missing by name** (514 of Microsoft's 523 present, 505 working): DETECTLANGUAGE, TRANSLATE,
+  IMAGE, RTD, STOCKHISTORY, CALL, REGISTER.ID, COPILOT and PY; nine stubs (7 CUBE, WEBSERVICE,
+  FILTERXML). Measured 11-02 with `gridcraft-cli functions --json` (515 specs, one of them
+  USDOLLAR, which is not on Microsoft's list). No Excel-computed oracle corpus; #137, #138.
+  **Estimate:** 13–22 h. [function-parity.md](function-parity.md)
 
 ### 16. Collaboration and review (F)
 - No co-authoring, Show Changes, comment navigation, notes ↔ comments
@@ -641,6 +653,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §8: GETPIVOTDATA reads a report cell by its field items (every layout, Σ Values in Rows, subtotals, page filters, numbers and grand totals), depends on the report's written area so a refresh recalculates it, and is in the Insert Function list; calculated items, value/label filters and number grouping are what remain |
 | 2026-11-02 | minor | 100 seeds × 200 steps (20,000 commands) command-sequence soak green in 68.3 s, 0 invariant failures; the hardware reports still need their machines. A WPS-authored `.xls` writes proprietary `0x087C`/`0x087D` records, not Excel `CF12`, so CF12 still needs gate #1 |
 | 2026-11-02 | minor | `chart.setSeriesAxis` moves a series to the secondary axis (and optionally changes its kind); the Format pane has the checkbox; combo series are read back in `c:order`, not group order |
 | 2026-10-30 | minor | §8: a table slicer follows a table and column rename, `insert.slicer` applies `caption`, and a report-side `pivot.filter` mirrors onto a connected slicer; corrected the stale "widget UI / timeline range / PivotCharts missing" list (`insert.pivotChart` landed 10-11) and dropped the stale "table slicer is not written" line |

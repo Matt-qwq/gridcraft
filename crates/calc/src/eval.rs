@@ -805,6 +805,7 @@ impl<'h> Evaluator<'h> {
             }
             "OFFSET" => self.offset(args),
             "INDIRECT" => self.indirect(args),
+            "GETPIVOTDATA" => self.getpivotdata(args),
             "INDEX" => self.index(args),
             "XLOOKUP" => self.xlookup(args),
             "CELL" => self.cell_info(args),
@@ -1304,6 +1305,42 @@ impl<'h> Evaluator<'h> {
             },
             _ => err(CellError::Ref),
         }
+    }
+
+    /// `GETPIVOTDATA(data_field, pivot_table, field1, item1, …)`: the report cell the pairs name.
+    /// The pivot table argument must be a reference into a written report; the lookup itself lives
+    /// in [`crate::pivot`].
+    fn getpivotdata(&mut self, args: &[Expr]) -> Ev {
+        if args.len() < 2 || !(args.len() - 2).is_multiple_of(2) {
+            return err(CellError::Value);
+        }
+        let data = match self.arg_val(args, 0).map(|v| v.scalar().to_text()) {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => return err(e),
+            None => return err(CellError::Value),
+        };
+        let area = match self.eval(&args[1]) {
+            Ev::R(a) => a.first().copied(),
+            Ev::V(Value::Error(e)) => return err(e),
+            _ => None,
+        };
+        let Some(area) = area else { return err(CellError::Ref) };
+        let mut pairs = Vec::with_capacity((args.len() - 2) / 2);
+        let mut i = 2;
+        while i + 1 < args.len() {
+            let mut pair = [String::new(), String::new()];
+            for (k, slot) in pair.iter_mut().enumerate() {
+                *slot = match self.arg_val(args, i + k).map(|v| v.scalar().to_text()) {
+                    Some(Ok(t)) => t,
+                    Some(Err(e)) => return err(e),
+                    None => return err(CellError::Value),
+                };
+            }
+            let [field, item] = pair;
+            pairs.push((field, item));
+            i += 2;
+        }
+        Ev::V(crate::pivot::get(self.host.workbook(), area.sheet, area.range.start, &data, &pairs))
     }
 
     fn index(&mut self, args: &[Expr]) -> Ev {
@@ -1995,6 +2032,30 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool, bo
             (_, Some(Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) | Expr::Array(_) | Expr::Missing)) => {}
             _ => dynamic = true,
         },
+        Expr::Call(n, args) if n.eq_ignore_ascii_case("GETPIVOTDATA") => {
+            // The answer is one cell of the report, but the report's shape changes when it is
+            // refreshed: the whole written area is the dependency (and the lookup is dynamic
+            // because a refresh may move the report).
+            dynamic = true;
+            if let Some(Expr::Ref(r)) = args.get(1) {
+                let at = r.range().start;
+                let mut sheets: Vec<usize> = Vec::new();
+                match &r.sheet {
+                    SheetSel::Current => sheets.push(sheet),
+                    SheetSel::Named(n) => sheets.extend(wb.sheet_index(n)),
+                    SheetSel::Span(a, b) => {
+                        if let (Some(i), Some(j)) = (wb.sheet_index(a), wb.sheet_index(b)) {
+                            sheets.extend(i.min(j)..=i.max(j));
+                        }
+                    }
+                }
+                for s in sheets {
+                    if let Some(area) = crate::pivot::pivot_at(wb, s, at).and_then(|p| p.last_range) {
+                        out.push(Area { sheet: s, range: area });
+                    }
+                }
+            }
+        }
         Expr::Call(n, _)
             if matches!(n.as_str(), "INDIRECT" | "OFFSET" | "NOW" | "TODAY" | "RAND" | "RANDBETWEEN" | "RANDARRAY" | "CELL" | "INFO") =>
         {
@@ -2041,6 +2102,7 @@ fn is_special(n: &str) -> bool {
             | "SHEETS"
             | "OFFSET"
             | "INDIRECT"
+            | "GETPIVOTDATA"
             | "INDEX"
             | "CELL"
             | "TRIMRANGE"
@@ -2079,6 +2141,7 @@ pub const SPECIAL_FUNCTIONS: &[&str] = &[
     "SHEETS",
     "OFFSET",
     "INDIRECT",
+    "GETPIVOTDATA",
     "INDEX",
     "CELL",
     "TRIMRANGE",
