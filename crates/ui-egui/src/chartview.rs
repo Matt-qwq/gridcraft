@@ -18,18 +18,32 @@ fn rgba(c: [u8; 4]) -> Color32 {
 struct EguiMeasure<'a> {
     painter: &'a Painter,
     z: f32,
+    /// The app's text engine, so a label's measured width is the width it is drawn at (the shaped
+    /// engine reorders and joins where epaint's own layout would not).
+    text: Option<&'a crate::text::GridText>,
 }
 
 impl gridcraft_chart::Measure for EguiMeasure<'_> {
     fn text_width(&self, text: &str, size: f32, bold: bool) -> f32 {
         let font = if bold { theme::ui_bold(size * self.z) } else { theme::ui_font(size * self.z) };
-        self.painter.layout_no_wrap(text.to_string(), font, Color32::BLACK).size().x / self.z.max(0.01)
+        let w = match self.text {
+            Some(engine) => engine.measure(self.painter.ctx(), &font, text, crate::text::base_direction(text, false)),
+            None => self.painter.layout_no_wrap(text.to_string(), font, Color32::BLACK).size().x,
+        };
+        w / self.z.max(0.01)
     }
 }
 
 /// Paints `chart` (not necessarily on the sheet: the Recommended Charts preview) scaled to fit
 /// `rect`.
-pub fn paint_chart(p: &Painter, rect: Rect, wb: &Workbook, sheet: usize, chart: &gridcraft_engine::model::Chart) {
+pub fn paint_chart(
+    p: &Painter,
+    rect: Rect,
+    wb: &Workbook,
+    sheet: usize,
+    chart: &gridcraft_engine::model::Chart,
+    text: Option<&crate::text::GridText>,
+) {
     let (w, h) = (chart.anchor.width.max(1.0), chart.anchor.height.max(1.0));
     let z = (rect.width() / w).min(rect.height() / h);
     if !(z.is_finite() && z > 0.0) {
@@ -37,9 +51,9 @@ pub fn paint_chart(p: &Painter, rect: Rect, wb: &Workbook, sheet: usize, chart: 
     }
     let origin = rect.center() - vec2(w * z, h * z) / 2.0;
     let data = gridcraft_chart::resolve(wb, sheet, chart);
-    let m = EguiMeasure { painter: p, z };
+    let m = EguiMeasure { painter: p, z, text };
     let prims = gridcraft_chart::render(chart, &data, w, h, &m);
-    paint_prims(&p.with_clip_rect(rect.intersect(p.clip_rect())), origin, &prims, z);
+    paint_prims(&p.with_clip_rect(rect.intersect(p.clip_rect())), origin, &prims, z, text);
 }
 
 /// What a click at `at` (screen coordinates) inside a chart's on-screen `rect` lands on, in the
@@ -52,6 +66,7 @@ pub fn element_at(
     chart: &gridcraft_engine::model::Chart,
     rect: Rect,
     at: Pos2,
+    text: Option<&crate::text::GridText>,
 ) -> Option<gridcraft_chart::Hit> {
     if !rect.contains(at) {
         return None;
@@ -62,13 +77,13 @@ pub fn element_at(
         return None;
     }
     let data = gridcraft_chart::resolve(wb, sheet, chart);
-    let m = EguiMeasure { painter: p, z };
+    let m = EguiMeasure { painter: p, z, text };
     let hits = gridcraft_chart::render_hits(chart, &data, w, h, &m);
     gridcraft_chart::hit_at(&hits, (at.x - rect.left()) / z, (at.y - rect.top()) / z)
 }
 
 /// Paints chart primitives at `origin`, scaled by `z`.
-pub fn paint_prims(p: &Painter, origin: Pos2, prims: &[Prim], z: f32) {
+pub fn paint_prims(p: &Painter, origin: Pos2, prims: &[Prim], z: f32, text: Option<&crate::text::GridText>) {
     let pt = |x: f32, y: f32| pos2(origin.x + x * z, origin.y + y * z);
     for prim in prims {
         match prim {
@@ -144,9 +159,14 @@ pub fn paint_prims(p: &Painter, origin: Pos2, prims: &[Prim], z: f32) {
                     p.circle_stroke(pt(*cx, *cy), r * z, Stroke::new(w * z.max(0.5), rgba(*c)));
                 }
             }
-            Prim::Text { x, y, text, size, color, bold, align, valign, rotation } => {
+            Prim::Text { x, y, text: label, size, color, bold, align, valign, rotation } => {
                 let font: FontId = if *bold { theme::ui_bold(size * z) } else { theme::ui_font(size * z) };
-                let galley = p.layout_no_wrap(text.clone(), font, rgba(*color));
+                // A label the bidi/joining/mark engines can change is shaped like cell text; the
+                // same galley is what the layout measured above.
+                let galley = match text {
+                    Some(engine) => engine.line(p.ctx(), &font, label, crate::text::base_direction(label, false), rgba(*color)).galley,
+                    None => p.layout_no_wrap(label.clone(), font, rgba(*color)),
+                };
                 let sz = galley.size();
                 let ax = match align {
                     HAlign::Left => 0.0,
@@ -574,9 +594,9 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
         p.rect_filled(r.translate(vec2(0.0, 1.5)), 2.0, Color32::from_black_alpha(18));
         p.rect_filled(r, 0.0, Color32::WHITE);
         let data = gridcraft_chart::resolve(wb, si, ch);
-        let m = EguiMeasure { painter: p, z: geo.z };
+        let m = EguiMeasure { painter: p, z: geo.z, text: Some(&app.text) };
         let prims = gridcraft_chart::render(ch, &data, ch.anchor.width, ch.anchor.height, &m);
-        paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &prims, geo.z);
+        paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &prims, geo.z, Some(&app.text));
         if app.selected_chart == Some(ch.id) {
             selection_frame(p, r);
         }
@@ -871,5 +891,36 @@ mod tests {
         // A frame left of the first column anchors at A1 with a zero offset.
         let (cell, dx, dy, w, _) = anchor_of(&sh, Frame { x: 0.0, y: 0.0, ..f });
         assert_eq!((cell, dx, dy, w), (CellRef::new(0, 0), 0.0, 0.0, 320.0));
+    }
+
+    use super::EguiMeasure;
+    use gridcraft_chart::Measure;
+
+    /// A chart label is measured by the shaped engine when one is handed in, so the layout that
+    /// places it and the galley that draws it agree; without an engine the old epaint measure is
+    /// kept (the Recommended Charts preview's and the tests' path).
+    #[test]
+    fn a_label_is_measured_with_the_shaped_engine() {
+        let Some(file) = gridcraft_engine::core::fonts::resolve_for_char('م').ok() else {
+            eprintln!("skipped: no installed Arabic face (set CRAFT_FONTS_DIR to test it)");
+            return;
+        };
+        let Some(index) = (0..8).find(|i| {
+            use skrifa::MetadataProvider;
+            skrifa::FontRef::from_index(&file.data, *i).is_ok_and(|f| f.charmap().map('م').is_some())
+        }) else {
+            return;
+        };
+        // The label's font is the UI family (`theme::ui_font`), so bind the face to that name.
+        let ctx = crate::text::test_context(crate::theme::UI, &file.data, index);
+        let engine = crate::text::GridText::new();
+        let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), egui::Rect::EVERYTHING);
+        let label = "مرحبا";
+        let font = crate::theme::ui_font(32.0);
+        let shaped = engine.measure(&ctx, &font, label, crate::text::base_direction(label, false));
+        let with = EguiMeasure { painter: &painter, z: 1.0, text: Some(&engine) };
+        assert!((with.text_width(label, 32.0, false) - shaped).abs() < 0.01, "the label is measured shaped");
+        let without = EguiMeasure { painter: &painter, z: 1.0, text: None };
+        assert!(without.text_width(label, 32.0, false) > 0.0, "the unshaped fallback still measures");
     }
 }

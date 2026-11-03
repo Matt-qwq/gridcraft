@@ -27,10 +27,10 @@
 //! with — otherwise the measure and the drawing would disagree.
 //!
 //! # What is not shaped here
-//! Word-wrapped cells (the grid keeps its `LayoutJob` wrap), text boxes, chart labels and PDF
-//! export still go through their own layout. This module covers the one-line cell text the grid
-//! paints — including rotated cells, which paint the shaped galley turned — and the in-cell
-//! editor's shaped line.
+//! Text boxes and the PDF writer's `text_width` still go through their own layout (the PDF
+//! *drawing* shapes through the same core engine in its own writer). This module covers the
+//! one-line and word-wrapped cell text the grid paints — including rotated cells, which paint the
+//! shaped galley turned — chart labels, and the in-cell editor's shaped line.
 //!
 //! # Never crash
 //! A family egui has no data for, a font file the engine refuses, a string over the engine's
@@ -171,6 +171,73 @@ impl std::fmt::Debug for GridText {
     }
 }
 
+/// One shaped cluster of a paragraph: its source bytes and the pen position after it.
+struct Cluster {
+    start: usize,
+    end: usize,
+    /// Pen position after this cluster, in drawing units, in logical order.
+    cum: f32,
+}
+
+/// The paragraph's clusters in logical order, with the pen position after each. Glyphs inside a
+/// cluster (a base and its marks) are summed into that cluster.
+fn cluster_prefix(text: &str, shaped: &ShapedText) -> Vec<Cluster> {
+    let mut by_start: std::collections::BTreeMap<usize, (usize, f32)> = std::collections::BTreeMap::new();
+    for glyph in shaped.glyphs() {
+        let start = glyph.cluster_start as usize;
+        let end = glyph.cluster_end as usize;
+        if start >= end || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let e = by_start.entry(start).or_insert((end, 0.0));
+        e.0 = e.0.max(end);
+        e.1 += glyph.advance;
+    }
+    let mut cum = 0.0;
+    let mut out = Vec::with_capacity(by_start.len());
+    for (start, (end, advance)) in by_start {
+        cum += advance;
+        out.push(Cluster { start, end, cum });
+    }
+    out
+}
+
+/// The pen position just before byte `at` (or of the last cluster that starts before it).
+fn width_at(clusters: &[Cluster], at: usize) -> f32 {
+    let i = clusters.partition_point(|c| c.start < at);
+    if i == 0 { 0.0 } else { clusters.get(i - 1).map(|c| c.cum).unwrap_or(0.0) }
+}
+
+/// Longest wrapped cell text the shaper wraps itself; longer text keeps the unshaped wrap (the
+/// wrap is recomputed every frame, and a 32,000-character cell must not cost more than it did).
+const MAX_WRAP_BYTES: usize = 16_384;
+
+/// Where a paragraph may break: after a space, tab or hyphen, and on either side of a wide
+/// (CJK, Hangul, kana, fullwidth) character, which needs no space to break. Positions are byte
+/// offsets just past the character, and the end of the paragraph is not a break.
+fn break_positions(text: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut prev_wide = false;
+    for (i, ch) in text.char_indices() {
+        let end = i + ch.len_utf8();
+        let wide = is_wide(ch);
+        if end < text.len() && (prev_wide || wide || matches!(ch, ' ' | '\t' | '-' | '\u{2010}' | '\u{2013}')) {
+            out.push(end);
+        }
+        prev_wide = wide;
+    }
+    out
+}
+
+/// A character that may be broken between (CJK ideographs, kana, Hangul and fullwidth forms).
+fn is_wide(c: char) -> bool {
+    let u = u32::from(c);
+    matches!(
+        u,
+        0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x20000..=0x2FA1F
+    )
+}
+
 /// One line of cell text, ready to measure and to paint.
 pub struct Line {
     /// Width in points: what the `####` overflow test, AutoFit and the editor's size use.
@@ -182,7 +249,7 @@ pub struct Line {
 }
 
 impl Line {
-    /// The line's height (one row: the grid never shapes wrapped text).
+    /// The line's height (one row of the font at this size).
     pub fn height(&self) -> f32 {
         self.galley.size().y
     }
@@ -228,6 +295,75 @@ impl GridText {
         }
         let galley = ctx.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font.clone(), color));
         Line { width: galley.size().x, galley, shaped: None }
+    }
+
+    /// The shaped lines a cell's text wraps into at `width` points — one per explicit line break
+    /// and one per wrap — or `None` when the text needs no shaping.
+    ///
+    /// `None` keeps the caller's unshaped `LayoutJob` wrap: printable ASCII (line breaks aside)
+    /// has no bidi reordering, no joining and no marks, so its wrap is bit-identical to this one
+    /// and existing layout and screenshot tests stay valid.
+    ///
+    /// A paragraph is shaped once to measure its clusters, then each line is shaped on its own, so
+    /// a wrapped line gets the same bidi resolution, joining and mark positioning as a one-line
+    /// cell. Line breaks follow spaces, tabs and hyphens, and are allowed between CJK characters;
+    /// a single word wider than the cell breaks at the furthest cluster boundary that fits, so a
+    /// line always makes progress.
+    pub fn wrap(&self, ctx: &Context, font: &FontId, text: &str, direction: Direction, color: Color32, width: f32) -> Option<Vec<Line>> {
+        let flat: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        if width <= 0.0 || flat.is_empty() || text.len() > MAX_WRAP_BYTES || !needs_shaping(&flat, direction) {
+            return None;
+        }
+        let mut out: Vec<Line> = Vec::new();
+        for para in text.split('\n') {
+            let para = para.strip_suffix('\r').unwrap_or(para);
+            if para.is_empty() {
+                out.push(self.line(ctx, font, "", direction, color));
+                continue;
+            }
+            // One shaped line when it fits: no wrapping work at all.
+            if self.measure(ctx, font, para, direction) <= width {
+                out.push(self.line(ctx, font, para, direction, color));
+                continue;
+            }
+            let shaped = self.shape(ctx, font, para, direction)?;
+            let clusters = cluster_prefix(para, &shaped);
+            let breaks = break_positions(para);
+            let mut start = 0usize;
+            while start < para.len() {
+                let start_w = width_at(&clusters, start);
+                let from = breaks.partition_point(|p| *p <= start);
+                let fitting = breaks[from..].iter().copied().take_while(|p| width_at(&clusters, *p) - start_w <= width).last();
+                let end = match fitting {
+                    Some(b) => b,
+                    None => {
+                        // No break opportunity fits: the furthest cluster end that does. One
+                        // cluster always goes on the line, even a cluster wider than the cell.
+                        let bounded = clusters
+                            .iter()
+                            .filter(|c| c.start >= start)
+                            .map(|c| c.end)
+                            .take_while(|e| width_at(&clusters, *e) - start_w <= width)
+                            .last();
+                        bounded.or_else(|| clusters.iter().find(|c| c.start >= start).map(|c| c.end)).unwrap_or(para.len())
+                    }
+                };
+                let end = end.clamp(start, para.len());
+                out.push(self.line(ctx, font, para.get(start..end).unwrap_or(""), direction, color));
+                if end <= start {
+                    break;
+                }
+                start = end;
+            }
+        }
+        Some(out)
+    }
+
+    /// The base direction the shaper resolved for the first paragraph of `text`, when it shapes
+    /// it. The wrapped path uses it to align general text by its own reading direction.
+    pub fn direction_of(&self, ctx: &Context, font: &FontId, text: &str, direction: Direction) -> Option<Direction> {
+        let first = text.split('\n').next().unwrap_or(text);
+        self.shape(ctx, font, first, direction).map(|s| s.base_direction)
     }
 
     /// The width of one line, in points, as the grid draws it. This is the measure the `####`

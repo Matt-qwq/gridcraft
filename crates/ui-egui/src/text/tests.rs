@@ -389,3 +389,70 @@ fn nominal_glyph(face: &ChainFace, c: char) -> Option<u16> {
     let font = skrifa::FontRef::from_index(&face.bytes, face.index).ok()?;
     font.charmap().map(c).map(|g| u16::try_from(g.to_u32()).unwrap_or(0))
 }
+
+// ---------------------------------------------------------------- wrapped text
+
+#[test]
+fn wrapped_ascii_keeps_the_unshaped_layout() {
+    let ctx = ubuntu_context();
+    let engine = ubuntu_engine();
+    // No joining, bidi or marks: the caller's LayoutJob wrap is bit-identical and stays.
+    assert!(engine.wrap(&ctx, &font(14.0), "a plain ascii sentence that has to wrap", Direction::Auto, Color32::BLACK, 40.0).is_none());
+    // Explicit line breaks alone do not force the shaped path either.
+    assert!(engine.wrap(&ctx, &font(14.0), "first line\nsecond line", Direction::Ltr, Color32::BLACK, 30.0).is_none());
+    // A width past the whole paragraph is one line (still the shaped wrap when it needs shaping).
+    assert!(engine.wrap(&ctx, &font(14.0), "abc", Direction::Auto, Color32::BLACK, 0.0).is_none());
+}
+
+#[test]
+fn wrapped_arabic_is_shaped_line_by_line() {
+    let text = "مرحبا بالعالم هذا نص عربي طويل";
+    let Some((ctx, id, engine)) = covered_context('م', text) else {
+        eprintln!("skipped: no installed Arabic face (set CRAFT_FONTS_DIR to test it)");
+        return;
+    };
+    let width = 60.0;
+    let lines = engine.wrap(&ctx, &id, text, Direction::Auto, Color32::BLACK, width).expect("Arabic wraps through the shaper");
+    assert!(lines.len() > 1, "{} lines", lines.len());
+    let mut shaped_lines = 0;
+    for line in &lines {
+        match &line.shaped {
+            Some(shaped) => {
+                shaped_lines += 1;
+                assert_eq!(shaped.base_direction, Direction::Rtl);
+            }
+            // A break can leave a line of ASCII only (a space, a number), which the fast path
+            // draws identically; that is not a shaping failure.
+            None => assert!(line.galley.text().is_ascii(), "{:?} was not shaped", line.galley.text()),
+        }
+        // A line fits the width, or holds one unbreakable cluster wider than it.
+        assert!(line.width <= width + 32.0, "line is {} pt for a {width} pt column", line.width);
+    }
+    assert!(shaped_lines > 0, "no line went through the shaper");
+    // The lines cover the paragraph: no character lost, none repeated (the source text is kept by
+    // each line's galley, and a break keeps its space on the previous line).
+    let joined: String = lines.iter().map(|l| l.galley.text().to_string()).collect();
+    assert_eq!(joined, text);
+}
+
+#[test]
+fn a_cjk_paragraph_breaks_between_characters() {
+    let text = "中文字符测试中文字符测试";
+    let Some((ctx, id, engine)) = covered_context('中', text) else {
+        eprintln!("skipped: no installed CJK face (set CRAFT_FONTS_DIR to test it)");
+        return;
+    };
+    // 32 pt characters in a 48 pt column: one glyph per line, more than three lines.
+    let lines = engine.wrap(&ctx, &id, text, Direction::Auto, Color32::BLACK, 48.0).expect("CJK wraps through the shaper");
+    assert!(lines.len() >= 3, "{} lines", lines.len());
+    for line in &lines {
+        assert!(line.width <= 48.0 + 32.0, "line is {} pt", line.width);
+    }
+    let joined: String = lines.iter().map(|l| l.galley.text().to_string()).collect();
+    assert_eq!(joined, text);
+    // An explicit break is kept as its own line, even where the paragraph would fit.
+    let two = engine.wrap(&ctx, &id, "中文\n字", Direction::Auto, Color32::BLACK, 1000.0).expect("shaped");
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0].galley.text(), "中文");
+    assert_eq!(two[1].galley.text(), "字");
+}

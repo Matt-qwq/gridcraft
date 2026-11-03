@@ -1328,6 +1328,38 @@ pub(crate) fn paint_quadrant(
         // Rotated text wraps along its own direction (below), not across the column width.
         if !rotated && (st.align.wrap || st.align.h == HAlign::Justify) {
             let wrap_w = (rect.width() - 2.0 * pad - indent).max(4.0);
+            // Shaped wrapping for text the bidi/joining/mark engines can change, with each line
+            // shaped on its own; printable ASCII keeps epaint's wrap, which is bit-identical.
+            let direction = crate::text::base_direction(&text, sh.right_to_left);
+            if let Some(lines) = engine.wrap(p.ctx(), &font, &text, direction, color, wrap_w) {
+                // General-aligned text follows its own reading direction, as the one-line path
+                // does: a right-to-left paragraph in a left-to-right sheet aligns right.
+                if !geo.rtl
+                    && st.align.h == HAlign::General
+                    && !numeric
+                    && halign == HAlign::Left
+                    && engine.direction_of(p.ctx(), &font, &text, direction).is_some_and(|d| d.is_rtl())
+                {
+                    halign = HAlign::Right;
+                }
+                let total: f32 = lines.iter().map(|l| l.height()).sum();
+                let mut y = wrapped_cell_text_y(st.align.v, *rect, total, z);
+                let clip = p.with_clip_rect(rect.intersect(p.clip_rect()));
+                for line in &lines {
+                    // Each line is aligned on its own, as the LayoutJob's halign did: the shaped
+                    // galley has no alignment of its own, so the whole line's width is taken off
+                    // for right and half of it for centre.
+                    let lw = line.galley.size().x;
+                    let lx = match halign {
+                        HAlign::Center | HAlign::CenterAcross => rect.center().x - lw / 2.0,
+                        HAlign::Right => rect.right() - pad - lw,
+                        _ => text_left + pad + indent,
+                    };
+                    line.paint(&clip, pos2(lx, y), color);
+                    y += line.height();
+                }
+                continue;
+            }
             let mut job = egui::text::LayoutJob::simple(text.clone(), font.clone(), color, wrap_w);
             job.halign = match halign {
                 HAlign::Center | HAlign::CenterAcross => egui::Align::Center,
@@ -1544,7 +1576,7 @@ pub(crate) fn paint_quadrant(
         };
         let col = sp.color.resolve(&wb.theme).unwrap_or([0x2B, 0x7C, 0xD3]);
         let prims = gridcraft_chart::render_sparkline(sp.kind, &vals, [col[0], col[1], col[2], 255], sp.markers, rect.width(), rect.height());
-        crate::chartview::paint_prims(p, rect.min, &prims, 1.0);
+        crate::chartview::paint_prims(p, rect.min, &prims, 1.0, None);
     }
     // Filter buttons.
     let mut buttons: Vec<(CellRef, bool)> = Vec::new();
@@ -2316,7 +2348,7 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 && primary_clicked
                 && already
                 && let Some(ch) = sh.charts.iter().find(|c| c.id == id)
-                && let Some(hit) = crate::chartview::element_at(ui.painter(), wb, wb.active_sheet, ch, rect, p)
+                && let Some(hit) = crate::chartview::element_at(ui.painter(), wb, wb.active_sheet, ch, rect, p, Some(&app.text))
             {
                 crate::chart_format::select_element(app, ui, id, hit);
             }

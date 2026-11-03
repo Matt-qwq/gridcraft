@@ -55,8 +55,12 @@ right-to-left sheets and full complex-script support. Part of
   bidirectional algorithm puts Latin and digit islands back in left-to-right order inside Hebrew
   or Arabic, general right-to-left cell text aligns right, neutral text on a right-to-left sheet
   follows the sheet, and the in-cell editor's caret and selection follow visual clusters while
-  the buffer, the formula bar and tooltips stay logical. Wrapped and multi-line cells, text boxes
-  and chart labels are still drawn by egui's own (unshaped) layout, and PDF export is unshaped.
+  the buffer, the formula bar and tooltips stay logical. **Word-wrapped cells and chart labels are
+  shaped since 11-02**: a wrapped paragraph is measured once, broken at spaces, hyphens and CJK
+  boundaries, and each line is shaped on its own (bidi, joining and marks per line), with each line
+  aligned on its own and general right-to-left wrapped text aligned right; the chart layout
+  measures labels with the shaped width. Printable ASCII keeps egui's own wrap. Text boxes are
+  still drawn unshaped, and the PDF draws shaped glyphs but measures them unshaped.
   **Sheet Right-to-Left**
   (`view.rightToLeft`, Page Layout › Sheet Options, XLSX `rightToLeft`, `.xls` WINDOW2 fRightToLeft) mirrors the grid (#146):
   column A and the row headers on the right, the vertical scrollbar on the left; hit-testing,
@@ -187,8 +191,7 @@ Decisions and limits, also stated in the code:
 - **wasm** has no filesystem: font discovery returns an error, no face is embedded, and the
   document keeps the standard fonts and the CID fallback.
 - Remaining: CJK system-font fallback for every script, mirrored printing and sheet tabs for
-  right-to-left sheets, shaped layout for wrapped cells, text boxes and chart labels, and per-run
-  font fallback. **Needs a human:** native-speaker review of every language (none so far) and of
+  right-to-left sheets, shaped text boxes and a shaped PDF `text_width`, and per-run font fallback. **Needs a human:** native-speaker review of every language (none so far) and of
   localized function names.
 
 ## Infrastructure (do first)
@@ -202,12 +205,13 @@ Decisions and limits, also stated in the code:
 3. Text shaping and fallback: the shared `gridcraft_core::text` engine shapes cell text on the grid,
    in the in-cell editor and in PDF export (Arabic, Devanagari, Thai, bidi, cluster-exact extraction).
    Remaining: CJK system font fallback for every script, right-to-left sheet tabs and mirrored
-   printing, shaped layout for wrapped cells, text boxes and chart labels, and per-run fallback.
+   printing, shaped text boxes and a shaped PDF `text_width`, and per-run fallback.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | Word-wrapped cell text and chart labels are shaped: each paragraph is measured once from its shaped clusters, broken at spaces/hyphens/CJK boundaries, and each line is shaped and aligned on its own (RTL General text aligns right). Printable ASCII keeps the unshaped wrap bit for bit. Text boxes and the PDF's `text_width` remain unshaped |
 | 2026-10-30 | major | PDF text is shaped with `gridcraft_core::text`: Arabic joins, Devanagari reorders, Thai marks are positioned and bidi runs are laid out in visual order (`TJ`/`Ts` on one text matrix); `ToUnicode` follows the glyph's whole cluster and a `CIDToGIDMap` is written only when one glyph must extract differently, so WinAnsi text stays byte-identical |
 | 2026-10-30 | minor | Cell text on the grid and in the in-cell editor is shaped and bidi-ordered (`crates/ui-egui/src/text.rs`, one `gridcraft_core::text` engine per app, the faces egui paints with): Arabic joins, Devanagari reorders and merges clusters, Thai marks take zero advance, mixed runs draw in visual order and the caret walks visual clusters; a Devanagari fallback face makes Hindi cells draw |
 | 2026-10-30 | major | PDF export embeds subset TrueType fonts (`crates/pdf/src/truetype.rs`, `gridcraft_core::fonts`): Cyrillic, Greek, Hebrew, CJK, Korean and the glyphs of Arabic, Devanagari and Thai now reach the PDF (unshaped, left to right) with `ToUnicode` so the text stays copyable; `file.exportPdf`/`file.print` take `fontPath`; a WinAnsi-only document's bytes are unchanged |

@@ -293,10 +293,20 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   multi-glyph cluster never repeats one) and a `CIDToGIDMap` is written only when one glyph must
   extract differently — so WinAnsi text stays **byte-identical**. `pdftotext` now returns Cyrillic,
   Arabic, Hebrew, Devanagari and Thai in logical order.
+- **Landed 11-02 (wrapped cells and chart labels):** a word-wrapped cell now shapes like a
+  one-line one. Each paragraph is shaped once to measure its clusters (logical prefix widths from
+  the shaped glyphs), broken after spaces, tabs and hyphens and between wide CJK characters, and
+  each resulting line is shaped on its own, so its bidi runs, joining and marks are resolved for
+  that line; a word wider than the cell breaks at the furthest cluster boundary that fits, so a
+  line always progresses. General-aligned right-to-left wrapped text aligns right, and each line
+  is aligned on its own (centre/right take the line's width off), as the old `LayoutJob` did.
+  Printable ASCII keeps the unshaped wrap bit for bit, and text over 16,384 bytes or a face that
+  cannot cover it falls back to it. **Chart labels** (titles, axis and series labels) are shaped
+  through the same engine, and the chart layout measures them with the shaped width, so a label's
+  box and its glyphs agree. Text boxes and the PDF's `text_width` remain.
 - **Still missing:** CJK and Arabic in one document (no single face covers both), fonts shipped per
-  platform, per-run font fallback, shaped layout for **wrapped** cells, text boxes and chart labels,
-  mirrored printing and right-to-left sheet tabs, and shaped *measurement* in the PDF's
-  `text_width`; CFF/OTF (`CIDFontType0`) and TTC faces past index 0 are not embedded; a
+  platform, per-run font fallback, shaped **text boxes**, mirrored printing and right-to-left sheet
+  tabs, and shaped *measurement* in the PDF's `text_width`; CFF/OTF (`CIDFontType0`) and TTC faces past index 0 are not embedded; a
   mixed-direction line cannot extract back to source order through an extractor that re-applies the
   UBA (documented, not fixable in the file for Xpdf 4.00).
 - **Evidence:** the matrix in [localization-parity.md](localization-parity.md); #142, #54; UI 997
@@ -742,6 +752,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §5: word-wrapped cells and chart labels are shaped — each paragraph measured once, broken at spaces/hyphens/CJK boundaries and shaped line by line (bidi per line, Arabic joining, marks), with right-aligned RTL General text and per-line alignment; printable ASCII keeps the unshaped wrap bit for bit. Chart layout measures labels with the shaped width. Text boxes and the PDF's `text_width` remain |
 | 2026-11-02 | minor | §18: `Shift+F10` on a selected chart, picture, shape or slicer opens the object's own context menu at its frame (the right-click menu), while a cell selection keeps the cell menu; model helper + dispatch test. The accessibility/keyboard tail on the sheet is closed |
 | 2026-11-02 | minor | §18: the status bar has an Accessibility entry with the issue count from `review.checkAccessibility` (cached per document revision), opening the same Check Accessibility dialog as the Review tab; what remains of the section is keyboard access to the sheet's object context menus |
 | 2026-11-02 | minor | §7: `.xls` **pictures** landed — OfficeArt drawings (`MSODRAWING`, one `DgContainer` tree when concatenated) and the workbook's blip store (`MSODRAWINGGROUP` → `FBSE` → PNG/JPEG/DIB/TIFF), with `msosptPictureFrame` shapes turned into `Image`s at their `OfficeArtClientAnchorSheet` cell and offsets. The move/size bits map the way Excel writes them (0x0000 move+size, 0x0002 move only, 0x0003 free-floating), established from Excel-authored files. Charts, shapes, controls and vector pictures are skipped; malformed drawings never panic. §7 is down to charts and RC4 writing |

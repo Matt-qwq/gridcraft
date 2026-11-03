@@ -2562,7 +2562,7 @@ fn recommended_charts(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, con
             if let Some(doc) = app.session.active()
                 && let Ok((sheet, chart)) = gridcraft_engine::cmd::insert::build_chart(&app.session, &params)
             {
-                crate::chartview::paint_chart(ui.painter(), rect, &doc.wb, sheet, &chart);
+                crate::chartview::paint_chart(ui.painter(), rect, &doc.wb, sheet, &chart, Some(&app.text));
             }
         });
     });
