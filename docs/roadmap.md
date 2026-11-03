@@ -24,7 +24,7 @@ Ordered; each wave can overlap with the next where noted. Estimates are Opus 5.5
 |---|---|---|---|---|
 | **0** | **Close the base**: page-file rewrite (deferred); save streaming (S4c) is post-beta | M19 follow-up | **0–8** | S1–S4b landed 10-29; wave 0's base is closed. Start wave 1 (XLSX corpus/Excel) next. |
 | **0b** | Stability soak and the field crash/freeze list | #10 | 8–12 | Parallel with 0; Windows GPU machines for the driver cases. |
-| **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair | #1 | 15–25 | **Owner: half a day in Excel.** The only gate that cannot be finished without the owner. Start as soon as they are available; overlaps 0. #3's pass-through half landed 10-29. |
+| **1** | **XLSX corpus + Excel acceptance**: run a real-world corpus; Excel opens our output without repair | #1 | 3–6 + owner | **Split 11-02.** The corpus repo run and the foreign-reader/application oracle (`cargo xtask oracle`, [oracle.md](oracle.md)) need no Excel and are 3–6 h; the Excel acceptance itself is the owner's half day and cannot be dropped. #3's pass-through half landed 10-29. |
 | **1b** | Calculation correctness: 15-digit equality, stale spills, 3-D/name edge cases, iterative calculation | #6 | 2–5 | **met 10-30**: the five reports are closed, iterative calculation is in, and a 595-example / 275-function documented oracle suite runs through the real calc path. What remains is re-running it against an Excel-computed corpus, which belongs to #1 |
 | **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | #4 | 0 | **Closed 11-02.** A1 landed 10-29 (model, round-trip, render, four commands), A7 10-29 (an edit patches the kept part; unmodelled kinds kept whole; secondary axis modelled, written, drawn), the Format pane and eight-handle resize 10-30, and on 11-02 per-point marker size, click-to-select of any drawn element and a label's own font at the chart, series and point level. Chartex granularity (its label font, per-point options) and a pane per shape/picture remain, and neither is part of this gate. |
 | **2b** | All-script text: Arabic/Devanagari/Thai shaping, bidi | #5 | 0–3 | **Shaping engine landed 10-30** (`core::text`: unicode-bidi levels + rustybuzz, visual-order runs, logical clusters, 26 tests). What remains is wiring it into the grid and the PDF writer — two tasks in flight. |
@@ -66,7 +66,7 @@ and edge features. Each gate links its gap.
 
 | Gate | Gap | Status (2026-10-29) | Hours left |
 |---|---|---|---|
-| XLSX proven on a real-world corpus; Excel opens our output without repair | #1 | **open**; owner needed | 15–25 |
+| XLSX proven on a real-world corpus; Excel opens our output without repair | #1 | **open, owner-blocked** — the owner recorded on 11-02 that Excel is not licensed here (`ProPlus2024Volume`, no key, no KMS host, no account), and no substitute activation is acceptable. `cargo xtask oracle` is the accepted substitute: openpyxl reads our output (cells, formats, merges, tables, CF/DV/chart counts, names) and WPS 12.0 opens, recalculates and re-saves it for us to read back; the package validator now refuses a part with an undeclared namespace prefix, which is how it found an `r:` prefix missing from PivotTable parts. It proves a foreign reader and a foreign application accept our files — **not** that Excel skips its repair prompt. What is left: the corpus repo run (3–6 h, no Excel) and one Excel run over it (the owner's) | 3–6 + owner |
 | Unmodelled XLSX parts preserved on save | #3 | **met 10-29** (slicers, timelines, table query tables, unknown `extLst`, strict package validator); data model and chart `extLst` remain, Excel check folded into #1 | 0–4 |
 | 100 MB workbooks open; 1M rows usable; multi-threaded recalc; 100k-edit recalc < 100 ms | #2 | **met 10-28** (M19/M20); M20/M19 polish in wave 0 | 0 for the gate; 20–30 polish |
 | Charts: kinds and options survive round trip; axes, trendlines, error bars | #4 | **met 11-02**: axis scaling, data labels (including a label's own size, weight and colour at the chart, series and point level), error bars and per-point formatting modelled, round-tripped, drawn and command-driven; an edit patches the kept chart part so unmodelled XML (manual layout, callouts, `dTable`, date-axis units, `extLst`) survives; unmodelled kinds are kept whole; secondary axis modelled, written and drawn, with combo series read back in `c:order`; clicking a bar, slice, marker, legend entry or axis label selects it in the Format pane. What is left is chartex granularity (its label font and per-point options stay with the kept part) and a pane per shape/picture, neither of which the gate asks for | 0 |
@@ -79,7 +79,9 @@ and edge features. Each gate links its gap.
 | **Total** | | gates #1, #8, #10 open or partial (pass-through #3, charts #4, keyboard #9, calc #6, all-script text #5 met; `.xls`/encryption #7 and PivotTables #8 partly, and #1 is the owner's) | **~53–99 + 20–30 base = ~73–129** |
 
 With 4–6 agents and an integrator, about 40–60 wall-clock hours. Needs the owner: running Excel
-to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10).
+to check our files (gate #1/#8), and Windows machines with the reported GPU drivers (gate #10). Excel
+is not licensed on the dev machine (recorded 2026-11-02), so the Excel checks stay open until the
+owner provides one; [oracle.md](oracle.md) is what runs in the meantime and is not a substitute for them.
 
 ## Milestones
 
@@ -818,6 +820,7 @@ different trade — speed and size against interoperability, and against every t
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | Gate #1 split and recorded as **owner-blocked**: Excel is unlicensed here (volume SKU, no key, no account), so `cargo xtask oracle` — openpyxl as a foreign reader, WPS 12.0 as a foreign application that recalculates and re-saves — is the accepted substitute ([oracle.md](oracle.md)). It found a PivotTable part using an undeclared `r:` prefix, which `lxml` and WPS both rejected; fixed, and the package validator now refuses that class (11 saving tests red first). #1 → 3–6 h + the owner's run |
 | 2026-11-02 | minor | High contrast (`view.highContrast`, View ▸ Show, keytip WVI): black/white/yellow chrome, yellow selection, egui widgets dark, the sheet's own white page, remembered in `ui.json`. Gap #18 → 1–2 h |
 | 2026-11-02 | minor | A screen reader can walk the sheet: the visible cells are an AccessKit grid (value, address, formula, row/column index, the active cell selected and named as the grid's active descendant; frozen panes, scrolling, capped at 2,000 cells, built only while a reader is attached). Gap #18 → 3–5 h (high contrast and a status-bar entry remain); the header row and column are header nodes too |
 | 2026-11-02 | minor | Alternative text for charts and shapes written to `xdr:cNvPr/@descr` (escaped) and set by `object.setAltText`; the accessibility check covers charts, pictures, shapes, pictures in cells and tables without a header row, and its dialog goes to each issue and sets alt text inline. Not a beta gate; #18 drops to 8–12 h |

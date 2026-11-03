@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (a timeline's range handles drag on the sheet, a chart series moves to the secondary axis by command and from the Format pane, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green; a WPS-authored `.xls` cannot resolve the CF12 layout, so gate #1 remains the only way) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open

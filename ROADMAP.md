@@ -2,7 +2,7 @@
 
 **Stage: alpha** · large-workbook beta gate met · next: beta, ~24 points of "ready for real work" and ~73–129 h away
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (high contrast: a black/white/yellow chrome from View ▸ Show; a screen reader can walk the sheet — the visible cells are an AccessKit grid; alternative text for charts and shapes with a checker that navigates to each issue; a PivotTable filter records its area, so a page filter on an axis field keeps its row; a data label's own font — size, bold, colour — is modelled at the chart, series and point level; a click on a chart element selects it; a chart point carries its own marker size; custom error-bar references are editable in the pane; a timeline's selected range handles drag on the sheet; a chart series moves to the secondary axis; chart edits patch the kept part, unmodelled kinds kept whole; **gate #4 is met**, so gates #7 7–16 h and #8 4–8 h remain; beta ~73–129 h) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (gate #1 is split: Excel is unlicensed on the dev machine, so it stays owner-blocked, and `cargo xtask oracle` — openpyxl as a foreign reader, WPS as a foreign application — is the accepted substitute and already found a PivotTable part whose undeclared `r:` prefix both a strict parser and WPS rejected; high contrast: a black/white/yellow chrome from View ▸ Show; a screen reader can walk the sheet — the visible cells are an AccessKit grid; alternative text for charts and shapes with a checker that navigates to each issue; a PivotTable filter records its area, so a page filter on an axis field keeps its row; a data label's own font — size, bold, colour — is modelled at the chart, series and point level; a click on a chart element selects it; a chart point carries its own marker size; custom error-bar references are editable in the pane; a timeline's selected range handles drag on the sheet; a chart series moves to the secondary axis; chart edits patch the kept part, unmodelled kinds kept whole; **gate #4 is met**, so gates #7 7–16 h and #8 4–8 h remain; beta ~73–129 h) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -46,7 +46,9 @@ on macOS with save and reopen, and the large-workbook beta gate is now met: 100M
 16.7 MiB live / 183 MiB peak, independent formulas recalculate on the machine's threads (100k edit
 20–25 ms), row and column structural edits are maps rather than cell moves, and whole-sheet data
 commands are bounded. The remaining beta work is evidence and fidelity: nobody has yet confirmed
-that Excel opens our output without a repair prompt across a real corpus (#1/#3), there is no
+that **Excel** opens our output without a repair prompt across a real corpus (#1) — Excel itself is
+not licensed on the dev machine, so a foreign reader (openpyxl) and a foreign application (WPS) stand
+in for it ([oracle.md](docs/oracle.md)) and one Excel run stays the owner's — there is no
 `.xls` or password support (#7), Arabic/Devanagari/Thai text is not shaped and non-Latin PDF is
 weak (#5), charts lose options (#4), PivotTables lack slicers (#8), keyboard key tips remain (#9),
 and the stability soak is not final (#10). Beta needs those closed (see
@@ -293,6 +295,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | Gate #1 recorded as owner-blocked (Excel is a `ProPlus2024Volume` install with no key, KMS host or account) and split: `cargo xtask oracle` reads our output back through openpyxl and WPS 12.0 and is the accepted substitute, documented with its limits in [docs/oracle.md](docs/oracle.md). Its first find was a PivotTable part using `r:id` without declaring `xmlns:r`, which `lxml` and WPS both refused — fixed, and `testing::check_package` now fails any part with an undeclared prefix (11 saving tests red first). #1 → 3–6 h of corpus work + the owner's Excel run |
 | 2026-11-02 | minor | High contrast: `view.highContrast` (View ▸ Show, keytip WVI) paints the chrome black/white/yellow with a yellow selection and dark egui widgets, keeps the sheet's own page, and persists in `ui.json`. Gap #18 → 1–2 h (status-bar entry) |
 | 2026-11-02 | minor | The visible cells are an AccessKit grid for screen readers (value, address, formula, row/column index, active cell selected and an active descendant, frozen panes, capped at 2,000 cells, built only with a reader attached); gap #18 → 3–5 h |
 | 2026-11-02 | minor | Alternative text for charts and shapes (`Chart::alt`, `Shape::alt`, `xdr:cNvPr/@descr` escaped, `object.setAltText`) and an accessibility check that covers them, pictures in cells and tables without a header row, and navigates to each issue |
