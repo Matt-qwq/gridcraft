@@ -18,9 +18,10 @@ use std::fmt::Write as _;
 use gridcraft_core::date::datetime_from_serial;
 use gridcraft_core::{CellRef, DateSystem, RangeRef, Value, number_to_text};
 use gridcraft_formula::quote_sheet;
+use gridcraft_model::pivot_item;
 use gridcraft_model::{
-    PivotCalcField, PivotDateGroup, PivotField, PivotFilter, PivotFilterArea, PivotFunc, PivotLayout, PivotNumberGroup, PivotShowAs, PivotSort,
-    PivotTable, PivotValue, Workbook,
+    PivotCalcField, PivotCalcItem, PivotDateGroup, PivotField, PivotFilter, PivotFilterArea, PivotFunc, PivotLayout, PivotNumberGroup, PivotShowAs,
+    PivotSort, PivotTable, PivotValue, Workbook,
 };
 
 use crate::IoError;
@@ -38,6 +39,8 @@ const MAX_SOURCE_CELLS: u64 = 10_000_000;
 const MAX_RECORD_CELLS: u64 = 2_000_000;
 /// Most shared items kept per field (Excel's limit is 1,048,576 unique items).
 const MAX_ITEMS: usize = 1_048_576;
+/// Most calculated items written per PivotTable.
+const MAX_CALC_ITEMS: usize = 256;
 /// Most cache fields read.
 const MAX_FIELDS: usize = 16_384;
 /// The `x14:dataField` extension (Excel 2010 show-values-as additions such as rank).
@@ -249,14 +252,25 @@ struct CField {
     group: Option<Group>,
     /// A calculated field's formula (without `=`); such fields aren't database fields.
     formula: Option<String>,
+    /// Calculated items: appended to the shared items with `f="1"` (Excel's marker) and listed
+    /// as `<item f="1" x>` in the table.
+    calc_items: Vec<CalcOut>,
+}
+
+/// A calculated item written with its field.
+struct CalcOut {
+    name: String,
+    /// Formula in the dialog form (`=North+South`).
+    formula: String,
 }
 
 impl CField {
-    /// Item captions the PivotTable's `<item x>` indices refer to.
+    /// Item captions the PivotTable's `<item x>` indices refer to (real items, then calculated
+    /// ones).
     fn item_labels(&self) -> Vec<String> {
         match &self.group {
             Some(g) => g.items.clone(),
-            None => self.items.iter().map(label).collect(),
+            None => self.items.iter().map(label).chain(self.calc_items.iter().map(|c| c.name.clone())).collect(),
         }
     }
 }
@@ -314,7 +328,7 @@ impl PivotWriter {
             // What the source cache definition kept that the model has no room for.
             let key = crate::passthrough::pivot_cache_key(&pt.name);
             let ext = crate::passthrough::owner_extras(sheet.preserved.as_deref(), key.as_deref(), &mut cr, out);
-            out.part(&cache_part, Some(CT_PIVOT_CACHE_DEF), cache_xml(&cache, rec_rid.as_deref(), wb.date_system, &ext).into_bytes());
+            out.part(&cache_part, Some(CT_PIVOT_CACHE_DEF), cache_xml(&cache, n, rec_rid.as_deref(), wb.date_system, &ext).into_bytes());
             if !cr.is_empty() {
                 out.part(&format!("xl/pivotCache/_rels/pivotCacheDefinition{n}.xml.rels"), None, cr.xml().into_bytes());
             }
@@ -525,6 +539,7 @@ fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize, slicer_fields
             itemized: false,
             group: None,
             formula: None,
+            calc_items: vec![],
         });
     }
     let find = |fields: &[CField], name: &str| fields.iter().position(|f| f.col.is_some() && same(&f.name, name));
@@ -638,6 +653,7 @@ fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize, slicer_fields
                 itemized: false,
                 group: Some(make(*by)),
                 formula: None,
+                calc_items: vec![],
             });
             prev = new;
         }
@@ -691,6 +707,26 @@ fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize, slicer_fields
         } else if f.col.is_some() && (f.stats.text || f.stats.boolean || f.stats.error) {
             f.itemized = true;
         }
+    }
+    // Calculated items: an extra item of a field on an axis, after its real items. A grouped
+    // field's items are ranges, so it cannot carry one (the engine drops them when it groups).
+    for ci in pt.calculated_items.iter().take(MAX_CALC_ITEMS) {
+        let Some(ai) = axis.iter().position(|f| same(&f.source_col, &ci.field)) else { continue };
+        let Some(fi) = axis_map.get(ai).copied().flatten() else { continue };
+        let Some(cf) = fields.get_mut(fi) else { continue };
+        let name = ci.name.trim();
+        if cf.group.is_some() || cf.col.is_none() || !cf.itemized || name.is_empty() {
+            continue;
+        }
+        if cf.calc_items.iter().any(|c| same(&c.name, name)) {
+            continue;
+        }
+        // Only a formula this model can write for this field is kept (the reader warns otherwise).
+        let Ok(compiled) = pivot_item::compile(&cf.name, &ci.formula) else { continue };
+        if compiled.items().is_empty() {
+            continue;
+        }
+        cf.calc_items.push(CalcOut { name: name.to_string(), formula: ci.formula.clone() });
     }
     // Shared items, in order of first appearance.
     for &row in &rows {
@@ -747,6 +783,7 @@ fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize, slicer_fields
             itemized: false,
             group: None,
             formula: Some(f.to_string()),
+            calc_items: vec![],
         });
     }
     Some(Cache { fields, axis_map, source_xml, records })
@@ -794,7 +831,7 @@ fn item_xml(v: &Value, sys: DateSystem, date: bool) -> String {
     }
 }
 
-fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -> String {
+fn cache_xml(c: &Cache, cache_id: u32, records_rid: Option<&str>, sys: DateSystem, ext: &str) -> String {
     let mut s = format!("{XML_DECL}<pivotCacheDefinition xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\"");
     match (records_rid, &c.records) {
         (Some(rid), Some((count, _))) => {
@@ -867,9 +904,13 @@ fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -
             }
             let number_group = f.group.as_ref().is_some_and(|g| g.number.is_some());
             if f.itemized || number_group {
-                let _ = write!(s, " count=\"{}\">", f.items.len());
+                let _ = write!(s, " count=\"{}\">", f.items.len() + f.calc_items.len());
                 for v in &f.items {
                     s.push_str(&item_xml(v, sys, false));
+                }
+                // A calculated item is the last shared item, marked `f="1"` (Excel's marker).
+                for c in &f.calc_items {
+                    let _ = write!(s, "<s v=\"{}\" f=\"1\"/>", esc_attr(&c.name));
                 }
                 s.push_str("</sharedItems>");
             } else {
@@ -912,6 +953,30 @@ fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -
         s.push_str("</cacheField>");
     }
     s.push_str("</cacheFields>");
+    // Calculated items live on the cache: the formula in Excel's `Field[item]` form, the item's
+    // index among the field's shared items, and the field's position on the axis.
+    let mut calc: Vec<(usize, usize, usize, String)> = Vec::new();
+    for (fi, f) in c.fields.iter().enumerate() {
+        if f.calc_items.is_empty() {
+            continue;
+        }
+        let Some(pos) = c.axis_map.iter().position(|x| *x == Some(fi)) else { continue };
+        for (k, item) in f.calc_items.iter().enumerate() {
+            let Some(compiled) = pivot_item::compile(&f.name, &item.formula).ok() else { continue };
+            calc.push((fi, f.items.len() + k, pos, compiled.stored_form(&f.name)));
+        }
+    }
+    if !calc.is_empty() {
+        let _ = write!(s, "<calculatedItems count=\"{}\">", calc.len());
+        for (field, item, pos, formula) in &calc {
+            let _ = write!(
+                s,
+                "<calculatedItem formula=\"{}\"><pivotArea cacheIndex=\"{cache_id}\" outline=\"0\" fieldPosition=\"{pos}\"><references count=\"1\"><reference field=\"{field}\" count=\"1\"><x v=\"{item}\"/></reference></references></pivotArea></calculatedItem>",
+                esc_attr(formula)
+            );
+        }
+        s.push_str("</calculatedItems>");
+    }
     if !ext.is_empty() {
         let _ = write!(s, "<extLst>{ext}</extLst>");
     }
@@ -1046,6 +1111,12 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
             Some(sel) if !(is_page && sel.len() == 1) => labels.iter().map(|l| !sel.iter().any(|x| same(x, l))).collect(),
             _ => vec![false; labels.len()],
         };
+        // A calculated item is never hidden by an item selection: its caption is not one of the
+        // field's source items, and the report always shows it (record-level filters only).
+        let calc_from = labels.len().saturating_sub(f.calc_items.len());
+        for h in hide.iter_mut().skip(calc_from) {
+            *h = false;
+        }
         if !hide.is_empty() && hide.iter().all(|h| *h) {
             hide.iter_mut().for_each(|h| *h = false);
         }
@@ -1070,8 +1141,12 @@ fn table_xml(pt: &PivotTable, idx: usize, cache_id: u32, c: &Cache, fmt_id: &dyn
             let collapsed: &[String] = axis_field(i).map(|f| f.collapsed_items.as_slice()).unwrap_or(&[]);
             let count = labels.len() + usize::from(pt.subtotals);
             let _ = write!(s, "><items count=\"{count}\">");
+            // The calculated items are the tail of `labels` (their captions were appended last).
             for (x, l) in labels.iter().enumerate() {
                 let _ = write!(s, "<item x=\"{x}\"");
+                if x >= calc_from && !f.calc_items.is_empty() {
+                    s.push_str(" f=\"1\"");
+                }
                 if hide.get(x).copied().unwrap_or(false) {
                     s.push_str(" h=\"1\"");
                 }
@@ -1212,6 +1287,8 @@ struct FieldIn {
     group: Option<FieldGroupIn>,
     /// A calculated field's formula.
     formula: Option<String>,
+    /// The calculated items among the shared items: their index and caption (`f="1"`).
+    calc: Vec<(u32, String)>,
 }
 
 impl FieldIn {
@@ -1223,10 +1300,20 @@ impl FieldIn {
     }
 }
 
+/// A calculated item as the cache stores it: its field, its index among that field's shared
+/// items, and the formula in Excel's `Field[item]` form.
+#[derive(Clone, Debug)]
+struct CalcIn {
+    field: usize,
+    item: usize,
+    formula: String,
+}
+
 #[derive(Clone, Debug, Default)]
 struct CacheIn {
     source: String,
     fields: Vec<FieldIn>,
+    calc_items: Vec<CalcIn>,
 }
 
 /// Workbook-level pivot cache lookup, filled from `<pivotCaches>`; caches are parsed once.
@@ -1301,6 +1388,13 @@ fn read_cache(cx: &mut Ctx<'_>, part: &str, sheet_name: &str) -> Option<CacheIn>
     if let Some(cf) = x.child("cacheFields") {
         for f in cf.kids("cacheField").take(MAX_FIELDS) {
             let items = f.child("sharedItems").map(|si| si.children.iter().map(|e| item_label_el(e, sys)).collect()).unwrap_or_default();
+            // A calculated item is marked `f="1"` on its shared item, after the real ones.
+            let calc = f
+                .child("sharedItems")
+                .map(|si| {
+                    si.children.iter().enumerate().filter(|(_, e)| e.flag("f", false)).map(|(i, e)| (i as u32, item_label_el(e, sys))).collect()
+                })
+                .unwrap_or_default();
             let group = f.child("fieldGroup").map(|g| {
                 let base = g.attr_u32("base").map(|b| b as usize);
                 let rp = g.child("rangePr");
@@ -1332,6 +1426,7 @@ fn read_cache(cx: &mut Ctx<'_>, part: &str, sheet_name: &str) -> Option<CacheIn>
                 items,
                 group,
                 formula: f.attr("formula").map(str::to_string),
+                calc,
             });
         }
     }
@@ -1339,7 +1434,24 @@ fn read_cache(cx: &mut Ctx<'_>, part: &str, sheet_name: &str) -> Option<CacheIn>
         cx.warn("a PivotTable's cache has no fields; kept as plain cells");
         return None;
     }
-    Some(CacheIn { source, fields })
+    // Calculated items are a child of the cache definition: `Field[item]` references, the item's
+    // index among its field's shared items, and the field's position on the axis.
+    let mut calc_items: Vec<CalcIn> = Vec::new();
+    if let Some(list) = x.child("calculatedItems") {
+        for it in list.kids("calculatedItem").take(MAX_CALC_ITEMS) {
+            let Some(formula) = it.attr("formula").map(str::to_string) else { continue };
+            let Some(r) = it.child("pivotArea").and_then(|a| a.child("references")).and_then(|rs| rs.kids("reference").next()) else {
+                cx.warn("a calculated item has no area reference; it was dropped");
+                continue;
+            };
+            let (Some(field), Some(item)) = (r.attr_u32("field"), r.kids("x").next().and_then(|x| x.attr_u32("v"))) else {
+                cx.warn("a calculated item has no item reference; it was dropped");
+                continue;
+            };
+            calc_items.push(CalcIn { field: field as usize, item: item as usize, formula });
+        }
+    }
+    Some(CacheIn { source, fields, calc_items })
 }
 
 /// Reads the PivotTables related to a worksheet part.
@@ -1450,8 +1562,8 @@ fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<Pivo
     pt.grand_totals_cols = x.flag("rowGrandTotals", true);
     pt.show_headers = x.flag("showHeaders", true);
     pt.style = x.child("pivotTableStyleInfo").and_then(|s| s.attr("name")).unwrap_or("").to_string();
-    if x.child("calculatedItems").is_some() || x.path(&["filters", "filter"]).is_some() {
-        cx.warn(format!("PivotTable \"{}\": calculated items and label/value filters are not supported", pt.name));
+    if x.path(&["filters", "filter"]).is_some() {
+        cx.warn(format!("PivotTable \"{}\": label/value filters are not supported", pt.name));
     }
 
     let mut filters: Vec<PivotFilter> = Vec::new();
@@ -1581,6 +1693,42 @@ fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<Pivo
             let formula = if formula.starts_with('=') { formula.to_string() } else { format!("={formula}") };
             pt.calculated_fields.push(PivotCalcField { name: f.name.clone(), formula });
         }
+    }
+
+    // Calculated items: an item of a row or column field, computed from that field's own items.
+    for ci in &cache.calc_items {
+        let Some(f) = cache.fields.get(ci.field) else {
+            cx.warn(format!(
+                "PivotTable \"{}\": a calculated item names cache field {} of {}; it was dropped",
+                pt.name,
+                ci.field,
+                cache.fields.len()
+            ));
+            continue;
+        };
+        let Some((_, name)) = f.calc.iter().find(|(i, _)| *i as usize == ci.item) else {
+            cx.warn(format!(
+                "PivotTable \"{}\": a calculated item points at item {} of \"{}\", which isn't a calculated item; it was dropped",
+                pt.name, ci.item, f.name
+            ));
+            continue;
+        };
+        if !pt.rows.iter().chain(pt.columns.iter()).any(|p| same(&p.source_col, &f.name)) {
+            cx.warn(format!(
+                "PivotTable \"{}\": the calculated item \"{name}\" is on \"{}\", which is not in Rows or Columns; it was dropped",
+                pt.name, f.name
+            ));
+            continue;
+        }
+        if f.group.is_some() {
+            cx.warn(format!("PivotTable \"{}\": the calculated item \"{name}\" is on the grouped field \"{}\"; it was dropped", pt.name, f.name));
+            continue;
+        }
+        let Ok(compiled) = pivot_item::compile(&f.name, &ci.formula) else {
+            cx.warn(format!("PivotTable \"{}\": the calculated item \"{name}\" has a formula this version can't read; it was dropped", pt.name));
+            continue;
+        };
+        pt.calculated_items.push(PivotCalcItem { field: f.name.clone(), name: name.clone(), formula: compiled.dialog_form(&f.name) });
     }
 
     pt.anchor = loc.start;

@@ -10,6 +10,7 @@ mod cellmap;
 pub mod features;
 pub mod line;
 pub mod password;
+pub mod pivot_item;
 pub mod preserved;
 pub mod sheet;
 mod slicer;

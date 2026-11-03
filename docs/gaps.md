@@ -413,7 +413,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 7–16 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, RC4 write 1,
   an Excel run over a `.xls` 1–6). [file-format-parity.md](file-format-parity.md)
 
-### 8. PivotTables: calculated items, value/label filters; unverified in Excel (F)
+### 8. PivotTables: data-model pivots and a real-world corpus (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
   field, the PivotTables they filter, item values with their selected flags, name, caption, style,
   column count, timeline unit and anchor — read into the model and written once from it, so
@@ -511,21 +511,46 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   by value". A rule and an item selection on one field replace each other; a calculated field as
   the measure is refused by name. Guarded: between needs both bounds, and the field must be on an
   axis.
-- **Missing:** calculated items and data-model pivots; a real-world corpus for the PivotTable gate. (`insert.pivotChart` landed 10-11 and is in the catalog, so PivotCharts are
-  no longer part of this gap.) The "Generate GetPivotData" click option (Excel writes a
-  `GETPIVOTDATA` formula when a pivot cell is clicked) is not wired into the grid yet.
-  Calculated items were deferred while no primary source here settled the `calculatedItems`
-  element's placement and item-index rules; **Excel is now available**, so the shape can be
-  observed from an Excel-authored pivot instead of guessed (the next slice).
+- **Landed 11-02 (calculated items):** `pivot.calculatedItem {field, name, formula, delete?}` adds
+  an item of a row or column field computed from that field's own items (`=North+South`, bare,
+  quoted or `Field[item]`), the way Excel's Fields, Items & Sets ▸ Calculated Item does. The
+  formula is parsed by a small shared grammar (`crates/model/src/pivot_item.rs`: numbers,
+  `+ - * / ^`, parentheses and item captions; no functions, cells or other fields), resolved
+  against the field's real items (an unknown caption, a real item's caption, another **calculated**
+  item's caption — so no cycles — or a grouped field is refused by name), and stored in the model
+  (`PivotTable.calculated_items`) in the dialog form. The engine appends the item after the real
+  ones (so it sorts last, as Excel shows it), gives it a synthetic report path under every parent
+  group on its axis, and evaluates the formula on each report cell's item aggregates — one value
+  per value field, so the report, subtotals and show-values-as see an ordinary item. As in Excel,
+  the grand totals stay the source totals (the item is not added to them) and record-level filters
+  leave it alone. The file encoding is Excel's own, captured from an Excel-authored pivot
+  (`plan/excel/calculated-items.md`): the caption is the field's **last** shared item with
+  `f="1"`, the table lists `<item f="1" x>`, and `<calculatedItems>` is a child of the **cache
+  definition** after `</cacheFields>` with the `Field[item]` formula, the item's index and the
+  field's axis position. Reading takes that back into the dialog form and drops a definition it
+  cannot express with a warning (another field's item, another field's index, a bad formula, a
+  field not on an axis). Removing the field from the axes, grouping it, or a source change that
+  loses the field or its items drops the item with them. **Verified in Excel 16 (11-02):** the
+  `pivot` oracle fixture now carries `Region[East]+Region[West]`; Excel opens the file, refreshes
+  the pivot, **keeps the `<calculatedItems>` definition**, recomputes the item (116,320 = 55,300 +
+  61,020) and re-saves with every compared cell equal, and our reader reads Excel's own copy back
+  as `=East+West`.
+- **Missing:** data-model (OLAP) pivots and a real-world corpus for the PivotTable gate.
+  (`insert.pivotChart` landed 10-11 and is in the catalog, so PivotCharts are no longer part of
+  this gap.) The "Generate GetPivotData" click option (Excel writes a `GETPIVOTDATA` formula when a
+  pivot cell is clicked) is not wired into the grid yet.
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
-  never been opened in Excel — gate #1. The number-grouping and hidden-item encodings do pass
-  [`cargo xtask oracle`](oracle.md) on the `pivot` fixture (openpyxl reads every cell back; WPS 12.0
-  opens, recalculates and re-saves the package), which proves the XML is well formed and tolerated,
-  not that Excel accepts it.
+  never been opened in Excel — gate #1. The number-grouping, hidden-item and calculated-item
+  encodings do pass [`cargo xtask oracle`](oracle.md) on the `pivot` fixture **in Excel 16**
+  (open, refresh every pivot, recalculate, save, re-read: every compared cell equal, and Excel's own
+  copy still carries the `<calculatedItems>` definition and the recomputed item), as well as
+  openpyxl's readback and WPS 12.0's open/recalculate/save.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 2–4 h for beta (18–27 h full): calculated items (now observable in Excel) and a real-world corpus for the Excel check.
+- **Estimate:** 3–6 h to close beta: a real-world corpus for the PivotTable gate (no corpus URL in
+  the repo and no network here). The full scope keeps data-model (OLAP) pivots and writing Excel's
+  own `<filters>` rules.
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
@@ -697,6 +722,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §8: calculated items landed (`pivot.calculatedItem`, item captions as the field's last shared items with `f="1"`, `<calculatedItems>` on the cache with the `Field[item]` formula, the item sorted last and evaluated on the cell's item aggregates, out of the grand totals), **verified in Excel 16**: the oracle pivot carries `Region[East]+Region[West]`, Excel keeps the definition, computes 116,320 and re-saves with every cell equal. §8 is now only data-model pivots and the corpus |
 | 2026-11-02 | major | §1: Excel 16 is activated and `cargo xtask oracle` now uses it as the gate probe (open, refresh every PivotTable, recalc, save, re-read, compare every cell) on all five fixtures — no repair, no lost content; the corpus half is still missing. §8: the probe found and pinned the number-group encoding (no `refreshOnLoad`, base values in `sharedItems`, next-boundary tail, min-extent anchoring); calculated items are now observable in Excel |
 | 2026-11-02 | minor | §8: recorded why calculated items wait (no primary source here settles `calculatedItems`' placement and index rules, and a guessed part risks an Excel repair prompt); the engine half is understood |
 | 2026-11-02 | minor | §8: the `pivot` oracle fixture now carries a grouped numeric field (`rangePr` + 13 group captions) and a value filter's hidden items, and both probes pass (openpyxl readback; WPS opens, recalculates, re-saves) — well-formedness evidence, not the Excel check |

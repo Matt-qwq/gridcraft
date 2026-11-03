@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use gridcraft_core::date::datetime_from_serial;
 pub use gridcraft_core::quote_sheet;
 use gridcraft_core::{CellError, CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value, split_sheet};
+use gridcraft_model::pivot_item;
 use gridcraft_model::*;
 
 use crate::pivot_calc::CalcSet;
@@ -23,6 +24,14 @@ pub const MAX_OUTPUT_CELLS: u64 = 2_000_000;
 pub const MAX_AXIS_FIELDS: usize = 32;
 /// Most fields in the Values area.
 pub const MAX_VALUE_FIELDS: usize = 256;
+/// Most calculated items per PivotTable.
+pub const MAX_CALC_ITEMS: usize = 256;
+/// Most report paths a calculated item may add to an axis (a hostile document must not ask for
+/// an unbounded report).
+const MAX_CALC_PATHS: usize = 200_000;
+/// Deepest chain of calculated items a lookup follows (they may not name each other, but a hand-
+/// written document could still nest them).
+const MAX_CALC_DEPTH: u32 = 8;
 
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -267,6 +276,14 @@ impl FieldItems {
         self.index.insert(key, i);
         i
     }
+    /// Appends a calculated item's caption: it sorts after the real items (`class` 4) and never
+    /// shares an identity key with a source value.
+    fn push_calc(&mut self, label: &str) -> u32 {
+        let i = self.items.len() as u32;
+        let text = label.to_lowercase();
+        self.items.push(Item { value: Value::text(label), label: label.to_string(), class: 4, num: 0.0, text, first: usize::MAX, formatted: false });
+        i
+    }
     fn get(&self, i: u32) -> Option<&Item> {
         self.items.get(i as usize)
     }
@@ -362,6 +379,87 @@ pub fn distinct_labels(wb: &Workbook, src: &Source, col: usize, group: Grouping,
     let mut items = fi.items;
     items.sort_by(cmp_items);
     items.into_iter().take(limit).map(|i| i.label).collect()
+}
+
+// ---------------------------------------------------------------- calculated items
+
+/// A calculated item appended to a field on an axis, ready to look up.
+struct CalcItem {
+    /// The field's depth among the axis's fields, and the position it holds in a report path.
+    depth: usize,
+    /// Its item index in the field's items (after the real ones).
+    item: u32,
+    /// The arithmetic over the item indexes in `refs`.
+    term: pivot_item::Term,
+    /// The item index of each caption the formula names, in `Compiled::items()` order; `None`
+    /// for a caption that isn't an item of the field (it evaluates to `#REF!`).
+    refs: Vec<Option<u32>>,
+}
+
+/// Parses a PivotTable's calculated items against the axis's fields and appends each one to its
+/// field's items. Every caption is resolved before any item is appended, so a formula cannot
+/// name another calculated item — references never form a cycle.
+fn plan_calc_items(calc_items: &[PivotCalcItem], fields: &[(usize, &PivotField)], items: &mut [FieldItems]) -> Vec<CalcItem> {
+    let mut pending: Vec<(usize, String, pivot_item::Compiled, Vec<Option<u32>>)> = Vec::new();
+    for ci in calc_items.iter().take(MAX_CALC_ITEMS) {
+        let field = ci.field.trim();
+        let Some(depth) = fields.iter().position(|(_, f)| f.source_col.eq_ignore_ascii_case(field)) else { continue };
+        let Some((_, f)) = fields.get(depth) else { continue };
+        // A grouped field's items are ranges or dates, not captions a formula can name.
+        if !Grouping::of(f).is_none() {
+            continue;
+        }
+        let name = ci.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(fi) = items.get(depth) else { continue };
+        // A caption already used by a real item (or by an earlier calculated item on this field).
+        if fi.items.iter().any(|it| it.label.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        if pending.iter().any(|(d, n, _, _)| *d == depth && n.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        let Ok(c) = pivot_item::compile(field, &ci.formula) else { continue };
+        let refs = c.items().iter().map(|n| fi.items.iter().position(|it| it.label.eq_ignore_ascii_case(n.trim())).map(|i| i as u32)).collect();
+        pending.push((depth, name.to_string(), c, refs));
+    }
+    let mut out = Vec::with_capacity(pending.len());
+    for (depth, name, c, refs) in pending {
+        let Some(fi) = items.get_mut(depth) else { continue };
+        let item = fi.push_calc(&name);
+        out.push(CalcItem { depth, item, term: c.term().clone(), refs });
+    }
+    out
+}
+
+/// Adds a synthetic report path for every calculated item under the parent groups the axis
+/// already has: `[calc]` at depth 0, `[parent, calc]` below each first-level item, and so on.
+fn add_calc_paths(set: &mut HashSet<Vec<u32>>, calc: &[CalcItem]) {
+    let mut by_depth: HashMap<usize, Vec<u32>> = HashMap::new();
+    for c in calc {
+        by_depth.entry(c.depth).or_default().push(c.item);
+    }
+    for (depth, items) in by_depth {
+        // The parent groups, collected before anything is inserted into the set.
+        let mut prefixes: HashSet<Vec<u32>> = HashSet::new();
+        for p in set.iter() {
+            if p.len() > depth {
+                prefixes.insert(p[..depth].to_vec());
+            }
+        }
+        for pre in prefixes {
+            for item in &items {
+                if set.len() >= MAX_CALC_PATHS {
+                    return;
+                }
+                let mut q = pre.clone();
+                q.push(*item);
+                set.insert(q);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- aggregation
@@ -889,6 +987,74 @@ fn data_cols_exceed_sheet(col_groups: usize, grand_total: bool, values: usize) -
     (col_groups + usize::from(grand_total)).saturating_mul(values.max(1)) > MAX_COLS as usize
 }
 
+/// One report cell's value: the aggregates, with a calculated item in the row or column path
+/// replaced by its formula over the items it names.
+struct Lookup<'a> {
+    wb: &'a Workbook,
+    src: &'a Source,
+    vals: &'a [(ValSrc, &'a PivotValue)],
+    /// Source columns summed for the calculated fields.
+    extra: &'a [usize],
+    calcset: &'a CalcSet,
+    aggs: &'a AggMap,
+    /// Number of value fields.
+    k: usize,
+    rows: &'a [CalcItem],
+    cols: &'a [CalcItem],
+}
+
+impl Lookup<'_> {
+    /// The aggregate of the records of one cell (no calculated item in the path).
+    fn raw(&self, rp: &[u32], cp: &[u32], vi: usize) -> Option<Value> {
+        let (vs, v) = self.vals.get(vi)?;
+        let accs = self.aggs.get(&(rp.to_vec(), cp.to_vec()))?;
+        match vs {
+            ValSrc::Col(_) => accs.get(vi).map(|a| a.result(v.func)),
+            ValSrc::Calc(i) => {
+                let sum = |name: &str| -> Value {
+                    self.src
+                        .col(name)
+                        .and_then(|c| self.extra.iter().position(|x| *x == c))
+                        .and_then(|j| accs.get(self.k + j))
+                        .map(|a| a.result(PivotFunc::Sum))
+                        .unwrap_or(Value::Number(0.0))
+                };
+                Some(self.calcset.value(self.wb, *i, &sum))
+            }
+        }
+    }
+
+    /// A cell's value, evaluating a calculated item in the row or column path.
+    fn get(&self, rp: &[u32], cp: &[u32], vi: usize, depth: u32) -> Option<Value> {
+        if depth > MAX_CALC_DEPTH {
+            return Some(Value::Error(CellError::Num));
+        }
+        if let Some(c) = self.rows.iter().find(|c| rp.get(c.depth) == Some(&c.item)) {
+            let mut p = rp.to_vec();
+            let mut item = |i: usize| -> Value {
+                let Some(j) = c.refs.get(i).copied().flatten() else { return Value::Error(CellError::Ref) };
+                if let Some(slot) = p.get_mut(c.depth) {
+                    *slot = j;
+                }
+                self.get(&p, cp, vi, depth + 1).unwrap_or(Value::Error(CellError::Ref))
+            };
+            return Some(pivot_item::eval(&c.term, &mut item));
+        }
+        if let Some(c) = self.cols.iter().find(|c| cp.get(c.depth) == Some(&c.item)) {
+            let mut p = cp.to_vec();
+            let mut item = |i: usize| -> Value {
+                let Some(j) = c.refs.get(i).copied().flatten() else { return Value::Error(CellError::Ref) };
+                if let Some(slot) = p.get_mut(c.depth) {
+                    *slot = j;
+                }
+                self.get(rp, &p, vi, depth + 1).unwrap_or(Value::Error(CellError::Ref))
+            };
+            return Some(pivot_item::eval(&c.term, &mut item));
+        }
+        self.raw(rp, cp, vi)
+    }
+}
+
 /// Computes a PivotTable report from the workbook.
 pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Output, String> {
     let src = read_source(wb, &pt.source, pivot_sheet)?;
@@ -1012,6 +1178,12 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     }
 
     // ---- axes
+    // Calculated items first: they extend their field's items and get a report path under every
+    // parent group the axis already has.
+    let row_calc = plan_calc_items(&pt.calculated_items, &rows, &mut row_items);
+    let col_calc = plan_calc_items(&pt.calculated_items, &cols, &mut col_items);
+    add_calc_paths(&mut row_set, &row_calc);
+    add_calc_paths(&mut col_set, &col_calc);
     let row_fields: Vec<&PivotField> = rows.iter().map(|(_, f)| *f).collect();
     let col_fields: Vec<&PivotField> = cols.iter().map(|(_, f)| *f).collect();
     let row_paths: Vec<&[u32]> = row_set.iter().map(Vec::as_slice).collect();
@@ -1024,6 +1196,7 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
 
     let val_names: Vec<String> = vals.iter().map(|(_, v)| v.name.clone()).collect();
     let ctx = Ctx { pt, rows: row_fields.clone(), row_items, row_fmts: row_fmts.clone(), vpos, val_names: val_names.clone() };
+    let lk = Lookup { wb, src: &src, vals: &vals, extra: &extra, calcset: &calc, aggs: &aggs, k, rows: &row_calc, cols: &col_calc };
     let mut lines: Vec<Line> = Vec::new();
     if row_levels == 0 {
         lines.push(Line { kind: LineKind::Item(false), leaf: true, path: vec![], values: true, labels: vec![], vi: None });
@@ -1217,23 +1390,7 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     }
 
     // ---- body
-    let get = |rp: &[u32], cp: &[u32], vi: usize| -> Option<Value> {
-        let (vs, v) = vals.get(vi)?;
-        let accs = aggs.get(&(rp.to_vec(), cp.to_vec()))?;
-        match vs {
-            ValSrc::Col(_) => accs.get(vi).map(|a| a.result(v.func)),
-            ValSrc::Calc(i) => {
-                let sum = |name: &str| -> Value {
-                    src.col(name)
-                        .and_then(|c| extra.iter().position(|x| *x == c))
-                        .and_then(|j| accs.get(k + j))
-                        .map(|a| a.result(PivotFunc::Sum))
-                        .unwrap_or(Value::Number(0.0))
-                };
-                Some(calc.value(wb, *i, &sum))
-            }
-        }
-    };
+    let get = |rp: &[u32], cp: &[u32], vi: usize| -> Option<Value> { lk.get(rp, cp, vi, 0) };
     let num = |v: &Option<Value>| v.as_ref().and_then(Value::as_f64);
     let ratio = |a: Value, b: Option<Value>| -> Value {
         match (a, b) {

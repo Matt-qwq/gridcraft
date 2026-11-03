@@ -118,6 +118,7 @@ fn workbook() -> Workbook {
         value_filters: vec![],
         values_on_rows: false,
         values_position: None,
+        calculated_items: vec![],
     };
     // Pivot 2: table source, date grouping on two levels, show-values-as, multi-select page
     // filter and a hidden-items filter on a column field.
@@ -191,6 +192,7 @@ fn workbook() -> Workbook {
         value_filters: vec![],
         values_on_rows: false,
         values_position: None,
+        calculated_items: vec![],
     };
     // Pivot 3: defaults, defined-name source, compact.
     let p3 = PivotTable {
@@ -301,6 +303,72 @@ fn number_grouping_writes_the_range_and_reads_it_back() {
     let p = &back.sheet(1).unwrap().pivots[0];
     assert_eq!(p.rows[0].number_group, Some(g));
     assert_eq!(p.rows[0].date_group, PivotDateGroup::None);
+}
+
+#[test]
+fn calculated_items_write_excels_encoding_and_read_back() {
+    // Excel's own shape (seen in an Excel-authored file): a calculated item is the *last* shared
+    // item of its field with `f="1"`, the table lists it as `<item f="1" x="N">`, and the cache
+    // holds `<calculatedItems>` after `</cacheFields>` with the `Field[item]` formula.
+    let mut wb = workbook();
+    {
+        let sh = wb.sheet_mut(1).unwrap();
+        let p = &mut sh.pivots[0];
+        p.calculated_items = vec![PivotCalcItem { field: "Region".into(), name: "North+East".into(), formula: "=North+East".into() }];
+    }
+    let bytes = write_xlsx(&wb).unwrap();
+    let parts = unzip(&bytes);
+    let trels = xml::parse(parts.get("xl/pivotTables/_rels/pivotTable1.xml.rels").unwrap()).unwrap();
+    let target = crate::package::resolve("xl/pivotTables", trels.kids("Relationship").next().unwrap().attr("Target").unwrap());
+    let cache = xml::parse(parts.get(&target).unwrap()).unwrap();
+    let cf = cache.child("cacheFields").unwrap().kids("cacheField").find(|f| f.attr("name") == Some("Region")).unwrap();
+    let si = cf.child("sharedItems").unwrap();
+    let last = si.children.last().unwrap();
+    assert_eq!(last.name, "s");
+    assert_eq!(last.attr("v"), Some("North+East"));
+    assert_eq!(last.attr("f"), Some("1"));
+    assert_eq!(si.attr_u32("count"), Some(si.children.len() as u32));
+    // The index of the calculated item among the shared items.
+    let x = si.children.len() as u32 - 1;
+    // `<calculatedItems>` is a child of the cache, after the fields.
+    let cis = cache.child("calculatedItems").unwrap();
+    assert_eq!(cis.attr_u32("count"), Some(1));
+    let ci = cis.kids("calculatedItem").next().unwrap();
+    assert_eq!(ci.attr("formula"), Some("Region[North]+Region[East]"));
+    let area = ci.child("pivotArea").unwrap();
+    assert_eq!(area.attr_u32("cacheIndex"), Some(1));
+    assert_eq!(area.attr_u32("fieldPosition"), Some(0), "Region is the first row field");
+    let r = area.child("references").unwrap().kids("reference").next().unwrap();
+    assert_eq!(r.attr_u32("field"), Some(0), "Region is cache field 0");
+    assert_eq!(r.kids("x").next().and_then(|x| x.attr_u32("v")), Some(x));
+    // The table's item list marks it.
+    let t = xml::parse(parts.get("xl/pivotTables/pivotTable1.xml").unwrap()).unwrap();
+    let pf = t.child("pivotFields").unwrap().kids("pivotField").next().unwrap();
+    let items = pf.child("items").unwrap();
+    let item = items.kids("item").find(|i| i.attr_u32("x") == Some(x)).unwrap();
+    assert_eq!(item.attr("f"), Some("1"));
+    assert_eq!(items.kids("item").filter(|i| i.attr("f").is_some()).count(), 1);
+    // A filter on the same field never hides the calculated item: its caption is not a source
+    // item and the report always shows it.
+    {
+        let sh = wb.sheet_mut(1).unwrap();
+        let p = &mut sh.pivots[0];
+        p.filters.push(PivotFilter { source_col: "Region".into(), selected: Some(vec!["East".into()]), area: PivotFilterArea::Axis });
+    }
+    let parts = unzip(&write_xlsx(&wb).unwrap());
+    let t = xml::parse(parts.get("xl/pivotTables/pivotTable1.xml").unwrap()).unwrap();
+    let pf = t.child("pivotFields").unwrap().kids("pivotField").next().unwrap();
+    let items = pf.child("items").unwrap();
+    let item = items.kids("item").find(|i| i.attr_u32("x") == Some(x)).unwrap();
+    assert_eq!(item.attr("h"), None);
+    assert_eq!(items.kids("item").filter(|i| i.attr("h") == Some("1")).count(), 2, "only the source items the filter leaves out");
+    // Reading gets the item and the dialog form back; a second trip is stable.
+    let (back, report) = read_xlsx(&bytes).unwrap();
+    assert!(report.warnings.iter().all(|w| !w.to_lowercase().contains("calculated")), "{:?}", report.warnings);
+    let p = &back.sheet(1).unwrap().pivots[0];
+    assert_eq!(p.calculated_items, vec![PivotCalcItem { field: "Region".into(), name: "North+East".into(), formula: "=North+East".into() }]);
+    let (again, _) = read_xlsx(&write_xlsx(&back).unwrap()).unwrap();
+    assert_eq!(&again.sheet(1).unwrap().pivots[0], p);
 }
 
 #[test]
@@ -656,6 +724,31 @@ fn calculated_fields_round_trip() {
     for (a, b) in orig.iter().zip(read.iter()) {
         assert_eq!(a, b, "pivot {} differs", a.name);
     }
+}
+
+#[test]
+fn hostile_calculated_items_warn_not_panic() {
+    // A cache whose calculated items are all unusable in some way, against a one-field table.
+    let table = r#"<pivotTableDefinition name="P" cacheId="1"><location ref="D3:E9"/><pivotFields count="2"><pivotField axis="axisRow"><items count="3"><item x="0"/><item x="1"/><item x="2" f="1"/><item t="default"/></items></pivotField><pivotField dataField="1"/></pivotFields><rowFields><field x="0"/></rowFields><dataFields><dataField name="Total" fld="1"/></dataFields></pivotTableDefinition>"#;
+    let cache = r#"<pivotCacheDefinition><cacheSource type="worksheet"><worksheetSource ref="A1:B3"/></cacheSource><cacheFields count="2">
+<cacheField name="K" numFmtId="0"><sharedItems count="3"><s v="x"/><s v="y"/><s v="Combo" f="1"/></sharedItems></cacheField>
+<cacheField name="V" numFmtId="0"><sharedItems/></cacheField></cacheFields>
+<calculatedItems count="6">
+<calculatedItem formula="K[x]+K[y]"><pivotArea cacheIndex="1" fieldPosition="0"><references count="1"><reference field="0" count="1"><x v="2"/></reference></references></pivotArea></calculatedItem>
+<calculatedItem formula="K[x]+Nope[y]"><pivotArea cacheIndex="1" fieldPosition="0"><references count="1"><reference field="0" count="1"><x v="2"/></reference></references></pivotArea></calculatedItem>
+<calculatedItem formula="K[x"><pivotArea cacheIndex="1" fieldPosition="0"><references count="1"><reference field="0" count="1"><x v="2"/></reference></references></pivotArea></calculatedItem>
+<calculatedItem formula="K[x]"><pivotArea cacheIndex="1" fieldPosition="0"><references count="1"><reference field="9" count="1"><x v="0"/></reference></references></pivotArea></calculatedItem>
+<calculatedItem formula="K[x]"><pivotArea cacheIndex="1" fieldPosition="0"><references count="1"><reference field="0" count="1"><x v="0"/></reference></references></pivotArea></calculatedItem>
+<calculatedItem formula="K[x]"><pivotArea cacheIndex="1" fieldPosition="0"/></calculatedItem>
+</calculatedItems></pivotCacheDefinition>"#;
+    let (wb, report) = read_xlsx(&with_pivot(table, Some(cache))).unwrap();
+    let p = &wb.sheet(0).unwrap().pivots[0];
+    // The one good item survives; every bad one is a warning, not a lost PivotTable.
+    assert_eq!(p.calculated_items.len(), 1, "{:?}", p.calculated_items);
+    assert_eq!(p.calculated_items[0].name, "Combo");
+    assert_eq!(p.calculated_items[0].field, "K");
+    assert_eq!(p.calculated_items[0].formula, "=x+y");
+    assert!(report.warnings.iter().filter(|w| w.contains("calculated item")).count() >= 4, "{:?}", report.warnings);
 }
 
 /// The `x` attributes of an axis list (`rowFields`/`colFields`) in a pivotTable part.

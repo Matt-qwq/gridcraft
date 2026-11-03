@@ -1755,6 +1755,9 @@ pub struct PivotTable {
     pub last_range: Option<RangeRef>,
     /// Calculated fields, usable in the Values area by name.
     pub calculated_fields: Vec<PivotCalcField>,
+    /// Calculated items: extra items of a row or column field, computed from its other items
+    /// (`=North+South`). They sort after the real items and stay out of the grand totals.
+    pub calculated_items: Vec<PivotCalcItem>,
     /// Label filters on row or column fields (at most one per field).
     pub label_filters: Vec<PivotLabelFilter>,
     /// Value filters on row or column fields (at most one per field).
@@ -1774,6 +1777,20 @@ pub struct PivotTable {
 pub struct PivotCalcField {
     pub name: String,
     /// Formula text, starting with `=`.
+    pub formula: String,
+}
+
+/// A calculated item: an extra item of a row or column field, computed from other items of the
+/// same field (`=North+South`). It is shown after the real items and, as Excel does, left out of
+/// the grand totals and of record-level filters.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PivotCalcItem {
+    /// The row or column field the item belongs to (its source column name).
+    pub field: String,
+    /// The item's caption, the way the report shows it.
+    pub name: String,
+    /// Formula text in the dialog form (`=North+South`); items of other fields are not allowed.
     pub formula: String,
 }
 
@@ -1797,6 +1814,7 @@ impl Default for PivotTable {
             show_headers: true,
             last_range: None,
             calculated_fields: vec![],
+            calculated_items: vec![],
             label_filters: vec![],
             value_filters: vec![],
             values_on_rows: false,

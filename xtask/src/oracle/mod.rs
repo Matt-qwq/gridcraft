@@ -194,6 +194,9 @@ fn pivot_fixture() -> Result<(Workbook, String), String> {
     // A value filter keeps only the buckets whose sum passes; its kept items are written as the
     // field's `item/@h` hidden items.
     exec(&mut s, "pivot.filterByValue", json!({"field": "Q1", "op": "greaterThan", "value": 150_000}))?;
+    // A calculated item over two of a field's own items: Excel must keep the definition, recompute
+    // it on refresh and re-save it, with every compared cell equal.
+    exec(&mut s, "pivot.calculatedItem", json!({"field": "Region", "name": "East+West", "formula": "=East+West"}))?;
     let pivots = exec(&mut s, "pivot.list", json!({}))?;
     let name = pivots
         .as_array()
