@@ -10,6 +10,8 @@ mod eol;
 mod ico;
 mod keytips;
 mod layers;
+#[cfg(feature = "engine")]
+mod oracle;
 #[cfg_attr(not(feature = "engine"), allow(dead_code))]
 mod parity;
 mod stats;
@@ -29,6 +31,9 @@ commands:
   wasm            cargo check --target wasm32-unknown-unknown for the L0-L5 crates (+ gridcraft-web)
   parity [--check] [--out PATH]
                   write docs/parity-checklist.md from gridcraft_engine::catalog (implemented vs missing ids)
+  oracle [--fixture=NAME] [--no-app] [--keep]
+                  read the sample workbooks back through foreign implementations (openpyxl; an
+                  independent application through COM on Windows) — see docs/oracle.md
   keytips [--check]
                   regenerate crates/ui-egui/src/keytips/generated.rs from keytips.json (--check: fail if stale)
   version [set X.Y.Z[-pre]]
@@ -48,6 +53,10 @@ fn main() -> ExitCode {
         Some("ci") => cmd_ci(),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
         Some("parity") => parity::run(&root(), &rest),
+        #[cfg(feature = "engine")]
+        Some("oracle") => oracle::run(&root(), &rest),
+        #[cfg(not(feature = "engine"))]
+        Some("oracle") => Err("`oracle` needs the engine feature (on by default)".to_string()),
         Some("keytips") => keytips::run(&root(), &rest),
         Some("ico") => ico::run(&rest),
         Some("version") => version::run(&root(), &rest),
