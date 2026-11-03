@@ -317,8 +317,9 @@ pub(crate) fn encrypt_standard(plain: &[u8], password: &str) -> (Vec<u8>, Vec<u8
 // ---------------------------------------------------------------- package validator
 
 /// A strict check of an `.xlsx` package, for tests: every relationship target exists, every part
-/// has a content type, no part is orphaned, and `[Content_Types].xml` has no override for a part
-/// the package doesn't have. These are the four ways a package makes Excel show a repair prompt.
+/// has a content type, no part is orphaned, no part uses an undeclared namespace prefix, and
+/// `[Content_Types].xml` has no override for a part the package doesn't have. These are the ways a
+/// package makes Excel show a repair prompt.
 ///
 /// The writer runs it on every package the test suite saves ([`crate::write::checked`]), so a
 /// future change that writes a part without a relationship (or a relationship to a part it forgot
@@ -444,7 +445,128 @@ pub fn check_unpacked(parts: &std::collections::HashMap<String, Vec<u8>>) -> Res
             _ => {}
         }
     }
+    // A part may not use a namespace prefix it never declares: a strict XML parser rejects the
+    // part (lxml refused our `pivotTable1.xml` with "Namespace prefix r for id is not defined"),
+    // and a part Excel cannot parse is a repair prompt.
+    for (name, data) in parts {
+        if !(name.ends_with(".xml") || name.ends_with(".rels")) {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(data) else { continue };
+        let missing = undeclared_prefixes(text);
+        if !missing.is_empty() {
+            return Err(format!("{name} uses the undeclared namespace prefix {}", missing.join(", ")));
+        }
+    }
+
     Ok(())
+}
+
+/// Namespace prefixes a part uses in a tag without declaring them with `xmlns:prefix`.
+///
+/// Text content and attribute values are skipped, so a URL in a `Target` attribute is not mistaken
+/// for a prefix. `xml` is bound implicitly, and `xmlns:` declares rather than uses.
+fn undeclared_prefixes(text: &str) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut declared: HashSet<String> = HashSet::new();
+    let mut used: HashSet<String> = HashSet::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        rest = &rest[open..];
+        if let Some(after) = rest.strip_prefix("<?") {
+            rest = after.find("?>").map(|k| &after[k + 2..]).unwrap_or("");
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("<!--") {
+            rest = after.find("-->").map(|k| &after[k + 3..]).unwrap_or("");
+            continue;
+        }
+        let end = tag_end(rest);
+        let tag = &rest[..end];
+        let (declares, uses) = tag_prefixes(&strip_quoted(tag));
+        declared.extend(declares);
+        for prefix in uses {
+            if prefix != "xml" {
+                used.insert(prefix);
+            }
+        }
+        rest = &rest[end..];
+        rest = rest.strip_prefix('>').unwrap_or(rest);
+    }
+    let mut missing: Vec<String> = used.difference(&declared).cloned().collect();
+    missing.sort();
+    missing
+}
+
+/// Byte offset just past the `<` tag's closing `>` (or the end, for a truncated part).
+fn tag_end(tag: &str) -> usize {
+    let bytes = tag.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &c) in bytes.iter().enumerate().skip(1) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b'>' => return i + 1,
+            None => {}
+        }
+    }
+    bytes.len()
+}
+
+/// The tag with every `"…"` and `'…'` value removed, so scanning names cannot hit a URL.
+fn strip_quoted(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len());
+    let mut quote: Option<char> = None;
+    for c in tag.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                out.push(' ');
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// The namespace prefixes a tag declares (`xmlns:p`) and the ones it uses (`p:name`).
+fn tag_prefixes(tag: &str) -> (Vec<String>, Vec<String>) {
+    let bytes = tag.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.';
+    let mut declared = vec![];
+    let mut used = vec![];
+    let mut i = 0;
+    while i < bytes.len() {
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        let first = &tag[start..i];
+        let Some(next) = bytes.get(i + 1) else { break };
+        if bytes[i] != b':' || !(next.is_ascii_alphabetic() || *next == b'_') {
+            continue;
+        }
+        i += 1;
+        let name_start = i;
+        while i < bytes.len() && ident(bytes[i]) {
+            i += 1;
+        }
+        let second = &tag[name_start..i];
+        if first == "xmlns" {
+            declared.push(second.to_string());
+        } else {
+            used.push(first.to_string());
+        }
+    }
+    (declared, used)
 }
 
 /// The part a `.rels` part describes: `xl/_rels/sheet1.xml.rels` → `xl/worksheets/sheet1.xml`… seen
@@ -460,4 +582,30 @@ fn rels_source(name: &str) -> Result<Option<String>, String> {
         return Err(format!("{name} is not in a _rels folder"));
     };
     Ok(Some(if parent.is_empty() { stem.to_string() } else { format!("{parent}/{stem}") }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::undeclared_prefixes;
+
+    #[test]
+    fn a_part_that_uses_an_unbound_prefix_is_flagged() {
+        // The defect this guard was written for: the extension declares `x14` but uses `r`, which a
+        // strict XML parser rejects (openpyxl/lxml: "Namespace prefix r for id is not defined").
+        let part = r#"<pivotTableDefinition xmlns="main"><extLst><ext xmlns:x14="x14"><x14:slicerCacheData><x14:slicerCache r:id="rId2"/></x14:slicerCacheData></ext></extLst></pivotTableDefinition>"#;
+        assert_eq!(undeclared_prefixes(part), vec!["r".to_string()]);
+    }
+
+    #[test]
+    fn declarations_urls_comments_and_the_xml_prefix_are_not_a_use() {
+        let ok = concat!(
+            r#"<?xml version="1.0"?>"#,
+            r#"<!-- r:id inside a comment is not markup -->"#,
+            r#"<workbook xmlns="main" xmlns:r="rel">"#,
+            r#"<sheet r:id="rId1" target="https://example.com/a?b:c"/>"#,
+            r#"<t xml:space="preserve">a:b is text, not a prefix</t>"#,
+            r#"</workbook>"#,
+        );
+        assert!(undeclared_prefixes(ok).is_empty(), "{:?}", undeclared_prefixes(ok));
+    }
 }

@@ -65,7 +65,7 @@ use gridcraft_model::{
 use crate::package::normalize;
 use crate::pivot::PivotWriter;
 use crate::read::Ctx;
-use crate::write::{Out, Rels, XML_DECL};
+use crate::write::{NS_REL, Out, Rels, XML_DECL};
 use crate::xml::{self, El, esc_attr};
 
 pub const CT_SLICER_CACHE: &str = "application/vnd.ms-excel.slicerCache+xml";
@@ -128,7 +128,9 @@ pub fn pivot_ext(pivot: &str, links: &[CacheLink], rels: &mut Rels) -> String {
     if mine.is_empty() {
         return String::new();
     }
-    let mut x = format!("<ext uri=\"{EXT_PIVOT_SLICER_CACHE}\" xmlns:x14=\"{NS_X14}\"><x14:slicerCacheData>");
+    // `xmlns:r` is declared here, on the element that uses it: the PivotTable part's root does not
+    // carry it, and a strict parser rejects a part with an unbound prefix (Excel: repair prompt).
+    let mut x = format!("<ext uri=\"{EXT_PIVOT_SLICER_CACHE}\" xmlns:r=\"{NS_REL}\" xmlns:x14=\"{NS_X14}\"><x14:slicerCacheData>");
     let mut seen = HashSet::new();
     for link in mine {
         if !seen.insert(link.cache_part.to_ascii_lowercase()) {
