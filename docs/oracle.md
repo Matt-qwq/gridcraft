@@ -1,24 +1,27 @@
 # The foreign-implementation oracle
 
-> **Last reviewed:** 2026-11-02 · **Status:** the accepted substitute for the Excel half of gate #1.
-> The gate itself is **not met** — see [gaps.md §1](gaps.md).
+> **Last reviewed:** 2026-11-02 · **Status:** Excel 16 is activated and is the gate probe (open,
+> refresh every PivotTable, recalculate, save, re-read); the **real-world corpus** half of gate #1
+> is still missing — see [gaps.md §1](gaps.md).
 
 GridCraft's target consumer is Microsoft Excel, and the one question a self round-trip cannot answer
-is *"does somebody else's reader accept this package?"*. Excel is the only consumer whose repair
-prompt actually matters, and it is not licensed on the dev machine (`ProPlus2024Volume`, no key, no
-KMS host, no signed-in account). `cargo xtask oracle` closes as much of that gap as can be closed
-without it: it reads a GridCraft-written package back through implementations that are **not ours**.
+is *"does somebody else's reader accept this package?"*. `cargo xtask oracle` answers it with three
+probes that are **not ours**: openpyxl (a foreign parser), Excel 16 and WPS 12.0 (independent
+applications that open, recalculate and save a copy).
 
 ```text
-cargo xtask oracle                    # all fixtures, both probes
+cargo xtask oracle                    # all fixtures, every available probe
 cargo xtask oracle --fixture=pivot    # one fixture (sales | budget | grades | features | pivot)
 cargo xtask oracle --no-app           # foreign reader only (no COM application needed)
 cargo xtask oracle --keep             # keep the .xlsx artifacts in target/oracle/
+cargo xtask corpus <dir>              # open every .xlsx in a directory, save/reopen a sample,
+                                      # read it back with openpyxl (never writes into <dir>)
 ```
 
 It is a development tool, not part of `cargo xtask ci`: it needs `python` with `openpyxl`, and the
-application probe needs Windows with WPS installed. Missing prerequisites are reported as `SKIPPED`,
-never as a pass.
+application probe needs Windows with Excel or WPS installed. Missing prerequisites are reported as
+`SKIPPED`, never as a pass. The owner's manual checks (what the probes cannot compare) are in
+[excel-checks.md](excel-checks.md).
 
 ## The probes
 
@@ -28,10 +31,11 @@ the cells, number formats, merges, tables and their columns, conditional-format 
 relationships, content types or markup are wrong in a way only a strict consumer notices fails here.
 The probe also fails if openpyxl *refuses* the package.
 
-**app — an independent spreadsheet application.** WPS 12.0 (`KET.Application`) opens the file,
-recalculates it and saves a copy; GridCraft then reads that copy back and every value must survive.
-This is the closest available proxy for "Excel opens our output": the part a foreign writer mangles
-is exactly the part Excel would complain about.
+**app — an independent spreadsheet application.** Excel 16 (`Excel.Application`) and WPS 12.0
+(`KET.Application`) each open the file, refresh every PivotTable, recalculate and save a copy;
+GridCraft then reads that copy back and every value must survive. Excel is the gate probe; WPS is
+the second opinion (and the only one on a machine without Excel). Only Excel's localized PivotTable
+chrome (`Row Labels`, `Grand Total`) is tolerated as a text difference.
 
 **The package validator** (`gridcraft_xlsx::testing::check_package`, run on every package the test
 suite saves) gained the fifth repair-prompt cause: a part that uses a namespace prefix it never
@@ -45,7 +49,23 @@ declares. That one is not a heuristic — a strict XML parser rejects the part o
 | `budget` | accounting formats (built-in id 44), totals, a second sheet |
 | `grades` | pass marks, averages, conditional formatting over a small grid |
 | `features` | a merge, a note, a hyperlink, a list validation, frozen panes, a defined name, a custom number code |
-| `pivot` | a table-sourced PivotTable plus a slicer cache linked to it; a numeric field in Rows grouped by `rangePr` (the cache's `startNum`/`endNum`/`groupInterval` + one caption per group item) and a value filter whose kept items are the field's hidden items. Both probes refresh every PivotTable before saving, so the report is re-rendered from the cache as an application would |
+| `pivot` | a table-sourced PivotTable plus a slicer cache linked to it; a numeric field in Rows grouped by `rangePr` (the cache's `startNum`/`endNum`/`groupInterval` + one caption per group item), a value filter whose kept items are the field's hidden items, and a calculated item (`Region[East]+Region[West]`). Every probe refreshes each PivotTable before saving, so the report is re-rendered from the cache as an application would |
+
+## The corpus run
+
+`cargo xtask corpus <dir>` is the one-command version of the run that gate #1 needs on real-world
+files: it opens every `.xlsx` in the directory (skipping `~$` temporary files), reports each
+workbook's sheet and cell count and its warnings, saves and reopens one in five (or `--all`) and
+compares a digest of sheet names, cells, values, formulas and number formats, and — when python and
+openpyxl are installed — reads the saved copy back through openpyxl. It **never writes into the
+corpus directory**: saved copies go to a temporary directory that is removed afterwards, and a
+directory over the caps (2,000 files, 4 GB) is refused rather than sampled. `--recursive` descends
+into subdirectories (eight levels); `--no-openpyxl` skips the foreign readback.
+
+`cargo xtask corpus target/oracle` on a fresh `cargo xtask oracle --keep` run is green (15 fixtures
+and their Excel/WPS copies, 0 failures, 0 save/reopen mismatches). When a pinned corpus is available,
+point the command at its directory: a nonzero exit means at least one workbook failed to open or did
+not survive the round trip.
 
 ## What it has found
 

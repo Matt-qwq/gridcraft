@@ -6,6 +6,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod assets;
+#[cfg(feature = "engine")]
+mod corpus;
 mod eol;
 mod ico;
 mod keytips;
@@ -34,6 +36,9 @@ commands:
   oracle [--fixture=NAME] [--no-app] [--keep]
                   read the sample workbooks back through foreign implementations (openpyxl; an
                   independent application through COM on Windows) — see docs/oracle.md
+  corpus <dir> [--recursive] [--all] [--no-openpyxl]
+                  open every .xlsx in a directory, report warnings, save/reopen a sample and
+                  read it back with openpyxl — never writes into <dir> (see docs/oracle.md)
   keytips [--check]
                   regenerate crates/ui-egui/src/keytips/generated.rs from keytips.json (--check: fail if stale)
   version [set X.Y.Z[-pre]]
@@ -55,6 +60,10 @@ fn main() -> ExitCode {
         Some("parity") => parity::run(&root(), &rest),
         #[cfg(feature = "engine")]
         Some("oracle") => oracle::run(&root(), &rest),
+        #[cfg(feature = "engine")]
+        Some("corpus") => corpus::run(&rest),
+        #[cfg(not(feature = "engine"))]
+        Some("corpus") => Err("`corpus` needs the engine feature (on by default)".to_string()),
         #[cfg(not(feature = "engine"))]
         Some("oracle") => Err("`oracle` needs the engine feature (on by default)".to_string()),
         Some("keytips") => keytips::run(&root(), &rest),

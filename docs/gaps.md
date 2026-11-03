@@ -25,9 +25,14 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   prompt, no lost content — including a PivotTable with a grouped numeric field, a value filter
   and a slicer. The probe tolerates only Excel's own localized PivotTable chrome (`Row Labels`,
   `Grand Total`) because Excel re-renders those in its UI language.
-- **Still missing:** the pinned real-world corpus (3–6 h). The repo records no corpus URL, there
-  is no `craftrules` checkout and no network on this machine, so it cannot be fetched here. An
-  Excel-authored `.xls` (now possible) is the other open item, under §7.
+- **Still missing:** the pinned real-world corpus (3–6 h). The repo records no corpus URL and
+  `storytold/craftrules` (which would name it) is a private repository — a clone answers
+  "Repository not found" — so the corpus cannot be fetched here. **The run is one command now:**
+  `cargo xtask corpus <dir>` opens every workbook, reports warnings, saves/reopens one in five with
+  a digest comparison and reads the copy back through openpyxl, never writing into the directory
+  (see [oracle.md](oracle.md#the-corpus-run)); on a fresh `cargo xtask oracle --keep` directory it
+  is green. The owner's manual checks are in [excel-checks.md](excel-checks.md). An Excel-authored
+  `.xls` is the other open item, under §7.
 - **Impact:** the main format; a repair prompt or silent loss destroys trust.
 - **Estimate:** 3–6 h of corpus work (no Excel needed) after gate #7's `.xls` slice. [file-format-parity.md](file-format-parity.md)
 
@@ -758,6 +763,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §1: the corpus run is one command — `cargo xtask corpus <dir>` (open every workbook, per-file warnings, save/reopen digest of names/cells/values/formulas/formats, openpyxl readback, temp-only writes, caps) and it is green on a fresh oracle directory; the real-world corpus itself is still missing because `storytold/craftrules` is private. Added `docs/excel-checks.md`, the owner's executable checklist for #1/#7/#8/#10 |
 | 2026-11-02 | minor | §13: the Analysis ToolPak is **complete (19/19)** — Sampling (periodic/random with a seed), Random Number Generation (uniform, normal, Bernoulli, binomial, Poisson, pattern, discrete; one seeded SplitMix64) and Fourier Analysis (power-of-two real or `a+bi` input, radix-2 FFT, complex text out) joined the z-Test and the two-factor ANOVAs. Remaining in the gap: Solver refinements and the Forecast Sheet options |
 | 2026-11-02 | minor | §13: both **two-factor ANOVAs** landed (`anovaTwoFactor` without replication: Rows/Columns/Error and a rows-then-columns SUMMARY; `anovaTwoFactorRep` with replication: Sample/Columns/Interaction/Within/Total and one SUMMARY block per row level, `rowsPerSample` replicates per cell). 16 of 19 tools; Fourier Analysis, Random Number Generation and Sampling remain |
 | 2026-11-02 | minor | §13: Analysis ToolPak **z-Test: Two Sample for Means** landed (known variances, hypothesized difference, z / P(Z<=z) one-tail / z critical one-tail / two-tail rows through `NORM.S.DIST`/`NORM.S.INV`, in the t-tests' layout; dialog fields added). 14 of 19 tools; Fourier, Random Number Generation, Sampling and the two two-factor ANOVAs remain |
