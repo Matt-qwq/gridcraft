@@ -2837,6 +2837,42 @@ fn toolpak_fields(tool: &str) -> Vec<Field> {
             v
         }
         "anovaTwoFactor" => vec![range(), labels(), Text { key: "alpha", label: "Alpha:" }],
+        "sampling" => vec![
+            range(),
+            labels(),
+            Choice { key: "method", label: "Method:", options: vec![("periodic", "Periodic"), ("random", "Random")] },
+            Text { key: "period", label: "Period:" },
+            Text { key: "sampleSize", label: "Number of Samples:" },
+            Text { key: "seed", label: "Seed (random, 0 for any):" },
+        ],
+        "randomNumberGeneration" => vec![
+            Text { key: "numberOfVariables", label: "Number of Variables:" },
+            Text { key: "numberOfRandomNumbers", label: "Number of Random Numbers:" },
+            Choice {
+                key: "distribution",
+                label: "Distribution:",
+                options: vec![
+                    ("uniform", "Uniform"),
+                    ("normal", "Normal"),
+                    ("bernoulli", "Bernoulli"),
+                    ("binomial", "Binomial"),
+                    ("poisson", "Poisson"),
+                    ("pattern", "Pattern"),
+                    ("discrete", "Discrete"),
+                ],
+            },
+            Text { key: "seed", label: "Seed (0 for any):" },
+            Text { key: "between", label: "Uniform: between" },
+            Text { key: "and", label: "and" },
+            Text { key: "mean", label: "Normal: mean" },
+            Text { key: "standardDev", label: "standard deviation" },
+            Text { key: "probability", label: "Bernoulli/Binomial: probability" },
+            Text { key: "trials", label: "Binomial: number of trials" },
+            Text { key: "lambda", label: "Poisson: lambda" },
+            Text { key: "pattern", label: "Pattern: values separated by commas" },
+            Text { key: "probabilities", label: "Discrete: probability range" },
+        ],
+        "fourierAnalysis" => vec![range()],
         "anovaTwoFactorRep" => {
             vec![range(), Text { key: "rowsPerSample", label: "Rows per sample:" }, labels(), Text { key: "alpha", label: "Alpha:" }]
         }
@@ -2869,6 +2905,9 @@ fn toolpak_defaults(sel: &str, tool: &str) -> Map<String, Json> {
         "tool": tool, "range": sel, "inputY": "", "inputX": "", "range1": sel, "range2": "", "bins": "",
         "groupedBy": "columns", "labels": false, "summary": true, "confidence": "", "kthLargest": "", "kthSmallest": "",
         "interval": "3", "damping": "0.3", "alpha": "0.05", "hypothesizedDifference": "0", "variance1": "", "variance2": "", "rowsPerSample": "",
+        "method": "periodic", "period": "1", "sampleSize": "", "numberOfVariables": "1", "numberOfRandomNumbers": "1",
+        "distribution": "uniform", "seed": "0", "between": "0", "and": "1", "mean": "0", "standardDev": "1",
+        "probability": "0.5", "trials": "10", "lambda": "1", "pattern": "", "probabilities": "",
         "outputTo": "newSheet", "output": "", "newSheet": "",
     });
     if tool == "regression" {

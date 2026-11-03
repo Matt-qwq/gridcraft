@@ -675,15 +675,14 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   successful solve and its reports share one Undo step (#1050). AllDifferent constraints,
   the Solver Options dialog, the Sensitivity and Population reports and Load/Save Model remain.
   The Analysis ToolPak
-  (`data.analysisToolPak`) has 16 of 19 tools: the **z-Test: Two Sample for Means** and both
-  **two-factor ANOVAs** landed 11-02. The z-Test takes the known variances
-  (`variance1`/`variance2`), the hypothesized difference and writes the z / one-tail / critical
-  rows from `NORM.S.DIST`/`NORM.S.INV`; the ANOVAs write the SUMMARY blocks (rows then columns
-  without replication; one block per row level with column and Total figures with replication) and
-  the Source of Variation table (Rows/Columns/Error or Sample/Columns/Interaction/Within/Total),
-  with F, P and F crit from the worksheet functions. Still missing: Fourier Analysis, Random Number
-  Generation and Sampling. Forecast Sheet (`data.forecastSheet`) and the FORECAST.ETS family are
-  in; the sheet has no Forecast Start (hindcast) option yet. **Estimate:** 8–15 h.
+  (`data.analysisToolPak`) has **all 19 tools** since 11-02: z-Test and the two-factor ANOVAs, plus
+  **Sampling** (periodic every k-th value, or a seeded random sample), **Random Number Generation**
+  (uniform, normal, Bernoulli, binomial, Poisson, pattern and discrete, one seeded SplitMix64 so a
+  report repeats) and **Fourier Analysis** (a power-of-two list of real numbers or `a+bi` text,
+  radix-2 FFT, complex text out). The z-Test/ANOVA p and critical values come from the worksheet
+  functions, and the ANOVA layouts follow Excel's SUMMARY + Source of Variation blocks. Forecast
+  Sheet (`data.forecastSheet`) and the FORECAST.ETS family are in; the sheet has no Forecast Start
+  (hindcast) option yet. **Estimate:** 4–10 h (Solver refinements and the Forecast Sheet options).
 
 ### 14. Page Layout view and print polish (U, F)
 - Page Layout view landed (#329): paper view with rulers and in-place header/footer editing.
@@ -759,6 +758,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §13: the Analysis ToolPak is **complete (19/19)** — Sampling (periodic/random with a seed), Random Number Generation (uniform, normal, Bernoulli, binomial, Poisson, pattern, discrete; one seeded SplitMix64) and Fourier Analysis (power-of-two real or `a+bi` input, radix-2 FFT, complex text out) joined the z-Test and the two-factor ANOVAs. Remaining in the gap: Solver refinements and the Forecast Sheet options |
 | 2026-11-02 | minor | §13: both **two-factor ANOVAs** landed (`anovaTwoFactor` without replication: Rows/Columns/Error and a rows-then-columns SUMMARY; `anovaTwoFactorRep` with replication: Sample/Columns/Interaction/Within/Total and one SUMMARY block per row level, `rowsPerSample` replicates per cell). 16 of 19 tools; Fourier Analysis, Random Number Generation and Sampling remain |
 | 2026-11-02 | minor | §13: Analysis ToolPak **z-Test: Two Sample for Means** landed (known variances, hypothesized difference, z / P(Z<=z) one-tail / z critical one-tail / two-tail rows through `NORM.S.DIST`/`NORM.S.INV`, in the t-tests' layout; dialog fields added). 14 of 19 tools; Fourier, Random Number Generation, Sampling and the two two-factor ANOVAs remain |
 | 2026-11-02 | minor | §5: word-wrapped cells and chart labels are shaped — each paragraph measured once, broken at spaces/hyphens/CJK boundaries and shaped line by line (bidi per line, Arabic joining, marks), with right-aligned RTL General text and per-line alignment; printable ASCII keeps the unshaped wrap bit for bit. Chart layout measures labels with the shaped width. Text boxes and the PDF's `text_width` remain |

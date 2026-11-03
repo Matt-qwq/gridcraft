@@ -42,10 +42,13 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("descriptive", "Descriptive Statistics"),
     ("exponentialSmoothing", "Exponential Smoothing"),
     ("fTest", "F-Test Two-Sample for Variances"),
+    ("fourierAnalysis", "Fourier Analysis"),
     ("histogram", "Histogram"),
     ("movingAverage", "Moving Average"),
+    ("randomNumberGeneration", "Random Number Generation"),
     ("rankPercentile", "Rank and Percentile"),
     ("regression", "Regression"),
+    ("sampling", "Sampling"),
     ("tTestPaired", "t-Test: Paired Two Sample for Means"),
     ("tTestEqual", "t-Test: Two-Sample Assuming Equal Variances"),
     ("tTestUnequal", "t-Test: Two-Sample Assuming Unequal Variances"),
@@ -58,7 +61,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Data Analysis…",
         ["Data", "Analysis"],
         None,
-        "{tool: anovaSingle|correlation|covariance|descriptive|exponentialSmoothing|fTest|histogram|movingAverage|rankPercentile|regression|tTestPaired|tTestEqual|tTestUnequal (or the tool's label), output?: \"E1\" (top-left of the report; default a new sheet), newSheet?: name, outputTo?: range|newSheet (picks between the two), overwrite?: bool (else non-empty output cells are refused), labels?: bool (first row/column holds names), groupedBy?: columns|rows, …tool params} — range tools take `range`; descriptive: summary? (default true), confidence?: 95, kthLargest?, kthSmallest?; histogram: bins?: range (default evenly spaced), pareto?, cumulative?; regression: inputY, inputX, constantZero?, confidence?: 95, residuals?, standardizedResiduals?, normalProbability?; movingAverage: interval? (3), standardErrors?; exponentialSmoothing: damping? (0.3), standardErrors?; t-tests and fTest: range1, range2, alpha? (0.05), hypothesizedDifference? (0); zTest: range1, range2, variance1, variance2 (the known variances), alpha? (0.05), hypothesizedDifference? (0); anovaSingle: alpha?; anovaTwoFactor: labels?, alpha? (two-factor without replication); anovaTwoFactorRep: range (factor A down the first column, factor B across the top, one block of rows per A level), rowsPerSample: r (the replicates per cell), labels?, alpha?. Writes static values. No `tool` → {tools} (the menu opens the dialog).",
+        "{tool: anovaSingle|correlation|covariance|descriptive|exponentialSmoothing|fTest|histogram|movingAverage|rankPercentile|regression|tTestPaired|tTestEqual|tTestUnequal (or the tool's label), output?: \"E1\" (top-left of the report; default a new sheet), newSheet?: name, outputTo?: range|newSheet (picks between the two), overwrite?: bool (else non-empty output cells are refused), labels?: bool (first row/column holds names), groupedBy?: columns|rows, …tool params} — range tools take `range`; descriptive: summary? (default true), confidence?: 95, kthLargest?, kthSmallest?; histogram: bins?: range (default evenly spaced), pareto?, cumulative?; regression: inputY, inputX, constantZero?, confidence?: 95, residuals?, standardizedResiduals?, normalProbability?; movingAverage: interval? (3), standardErrors?; exponentialSmoothing: damping? (0.3), standardErrors?; t-tests and fTest: range1, range2, alpha? (0.05), hypothesizedDifference? (0); zTest: range1, range2, variance1, variance2 (the known variances), alpha? (0.05), hypothesizedDifference? (0); anovaSingle: alpha?; anovaTwoFactor: labels?, alpha? (two-factor without replication); anovaTwoFactorRep: range (factor A down the first column, factor B across the top), rowsPerSample: r (the replicates per cell), labels?, alpha?; sampling: range, method?: periodic|random, period?: k (periodic), sampleSize?: n (random), seed?; randomNumberGeneration: numberOfVariables?, numberOfRandomNumbers?, distribution?: uniform|normal|bernoulli|binomial|poisson|pattern|discrete, seed?, between?/and? (uniform), mean?/standardDev? (normal), probability? (bernoulli, binomial), trials? (binomial), lambda? (poisson), pattern? (pattern), range?/probabilities? (discrete); fourierAnalysis: range (a power of two of real numbers or a+bi text) → complex text. Writes static values. No `tool` → {tools} (the menu opens the dialog).",
         has_doc,
         run
     )]
@@ -1345,6 +1348,390 @@ fn anova_two_factor(s: &Session, p: &Json, replication: bool) -> Result<Grid> {
     Ok(g)
 }
 
+// ---------------------------------------------------------------- random tools
+
+/// A small deterministic generator (SplitMix64) for the sampling tools: the same `seed` and the
+/// same parameters give the same report, so a test (and a user) can reproduce one.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// A uniform number in [0, 1).
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// A standard normal (Box–Muller).
+    fn normal(&mut self) -> f64 {
+        let u1 = self.unit().max(1e-12);
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+    /// A Poisson sample with mean `lambda` by inverse CDF (Knuth's product form), exact for the
+    /// small means a report uses; a huge lambda is refused before it gets here.
+    fn poisson(&mut self, lambda: f64) -> f64 {
+        let l = (-lambda).exp();
+        let mut k = 0.0;
+        let mut p = 1.0;
+        loop {
+            p *= self.unit();
+            if p <= l || k >= MAX_TRIALS as f64 {
+                return k;
+            }
+            k += 1.0;
+        }
+    }
+}
+
+/// Most generated values (a report is refused past this), and most trials one binomial or Poisson
+/// sample may take: a hostile parameter must not turn into an unbounded loop.
+const MAX_GENERATED: u64 = 1_000_000;
+const MAX_TRIALS: u64 = 1_000_000;
+
+fn seed(p: &Json) -> u64 {
+    num(p, "seed").filter(|v| v.is_finite()).map(|v| v as i64 as u64).unwrap_or(0)
+}
+
+fn whole(p: &Json, keys: &[&str], default: Option<f64>, min: f64) -> Result<f64> {
+    let v = keys.iter().find_map(|k| num(p, k)).or(default);
+    match v {
+        Some(v) if v.is_finite() && v >= min && v.round() == v => Ok(v),
+        Some(_) => Err(bad(CMD, format!("`{}` must be a whole number of at least {min}", keys.first().copied().unwrap_or("value")))),
+        None => Err(bad(CMD, format!("missing `{}`", keys.first().copied().unwrap_or("value")))),
+    }
+}
+
+/// Sampling: periodic takes every `period`-th value of the input, random takes `sampleSize`
+/// values picked uniformly (with replacement, as Excel's tool does). Values are read row by row.
+fn sampling(s: &Session, p: &Json) -> Result<Grid> {
+    let (si, r) = input_range(s, p, &["range", "input"])?;
+    let labels = flag(p, "labels");
+    let mut values: Vec<Value> = Vec::new();
+    for (i, row) in read_matrix(s, si, r)?.into_iter().enumerate() {
+        for (j, v) in row.into_iter().enumerate() {
+            if labels && i == 0 && j == 0 {
+                continue;
+            }
+            if !v.is_empty() {
+                values.push(v);
+            }
+        }
+    }
+    if values.is_empty() {
+        return Err(EngineError::Other("The input range has no values to sample.".into()));
+    }
+    let method = text(p, &["method"]).unwrap_or("periodic").to_ascii_lowercase();
+    let mut g = Grid::default();
+    let picked: Vec<Value> = match method.as_str() {
+        "random" => {
+            let n = whole(p, &["sampleSize", "samples", "number"], None, 1.0)? as u64;
+            if n > MAX_GENERATED {
+                return Err(bad(CMD, format!("a sample of at most {MAX_GENERATED} values can be written")));
+            }
+            let mut rng = Rng::new(seed(p));
+            (0..n)
+                .map(|_| {
+                    let i = (rng.next_u64() % values.len() as u64) as usize;
+                    values.get(i).cloned().unwrap_or(Value::Empty)
+                })
+                .collect()
+        }
+        _ => {
+            let k = whole(p, &["period", "interval"], Some(1.0), 1.0)? as usize;
+            values.iter().step_by(k.max(1)).cloned().collect()
+        }
+    };
+    for (i, v) in picked.into_iter().enumerate() {
+        g.put(idx(i), 0, v);
+    }
+    Ok(g)
+}
+
+/// Random Number Generation: `numberOfRandomNumbers` rows by `numberOfVariables` columns from the
+/// chosen distribution, all from one seeded generator so a report can be reproduced.
+fn random_numbers(s: &Session, p: &Json) -> Result<Grid> {
+    let _ = s;
+    let rows = whole(p, &["numberOfRandomNumbers", "numbers"], Some(1.0), 1.0)? as u64;
+    let cols = whole(p, &["numberOfVariables", "variables"], Some(1.0), 1.0)? as u64;
+    if rows.saturating_mul(cols) > MAX_GENERATED {
+        return Err(bad(CMD, format!("a report of at most {MAX_GENERATED} numbers can be written")));
+    }
+    let dist = text(p, &["distribution"]).unwrap_or("uniform").to_ascii_lowercase();
+    if !matches!(dist.as_str(), "uniform" | "normal" | "gaussian" | "bernoulli" | "binomial" | "binom" | "poisson" | "pattern" | "discrete") {
+        return Err(bad(CMD, format!("unknown distribution `{dist}` (uniform|normal|bernoulli|binomial|poisson|pattern|discrete)")));
+    }
+    let mut rng = Rng::new(seed(p));
+    let mut g = Grid::default();
+    match dist.as_str() {
+        "normal" | "gaussian" => {
+            let m = num(p, "mean").unwrap_or(0.0);
+            let sd = num(p, "standardDev").or_else(|| num(p, "standardDeviation")).unwrap_or(1.0);
+            if !sd.is_finite() || sd < 0.0 {
+                return Err(bad(CMD, "`standardDev` must be a number at least zero"));
+            }
+            for i in 0..rows {
+                for j in 0..cols {
+                    g.num(idx(i as usize), idx(j as usize), m + sd * rng.normal());
+                }
+            }
+        }
+        "bernoulli" => {
+            let prob = num(p, "probability").filter(|v| (0.0..=1.0).contains(v)).ok_or_else(|| bad(CMD, "`probability` must be between 0 and 1"))?;
+            for i in 0..rows {
+                for j in 0..cols {
+                    g.num(idx(i as usize), idx(j as usize), if rng.unit() < prob { 1.0 } else { 0.0 });
+                }
+            }
+        }
+        "binomial" | "binom" => {
+            let prob = num(p, "probability").filter(|v| (0.0..=1.0).contains(v)).ok_or_else(|| bad(CMD, "`probability` must be between 0 and 1"))?;
+            let trials = whole(p, &["trials"], None, 1.0)? as u64;
+            if trials > MAX_TRIALS {
+                return Err(bad(CMD, format!("`trials` must be at most {MAX_TRIALS}")));
+            }
+            for i in 0..rows {
+                for j in 0..cols {
+                    let mut k = 0.0;
+                    for _ in 0..trials {
+                        if rng.unit() < prob {
+                            k += 1.0;
+                        }
+                    }
+                    g.num(idx(i as usize), idx(j as usize), k);
+                }
+            }
+        }
+        "poisson" => {
+            let lambda = num(p, "lambda")
+                .filter(|v| *v > 0.0 && *v <= MAX_TRIALS as f64)
+                .ok_or_else(|| bad(CMD, format!("`lambda` must be a number past zero and at most {MAX_TRIALS}")))?;
+            for i in 0..rows {
+                for j in 0..cols {
+                    g.num(idx(i as usize), idx(j as usize), rng.poisson(lambda));
+                }
+            }
+        }
+        "pattern" => {
+            // A repeating list: a JSON array, or a comma-separated string of numbers or text.
+            let items: Vec<Value> = match p.get("pattern") {
+                Some(Json::Array(a)) => a
+                    .iter()
+                    .take(MAX_GENERATED as usize)
+                    .map(|v| match v {
+                        Json::Number(n) => n.as_f64().filter(|x| x.is_finite()).map(Value::number).unwrap_or(Value::Empty),
+                        Json::String(s) => Value::text(s.as_str()),
+                        _ => Value::Empty,
+                    })
+                    .collect(),
+                Some(Json::String(s)) => s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse::<f64>().ok().filter(|x| x.is_finite()).map(Value::number).unwrap_or_else(|| Value::text(s)))
+                    .collect(),
+                _ => vec![],
+            };
+            if items.is_empty() {
+                return Err(bad(CMD, "`pattern` must hold at least one value"));
+            }
+            for i in 0..rows {
+                for j in 0..cols {
+                    let k = ((i * cols + j) % items.len() as u64) as usize;
+                    g.put(idx(i as usize), idx(j as usize), items.get(k).cloned().unwrap_or(Value::Empty));
+                }
+            }
+        }
+        "discrete" => {
+            // A value range and a probability range of the same shape.
+            let (vsi, vr) = input_range(s, p, &["range", "input"])?;
+            let values: Vec<f64> = read_matrix(s, vsi, vr)?
+                .into_iter()
+                .flatten()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.as_f64().ok_or_else(|| EngineError::Other("The value range contains non-numeric data.".into())))
+                .collect::<Result<_>>()?;
+            let (psi, pr) = input_range(s, p, &["probabilities", "weights"])?;
+            let probs: Vec<f64> = read_matrix(s, psi, pr)?
+                .into_iter()
+                .flatten()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.as_f64().ok_or_else(|| EngineError::Other("The probability range contains non-numeric data.".into())))
+                .collect::<Result<_>>()?;
+            if values.is_empty() || values.len() != probs.len() {
+                return Err(EngineError::Other("The value and probability ranges must hold the same number of entries.".into()));
+            }
+            let total: f64 = probs.iter().sum();
+            if total <= 0.0 || !total.is_finite() {
+                return Err(EngineError::Other("The probabilities must sum to a number past zero.".into()));
+            }
+            for i in 0..rows {
+                for j in 0..cols {
+                    let mut u = rng.unit() * total;
+                    let mut chosen = values.last().copied().unwrap_or(0.0);
+                    for (v, p) in values.iter().zip(&probs) {
+                        u -= *p;
+                        if u <= 0.0 {
+                            chosen = *v;
+                            break;
+                        }
+                    }
+                    g.num(idx(i as usize), idx(j as usize), chosen);
+                }
+            }
+        }
+        _ => {
+            let a = num(p, "between").or_else(|| num(p, "min")).unwrap_or(0.0);
+            let b = num(p, "and").or_else(|| num(p, "max")).unwrap_or(1.0);
+            if !(a.is_finite() && b.is_finite()) || a > b {
+                return Err(bad(CMD, "`between` must be at most `and`"));
+            }
+            for i in 0..rows {
+                for j in 0..cols {
+                    g.num(idx(i as usize), idx(j as usize), a + (b - a) * rng.unit());
+                }
+            }
+        }
+    }
+    Ok(g)
+}
+
+/// Fourier Analysis: a radix-2 FFT of a power-of-two list of real numbers or `a+bi` text, written
+/// as the same-shaped list of `a+bi` text (a zero imaginary part is omitted, as Excel shows it).
+fn fourier(s: &Session, p: &Json) -> Result<Grid> {
+    let (si, r) = input_range(s, p, &["range", "input"])?;
+    let cells: Vec<Value> = read_matrix(s, si, r)?.into_iter().flatten().filter(|v| !v.is_empty()).collect();
+    let n = cells.len();
+    if n < 2 || !n.is_power_of_two() {
+        return Err(EngineError::Other("Fourier Analysis needs 2, 4, 8, ... (a power of two) input values.".into()));
+    }
+    let mut data: Vec<(f64, f64)> = Vec::with_capacity(n);
+    for v in &cells {
+        data.push(complex_value(v).ok_or_else(|| EngineError::Other("The input range must be numbers or complex text like 3+4i.".into()))?);
+    }
+    fft(&mut data);
+    // Write the results in the shape of the input (a row stays a row, anything else a column).
+    let row_shape = r.height() == 1;
+    let mut g = Grid::default();
+    for (i, (re, im)) in data.iter().enumerate() {
+        let (r0, c0) = if row_shape { (0, idx(i)) } else { (idx(i), 0) };
+        g.txt(r0, c0, complex_text(*re, *im));
+    }
+    Ok(g)
+}
+
+/// A cell as a complex number: a number is real, text is `a+bi`/`a-bi`/`bi`/`a`.
+fn complex_value(v: &Value) -> Option<(f64, f64)> {
+    match v {
+        Value::Number(n) => Some((*n, 0.0)),
+        Value::Text(t) => {
+            let t = t.trim().replace(' ', "");
+            if t.is_empty() {
+                return None;
+            }
+            let (re, im) = match t.rfind(['+', '-']) {
+                // The sign of the imaginary part separates the two halves; a leading sign is real.
+                Some(i) if i > 0 => {
+                    let (a, b) = t.split_at(i);
+                    let im = b.trim_end_matches(['i', 'j']);
+                    (
+                        a.parse::<f64>().ok()?,
+                        if im.is_empty() || im == "+" {
+                            1.0
+                        } else if im == "-" {
+                            -1.0
+                        } else {
+                            im.parse::<f64>().ok()?
+                        },
+                    )
+                }
+                _ => {
+                    if let Some(im) = t.strip_suffix(['i', 'j']) {
+                        let im = if im.is_empty() || im == "+" {
+                            1.0
+                        } else if im == "-" {
+                            -1.0
+                        } else {
+                            im.parse::<f64>().ok()?
+                        };
+                        (0.0, im)
+                    } else {
+                        (t.parse::<f64>().ok()?, 0.0)
+                    }
+                }
+            };
+            if re.is_finite() && im.is_finite() { Some((re, im)) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// In-place iterative Cooley–Tukey FFT, the engineering convention X[k] = sum x[n] e^(-2πikn/N).
+fn fft(data: &mut [(f64, f64)]) {
+    let n = data.len();
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            data.swap(i, j);
+        }
+    }
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -std::f64::consts::TAU / len as f64;
+        let (wr, wi) = (ang.cos(), ang.sin());
+        let mut i = 0;
+        while i < n {
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            for k in 0..len / 2 {
+                let (ar, ai) = data[i + k];
+                let (br, bi) = data[i + k + len / 2];
+                let tr = br * cr - bi * ci;
+                let ti = br * ci + bi * cr;
+                data[i + k] = (ar + tr, ai + ti);
+                data[i + k + len / 2] = (ar - tr, ai - ti);
+                let next = (cr * wr - ci * wi, cr * wi + ci * wr);
+                cr = next.0;
+                ci = next.1;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// A complex number as Excel's tool shows it: `10`, `-2+2i`, `-2-2i`, `-0.5+0i` only when the
+/// imaginary part is not zero; four decimals at most, trailing zeros trimmed.
+fn complex_text(re: f64, im: f64) -> String {
+    let part = |v: f64| {
+        let v = if v.abs() < 1e-12 { 0.0 } else { v };
+        let s = format!("{v:.4}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    let re = if re.abs() < 1e-12 { 0.0 } else { re };
+    let im = if im.abs() < 1e-12 { 0.0 } else { im };
+    if im == 0.0 {
+        return part(re);
+    }
+    let sign = if im < 0.0 { "-" } else { "+" };
+    if re == 0.0 {
+        return format!("{}{}i", if im < 0.0 { "-" } else { "" }, part(im.abs()));
+    }
+    format!("{}{sign}{}i", part(re), part(im.abs()))
+}
+
 // ---------------------------------------------------------------- output
 
 /// Writes the report at `output` (refusing to overwrite data unless `overwrite`) or on a new
@@ -1457,6 +1844,9 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
         "tTestPaired" | "tTestEqual" | "tTestUnequal" => t_test(s, p, tool)?,
         "zTest" => z_test(s, p)?,
         "fTest" => f_test(s, p)?,
+        "sampling" => sampling(s, p)?,
+        "randomNumberGeneration" => random_numbers(s, p)?,
+        "fourierAnalysis" => fourier(s, p)?,
         "anovaSingle" => anova_single(s, p)?,
         "anovaTwoFactor" => anova_two_factor(s, p, false)?,
         "anovaTwoFactorRep" => anova_two_factor(s, p, true)?,
@@ -1944,5 +2334,195 @@ mod anova_two_factor_tests {
         let tools = s.execute("data.analysisToolPak", json!({})).unwrap();
         let ids: Vec<&str> = tools["tools"].as_array().map(|a| a.iter().filter_map(|t| t["id"].as_str()).collect()).unwrap_or_default();
         assert!(ids.contains(&"anovaTwoFactor") && ids.contains(&"anovaTwoFactorRep"), "{ids:?}");
+    }
+}
+
+#[cfg(test)]
+mod random_and_fourier_tests {
+    use gridcraft_core::Value;
+    use serde_json::{Value as Json, json};
+
+    use crate::Session;
+
+    fn session() -> Session {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3], [4], [5], [6]]})).unwrap();
+        s
+    }
+    fn value(s: &Session, a: &str) -> Value {
+        let d = s.doc().unwrap();
+        let (sh, body) = crate::cmd::split_sheet(a);
+        let si = sh.map(|n| d.wb.sheet_index(&n).unwrap()).unwrap_or(d.wb.active_sheet);
+        d.wb.sheet(si).unwrap().value(gridcraft_core::CellRef::parse(body).unwrap())
+    }
+    fn num(s: &Session, a: &str) -> f64 {
+        value(s, a).as_f64().unwrap_or(f64::NAN)
+    }
+
+    #[test]
+    fn periodic_sampling_takes_every_kth_value_and_random_sampling_repeats_with_a_seed() {
+        let mut s = session();
+        s.execute("data.analysisToolPak", json!({"tool": "sampling", "range": "A1:A6", "method": "periodic", "period": 2, "output": "C1"})).unwrap();
+        assert_eq!((num(&s, "C1"), num(&s, "C2"), num(&s, "C3")), (1.0, 3.0, 5.0));
+        assert_eq!(value(&s, "C4"), Value::Empty);
+        // A random sample has the requested count, values from the input, and the same seed makes
+        // the same report.
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "sampling", "range": "A1:A6", "method": "random", "sampleSize": 8, "seed": 7, "output": "E1"}),
+        )
+        .unwrap();
+        for r in 1..=8 {
+            let v = num(&s, &format!("E{r}"));
+            assert!((1.0..=6.0).contains(&v) && v.fract() == 0.0, "row {r}: {v}");
+        }
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "sampling", "range": "A1:A6", "method": "random", "sampleSize": 8, "seed": 7, "output": "G1"}),
+        )
+        .unwrap();
+        for r in 1..=8 {
+            assert_eq!(num(&s, &format!("E{r}")), num(&s, &format!("G{r}")), "row {r}");
+        }
+        // A different seed (usually) changes it, and a broken parameter is refused.
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "sampling", "range": "A1:A6", "method": "random", "sampleSize": 8, "seed": 8, "output": "I1"}),
+        )
+        .unwrap();
+        let a: Vec<f64> = (1..=8).map(|r| num(&s, &format!("E{r}"))).collect();
+        let b: Vec<f64> = (1..=8).map(|r| num(&s, &format!("I{r}"))).collect();
+        assert_ne!(a, b);
+        assert!(
+            s.execute("data.analysisToolPak", json!({"tool": "sampling", "range": "A1:A6", "method": "random", "sampleSize": 0, "output": "K1"}))
+                .is_err()
+        );
+        assert!(
+            s.execute("data.analysisToolPak", json!({"tool": "sampling", "range": "A1:A6", "method": "periodic", "period": 1.5, "output": "K1"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_numbers_follow_their_distributions_and_repeat_with_a_seed() {
+        let mut s = session();
+        // Uniform: 3 columns by 4 rows inside [10, 20], reproducible.
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 4, "numberOfVariables": 3, "distribution": "uniform", "between": 10, "and": 20, "seed": 3, "output": "C1"}),
+        )
+        .unwrap();
+        for r in 1..=4 {
+            for c in ['C', 'D', 'E'] {
+                let v = num(&s, &format!("{c}{r}"));
+                assert!((10.0..=20.0).contains(&v), "{c}{r}: {v}");
+            }
+        }
+        let first: Vec<f64> = (1..=4).flat_map(|r| ['C', 'D', 'E'].map(|c| num(&s, &format!("{c}{r}")))).collect();
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 4, "numberOfVariables": 3, "distribution": "uniform", "between": 10, "and": 20, "seed": 3, "output": "G1"}),
+        )
+        .unwrap();
+        let again: Vec<f64> = (1..=4).flat_map(|r| ['G', 'H', 'I'].map(|c| num(&s, &format!("{c}{r}")))).collect();
+        assert_eq!(first, again);
+        // Normal: finite values around the mean.
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 20, "numberOfVariables": 1, "distribution": "normal", "mean": 100, "standardDev": 5, "seed": 4, "output": "K1"}),
+        )
+        .unwrap();
+        let xs: Vec<f64> = (1..=20).map(|r| num(&s, &format!("K{r}"))).collect();
+        assert!(xs.iter().all(|v| v.is_finite()));
+        let m = xs.iter().sum::<f64>() / xs.len() as f64;
+        assert!((m - 100.0).abs() < 5.0, "mean {m}");
+        // Bernoulli and binomial give their integer ranges; Poisson is a non-negative integer.
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 20, "distribution": "bernoulli", "probability": 0.5, "seed": 5, "output": "M1"}),
+        )
+        .unwrap();
+        assert!((1..=20).all(|r| matches!(num(&s, &format!("M{r}")), 0.0 | 1.0)));
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 20, "distribution": "binomial", "probability": 0.4, "trials": 10, "seed": 6, "output": "O1"}),
+        )
+        .unwrap();
+        assert!((1..=20).all(|r| {
+            let v = num(&s, &format!("O{r}"));
+            (0.0..=10.0).contains(&v) && v.fract() == 0.0
+        }));
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 20, "distribution": "poisson", "lambda": 3, "seed": 7, "output": "Q1"}),
+        )
+        .unwrap();
+        assert!((1..=20).all(|r| {
+            let v = num(&s, &format!("Q{r}"));
+            v >= 0.0 && v.fract() == 0.0
+        }));
+        // Pattern repeats its list; discrete only draws from the given values and honours a zero
+        // probability.
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 5, "distribution": "pattern", "pattern": ["a", 2, "c"], "output": "S1"}),
+        )
+        .unwrap();
+        assert_eq!(
+            (value(&s, "S1"), value(&s, "S2"), value(&s, "S3"), value(&s, "S4")),
+            (Value::text("a"), Value::number(2.0), Value::text("c"), Value::text("a"))
+        );
+        s.execute("range.setValues", json!({"range": "W1", "values": [[1], [2], [3]]})).unwrap();
+        s.execute("range.setValues", json!({"range": "X1", "values": [[0], [1], [0]]})).unwrap();
+        s.execute(
+            "data.analysisToolPak",
+            json!({"tool": "randomNumberGeneration", "numberOfRandomNumbers": 30, "distribution": "discrete", "range": "W1:W3", "probabilities": "X1:X3", "seed": 9, "output": "Z1"}),
+        )
+        .unwrap();
+        assert!((1..=30).all(|r| num(&s, &format!("Z{r}")) == 2.0));
+        // Refusals.
+        assert!(s.execute("data.analysisToolPak", json!({"tool": "randomNumberGeneration", "distribution": "cauchy"})).is_err());
+        assert!(
+            s.execute("data.analysisToolPak", json!({"tool": "randomNumberGeneration", "distribution": "binomial", "probability": 0.5})).is_err()
+        );
+        assert!(s.execute("data.analysisToolPak", json!({"tool": "randomNumberGeneration", "distribution": "poisson", "lambda": 0})).is_err());
+        assert!(
+            s.execute("data.analysisToolPak", json!({"tool": "randomNumberGeneration", "distribution": "uniform", "between": 5, "and": 1})).is_err()
+        );
+    }
+
+    #[test]
+    fn fourier_writes_the_transform_as_complex_text() {
+        let mut s = session();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3], [4]]})).unwrap();
+        s.execute("data.analysisToolPak", json!({"tool": "fourierAnalysis", "range": "A1:A4", "output": "C1"})).unwrap();
+        // X[k] = sum x[n] e^(-2*pi*i*k*n/N): 10, -2+2i, -2, -2-2i.
+        assert_eq!(value(&s, "C1"), Value::text("10"));
+        assert_eq!(value(&s, "C2"), Value::text("-2+2i"));
+        assert_eq!(value(&s, "C3"), Value::text("-2"));
+        assert_eq!(value(&s, "C4"), Value::text("-2-2i"));
+        // A row stays a row; a complex input is read as a+bi.
+        s.execute("range.setValues", json!({"range": "E1", "values": [[1, 2, 3, 4]]})).unwrap();
+        s.execute("data.analysisToolPak", json!({"tool": "fourierAnalysis", "range": "E1:H1", "output": "E3"})).unwrap();
+        assert_eq!(
+            (value(&s, "E3"), value(&s, "F3"), value(&s, "G3"), value(&s, "H3")),
+            (Value::text("10"), Value::text("-2+2i"), Value::text("-2"), Value::text("-2-2i"))
+        );
+        s.execute("range.setValues", json!({"range": "A10", "values": [["1+1i"], ["1-1i"], ["0"], ["0"]]})).unwrap();
+        s.execute("data.analysisToolPak", json!({"tool": "fourierAnalysis", "range": "A10:A13", "output": "C10"})).unwrap();
+        assert_eq!((value(&s, "C10"), value(&s, "C12")), (Value::text("2"), Value::text("2i")));
+        // A length that is not a power of two and a non-complex cell are refused.
+        s.execute("range.setValues", json!({"range": "A20", "values": [[1], [2], [3]]})).unwrap();
+        assert!(s.execute("data.analysisToolPak", json!({"tool": "fourierAnalysis", "range": "A20:A22", "output": "C20"})).is_err());
+        s.execute("range.setValues", json!({"range": "A30", "values": [["x"], [1]]})).unwrap();
+        assert!(s.execute("data.analysisToolPak", json!({"tool": "fourierAnalysis", "range": "A30:A31", "output": "C30"})).is_err());
+        // The tool list names all three new tools.
+        let tools = s.execute("data.analysisToolPak", json!({})).unwrap();
+        let ids: Vec<&str> = tools["tools"].as_array().map(|a| a.iter().filter_map(|t| t["id"].as_str()).collect()).unwrap_or_default();
+        for id in ["sampling", "randomNumberGeneration", "fourierAnalysis"] {
+            assert!(ids.contains(&id), "{id} missing from {ids:?}");
+        }
+        let _: Json = json!({});
     }
 }
