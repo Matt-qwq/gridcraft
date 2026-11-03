@@ -1469,15 +1469,21 @@ impl PivotNumberGroup {
             && self.groups().is_some_and(|n| n <= Self::MAX_GROUPS)
     }
 
-    /// The number of buckets in `start..=end`: the last value `end` falls in bucket
-    /// `floor((end - start) / interval)`, so the count is one more than that. `None` when that
-    /// count would exceed [`Self::MAX_GROUPS`] (or the bounds are unusable).
+    /// The number of buckets: the boundaries run `start + k x interval`, and `end` sits in the
+    /// last bucket, so the count is `ceil((end - start) / interval)`, at least one. `None` when
+    /// that count would exceed [`Self::MAX_GROUPS`] (or the bounds are unusable).
     pub fn groups(&self) -> Option<u64> {
         let span = (self.end - self.start) / self.interval;
         if !span.is_finite() || span < 0.0 || span >= Self::MAX_GROUPS as f64 {
             return None;
         }
-        Some(span.floor() as u64 + 1)
+        Some(span.ceil().max(1.0) as u64)
+    }
+
+    /// The first value past the last bucket. Excel names the upper tail after this boundary, not
+    /// after `end` (`...53740-78739`, `>78740` for 28740..72410 by 25000).
+    pub fn next_boundary(&self) -> f64 {
+        self.start + self.groups().unwrap_or(1) as f64 * self.interval
     }
 
     /// The caption of a value's group and a key that sorts the groups in order.
@@ -1488,18 +1494,19 @@ impl PivotNumberGroup {
         if v < self.start {
             return Some((format!("<{}", number_text(self.start)), f64::NEG_INFINITY));
         }
-        if v > self.end {
-            return Some((format!(">{}", number_text(self.end)), f64::INFINITY));
-        }
         let i = ((v - self.start) / self.interval).floor();
         if !i.is_finite() || i < 0.0 {
             return None;
+        }
+        // The tail holds the next boundary and everything past `end` (the last bucket's end).
+        if i >= self.groups().unwrap_or(1) as f64 || v > self.end {
+            return Some((format!(">{}", number_text(self.next_boundary())), f64::INFINITY));
         }
         let lo = self.start + i * self.interval;
         Some((self.span_caption(lo), lo))
     }
 
-    /// Every group caption in order: `<start`, the buckets, `>end`.
+    /// Every group caption in order: `<start`, the buckets, `>next boundary`.
     pub fn captions(&self) -> Vec<String> {
         let mut v = vec![format!("<{}", number_text(self.start))];
         if self.is_valid() {
@@ -1508,7 +1515,7 @@ impl PivotNumberGroup {
                 v.push(self.span_caption(lo));
             }
         }
-        v.push(format!(">{}", number_text(self.end)));
+        v.push(format!(">{}", number_text(self.next_boundary())));
         v
     }
 
@@ -1816,7 +1823,8 @@ mod pivot_group_tests {
         assert_eq!(g.bucket(11.0).map(|x| x.0), Some("11-20".to_string()));
         assert_eq!(g.bucket(100.0).map(|x| x.0), Some("91-100".to_string()));
         assert_eq!(g.captions().first(), Some(&"<1".to_string()));
-        assert_eq!(g.captions().last(), Some(&">100".to_string()));
+        // Excel names the upper tail after the next boundary (1 + 10 x 10 = 101), not after `end`.
+        assert_eq!(g.captions().last(), Some(&">101".to_string()));
         assert_eq!(g.captions().len(), 12);
     }
 
@@ -1835,7 +1843,8 @@ mod pivot_group_tests {
     fn a_fractional_step_shows_the_half_open_end() {
         let g = group(0.0, 2.0, 0.5);
         assert_eq!(g.bucket(0.25).map(|x| x.0), Some("0-0.5".to_string()));
-        assert_eq!(g.bucket(2.0).map(|x| x.0), Some("2-2.5".to_string()));
+        // The end itself sits on the next boundary, so it is the upper tail (Excel's `>2`).
+        assert_eq!(g.bucket(2.0).map(|x| x.0), Some(">2".to_string()));
     }
 
     #[test]

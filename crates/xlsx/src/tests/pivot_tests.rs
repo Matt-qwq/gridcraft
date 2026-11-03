@@ -268,17 +268,24 @@ fn number_grouping_writes_the_range_and_reads_it_back() {
     let cache = xml::parse(parts.get(&target).unwrap()).unwrap();
     let cf = cache.child("cacheFields").unwrap().kids("cacheField").find(|f| f.attr("name") == Some("Units")).unwrap();
     let rp = cf.path(&["fieldGroup", "rangePr"]).unwrap();
-    assert_eq!(rp.attr("groupBy"), Some("range"));
+    // `groupBy` defaults to "range"; Excel omits it and refused some explicit forms.
+    assert_eq!(rp.attr("groupBy"), None);
     assert_eq!(rp.attr_f64("startNum"), Some(0.0));
     assert_eq!(rp.attr_f64("endNum"), Some(100.0));
     assert_eq!(rp.attr_f64("groupInterval"), Some(10.0));
     let items: Vec<&str> = cf.path(&["fieldGroup", "groupItems"]).unwrap().children.iter().filter_map(|e| e.attr("v")).collect();
-    // 0..=100 by 10 is eleven half-open buckets (`100` falls in `100-109`), plus the two tails.
-    assert_eq!(items.len(), 13, "{items:?}");
+    // 0..100 by 10 is ten half-open buckets, plus the two tails; the upper tail names the first
+    // value past the last bucket (Excel's own shape).
+    assert_eq!(items.len(), 12, "{items:?}");
     assert_eq!(items.first(), Some(&"<0"));
     assert_eq!(items.get(1), Some(&"0-9"));
-    assert_eq!(items.get(11), Some(&"100-109"));
+    assert_eq!(items.get(10), Some(&"90-99"));
     assert_eq!(items.last(), Some(&">100"));
+    // Excel writes the base field's values into `sharedItems`; without them it rebuilds the
+    // grouping on open and re-anchors it at the data minimum.
+    let si = cf.child("sharedItems").unwrap();
+    assert_eq!(si.attr_u32("count"), Some(8), "the source's distinct Units values");
+    assert_eq!(si.kids("n").count(), 8);
     assert_eq!(cf.attr_u32("numFmtId"), Some(0), "a number group is not a date format");
     // The table's row field refers to those items only.
     let t = xml::parse(parts.get("xl/pivotTables/pivotTable1.xml").unwrap()).unwrap();
@@ -413,7 +420,10 @@ fn pivot_xml_details() {
     assert!(t1.contains("<pivotTableStyleInfo name=\"PivotStyleMedium9\""));
     let c1 = String::from_utf8(parts.get("xl/pivotCache/pivotCacheDefinition1.xml").unwrap().clone()).unwrap();
     assert!(c1.contains("<worksheetSource ref=\"A1:F9\" sheet=\"Data\"/>"), "{c1}");
-    assert!(c1.contains("refreshOnLoad=\"1\""));
+    // No `refreshOnLoad`: Excel rebuilt the cache on open and re-anchored a number field's
+    // grouping when it was set; the saved records make a refresh unnecessary.
+    assert!(!c1.contains("refreshOnLoad"), "{c1}");
+    assert!(c1.contains("recordCount=\"8\"") && c1.contains("r:id="), "{c1}");
     let c2 = String::from_utf8(parts.get("xl/pivotCache/pivotCacheDefinition2.xml").unwrap().clone()).unwrap();
     assert!(c2.contains("<worksheetSource name=\"SalesTbl\"/>"));
     assert!(c2.contains("groupBy=\"years\"") && c2.contains("groupBy=\"months\""));

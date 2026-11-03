@@ -43,7 +43,7 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     println!("oracle: {} fixture(s), artifacts in {}", fixtures.len(), dir.display());
 
     let mut failed = 0usize;
-    for Fixture { name, wb, app_skips } in &fixtures {
+    for Fixture { name, wb, app_skips, app_text_skips } in &fixtures {
         let gc_path = dir.join(format!("{name}.gc.xlsx"));
         let bytes = gridcraft_engine::io::save_bytes(wb, &gc_path.to_string_lossy()).map_err(|e| format!("{name}: our own save failed: {e}"))?;
         std::fs::write(&gc_path, &bytes).map_err(|e| format!("can't write {}: {e}", gc_path.display()))?;
@@ -60,15 +60,27 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
         if with_app {
             match &powershell {
                 Some(ps) => {
-                    let app_path = dir.join(format!("{name}.app.xlsx"));
-                    match probe_app(ps, &app_ps1, &gc_path, &app_path, wb, app_skips) {
-                        Ok(None) => println!("  app: SKIPPED (no spreadsheet application answers COM)"),
-                        Ok(Some(issues)) => {
-                            failed += report("app round-trip (independent application)", &issues);
+                    // Excel is the gate check (#1); WPS stays as the second opinion and is the one
+                    // whose regenerated PivotTable report is skipped (it rewrites it in its own
+                    // locale). Excel compares every sheet, so a report our writer got wrong in a
+                    // way Excel repairs or re-renders differently shows up here.
+                    for (label, progid, skips, texts) in [
+                        ("Excel", "Excel.Application", &[][..], app_text_skips.as_slice()),
+                        ("WPS", "KET.Application", app_skips.as_slice(), &[][..]),
+                    ] {
+                        let app_path = dir.join(format!("{name}.{label}.xlsx"));
+                        match probe_app(ps, &app_ps1, &gc_path, &app_path, progid, wb, skips, texts) {
+                            Ok(None) => println!("  app {label}: not installed"),
+                            Ok(Some(issues)) => {
+                                failed += report(&format!("app round-trip ({label})"), &issues);
+                            }
+                            Err(e) => {
+                                println!("  app {label}: FAILED — {e}");
+                                failed += 1;
+                            }
                         }
-                        Err(e) => {
-                            println!("  app: FAILED — {e}");
-                            failed += 1;
+                        if !keep {
+                            let _ = std::fs::remove_file(&app_path);
                         }
                     }
                 }
@@ -78,7 +90,6 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
 
         if !keep {
             let _ = std::fs::remove_file(&gc_path);
-            let _ = std::fs::remove_file(dir.join(format!("{name}.app.xlsx")));
         }
     }
 
@@ -96,7 +107,11 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
 struct Fixture {
     name: String,
     wb: Workbook,
+    /// Sheets an application probe must not compare (it regenerates them in its own locale).
     app_skips: Vec<String>,
+    /// Cell texts a probe may render differently because they are the application's own chrome
+    /// (Excel localizes "Row Labels" and "Grand Total" when it re-renders a PivotTable).
+    app_text_skips: Vec<String>,
 }
 
 /// The workbooks the probes run on. The samples carry tables, conditional formats, charts,
@@ -109,14 +124,14 @@ fn fixtures(only: Option<&str>) -> Result<Vec<Fixture>, String> {
             continue;
         }
         let wb = gridcraft_engine::sample::build(name).ok_or_else(|| format!("no sample named {name:?}"))?;
-        out.push(Fixture { name: name.to_string(), wb, app_skips: vec![] });
+        out.push(Fixture { name: name.to_string(), wb, app_skips: vec![], app_text_skips: vec![] });
     }
     if only.is_none_or(|want| want == "features") {
-        out.push(Fixture { name: "features".to_string(), wb: features_fixture()?, app_skips: vec![] });
+        out.push(Fixture { name: "features".to_string(), wb: features_fixture()?, app_skips: vec![], app_text_skips: vec![] });
     }
     if only.is_none_or(|want| want == "pivot") {
-        let (wb, report_sheet) = pivot_fixture()?;
-        out.push(Fixture { name: "pivot".to_string(), wb, app_skips: vec![report_sheet] });
+        let (wb, _report_sheet) = pivot_fixture()?;
+        out.push(Fixture { name: "pivot".to_string(), wb, app_skips: vec![], app_text_skips: vec!["Row Labels".into(), "Grand Total".into()] });
     }
     if out.is_empty() {
         return Err(format!("no fixture matched {:?}", only.unwrap_or("")));
@@ -171,7 +186,7 @@ fn pivot_fixture() -> Result<(Workbook, String), String> {
     exec(&mut s, "pivot.addField", json!({"field": "Q1", "area": "values", "func": "sum"}))?;
     // A value filter keeps only the buckets whose sum passes; its kept items are written as the
     // field's `item/@h` hidden items.
-    exec(&mut s, "pivot.filterByValue", json!({"field": "Q1", "op": "greaterThan", "value": 40_000}))?;
+    exec(&mut s, "pivot.filterByValue", json!({"field": "Q1", "op": "greaterThan", "value": 150_000}))?;
     let pivots = exec(&mut s, "pivot.list", json!({}))?;
     let name = pivots
         .as_array()
@@ -353,7 +368,16 @@ fn close(a: f64, b: f64) -> bool {
 
 /// `Ok(None)` when no application answered COM at all (nothing installed), `Ok(Some(issues))` after
 /// a real open/save, `Err` when the application was there and refused the file.
-fn probe_app(powershell: &str, script: &Path, src: &Path, dst: &Path, wb: &Workbook, skips: &[String]) -> Result<Option<Vec<String>>, String> {
+fn probe_app(
+    powershell: &str,
+    script: &Path,
+    src: &Path,
+    dst: &Path,
+    progid: &str,
+    wb: &Workbook,
+    skips: &[String],
+    text_skips: &[String],
+) -> Result<Option<Vec<String>>, String> {
     let out = Command::new(powershell)
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(script)
@@ -361,6 +385,8 @@ fn probe_app(powershell: &str, script: &Path, src: &Path, dst: &Path, wb: &Workb
         .arg(src)
         .arg("-Dst")
         .arg(dst)
+        .arg("-ProgId")
+        .arg(progid)
         .output()
         .map_err(|e| format!("can't run {powershell}: {e}"))?;
     if out.status.code() == Some(2) {
@@ -373,11 +399,11 @@ fn probe_app(powershell: &str, script: &Path, src: &Path, dst: &Path, wb: &Workb
     let bytes = std::fs::read(dst).map_err(|e| format!("can't read {}: {e}", dst.display()))?;
     let (reopened, _reports) =
         gridcraft_engine::io::open_bytes("oracle.xlsx", &bytes).map_err(|e| format!("we cannot read the application's own copy: {e}"))?;
-    Ok(Some(compare_values(wb, &reopened, skips)))
+    Ok(Some(compare_values(wb, &reopened, skips, text_skips)))
 }
 
 /// Every value a foreign application wrote must be the value we had.
-fn compare_values(model: &Workbook, reopened: &Workbook, skips: &[String]) -> Vec<String> {
+fn compare_values(model: &Workbook, reopened: &Workbook, skips: &[String], text_skips: &[String]) -> Vec<String> {
     let mut issues = Vec::new();
     if reopened.sheets.len() != model.sheets.len() {
         issues.push(format!("sheet count: model has {}, the application saved {}", model.sheets.len(), reopened.sheets.len()));
@@ -392,6 +418,12 @@ fn compare_values(model: &Workbook, reopened: &Workbook, skips: &[String]) -> Ve
         }
         for (cell_ref, cell) in sheet.cells.iter() {
             if cell.value.is_empty() {
+                continue;
+            }
+            // The application's own chrome (a PivotTable's "Row Labels"/"Grand Total") is localized
+            // when it re-renders the report; every value and item label we computed is still
+            // compared.
+            if matches!(&cell.value, Value::Text(t) if text_skips.iter().any(|skip| skip == t.as_ref())) {
                 continue;
             }
             let got = other.value(cell_ref);

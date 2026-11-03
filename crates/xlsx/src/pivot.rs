@@ -2,8 +2,9 @@
 //! definitions (§18.10.1.73), written from the model's [`PivotTable`]s and read back into them.
 //!
 //! Writing: one cache per PivotTable, with a records snapshot of the source list (omitted, with
-//! `saveData="0"`, for very large sources) and `refreshOnLoad="1"` so a reader recomputes the
-//! report from the source on open. Fields used on an axis get shared items (or, for date
+//! `saveData="0"`, for very large sources) and the records themselves, so a reader can render the
+//! report without a refresh (`refreshOnLoad` would make Excel rebuild the cache on open and
+//! re-anchor a number field's grouping at its minimum). Fields used on an axis get shared items (or, for date
 //! grouping, `fieldGroup` group items) so the table's `<items>` can refer to them. The report
 //! cells the engine wrote stay on the sheet as plain cells.
 //!
@@ -11,7 +12,7 @@
 //! layout flags, grand totals and style become a model [`PivotTable`]. Anything we don't model
 //! (OLAP sources, calculated fields, numeric grouping…) becomes a warning.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use gridcraft_core::date::datetime_from_serial;
@@ -564,7 +565,22 @@ fn build_cache(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize, slicer_fields
         let Some(b) = find(&fields, &pf.source_col) else { continue };
         if let Some(ng) = pf.number_group.filter(PivotNumberGroup::is_valid) {
             let (min, max) = fields.get(b).map(|f| (f.stats.min, f.stats.max)).unwrap_or((0.0, 0.0));
+            // Excel writes a grouped number field's base values into `sharedItems` (`count` + one
+            // `<n>` each). Without them it treats the grouping as unreliable, refreshes the cache
+            // and re-anchors the buckets at the field's minimum, which can silently change the
+            // report's labels; with them it keeps the `rangePr` bounds and the captions.
+            let mut vals: Vec<Value> = Vec::new();
+            let mut seen: HashSet<Key> = HashSet::new();
+            if let Some(col) = fields.get(b).and_then(|f| f.col) {
+                for &row in &rows {
+                    let v = sh.value(CellRef::new(row, r.start.col + col)).scalar();
+                    if !v.is_empty() && seen.insert(key(&v)) && vals.len() < MAX_ITEMS {
+                        vals.push(v);
+                    }
+                }
+            }
             if let Some(f) = fields.get_mut(b) {
+                f.items = vals;
                 f.group = Some(Group { by: PivotDateGroup::None, number: Some(ng), base: b, par: None, start: min, end: max, items: ng.captions() });
             }
             continue;
@@ -786,7 +802,10 @@ fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -
         }
         _ => s.push_str(" saveData=\"0\""),
     }
-    s.push_str(" refreshOnLoad=\"1\" refreshedBy=\"GridCraft\" createdVersion=\"6\" refreshedVersion=\"6\" minRefreshableVersion=\"3\">");
+    // No `refreshOnLoad`: with it Excel rebuilt the cache on every open and re-anchored a number
+    // field's grouping at the data's minimum, changing the report's labels. Records are saved
+    // (`r:id` above), so the cache is complete without a refresh.
+    s.push_str(" refreshedBy=\"GridCraft\" createdVersion=\"6\" refreshedVersion=\"6\" minRefreshableVersion=\"3\">");
     let _ = write!(s, "<cacheSource type=\"worksheet\">{}</cacheSource>", c.source_xml);
     let _ = write!(s, "<cacheFields count=\"{}\">", c.fields.len());
     for f in &c.fields {
@@ -806,6 +825,9 @@ fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -
                 && g.number.is_some()
             {
                 s.push_str(" containsSemiMixedTypes=\"0\" containsString=\"0\" containsNumber=\"1\"");
+                if !st.non_int {
+                    s.push_str(" containsInteger=\"1\"");
+                }
                 if st.blank {
                     s.push_str(" containsBlank=\"1\"");
                 }
@@ -843,7 +865,8 @@ fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -
                     s.push_str(" longText=\"1\"");
                 }
             }
-            if f.itemized {
+            let number_group = f.group.as_ref().is_some_and(|g| g.number.is_some());
+            if f.itemized || number_group {
                 let _ = write!(s, " count=\"{}\">", f.items.len());
                 for v in &f.items {
                     s.push_str(&item_xml(v, sys, false));
@@ -863,9 +886,11 @@ fn cache_xml(c: &Cache, records_rid: Option<&str>, sys: DateSystem, ext: &str) -
                 // [MS-XLSX] CT_RangePr for a number field: the bounds and the interval with
                 // `groupBy="range"`; each group's caption is its item's `<s>` text.
                 Some(ng) => {
+                    // `groupBy` defaults to "range"; Excel omits it, and an explicit value with a
+                    // start that does not cover the data made it refuse the file.
                     let _ = write!(
                         s,
-                        "<rangePr startNum=\"{}\" endNum=\"{}\" groupInterval=\"{}\" groupBy=\"range\"",
+                        "<rangePr startNum=\"{}\" endNum=\"{}\" groupInterval=\"{}\"",
                         crate::xml::num(ng.start),
                         crate::xml::num(ng.end),
                         crate::xml::num(ng.interval)
