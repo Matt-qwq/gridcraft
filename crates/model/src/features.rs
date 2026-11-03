@@ -1626,6 +1626,99 @@ impl PivotFilter {
     }
 }
 
+/// How a label filter compares a field's item captions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PivotLabelOp {
+    #[default]
+    Equals,
+    NotEquals,
+    BeginsWith,
+    EndsWith,
+    Contains,
+    DoesNotContain,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Between,
+    NotBetween,
+}
+
+/// A label filter: keeps the items of a row or column field whose caption matches. Text compares
+/// case-insensitively, and `>`/`<` are a plain case-insensitive text order.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PivotLabelFilter {
+    pub source_col: String,
+    pub op: PivotLabelOp,
+    pub value: String,
+    pub value2: Option<String>,
+}
+
+impl PivotLabelFilter {
+    pub fn passes(&self, label: &str) -> bool {
+        let l = label.to_lowercase();
+        let a = self.value.to_lowercase();
+        let b = self.value2.as_deref().unwrap_or_default().to_lowercase();
+        match self.op {
+            PivotLabelOp::Equals => l == a,
+            PivotLabelOp::NotEquals => l != a,
+            PivotLabelOp::BeginsWith => l.starts_with(&a),
+            PivotLabelOp::EndsWith => l.ends_with(&a),
+            PivotLabelOp::Contains => l.contains(&a),
+            PivotLabelOp::DoesNotContain => !l.contains(&a),
+            PivotLabelOp::GreaterThan => l > a,
+            PivotLabelOp::GreaterThanOrEqual => l >= a,
+            PivotLabelOp::LessThan => l < a,
+            PivotLabelOp::LessThanOrEqual => l <= a,
+            PivotLabelOp::Between => l >= a && l <= b,
+            PivotLabelOp::NotBetween => l < a || l > b,
+        }
+    }
+}
+
+/// How a value filter compares an item's aggregate with the bounds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PivotValueOp {
+    #[default]
+    Equals,
+    NotEquals,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Between,
+    NotBetween,
+}
+
+/// A value filter: keeps the items of a row or column field whose aggregate of `measure` passes
+/// (Excel's "Value Filters"). The measure is a value field's caption ("Sum of Sales") or, when
+/// unambiguous, its source column.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PivotValueFilter {
+    pub source_col: String,
+    pub measure: String,
+    pub op: PivotValueOp,
+    pub value: f64,
+    pub value2: Option<f64>,
+}
+
+impl PivotValueFilter {
+    pub fn passes(&self, x: f64) -> bool {
+        match self.op {
+            PivotValueOp::Equals => x == self.value,
+            PivotValueOp::NotEquals => x != self.value,
+            PivotValueOp::GreaterThan => x > self.value,
+            PivotValueOp::GreaterThanOrEqual => x >= self.value,
+            PivotValueOp::LessThan => x < self.value,
+            PivotValueOp::LessThanOrEqual => x <= self.value,
+            PivotValueOp::Between => x >= self.value && x <= self.value2.unwrap_or(self.value),
+            PivotValueOp::NotBetween => x < self.value || x > self.value2.unwrap_or(self.value),
+        }
+    }
+}
+
 /// A PivotTable: its definition plus where its output was last written. The output itself is
 /// static cell values and styles on the sheet, rewritten on every refresh.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1655,6 +1748,10 @@ pub struct PivotTable {
     pub last_range: Option<RangeRef>,
     /// Calculated fields, usable in the Values area by name.
     pub calculated_fields: Vec<PivotCalcField>,
+    /// Label filters on row or column fields (at most one per field).
+    pub label_filters: Vec<PivotLabelFilter>,
+    /// Value filters on row or column fields (at most one per field).
+    pub value_filters: Vec<PivotValueFilter>,
     /// The Σ Values pseudo-field (it exists with two or more value fields) sits in Rows rather
     /// than Columns (Excel's "values on rows").
     pub values_on_rows: bool,
@@ -1693,6 +1790,8 @@ impl Default for PivotTable {
             show_headers: true,
             last_range: None,
             calculated_fields: vec![],
+            label_filters: vec![],
+            value_filters: vec![],
             values_on_rows: false,
             values_position: None,
         }
@@ -1747,6 +1846,46 @@ mod pivot_group_tests {
         assert!(!group(0.0, 1e9, 0.001).is_valid(), "too many groups");
         assert!(group(0.0, 9_999.0, 1.0).is_valid());
         assert_eq!(group(0.0, 1e9, 0.001).groups(), None);
+    }
+}
+
+#[cfg(test)]
+mod pivot_filter_tests {
+    use super::*;
+
+    #[test]
+    fn a_label_filter_compares_case_insensitively() {
+        let f = |op, value: &str, value2: Option<&str>| PivotLabelFilter {
+            source_col: "Region".into(),
+            op,
+            value: value.into(),
+            value2: value2.map(str::to_string),
+        };
+        assert!(f(PivotLabelOp::Equals, "east", None).passes("East"));
+        assert!(!f(PivotLabelOp::NotEquals, "east", None).passes("East"));
+        assert!(f(PivotLabelOp::BeginsWith, "ea", None).passes("East"));
+        assert!(f(PivotLabelOp::EndsWith, "ST", None).passes("East"));
+        assert!(f(PivotLabelOp::Contains, "as", None).passes("East"));
+        assert!(f(PivotLabelOp::DoesNotContain, "we", None).passes("East"));
+        assert!(f(PivotLabelOp::Between, "a", Some("f")).passes("East"));
+        assert!(!f(PivotLabelOp::Between, "a", Some("d")).passes("East"));
+        assert!(f(PivotLabelOp::NotBetween, "a", Some("d")).passes("East"));
+        assert!(f(PivotLabelOp::GreaterThan, "east", None).passes("West"));
+    }
+
+    #[test]
+    fn a_value_filter_compares_the_aggregate() {
+        let f =
+            |op, value: f64, value2: Option<f64>| PivotValueFilter { source_col: "Region".into(), measure: "Sum of Sales".into(), op, value, value2 };
+        assert!(f(PivotValueOp::GreaterThan, 100.0, None).passes(250.0));
+        assert!(!f(PivotValueOp::GreaterThan, 250.0, None).passes(250.0));
+        assert!(f(PivotValueOp::GreaterThanOrEqual, 250.0, None).passes(250.0));
+        assert!(f(PivotValueOp::Equals, 250.0, None).passes(250.0));
+        assert!(f(PivotValueOp::NotEquals, 0.0, None).passes(250.0));
+        assert!(f(PivotValueOp::Between, 200.0, Some(300.0)).passes(250.0));
+        assert!(!f(PivotValueOp::NotBetween, 200.0, Some(300.0)).passes(250.0));
+        assert!(f(PivotValueOp::LessThan, 300.0, None).passes(250.0));
+        assert!(f(PivotValueOp::LessThanOrEqual, 250.0, None).passes(250.0));
     }
 }
 

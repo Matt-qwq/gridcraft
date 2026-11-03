@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (PivotTable number grouping buckets a number field into ranges, the way the Group Field dialog does; GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (PivotTable label and value filters keep the items whose captions or aggregates match; PivotTable number grouping buckets a number field into ranges, the way the Group Field dialog does; GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -487,8 +487,22 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   the range back and rebuilds the same labels on refresh. `pivot.fields` reports it; a range past
   100,000 groups, a non-positive interval, a reversed range or a text field is refused by name.
   **Never opened in Excel** — the caption question above is gate #1.
-- **Missing:** calculated items, value/label filters and data-model pivots; the PivotTable gate's
-  Excel verification. (`insert.pivotChart` landed 10-11 and is in the catalog, so PivotCharts are
+- **Landed 11-02 (label and value filters):** `pivot.filterByLabel` keeps the items of a row or
+  column field whose caption matches — equals, not equals, begins/ends with, contains, does not
+  contain, the four comparisons and between/not between, case-insensitively — and
+  `pivot.filterByValue` keeps the items whose aggregate of a chosen value field (sum, count,
+  average… by the value field's own function) passes the same comparisons. A value filter
+  aggregates over the records the report's other filters keep, across the column axis. Both are
+  evaluated when set and stored as the field's hidden items (`item/@h`), the representation the
+  file already uses for an axis filter and the slicer path already drives, so the report, a
+  save/reopen, a refresh and Excel all agree on the visible items; the rule itself is kept in the
+  model (`PivotTable.label_filters`/`value_filters`, reported by `pivot.fields`) and not written
+  as Excel's `<filters>` element — a refresh after new data keeps the item set instead of
+  re-evaluating the rule, and Excel's field dropdown will show hidden items rather than "filtered
+  by value". A rule and an item selection on one field replace each other; a calculated field as
+  the measure is refused by name. Guarded: between needs both bounds, and the field must be on an
+  axis.
+- **Missing:** calculated items and data-model pivots; the PivotTable gate's Excel verification. (`insert.pivotChart` landed 10-11 and is in the catalog, so PivotCharts are
   no longer part of this gap.) The "Generate GetPivotData" click option (Excel writes a
   `GETPIVOTDATA` formula when a pivot cell is clicked) is not wired into the grid yet.
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
@@ -496,7 +510,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
   never been opened in Excel — gate #1.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 2–5 h for beta (20–31 h full).
+- **Estimate:** 2–4 h for beta (18–27 h full).
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
@@ -663,6 +677,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §8: label and value filters landed (`pivot.filterByLabel`/`pivot.filterByValue`, evaluated when set and stored as the field's hidden items, so the report/reopen/refresh agree; the rule stays in the model and is not written as Excel's `<filters>`); calculated items and the Excel check are what remain |
 | 2026-11-02 | minor | §8: number grouping landed (`PivotNumberGroup`, `pivot.group` start/end/interval, `<start`/`>end` items, `rangePr` + `groupBy="range"` in the cache, round-trips through save/reopen); calculated items, value/label filters and the Excel check are what remain |
 | 2026-11-02 | minor | §8: GETPIVOTDATA reads a report cell by its field items (every layout, Σ Values in Rows, subtotals, page filters, numbers and grand totals), depends on the report's written area so a refresh recalculates it, and is in the Insert Function list; calculated items, value/label filters and number grouping are what remain |
 | 2026-11-02 | minor | 100 seeds × 200 steps (20,000 commands) command-sequence soak green in 68.3 s, 0 invariant failures; the hardware reports still need their machines. A WPS-authored `.xls` writes proprietary `0x087C`/`0x087D` records, not Excel `CF12`, so CF12 still needs gate #1 |

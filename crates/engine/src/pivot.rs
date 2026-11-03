@@ -280,6 +280,73 @@ pub fn item_label(wb: &Workbook, v: &Value, group: Grouping, fmt: &str) -> Strin
     make_item(wb, v, group, fmt, 0).1.label
 }
 
+/// Whether a record is hidden by the report's page filters and item selections. A label or value
+/// filter is evaluated when it is set and stored as the field's hidden items (the same check), so
+/// it needs no separate pass here.
+pub fn record_passes(wb: &Workbook, src: &Source, pt: &PivotTable, rec: &[Value]) -> bool {
+    for f in &pt.filters {
+        let Some(sel) = &f.selected else { continue };
+        let Some(c) = src.col(&f.source_col) else { continue };
+        let group =
+            pt.rows.iter().chain(pt.columns.iter()).find(|x| x.source_col.eq_ignore_ascii_case(&f.source_col)).map(Grouping::of).unwrap_or_default();
+        let fmt = src.formats.get(c).map(String::as_str).unwrap_or("General");
+        let label = item_label(wb, rec.get(c).unwrap_or(&Value::Empty), group, fmt);
+        if !sel.iter().any(|s| s.eq_ignore_ascii_case(&label)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The value field a filter names, as (source column, function). A calculated field has no source
+/// column to aggregate yet.
+pub fn value_measure(src: &Source, pt: &PivotTable, name: &str) -> Result<(usize, PivotFunc), String> {
+    let v = match pt.values.iter().find(|v| v.name.eq_ignore_ascii_case(name)) {
+        Some(v) => v,
+        None => {
+            let mut candidates = pt.values.iter().filter(|v| v.source_col.eq_ignore_ascii_case(name));
+            let first = candidates.next();
+            if candidates.next().is_some() {
+                return Err(format!("`{name}` names more than one value field; give its caption."));
+            }
+            first.ok_or_else(|| format!("There's no value field `{name}` to filter by."))?
+        }
+    };
+    let c = src.col(&v.source_col).ok_or_else(|| "Value filters on a calculated field aren't supported yet.".to_string())?;
+    Ok((c, v.func))
+}
+
+/// The labels of `field` whose aggregate of the filter's measure passes, over the records the
+/// report's other filters keep. The result is stored as the field's hidden items.
+pub fn value_filter_kept(wb: &Workbook, src: &Source, pt: &PivotTable, vf: &PivotValueFilter) -> Result<Vec<String>, String> {
+    let c = src.col(&vf.source_col).ok_or_else(|| format!("no field `{}` in the source data", vf.source_col))?;
+    let axis = pt
+        .rows
+        .iter()
+        .chain(pt.columns.iter())
+        .find(|f| f.source_col.eq_ignore_ascii_case(&vf.source_col))
+        .ok_or("Value filters apply to a row or column field.")?;
+    let group = Grouping::of(axis);
+    let fmt = src.formats.get(c).cloned().unwrap_or_else(|| "General".into());
+    let (vc, func) = value_measure(src, pt, &vf.measure)?;
+    let mut acc: HashMap<String, Acc> = HashMap::new();
+    let mut order: Vec<String> = vec![];
+    for rec in &src.rows {
+        if !record_passes(wb, src, pt, rec) {
+            continue;
+        }
+        let label = item_label(wb, rec.get(c).unwrap_or(&Value::Empty), group, &fmt);
+        acc.entry(label.clone()).or_default().add(rec.get(vc).unwrap_or(&Value::Empty));
+        if !order.iter().any(|x| x.eq_ignore_ascii_case(&label)) {
+            order.push(label);
+            if order.len() > 100_000 {
+                break;
+            }
+        }
+    }
+    Ok(order.into_iter().filter(|l| acc.get(l).and_then(|a| a.result(func).as_f64()).is_some_and(|x| vf.passes(x))).collect())
+}
+
 /// Distinct item labels of a source column, sorted like the field list shows them.
 pub fn distinct_labels(wb: &Workbook, src: &Source, col: usize, group: Grouping, limit: usize) -> Vec<String> {
     let mut fi = FieldItems::default();
@@ -893,17 +960,11 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     let mut row_set: HashSet<Vec<u32>> = HashSet::new();
     let mut col_set: HashSet<Vec<u32>> = HashSet::new();
     let mut col_leaves: HashSet<Vec<u32>> = HashSet::new();
-    let filter_fmts: Vec<String> = filters.iter().map(|f| fmt_of(f.0)).collect();
     let row_fmts: Vec<String> = rows.iter().map(|(c, _)| fmt_of(*c)).collect();
     let col_fmts: Vec<String> = cols.iter().map(|(c, _)| fmt_of(*c)).collect();
     'rec: for (ri, rec) in src.rows.iter().enumerate() {
-        for ((c, f, g, _), fmt) in filters.iter().zip(filter_fmts.iter()) {
-            if let Some(sel) = &f.selected {
-                let label = item_label(wb, rec.get(*c).unwrap_or(&Value::Empty), *g, fmt);
-                if !sel.iter().any(|s| s.eq_ignore_ascii_case(&label)) {
-                    continue 'rec;
-                }
-            }
+        if !record_passes(wb, &src, pt, rec) {
+            continue 'rec;
         }
         if empty {
             continue;

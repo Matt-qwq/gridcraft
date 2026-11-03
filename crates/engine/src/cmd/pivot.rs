@@ -101,6 +101,24 @@ pub fn specs() -> Vec<CommandSpec> {
             value_settings
         ),
         cmd!("pivot.filter", "Filter Items", [], None, "{pivot?, field, selected: [\"East\", ..] | null (all), replace?}", has_doc, filter),
+        cmd!(
+            "pivot.filterByLabel",
+            "Label Filters",
+            [],
+            None,
+            "{pivot?, field, op: equals|notEquals|beginsWith|endsWith|contains|doesNotContain|greaterThan|greaterThanOrEqual|lessThan|lessThanOrEqual|between|notBetween, value, value2? (between/notBetween), clear?: bool} keeps the items of a row or column field whose caption matches; the rule is evaluated now and stored as the field's hidden items → {field, items}",
+            has_doc,
+            filter_by_label
+        ),
+        cmd!(
+            "pivot.filterByValue",
+            "Value Filters",
+            [],
+            None,
+            "{pivot?, field, measure?: a value field's caption or source column (default: the first), op: equals|notEquals|greaterThan|greaterThanOrEqual|lessThan|lessThanOrEqual|between|notBetween, value, value2?, clear?: bool} keeps the items of a row or column field whose aggregate passes; evaluated now and stored as hidden items → {field, items}",
+            has_doc,
+            filter_by_value
+        ),
         cmd!("pivot.sort", "Sort Field", [], None, "{pivot?, field, order: asc|desc|none, replace?}", has_doc, sort),
         cmd!(
             "pivot.group",
@@ -337,6 +355,18 @@ fn in_axes(pt: &PivotTable, field: &str) -> bool {
 const VALUES_FIELD: &str = "Σ Values";
 
 /// Whether `field` names Σ Values: `Σ Values`, or `Values` unless a source field has that name.
+/// Drops a field's label/value filter rules: they only apply while it is on an axis.
+fn drop_axis_rules(pt: &mut PivotTable, field: &str) {
+    pt.label_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(field));
+    pt.value_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(field));
+}
+
+/// Drops the value filters whose measure no longer names a value field.
+fn prune_value_filters(pt: &mut PivotTable) {
+    let measures: Vec<String> = pt.values.iter().flat_map(|v| [v.name.clone(), v.source_col.clone()]).collect();
+    pt.value_filters.retain(|f| measures.iter().any(|m| m.eq_ignore_ascii_case(&f.measure)));
+}
+
 fn is_values_field(src: &pv::Source, field: &str) -> bool {
     let f = field.trim();
     f == VALUES_FIELD || (f.eq_ignore_ascii_case("values") && src.col(f).is_none())
@@ -475,12 +505,14 @@ fn add_to_area(
                 _ => auto_name(f, &field),
             };
             let nm = unique_value_name(pt, &base, None);
+            drop_axis_rules(pt, &field);
             let v = PivotValue { source_col: field, func: f, name: nm, show_as: PivotShowAs::Normal, number_format: None };
             let at = position.unwrap_or(pt.values.len()).min(pt.values.len());
             pt.values.insert(at, v);
         }
         _ => {
             take_from_axes(pt, &field);
+            drop_axis_rules(pt, &field);
             let existing = pt.filters.iter().position(|f| f.source_col.eq_ignore_ascii_case(&field));
             let entry = match existing {
                 Some(i) => pt.filters.remove(i),
@@ -506,6 +538,9 @@ fn remove_from_area(cmd: &str, pt: &mut PivotTable, field: &str, area: &str) -> 
             let f = list.remove(i);
             shift_values(pt, rows, i, false);
             pt.filters.retain(|x| !x.source_col.eq_ignore_ascii_case(&f.source_col));
+            if !in_axes(pt, &f.source_col) {
+                drop_axis_rules(pt, &f.source_col);
+            }
             Ok(f.source_col)
         }
         "values" => {
@@ -515,7 +550,9 @@ fn remove_from_area(cmd: &str, pt: &mut PivotTable, field: &str, area: &str) -> 
                 .position(|v| v.name.eq_ignore_ascii_case(field))
                 .or_else(|| pt.values.iter().position(|v| v.source_col.eq_ignore_ascii_case(field)))
                 .ok_or_else(|| bad(cmd, format!("`{field}` isn't in the values area")))?;
-            Ok(pt.values.remove(i).source_col)
+            let v = pt.values.remove(i);
+            prune_value_filters(pt);
+            Ok(v.source_col)
         }
         _ => {
             let i = pt
@@ -760,6 +797,36 @@ fn axis_json(f: &PivotField) -> Json {
     })
 }
 
+fn label_op_name(op: PivotLabelOp) -> &'static str {
+    match op {
+        PivotLabelOp::Equals => "equals",
+        PivotLabelOp::NotEquals => "notEquals",
+        PivotLabelOp::BeginsWith => "beginsWith",
+        PivotLabelOp::EndsWith => "endsWith",
+        PivotLabelOp::Contains => "contains",
+        PivotLabelOp::DoesNotContain => "doesNotContain",
+        PivotLabelOp::GreaterThan => "greaterThan",
+        PivotLabelOp::GreaterThanOrEqual => "greaterThanOrEqual",
+        PivotLabelOp::LessThan => "lessThan",
+        PivotLabelOp::LessThanOrEqual => "lessThanOrEqual",
+        PivotLabelOp::Between => "between",
+        PivotLabelOp::NotBetween => "notBetween",
+    }
+}
+
+fn value_op_name(op: PivotValueOp) -> &'static str {
+    match op {
+        PivotValueOp::Equals => "equals",
+        PivotValueOp::NotEquals => "notEquals",
+        PivotValueOp::GreaterThan => "greaterThan",
+        PivotValueOp::GreaterThanOrEqual => "greaterThanOrEqual",
+        PivotValueOp::LessThan => "lessThan",
+        PivotValueOp::LessThanOrEqual => "lessThanOrEqual",
+        PivotValueOp::Between => "between",
+        PivotValueOp::NotBetween => "notBetween",
+    }
+}
+
 fn pivot_json(wb: &Workbook, si: usize, pt: &PivotTable) -> Json {
     json!({
         "id": pt.id,
@@ -779,6 +846,8 @@ fn pivot_json(wb: &Workbook, si: usize, pt: &PivotTable) -> Json {
         "style": pt.style,
         "showHeaders": pt.show_headers,
         "calculatedFields": pt.calculated_fields.iter().map(|c| json!({"name": c.name, "formula": c.formula})).collect::<Vec<_>>(),
+        "labelFilters": pt.label_filters.iter().map(|f| json!({"field": f.source_col, "op": label_op_name(f.op), "value": f.value, "value2": f.value2})).collect::<Vec<_>>(),
+        "valueFilters": pt.value_filters.iter().map(|f| json!({"field": f.source_col, "measure": f.measure, "op": value_op_name(f.op), "value": f.value, "value2": f.value2})).collect::<Vec<_>>(),
         "valuesOnRows": pt.values_on_rows,
         "valuesPosition": pt.values_position,
     })
@@ -1132,6 +1201,8 @@ fn filter(s: &mut Session, p: &Json) -> Result<Json> {
     };
     update(s, p, |pt, src, _| {
         let field = canonical(C, src, &field)?;
+        pt.label_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
+        pt.value_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
         let i = pt.filters.iter().position(|f| f.source_col.eq_ignore_ascii_case(&field));
         match (i, selected) {
             (Some(i), None) => {
@@ -1150,6 +1221,134 @@ fn filter(s: &mut Session, p: &Json) -> Result<Json> {
             (None, None) => {}
         }
         Ok(json!({"field": field}))
+    })
+}
+
+fn label_op(v: &str) -> Option<PivotLabelOp> {
+    Some(match v.to_ascii_lowercase().as_str() {
+        "equals" | "eq" | "=" => PivotLabelOp::Equals,
+        "notequals" | "ne" | "<>" => PivotLabelOp::NotEquals,
+        "beginswith" | "startswith" => PivotLabelOp::BeginsWith,
+        "endswith" => PivotLabelOp::EndsWith,
+        "contains" => PivotLabelOp::Contains,
+        "doesnotcontain" | "notcontains" => PivotLabelOp::DoesNotContain,
+        "greaterthan" | ">" => PivotLabelOp::GreaterThan,
+        "greaterthanorequal" | ">=" => PivotLabelOp::GreaterThanOrEqual,
+        "lessthan" | "<" => PivotLabelOp::LessThan,
+        "lessthanorequal" | "<=" => PivotLabelOp::LessThanOrEqual,
+        "between" => PivotLabelOp::Between,
+        "notbetween" => PivotLabelOp::NotBetween,
+        _ => return None,
+    })
+}
+
+fn value_op(v: &str) -> Option<PivotValueOp> {
+    Some(match v.to_ascii_lowercase().as_str() {
+        "equals" | "eq" | "=" => PivotValueOp::Equals,
+        "notequals" | "ne" | "<>" => PivotValueOp::NotEquals,
+        "greaterthan" | ">" => PivotValueOp::GreaterThan,
+        "greaterthanorequal" | ">=" => PivotValueOp::GreaterThanOrEqual,
+        "lessthan" | "<" => PivotValueOp::LessThan,
+        "lessthanorequal" | "<=" => PivotValueOp::LessThanOrEqual,
+        "between" => PivotValueOp::Between,
+        "notbetween" => PivotValueOp::NotBetween,
+        _ => return None,
+    })
+}
+
+/// Stores `selected` as the field's item filter (hidden items on its axis).
+fn set_item_filter(pt: &mut PivotTable, field: &str, selected: Vec<String>) {
+    match pt.filters.iter_mut().find(|f| f.source_col.eq_ignore_ascii_case(field)) {
+        Some(f) => {
+            f.selected = Some(selected);
+            f.area = PivotFilterArea::Axis;
+        }
+        None => pt.filters.push(PivotFilter { source_col: field.to_string(), selected: Some(selected), area: PivotFilterArea::Axis }),
+    }
+}
+
+fn clear_item_filter(pt: &mut PivotTable, field: &str) {
+    if let Some(f) = pt.filters.iter_mut().find(|f| f.source_col.eq_ignore_ascii_case(field))
+        && f.area == PivotFilterArea::Axis
+    {
+        f.selected = None;
+    }
+}
+
+fn filter_by_label(s: &mut Session, p: &Json) -> Result<Json> {
+    const C: &str = "pivot.filterByLabel";
+    let field = str_param(p, "field").ok_or_else(|| bad(C, "missing `field`"))?.to_string();
+    let clear = bool_param(p, "clear").unwrap_or(false) || p.get("op").is_some_and(Json::is_null);
+    let raw = str_param(p, "op").unwrap_or("equals");
+    let op = if clear { None } else { Some(label_op(raw).ok_or_else(|| bad(C, format!("unknown operator `{raw}`")))?) };
+    let value = str_param(p, "value").unwrap_or_default().to_string();
+    let value2 = str_param(p, "value2").map(str::to_string);
+    if matches!(op, Some(PivotLabelOp::Between | PivotLabelOp::NotBetween)) && value2.is_none() {
+        return Err(bad(C, "`between`/`notBetween` need `value2`"));
+    }
+    update(s, p, move |pt, src, wb| {
+        let field = canonical(C, src, &field)?;
+        axis_field(C, pt, &field)?.collapsed_items.clear();
+        pt.value_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
+        pt.label_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
+        let Some(op) = op else {
+            clear_item_filter(pt, &field);
+            return Ok(json!({"field": field, "items": Json::Null}));
+        };
+        let rule = PivotLabelFilter { source_col: field.clone(), op, value, value2 };
+        let c = src.col(&field).ok_or_else(|| bad(C, format!("no field `{field}` in the source data")))?;
+        let group = pt
+            .rows
+            .iter()
+            .chain(pt.columns.iter())
+            .find(|f| f.source_col.eq_ignore_ascii_case(&field))
+            .map(crate::pivot::Grouping::of)
+            .unwrap_or_default();
+        let kept: Vec<String> = pv::distinct_labels(wb, src, c, group, 100_000).into_iter().filter(|l| rule.passes(l)).collect();
+        let n = kept.len();
+        set_item_filter(pt, &field, kept);
+        pt.label_filters.push(rule);
+        Ok(json!({"field": field, "items": n}))
+    })
+}
+
+fn filter_by_value(s: &mut Session, p: &Json) -> Result<Json> {
+    const C: &str = "pivot.filterByValue";
+    let field = str_param(p, "field").ok_or_else(|| bad(C, "missing `field`"))?.to_string();
+    let clear = bool_param(p, "clear").unwrap_or(false) || p.get("op").is_some_and(Json::is_null);
+    let raw = str_param(p, "op").unwrap_or("greaterThan");
+    let op = if clear { None } else { Some(value_op(raw).ok_or_else(|| bad(C, format!("unknown operator `{raw}`")))?) };
+    if !clear && f64_param(p, "value").is_none() {
+        return Err(bad(C, "missing `value`"));
+    }
+    let value = f64_param(p, "value").unwrap_or(0.0);
+    let value2 = f64_param(p, "value2");
+    if matches!(op, Some(PivotValueOp::Between | PivotValueOp::NotBetween)) && value2.is_none() {
+        return Err(bad(C, "`between`/`notBetween` need `value2`"));
+    }
+    let measure = str_param(p, "measure").map(str::to_string);
+    update(s, p, move |pt, src, wb| {
+        let field = canonical(C, src, &field)?;
+        axis_field(C, pt, &field)?.collapsed_items.clear();
+        pt.label_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
+        pt.value_filters.retain(|f| !f.source_col.eq_ignore_ascii_case(&field));
+        let Some(op) = op else {
+            clear_item_filter(pt, &field);
+            return Ok(json!({"field": field, "items": Json::Null}));
+        };
+        let measure = match measure {
+            Some(m) => m,
+            None => pt.values.first().map(|v| v.name.clone()).ok_or_else(|| other("Add a value field before filtering by value."))?,
+        };
+        let rule = PivotValueFilter { source_col: field.clone(), measure, op, value, value2 };
+        // The new filter replaces this field's own selection; the other fields still narrow the
+        // records it aggregates over.
+        clear_item_filter(pt, &field);
+        let kept = pv::value_filter_kept(wb, src, pt, &rule).map_err(other)?;
+        let n = kept.len();
+        set_item_filter(pt, &field, kept);
+        pt.value_filters.push(rule);
+        Ok(json!({"field": field, "items": n}))
     })
 }
 
@@ -1412,6 +1611,8 @@ fn change_source(s: &mut Session, p: &Json) -> Result<Json> {
         }
         pt.values.retain(|f| keep(&f.source_col, &mut dropped));
         pt.filters.retain(|f| keep(&f.source_col, &mut dropped));
+        pt.label_filters.retain(|f| src.col(&f.source_col).is_some());
+        prune_value_filters(pt);
         Ok(json!({"source": source, "dropped": dropped}))
     })
 }

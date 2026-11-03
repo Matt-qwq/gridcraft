@@ -6220,6 +6220,77 @@ fn pivot_number_grouping_refuses_bounds_it_cannot_lay_out() {
 }
 
 #[test]
+fn pivot_label_filter_keeps_matching_items_and_clears() {
+    let mut s = pivot_months_session();
+    let r = s.execute("pivot.filterByLabel", json!({"pivot": "P1", "field": "Region", "op": "beginsWith", "value": "E"})).unwrap();
+    assert_eq!(r["items"], 1, "{r}");
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "East"), "{shown:?}");
+    assert!(!shown.iter().any(|t| t == "West"), "the filter hides West: {shown:?}");
+    // The rule and the item set it produced are both reported.
+    let f = s.execute("pivot.fields", json!({"pivot": "P1"})).unwrap();
+    assert_eq!(f["labelFilters"][0]["field"], "Region");
+    assert_eq!(f["labelFilters"][0]["op"], "beginsWith");
+    // The file stores the hidden items, so a reopen shows the same report.
+    reopen(&mut s);
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "East") && !shown.iter().any(|t| t == "West"), "{shown:?}");
+    // An item selection replaces the rule on that field.
+    s.execute("pivot.filter", json!({"pivot": "P1", "field": "Region", "selected": null})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "West"), "{shown:?}");
+    let f = s.execute("pivot.fields", json!({"pivot": "P1"})).unwrap();
+    assert_eq!(f["labelFilters"], json!([]), "the rule is gone with the selection");
+    // `between` needs its second bound, and the field must be on an axis.
+    assert!(s.execute("pivot.filterByLabel", json!({"pivot": "P1", "field": "Region", "op": "between", "value": "A"})).is_err());
+    s.execute("pivot.addField", json!({"pivot": "P1", "field": "Region", "area": "filters"})).unwrap();
+    let e = s.execute("pivot.filterByLabel", json!({"pivot": "P1", "field": "Region", "op": "equals", "value": "East"})).unwrap_err().to_string();
+    assert!(e.contains("rows or columns"), "{e}");
+}
+
+#[test]
+fn pivot_value_filter_keeps_items_by_their_aggregate() {
+    let mut s = pivot_months_session();
+    // East: 100 + 150 = 250, West: 200 + 250 = 450, across the month columns.
+    let r =
+        s.execute("pivot.filterByValue", json!({"pivot": "P1", "field": "Region", "measure": "Sales", "op": "greaterThan", "value": 300})).unwrap();
+    assert_eq!(r["items"], 1, "{r}");
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "West") && !shown.iter().any(|t| t == "East"), "{shown:?}");
+    let f = s.execute("pivot.fields", json!({"pivot": "P1"})).unwrap();
+    assert_eq!(f["valueFilters"][0]["measure"], "Sales");
+    assert_eq!(f["valueFilters"][0]["op"], "greaterThan");
+    // The file records the items it kept (`item/@h`), so the report survives a reopen.
+    reopen(&mut s);
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "West") && !shown.iter().any(|t| t == "East"), "{shown:?}");
+    // A bounded range picks the other item; a caption names the measure too.
+    s.execute(
+        "pivot.filterByValue",
+        json!({"pivot": "P1", "field": "Region", "measure": "Sum of Sales", "op": "between", "value": 200, "value2": 300}),
+    )
+    .unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "East") && !shown.iter().any(|t| t == "West"), "{shown:?}");
+    // A calculated-field measure is refused by name; so is an unknown one.
+    s.execute("pivot.calculatedField", json!({"pivot": "P1", "name": "Margin", "formula": "=Sales*0.1"})).unwrap();
+    let e = s
+        .execute("pivot.filterByValue", json!({"pivot": "P1", "field": "Region", "measure": "Margin", "op": "greaterThan", "value": 1}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("calculated"), "{e}");
+    let e = s
+        .execute("pivot.filterByValue", json!({"pivot": "P1", "field": "Region", "measure": "Nope", "op": "greaterThan", "value": 1}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("Nope"), "{e}");
+    // Clearing restores every item.
+    s.execute("pivot.filterByValue", json!({"pivot": "P1", "field": "Region", "clear": true})).unwrap();
+    let shown = sheet_texts(&s, "Report");
+    assert!(shown.iter().any(|t| t == "East") && shown.iter().any(|t| t == "West"), "{shown:?}");
+}
+
+#[test]
 fn every_label_of_a_pivot_slicer_comes_from_the_selected_tiles() {
     // Nothing selected is a filter that hides every row (Excel's "clear all buttons"), not "no
     // filter". `slicer.clear` selects everything again.
