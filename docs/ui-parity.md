@@ -311,8 +311,13 @@ a reader is attached (capped at 2,000 cells a frame), and the header row and col
 `ColumnHeader`/`RowHeader` nodes with their letters, numbers and indexes. **High contrast**
 (View ▸ Show, `view.highContrast`) paints the chrome black, white and yellow — with a yellow
 selection and cyan accents, white sheet page and black cell text — and sends egui's own widgets dark
-with it; the choice is remembered across restarts. What is missing: a status-bar accessibility
-entry. 1–2 h.
+with it; the choice is remembered across restarts. The **status bar carries an Accessibility
+entry**: it shows the issue count (`Accessibility: N`, or just `Accessibility` when there is
+nothing to fix) from `review.checkAccessibility`, cached per document revision (the check walks
+every sheet, so it does not run every frame), is a focusable status-bar button, and opens the same
+Check Accessibility dialog the Review tab does. Keyboard access to the object context menus on the
+sheet (Shift+F10 on a selected chart, picture or shape) is what remains of the accessibility and
+keyboard tail.
 
 ## Feel
 
@@ -330,6 +335,7 @@ scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | The status bar carries an **Accessibility** entry: the `review.checkAccessibility` issue count (cached per document revision, since the check walks every sheet), a focusable button that opens the same Check Accessibility dialog as the Review tab. Two tests (the count and its caching, and a status-bar frame that runs the command) |
 | 2026-11-02 | minor | A timeline's selected range handles drag on the sheet: either end resizes, the band slides, days snap, one drag is one undo step |
 | 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (its caption too while it still shows the old name), and a filter changed on the PivotTable mirrors onto a connected slicer when every connected report agrees; the timeline's range handles remain the one unfinished interaction |
 | 2026-10-30 | minor | PivotTable slicers and timelines on the sheet: a slicer's caption band and value tiles (grid of `columns` columns, selected tiles tinted and checked, clear-filter button, elided text, wheel-scrolled tiles with an `N of M` line, eight-handle selection frame), a timeline's caption, unit and full-range track with two handles, the same object drag/nudge/Delete/menu/Selection-pane wiring as charts and pictures through `slicer.toggle`/`slicer.move`/`slicer.delete`/`slicer.selectAll`/`slicer.clear`/`slicer.setStyle`, Tab/Enter tile focus, and tests for tile clicks, one-step drag undo, Delete, hostile anchors, empty items, Tab/Enter, the timeline drawing, the Selection pane and the right-click menu |

@@ -195,6 +195,9 @@ pub struct GridState {
     pub wheel_zoom: Option<WheelZoom>,
     /// A one-finger touch drag in progress: it pans the sheet instead of selecting.
     pub touch_pan: bool,
+    /// `review.checkAccessibility`'s issue count for the status bar, cached per document revision:
+    /// the check walks every sheet's cells and objects, far too slow to repeat every frame.
+    pub a11y: Option<((u64, u64), usize)>,
 }
 
 /// The grid's line geometry: prefix sums over custom row heights and column widths, and the

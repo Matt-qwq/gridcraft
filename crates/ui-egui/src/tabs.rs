@@ -16,6 +16,24 @@ fn rename_needs_focus(has_focus: bool, lost_focus: bool) -> bool {
     !has_focus && !lost_focus
 }
 
+/// The status bar's Accessibility entry: its label and the issue count from
+/// `review.checkAccessibility`. The count is cached per document revision, because the check walks
+/// every sheet's cells and objects and the status bar runs every frame.
+fn accessibility_status(app: &mut SheetApp) -> (String, usize) {
+    let Some(key) = app.session.active().map(|d| (d.uid, d.revision)) else {
+        return (app.ui.language.tr("Accessibility").to_string(), 0);
+    };
+    if app.grid.a11y.as_ref().is_none_or(|(k, _)| *k != key) {
+        let n = app.session.run("review.checkAccessibility", json!({})).ok().and_then(|v| v.as_array().map(Vec::len)).unwrap_or(0);
+        app.grid.a11y = Some((key, n));
+    }
+    let n = app.grid.a11y.as_ref().map(|(_, n)| *n).unwrap_or(0);
+    // No new string for the empty case: the entry reads "Accessibility" alone when there is
+    // nothing to fix, and "Accessibility: N" otherwise (Excel shows "Good to go" instead).
+    let label = if n == 0 { app.ui.language.tr("Accessibility").to_string() } else { format!("{}: {n}", app.ui.language.tr("Accessibility")) };
+    (label, n)
+}
+
 /// Rows of the All Sheets navigator as `(workbook index, name)`. Hidden sheets stay out, like on the tab strip:
 /// Unhide is the way to reach them.
 fn navigator_items(sheets: &[Arc<Sheet>]) -> Vec<(String, String)> {
@@ -335,6 +353,15 @@ pub fn status_bar(app: &mut SheetApp, ui: &mut Ui) {
                             app.run_or_alert(cmd, json!({}));
                         }
                     }
+                    ui.add_space(10.0);
+                    // Accessibility: the issue count, opening the same Check Accessibility dialog
+                    // the Review tab does (Excel shows this entry in its status bar too).
+                    let (label, issues) = accessibility_status(app);
+                    let color = if issues == 0 { t.text_dim } else { t.danger };
+                    let entry = egui::Button::new(egui::RichText::new(label).font(theme::ui_font(12.5)).color(color)).frame(false);
+                    if ui.add(entry).on_hover_text(app.ui.language.tr("Check Accessibility")).clicked() {
+                        app.open_dialog("accessibility", json!({}));
+                    }
                     ui.add_space(16.0);
                     // Average / Count / Sum.
                     if let Some(d) = app.session.active()
@@ -458,5 +485,53 @@ mod tests {
         assert_eq!(app.session.active().unwrap().wb.active_sheet, 1, "the corrected value commits and the sheet changes");
         let a1 = gridcraft_engine::core::CellRef::parse("A1").unwrap();
         assert!(app.session.active().unwrap().wb.sheet(0).unwrap().cell(a1).is_some(), "the value lands on the first sheet");
+    }
+}
+
+#[cfg(test)]
+mod a11y_status_tests {
+    use super::accessibility_status;
+    use crate::SheetApp;
+    use serde_json::json;
+
+    fn app_with_sheets() -> SheetApp {
+        let mut session = gridcraft_engine::Session::default();
+        session.new_workbook();
+        SheetApp::new(session, Default::default())
+    }
+
+    #[test]
+    fn the_status_bar_runs_the_accessibility_check() {
+        let mut app = app_with_sheets();
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::theme::font_definitions());
+        let mut out = ctx.run_ui(Default::default(), |ui| super::status_bar(&mut app, ui));
+        out.textures_delta.clear(); // nothing consumes the atlas in a headless test
+        assert!(app.grid.a11y.is_some(), "the bar asked for the issue count");
+    }
+
+    #[test]
+    fn the_status_bar_entry_counts_issues_once_per_revision() {
+        let mut app = app_with_sheets();
+        // A default sheet name is an issue of its own; name it first.
+        app.run("sheet.rename", json!({"sheet": 0, "name": "Data"})).unwrap();
+        // A merged range is one of the issues `review.checkAccessibility` reports.
+        app.run("selection.set", json!({"range": "A1:B2"})).unwrap();
+        app.run("home.mergeCells", json!({})).unwrap();
+        let (label, issues) = accessibility_status(&mut app);
+        assert!(issues >= 1, "{label}");
+        assert!(label.contains(&issues.to_string()), "{label}");
+        // The count is cached: a second frame without an edit does not run the command again.
+        let revision = app.session.active().unwrap().revision;
+        let cached = app.grid.a11y;
+        assert!(cached.is_some());
+        assert_eq!(accessibility_status(&mut app).1, issues);
+        assert_eq!(app.grid.a11y, cached);
+        assert_eq!(app.session.active().unwrap().revision, revision);
+        // An edit invalidates it, and a sheet with no issues says so instead of "0".
+        app.run("home.unmergeCells", json!({})).unwrap();
+        let (label, issues) = accessibility_status(&mut app);
+        assert_eq!(issues, 0, "{label}");
+        assert_eq!(label, "Accessibility", "nothing to fix: no count");
     }
 }
