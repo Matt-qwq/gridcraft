@@ -308,10 +308,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   Printable ASCII keeps the unshaped wrap bit for bit, and text over 16,384 bytes or a face that
   cannot cover it falls back to it. **Chart labels** (titles, axis and series labels) are shaped
   through the same engine, and the chart layout measures them with the shaped width, so a label's
-  box and its glyphs agree. Text boxes and the PDF's `text_width` remain.
+  box and its glyphs agree. Shape and text-box text is shaped and wrapped the same way (11-02),
+  with the outline halo drawn per line. The PDF's `text_width` remains.
 - **Still missing:** CJK and Arabic in one document (no single face covers both), fonts shipped per
-  platform, per-run font fallback, shaped **text boxes**, mirrored printing and right-to-left sheet
-  tabs, and shaped *measurement* in the PDF's `text_width`; CFF/OTF (`CIDFontType0`) and TTC faces past index 0 are not embedded; a
+  platform, per-run font fallback, mirrored printing and right-to-left sheet tabs, and shaped
+  *measurement* in the PDF's `text_width`; CFF/OTF (`CIDFontType0`) and TTC faces past index 0 are not embedded; a
   mixed-direction line cannot extract back to source order through an extractor that re-applies the
   UBA (documented, not fixable in the file for Xpdf 4.00).
 - **Evidence:** the matrix in [localization-parity.md](localization-parity.md); #142, #54; UI 997

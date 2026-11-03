@@ -59,8 +59,10 @@ right-to-left sheets and full complex-script support. Part of
   shaped since 11-02**: a wrapped paragraph is measured once, broken at spaces, hyphens and CJK
   boundaries, and each line is shaped on its own (bidi, joining and marks per line), with each line
   aligned on its own and general right-to-left wrapped text aligned right; the chart layout
-  measures labels with the shaped width. Printable ASCII keeps egui's own wrap. Text boxes are
-  still drawn unshaped, and the PDF draws shaped glyphs but measures them unshaped.
+  measures labels with the shaped width. Printable ASCII keeps egui's own wrap. **Shape and
+  text-box text is shaped and wrapped since 11-02** (the same per-line engine, per-line alignment
+  and the text box's outline halo), and the PDF draws shaped glyphs but still measures them
+  unshaped.
   **Sheet Right-to-Left**
   (`view.rightToLeft`, Page Layout › Sheet Options, XLSX `rightToLeft`, `.xls` WINDOW2 fRightToLeft) mirrors the grid (#146):
   column A and the row headers on the right, the vertical scrollbar on the left; hit-testing,
@@ -191,7 +193,7 @@ Decisions and limits, also stated in the code:
 - **wasm** has no filesystem: font discovery returns an error, no face is embedded, and the
   document keeps the standard fonts and the CID fallback.
 - Remaining: CJK system-font fallback for every script, mirrored printing and sheet tabs for
-  right-to-left sheets, shaped text boxes and a shaped PDF `text_width`, and per-run font fallback. **Needs a human:** native-speaker review of every language (none so far) and of
+  right-to-left sheets, a shaped PDF `text_width`, and per-run font fallback. **Needs a human:** native-speaker review of every language (none so far) and of
   localized function names.
 
 ## Infrastructure (do first)
@@ -205,7 +207,7 @@ Decisions and limits, also stated in the code:
 3. Text shaping and fallback: the shared `gridcraft_core::text` engine shapes cell text on the grid,
    in the in-cell editor and in PDF export (Arabic, Devanagari, Thai, bidi, cluster-exact extraction).
    Remaining: CJK system font fallback for every script, right-to-left sheet tabs and mirrored
-   printing, shaped text boxes and a shaped PDF `text_width`, and per-run fallback.
+   printing, a shaped PDF `text_width`, and per-run fallback.
 
 ## Revision history
 

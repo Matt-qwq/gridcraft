@@ -27,10 +27,10 @@
 //! with — otherwise the measure and the drawing would disagree.
 //!
 //! # What is not shaped here
-//! Text boxes and the PDF writer's `text_width` still go through their own layout (the PDF
-//! *drawing* shapes through the same core engine in its own writer). This module covers the
-//! one-line and word-wrapped cell text the grid paints — including rotated cells, which paint the
-//! shaped galley turned — chart labels, and the in-cell editor's shaped line.
+//! The PDF writer's `text_width` still measures with the face's `hmtx` (the PDF *drawing* shapes
+//! through the same core engine in its own writer). This module covers the one-line and
+//! word-wrapped cell text the grid paints — including rotated cells, which paint the shaped galley
+//! turned — chart labels, shape and text-box text, and the in-cell editor's shaped line.
 //!
 //! # Never crash
 //! A family egui has no data for, a font file the engine refuses, a string over the engine's

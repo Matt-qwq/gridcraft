@@ -241,7 +241,7 @@ fn area_mesh(v: &[Pos2], col: Color32) -> egui::Mesh {
 /// A shape's text with its formatting: size, bold/italic, typeface, colour, outline, horizontal
 /// alignment and vertical anchor. Shapes other than text boxes default to white text centred in
 /// the shape; text boxes to black text at the top left.
-fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Shape, r: Rect, z: f32) {
+fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Shape, r: Rect, z: f32, text: Option<&crate::text::GridText>) {
     use gridcraft_engine::model::{ShapeTextAlign, ShapeTextAnchor};
     let f = &sp.format;
     let text_box = sp.kind == ShapeKind::TextBox;
@@ -254,7 +254,45 @@ fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Sh
     let family = theme::cell_family(f.font.as_deref().unwrap_or(""), f.bold, f.italic);
     let inset = 4.0;
     let width = (r.width() - 2.0 * inset).max(1.0);
-    let mut job = egui::text::LayoutJob::simple(sp.text.clone(), FontId::new(size, family), color, width);
+    let font = FontId::new(size, family);
+    let clip = p.with_clip_rect(r.intersect(p.clip_rect()));
+    // The outline is the text drawn in the outline colour, offset in eight directions by the
+    // outline width, under the filled text (egui has no stroked text).
+    let halo = f.text_outline.and_then(|(c, w)| c.resolve(&wb.theme).map(|oc| (theme::color32(oc), w)));
+    let paint_line = |line: &crate::text::Line, x: f32, y: f32| {
+        if let Some((oc, w)) = halo {
+            let d = (w * 96.0 / 72.0 * z / 2.0).clamp(0.5, 20.0);
+            for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+                clip.galley_with_override_text_color(pos2(x + dx * d, y + dy * d), line.galley.clone(), oc);
+            }
+        }
+        clip.galley(pos2(x, y), line.galley.clone(), color);
+    };
+    // Wrapped shape text is shaped the way a wrapped cell is (its bidi runs, joining and marks
+    // resolved per line); printable ASCII keeps the unshaped layout below, bit for bit.
+    if let Some(engine) = text {
+        let direction = crate::text::base_direction(&sp.text, false);
+        if let Some(lines) = engine.wrap(p.ctx(), &font, &sp.text, direction, color, width) {
+            let total: f32 = lines.iter().map(|l| l.height()).sum();
+            let mut y = match anchor {
+                ShapeTextAnchor::Top => r.top() + inset,
+                ShapeTextAnchor::Middle => r.center().y - total / 2.0,
+                ShapeTextAnchor::Bottom => r.bottom() - inset - total,
+            };
+            for line in &lines {
+                let lw = line.galley.size().x;
+                let x = match align {
+                    ShapeTextAlign::Left => r.left() + inset,
+                    ShapeTextAlign::Center => r.center().x - lw / 2.0,
+                    ShapeTextAlign::Right => r.right() - inset - lw,
+                };
+                paint_line(line, x, y);
+                y += line.height();
+            }
+            return;
+        }
+    }
+    let mut job = egui::text::LayoutJob::simple(sp.text.clone(), font, color, width);
     job.halign = match align {
         ShapeTextAlign::Left => egui::Align::LEFT,
         ShapeTextAlign::Center => egui::Align::Center,
@@ -272,12 +310,7 @@ fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Sh
         ShapeTextAnchor::Bottom => r.bottom() - inset - g.size().y,
     };
     let pos = pos2(x, y);
-    let clip = p.with_clip_rect(r.intersect(p.clip_rect()));
-    // egui has no stroked text: the outline is the text drawn in the outline colour, offset in
-    // eight directions by the outline width, under the filled text.
-    if let Some((c, w)) = f.text_outline
-        && let Some(oc) = c.resolve(&wb.theme).map(theme::color32)
-    {
+    if let Some((oc, w)) = halo {
         let d = (w * 96.0 / 72.0 * z / 2.0).clamp(0.5, 20.0);
         for (dx, dy) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
             clip.galley_with_override_text_color(pos + vec2(dx * d, dy * d), g.clone(), oc);
@@ -561,7 +594,7 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
             }
         }
         if label && !sp.text.is_empty() && !app.editing_text_box(sp.id) {
-            paint_shape_text(p, wb, sp, r, geo.z);
+            paint_shape_text(p, wb, sp, r, geo.z, Some(&app.text));
         }
         if label && sp.kind == ShapeKind::TextBox && app.selected_chart == Some(sp.id) {
             selection_frame(p, r);
