@@ -509,6 +509,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Missing:** calculated items and data-model pivots; the PivotTable gate's Excel verification. (`insert.pivotChart` landed 10-11 and is in the catalog, so PivotCharts are
   no longer part of this gap.) The "Generate GetPivotData" click option (Excel writes a
   `GETPIVOTDATA` formula when a pivot cell is clicked) is not wired into the grid yet.
+  Calculated items are deliberately not started: they need a `calculatedItems` element whose exact
+  placement and item-index rules no primary source available here settles (openpyxl's schema model
+  has no calculated-item type, `craftrules` is not checked out and there is no network), and a
+  guessed part risks the Excel repair prompt the gate exists to prevent. The engine half (synthetic
+  items over the value fields' aggregates) is understood; it lands with the file shape once the
+  schema can be confirmed or Excel can open the result.
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
@@ -689,6 +695,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §8: recorded why calculated items wait (no primary source here settles `calculatedItems`' placement and index rules, and a guessed part risks an Excel repair prompt); the engine half is understood |
 | 2026-11-02 | minor | §8: the `pivot` oracle fixture now carries a grouped numeric field (`rangePr` + 13 group captions) and a value filter's hidden items, and both probes pass (openpyxl readback; WPS opens, recalculates, re-saves) — well-formedness evidence, not the Excel check |
 | 2026-11-02 | minor | §1: the corpus half cannot start on this machine — no corpus URL in the repo, no `craftrules` checkout, no network (github.com timed out) — so it is recorded instead of attempted; §10: a fresh 100 seeds × 200 steps soak at `3574f5d2` (after the three PivotTable changes) is green, 131 s, 0 failures |
 | 2026-11-02 | minor | §8: label and value filters landed (`pivot.filterByLabel`/`pivot.filterByValue`, evaluated when set and stored as the field's hidden items, so the report/reopen/refresh agree; the rule stays in the model and is not written as Excel's `<filters>`); calculated items and the Excel check are what remain |
