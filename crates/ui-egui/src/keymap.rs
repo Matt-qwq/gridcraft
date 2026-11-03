@@ -241,7 +241,19 @@ pub(crate) fn dispatch(app: &mut SheetApp, ctx: &egui::Context, key: Key, physic
         // the reachable pair.
         Shortcut::ContextMenu => {
             app.grid.menu_nav = None;
-            app.grid.context_menu = Some(geo.cell_rect(sh, active).center());
+            // A selected chart, picture, shape or slicer opens its own menu (delete, select data,
+            // format, slicer actions), the same one a right-click opens; otherwise the cell's.
+            match crate::grid::selected_object(sh, app.selected_chart) {
+                Some((kind, id, anchor)) => {
+                    let r = crate::chartview::anchor_rect(geo, sh, &anchor);
+                    app.grid.object_menu = Some((geo.mirror_pos(r.left_bottom()), kind, id));
+                    app.grid.context_menu = None;
+                }
+                None => {
+                    app.grid.context_menu = Some(geo.cell_rect(sh, active).center());
+                    app.grid.object_menu = None;
+                }
+            }
         }
         Shortcut::Print => {
             app.commit_edit(0, 0, false, false);
@@ -279,4 +291,43 @@ fn extend(app: &mut SheetApp, anchor: CellRef, active: CellRef, to: CellRef) {
     }
     app.grid.ensure_visible = true;
     app.grid.reveal_moving_end = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch;
+    use crate::SheetApp;
+    use crate::grid::Geo;
+    use egui::{Key, Modifiers, Rect, Vec2, pos2, vec2};
+    use serde_json::json;
+
+    /// Shift+F10 on a selected chart opens the chart's own menu at its frame, not the cell's
+    /// menu — and with no object selected it is still the cell menu.
+    #[test]
+    fn shift_f10_opens_the_selected_objects_menu() {
+        let mut session = gridcraft_engine::Session::default();
+        session.new_workbook();
+        let mut app = SheetApp::new(session, Default::default());
+        app.run("cell.set", json!({"cell": "A1", "input": "Data"})).unwrap();
+        let chart = app.run("insert.chart", json!({"type": "column", "at": "D2", "width": 300, "height": 200})).unwrap();
+        let id = chart["chart"].as_u64().unwrap() as u32;
+        let ctx = egui::Context::default();
+        let wb = app.session.active().unwrap().wb.clone();
+        let sh = wb.sheet(0).unwrap();
+        let geo = Geo::new(sh, Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0)), Vec2::ZERO);
+
+        // No object selected: the cell's context menu.
+        app.selected_chart = None;
+        assert!(dispatch(&mut app, &ctx, Key::F10, None, Modifiers::SHIFT, &geo, sh));
+        assert!(app.grid.context_menu.is_some());
+        assert!(app.grid.object_menu.is_none());
+        app.grid.context_menu = None;
+
+        // The selected chart: its own menu, and no cell menu under it.
+        app.selected_chart = Some(id);
+        assert!(dispatch(&mut app, &ctx, Key::F10, None, Modifiers::SHIFT, &geo, sh));
+        let (_, kind, got) = app.grid.object_menu.expect("the chart's menu opened");
+        assert_eq!((kind, got), ("chart", id));
+        assert!(app.grid.context_menu.is_none());
+    }
 }

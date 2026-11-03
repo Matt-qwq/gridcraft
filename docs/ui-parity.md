@@ -315,9 +315,11 @@ with it; the choice is remembered across restarts. The **status bar carries an A
 entry**: it shows the issue count (`Accessibility: N`, or just `Accessibility` when there is
 nothing to fix) from `review.checkAccessibility`, cached per document revision (the check walks
 every sheet, so it does not run every frame), is a focusable status-bar button, and opens the same
-Check Accessibility dialog the Review tab does. Keyboard access to the object context menus on the
-sheet (Shift+F10 on a selected chart, picture or shape) is what remains of the accessibility and
-keyboard tail.
+Check Accessibility dialog the Review tab does. A selected chart, picture, shape or slicer opens
+its **own context menu with Shift+F10** — the same one a right-click opens (delete, Select Data,
+Format Chart, slicer actions), at the object's frame — while a cell selection keeps the cell menu.
+What remains of the accessibility tail is nothing on this list; shape/picture menus carry alt text
+through the pane.
 
 ## Feel
 
@@ -335,6 +337,7 @@ scrollbar bugs 2–4 · pixel/feel pass against observed Excel 7–12.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | Shift+F10 on a selected chart, picture, shape or slicer opens its own context menu at the object's frame (the right-click menu: delete, Select Data, Format Chart Area, slicer actions), and the cell menu otherwise; the test drives `keymap::dispatch` with a real `Geo`. `grid::selected_object` is the model side (kind, id, anchor) and has its own test |
 | 2026-11-02 | minor | The status bar carries an **Accessibility** entry: the `review.checkAccessibility` issue count (cached per document revision, since the check walks every sheet), a focusable button that opens the same Check Accessibility dialog as the Review tab. Two tests (the count and its caching, and a status-bar frame that runs the command) |
 | 2026-11-02 | minor | A timeline's selected range handles drag on the sheet: either end resizes, the band slides, days snap, one drag is one undo step |
 | 2026-10-30 | minor | A table slicer follows a table rename and a column-header rename (its caption too while it still shows the old name), and a filter changed on the PivotTable mirrors onto a connected slicer when every connected report agrees; the timeline's range handles remain the one unfinished interaction |

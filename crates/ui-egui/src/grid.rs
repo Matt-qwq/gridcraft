@@ -3099,6 +3099,15 @@ fn object_anchor(sh: &Sheet, kind: &str, id: u32) -> Option<gridcraft_engine::mo
     }
 }
 
+/// The object `Shift+F10` targets when one is selected: its kind, id and anchor, else none. With
+/// no object selected the key opens the cell's context menu instead.
+pub(crate) fn selected_object(sh: &Sheet, selected: Option<u32>) -> Option<(&'static str, u32, gridcraft_engine::model::Anchor)> {
+    let id = selected?;
+    let kind = object_kind(sh, id)?;
+    let anchor = object_anchor(sh, kind, id)?;
+    Some((kind, id, anchor))
+}
+
 /// The kind of object `id` names on `sh`, as `object.move` spells it.
 fn object_kind(sh: &Sheet, id: u32) -> Option<&'static str> {
     if sh.charts.iter().any(|o| o.id == id) {
@@ -4782,5 +4791,42 @@ mod line_geo_tests {
         assert!(Arc::ptr_eq(&after.ri, &again.ri));
         let other_sheet = grid.line_geo_for((7, 2, 1), &sh);
         assert!(!Arc::ptr_eq(&after.ri, &other_sheet.ri), "the key tells sheets apart");
+    }
+}
+
+#[cfg(test)]
+mod selected_object_tests {
+    use super::selected_object;
+    use gridcraft_engine::core::CellRef;
+    use gridcraft_engine::model::{Anchor, AnchorMode, Chart, Image, Shape, ShapeKind, Sheet};
+
+    fn anchor() -> Anchor {
+        Anchor { cell: CellRef::new(2, 1), dx: 1.0, dy: 2.0, width: 30.0, height: 40.0, mode: AnchorMode::MoveOnly }
+    }
+
+    #[test]
+    fn shift_f10_targets_the_selected_chart_picture_or_shape() {
+        let mut sh = Sheet::new("Data");
+        sh.charts.push(Chart { id: 7, anchor: anchor(), ..Chart::default() });
+        let im = Image { id: 8, anchor: anchor(), data: std::sync::Arc::new(vec![]), mime: "image/png".into(), alt: String::new() };
+        sh.images.push(im);
+        sh.shapes.push(Shape {
+            id: 9,
+            anchor: anchor(),
+            kind: ShapeKind::Rectangle,
+            fill: Default::default(),
+            line: Default::default(),
+            text: String::new(),
+            alt: None,
+            format: Default::default(),
+        });
+        // Each kind comes back with the object's own anchor; an id nothing holds (or no selection
+        // at all) leaves the key to the cell's context menu.
+        assert_eq!(selected_object(&sh, Some(7)).map(|(k, i, _)| (k, i)), Some(("chart", 7)));
+        assert_eq!(selected_object(&sh, Some(8)).map(|(k, i, _)| (k, i)), Some(("image", 8)));
+        assert_eq!(selected_object(&sh, Some(9)).map(|(k, i, _)| (k, i)), Some(("shape", 9)));
+        assert_eq!(selected_object(&sh, Some(7)).map(|(_, _, a)| a), Some(anchor()));
+        assert_eq!(selected_object(&sh, Some(99)), None);
+        assert_eq!(selected_object(&sh, None), None);
     }
 }
