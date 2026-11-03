@@ -192,8 +192,25 @@ fn cmp_items(a: &Item, b: &Item) -> Ordering {
     a.class.cmp(&b.class).then(a.num.total_cmp(&b.num)).then_with(|| a.text.cmp(&b.text))
 }
 
-/// (identity key, item) for a source value under a field's date grouping.
-fn make_item(wb: &Workbook, v: &Value, group: PivotDateGroup, fmt: &str, first: usize) -> (String, Item) {
+/// How a field buckets its values: a date part, or a numeric range.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Grouping {
+    pub date: PivotDateGroup,
+    pub number: Option<PivotNumberGroup>,
+}
+
+impl Grouping {
+    /// The grouping a field on an axis uses (an invalid numeric group is ignored).
+    pub fn of(f: &PivotField) -> Grouping {
+        Grouping { date: f.date_group, number: f.number_group.filter(PivotNumberGroup::is_valid) }
+    }
+    pub fn is_none(&self) -> bool {
+        self.date == PivotDateGroup::None && self.number.is_none()
+    }
+}
+
+/// (identity key, item) for a source value under a field's grouping.
+fn make_item(wb: &Workbook, v: &Value, group: Grouping, fmt: &str, first: usize) -> (String, Item) {
     let it = |value: Value, label: String, class: u8, num: f64, formatted: bool| Item {
         text: label.to_lowercase(),
         value,
@@ -206,11 +223,16 @@ fn make_item(wb: &Workbook, v: &Value, group: PivotDateGroup, fmt: &str, first: 
     match v {
         Value::Empty => ("b".into(), it(Value::text("(blank)"), "(blank)".into(), 4, 0.0, false)),
         Value::Number(n) => {
-            if group != PivotDateGroup::None
+            if let Some(ng) = group.number
+                && let Some((label, key)) = ng.bucket(*n)
+            {
+                return (format!("r{}", label.to_lowercase()), it(Value::text(label.as_str()), label, 0, key, false));
+            }
+            if group.date != PivotDateGroup::None
                 && let Some(dt) = datetime_from_serial(wb.date_system, *n)
             {
                 let mon = MONTHS.get(dt.month.saturating_sub(1) as usize).copied().unwrap_or("Jan");
-                let (label, key) = match group {
+                let (label, key) = match group.date {
                     PivotDateGroup::Years => (dt.year.to_string(), dt.year as f64),
                     PivotDateGroup::Quarters => {
                         let q = (dt.month.saturating_sub(1)) / 3 + 1;
@@ -235,7 +257,7 @@ fn make_item(wb: &Workbook, v: &Value, group: PivotDateGroup, fmt: &str, first: 
 }
 
 impl FieldItems {
-    fn intern(&mut self, wb: &Workbook, v: &Value, group: PivotDateGroup, fmt: &str, first: usize) -> u32 {
+    fn intern(&mut self, wb: &Workbook, v: &Value, group: Grouping, fmt: &str, first: usize) -> u32 {
         let (key, item) = make_item(wb, v, group, fmt, first);
         if let Some(i) = self.index.get(&key) {
             return *i;
@@ -254,12 +276,12 @@ impl FieldItems {
 }
 
 /// The label of a source value under a date grouping (for filters and field lists).
-pub fn item_label(wb: &Workbook, v: &Value, group: PivotDateGroup, fmt: &str) -> String {
+pub fn item_label(wb: &Workbook, v: &Value, group: Grouping, fmt: &str) -> String {
     make_item(wb, v, group, fmt, 0).1.label
 }
 
 /// Distinct item labels of a source column, sorted like the field list shows them.
-pub fn distinct_labels(wb: &Workbook, src: &Source, col: usize, group: PivotDateGroup, limit: usize) -> Vec<String> {
+pub fn distinct_labels(wb: &Workbook, src: &Source, col: usize, group: Grouping, limit: usize) -> Vec<String> {
     let mut fi = FieldItems::default();
     let fmt = src.formats.get(col).map(String::as_str).unwrap_or("General");
     for (i, r) in src.rows.iter().enumerate() {
@@ -835,11 +857,11 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     if vals.len() > MAX_VALUE_FIELDS {
         return Err(format!("A PivotTable can have at most {MAX_VALUE_FIELDS} value fields."));
     }
-    let axis_group = |name: &str| -> Option<PivotDateGroup> {
-        pt.rows.iter().chain(pt.columns.iter()).find(|f| f.source_col.eq_ignore_ascii_case(name)).map(|f| f.date_group)
+    let axis_group = |name: &str| -> Option<Grouping> {
+        pt.rows.iter().chain(pt.columns.iter()).find(|f| f.source_col.eq_ignore_ascii_case(name)).map(Grouping::of)
     };
     // (column, filter, grouping used for labels, shown as a report filter)
-    let filters: Vec<(usize, &PivotFilter, PivotDateGroup, bool)> = pt
+    let filters: Vec<(usize, &PivotFilter, Grouping, bool)> = pt
         .filters
         .iter()
         .filter_map(|f| {
@@ -851,7 +873,7 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
             Some((c, f, g.unwrap_or_default(), f.is_page(g.is_some())))
         })
         .collect();
-    let shown_filters: Vec<&(usize, &PivotFilter, PivotDateGroup, bool)> = filters.iter().filter(|f| f.3).collect();
+    let shown_filters: Vec<&(usize, &PivotFilter, Grouping, bool)> = filters.iter().filter(|f| f.3).collect();
 
     let k = vals.len();
     let empty = rows.is_empty() && cols.is_empty() && vals.is_empty();
@@ -888,11 +910,11 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
         }
         let mut rp = Vec::with_capacity(rows.len());
         for (((c, f), fi), fmt) in rows.iter().zip(row_items.iter_mut()).zip(row_fmts.iter()) {
-            rp.push(fi.intern(wb, rec.get(*c).unwrap_or(&Value::Empty), f.date_group, fmt, ri));
+            rp.push(fi.intern(wb, rec.get(*c).unwrap_or(&Value::Empty), Grouping::of(f), fmt, ri));
         }
         let mut cp = Vec::with_capacity(cols.len());
         for (((c, f), fi), fmt) in cols.iter().zip(col_items.iter_mut()).zip(col_fmts.iter()) {
-            cp.push(fi.intern(wb, rec.get(*c).unwrap_or(&Value::Empty), f.date_group, fmt, ri));
+            cp.push(fi.intern(wb, rec.get(*c).unwrap_or(&Value::Empty), Grouping::of(f), fmt, ri));
         }
         for a in 0..=rp.len() {
             for b in 0..=cp.len() {

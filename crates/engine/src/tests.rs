@@ -6142,6 +6142,84 @@ fn getpivotdata_walks_nested_row_items_in_every_layout() {
 }
 
 #[test]
+fn pivot_number_grouping_buckets_values_and_round_trips() {
+    let mut s = s();
+    s.execute(
+        "range.setValues",
+        json!({"range": "A1", "values": [
+            ["Item", "Amount"],
+            ["a", 5.0],
+            ["b", 15.0],
+            ["c", 25.0],
+            ["d", 99.0],
+            ["e", 105.0],
+            ["f", -3.0],
+        ]}),
+    )
+    .unwrap();
+    s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
+    s.execute(
+        "insert.pivotTable",
+        json!({"source": "Sheet1!A1:B7", "destination": "Report!A3", "name": "P1",
+               "rows": ["Amount"], "values": ["Amount"]}),
+    )
+    .unwrap();
+    s.execute("pivot.group", json!({"pivot": "P1", "field": "Amount", "start": 0, "end": 100, "interval": 10})).unwrap();
+    let check = |s: &Session| {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        let at = |a: &str| sh.value(CellRef::parse(a).unwrap());
+        // Items are sorted by their bucket, so `<0` comes first and `>100` before the total.
+        assert_eq!(at("A4"), Value::text("<0"), "the item below the range");
+        assert_eq!(at("B4"), Value::Number(-3.0));
+        assert_eq!(at("A5"), Value::text("0-9"));
+        assert_eq!(at("B5"), Value::Number(5.0));
+        assert_eq!(at("A6"), Value::text("10-19"));
+        assert_eq!(at("A8"), Value::text("90-99"));
+        assert_eq!(at("B8"), Value::Number(99.0));
+        assert_eq!(at("A9"), Value::text(">100"), "the item above the range");
+        assert_eq!(at("B9"), Value::Number(105.0));
+        assert_eq!(at("A10"), Value::text("Grand Total"));
+        assert_eq!(at("B10"), Value::Number(246.0));
+        let pt = &sh.pivots[0];
+        assert_eq!(pt.rows[0].number_group, Some(gridcraft_model::PivotNumberGroup { start: 0.0, end: 100.0, interval: 10.0 }));
+        assert_eq!(pt.rows[0].date_group, gridcraft_model::PivotDateGroup::None);
+    };
+    check(&s);
+    // The grouping is a model property: it survives a save and a reopen, and a refresh rebuilt
+    // from the reopened cache labels the buckets the same way.
+    reopen(&mut s);
+    check(&s);
+    s.execute("pivot.refresh", json!({"pivot": "P1"})).unwrap();
+    check(&s);
+    // `pivot.fields` reports it, and a date grouping on the same field replaces it.
+    let f = s.execute("pivot.fields", json!({"pivot": "P1"})).unwrap();
+    assert_eq!(f["rows"][0]["numberGroup"]["interval"], json!(10.0), "{f}");
+    s.execute("pivot.group", json!({"pivot": "P1", "field": "Amount", "by": "none"})).unwrap();
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert!(sh.pivots[0].rows[0].number_group.is_none());
+    }
+}
+
+#[test]
+fn pivot_number_grouping_refuses_bounds_it_cannot_lay_out() {
+    let mut s = pivot_months_session();
+    // A value field is not on an axis: move it to Rows so it can be grouped.
+    s.execute("pivot.addField", json!({"pivot": "P1", "field": "Sales", "area": "rows"})).unwrap();
+    let e = |s: &mut Session, p: serde_json::Value| s.execute("pivot.group", p).unwrap_err().to_string();
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 0, "end": 10, "interval": 0})).contains("interval"));
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 10, "end": 0, "interval": 1})).contains("range"));
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 0, "end": 1e6, "interval": 1})).contains("range"));
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 0, "end": 10})).contains("interval"));
+    // A date grouping and a numeric range are different requests.
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "by": "months", "start": 0, "end": 10, "interval": 5})).contains("either"));
+    // A text field cannot be grouped by number.
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Region", "start": 0, "end": 10, "interval": 5})).contains("group"));
+}
+
+#[test]
 fn every_label_of_a_pivot_slicer_comes_from_the_selected_tiles() {
     // Nothing selected is a filter that hides every row (Excel's "clear all buttons"), not "no
     // filter". `slicer.clear` selects everything again.

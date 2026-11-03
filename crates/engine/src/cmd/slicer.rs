@@ -337,7 +337,7 @@ fn apply_pivot_slicer(wb: &mut Workbook, widget: &PivotSlicer) -> Result<usize> 
                     if !keys.contains(&SlicerValue::from_value(&v).key()) {
                         continue;
                     }
-                    let label = pv::item_label(wb, &v, PivotDateGroup::None, &fmt);
+                    let label = pv::item_label(wb, &v, crate::pivot::Grouping::default(), &fmt);
                     if !out.iter().any(|x| x.eq_ignore_ascii_case(&label)) {
                         out.push(label);
                     }
@@ -373,7 +373,7 @@ fn apply_pivot_timeline(wb: &mut Workbook, widget: &PivotTimeline) -> Result<usi
                     .iter()
                     .chain(pt.columns.iter())
                     .find(|f| f.source_col.eq_ignore_ascii_case(&widget.field))
-                    .map(|f| f.date_group)
+                    .map(crate::pivot::Grouping::of)
                     .unwrap_or_default();
                 Some(range_labels(wb, &src, col, group, range))
             }
@@ -387,7 +387,7 @@ fn apply_pivot_timeline(wb: &mut Workbook, widget: &PivotTimeline) -> Result<usi
 /// The item labels a range selects: one per distinct label of the source rows whose date is inside
 /// the range, labelled the way the report labels that field ([`PivotDateGroup`] when it is on an
 /// axis). Bounded like every other item list.
-fn range_labels(wb: &Workbook, src: &pv::Source, col: usize, group: PivotDateGroup, range: TimelineRange) -> Vec<String> {
+fn range_labels(wb: &Workbook, src: &pv::Source, col: usize, group: crate::pivot::Grouping, range: TimelineRange) -> Vec<String> {
     const MAX: usize = 100_000;
     let fmt = src.formats.get(col).cloned().unwrap_or_default();
     let mut out: Vec<String> = vec![];

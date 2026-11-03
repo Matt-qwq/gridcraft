@@ -1442,6 +1442,97 @@ pub enum PivotDateGroup {
     Days,
 }
 
+/// Numeric grouping of a number field: buckets `interval` wide from `start` to `end` (inclusive),
+/// as Excel's "Group Field ▸ Starting at / Ending at / By" does. A value outside the range falls in
+/// the `<start` or `>end` group, as Excel shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PivotNumberGroup {
+    pub start: f64,
+    pub end: f64,
+    pub interval: f64,
+}
+
+impl PivotNumberGroup {
+    /// The most groups one field may have: a hostile `start`/`end`/`interval` must not ask for an
+    /// unbounded caption or group-item list.
+    pub const MAX_GROUPS: u64 = 100_000;
+
+    /// Whether the group can be used: finite bounds, a positive interval, an ordered range and a
+    /// bounded number of buckets.
+    pub fn is_valid(&self) -> bool {
+        self.start.is_finite()
+            && self.end.is_finite()
+            && self.interval.is_finite()
+            && self.interval > 0.0
+            && self.start <= self.end
+            && self.groups().is_some_and(|n| n <= Self::MAX_GROUPS)
+    }
+
+    /// The number of buckets in `start..=end`: the last value `end` falls in bucket
+    /// `floor((end - start) / interval)`, so the count is one more than that. `None` when that
+    /// count would exceed [`Self::MAX_GROUPS`] (or the bounds are unusable).
+    pub fn groups(&self) -> Option<u64> {
+        let span = (self.end - self.start) / self.interval;
+        if !span.is_finite() || span < 0.0 || span >= Self::MAX_GROUPS as f64 {
+            return None;
+        }
+        Some(span.floor() as u64 + 1)
+    }
+
+    /// The caption of a value's group and a key that sorts the groups in order.
+    pub fn bucket(&self, v: f64) -> Option<(String, f64)> {
+        if !self.is_valid() || !v.is_finite() {
+            return None;
+        }
+        if v < self.start {
+            return Some((format!("<{}", number_text(self.start)), f64::NEG_INFINITY));
+        }
+        if v > self.end {
+            return Some((format!(">{}", number_text(self.end)), f64::INFINITY));
+        }
+        let i = ((v - self.start) / self.interval).floor();
+        if !i.is_finite() || i < 0.0 {
+            return None;
+        }
+        let lo = self.start + i * self.interval;
+        Some((self.span_caption(lo), lo))
+    }
+
+    /// Every group caption in order: `<start`, the buckets, `>end`.
+    pub fn captions(&self) -> Vec<String> {
+        let mut v = vec![format!("<{}", number_text(self.start))];
+        if self.is_valid() {
+            for i in 0..self.groups().unwrap_or(0) {
+                let lo = self.start + i as f64 * self.interval;
+                v.push(self.span_caption(lo));
+            }
+        }
+        v.push(format!(">{}", number_text(self.end)));
+        v
+    }
+
+    /// "0-9" for whole steps (the last value the bucket holds), "0-0.5" for a fractional one (the
+    /// bucket's half-open end), the way Excel names a group by its range.
+    fn span_caption(&self, lo: f64) -> String {
+        let hi = lo + self.interval;
+        if self.interval.fract() == 0.0 && lo.fract() == 0.0 {
+            format!("{}-{}", number_text(lo), number_text(hi - 1.0))
+        } else {
+            format!("{}-{}", number_text(lo), number_text(hi))
+        }
+    }
+}
+
+/// A number as a group caption writes it: whole numbers without a trailing `.0`, everything else
+/// in Rust's shortest round-trip form.
+fn number_text(x: f64) -> String {
+    if !x.is_finite() {
+        return format!("{x}");
+    }
+    if x.fract() == 0.0 && x.abs() < 1e15 { format!("{}", x as i64) } else { format!("{x}") }
+}
+
 /// A field placed in the Rows or Columns area.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1450,6 +1541,8 @@ pub struct PivotField {
     pub source_col: String,
     pub sort: PivotSort,
     pub date_group: PivotDateGroup,
+    /// Numeric grouping; set instead of `date_group` (a field has one grouping).
+    pub number_group: Option<PivotNumberGroup>,
     /// Item labels whose detail is hidden (collapsed).
     pub collapsed_items: Vec<String>,
 }
@@ -1603,6 +1696,57 @@ impl Default for PivotTable {
             values_on_rows: false,
             values_position: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod pivot_group_tests {
+    use super::PivotNumberGroup;
+
+    fn group(start: f64, end: f64, interval: f64) -> PivotNumberGroup {
+        PivotNumberGroup { start, end, interval }
+    }
+
+    #[test]
+    fn a_whole_step_names_the_last_value_it_holds() {
+        let g = group(1.0, 100.0, 10.0);
+        assert!(g.is_valid());
+        assert_eq!(g.groups(), Some(10));
+        assert_eq!(g.bucket(1.0).map(|x| x.0), Some("1-10".to_string()));
+        assert_eq!(g.bucket(10.0).map(|x| x.0), Some("1-10".to_string()));
+        assert_eq!(g.bucket(11.0).map(|x| x.0), Some("11-20".to_string()));
+        assert_eq!(g.bucket(100.0).map(|x| x.0), Some("91-100".to_string()));
+        assert_eq!(g.captions().first(), Some(&"<1".to_string()));
+        assert_eq!(g.captions().last(), Some(&">100".to_string()));
+        assert_eq!(g.captions().len(), 12);
+    }
+
+    #[test]
+    fn values_outside_the_range_are_their_own_groups() {
+        let g = group(0.0, 100.0, 10.0);
+        let (low, low_key) = g.bucket(-5.0).unwrap_or_default();
+        assert_eq!(low, "<0");
+        assert!(low_key < 0.0);
+        let (high, high_key) = g.bucket(1000.0).unwrap_or_default();
+        assert_eq!(high, ">100");
+        assert!(high_key > 0.0);
+    }
+
+    #[test]
+    fn a_fractional_step_shows_the_half_open_end() {
+        let g = group(0.0, 2.0, 0.5);
+        assert_eq!(g.bucket(0.25).map(|x| x.0), Some("0-0.5".to_string()));
+        assert_eq!(g.bucket(2.0).map(|x| x.0), Some("2-2.5".to_string()));
+    }
+
+    #[test]
+    fn hostile_bounds_are_refused_not_allocated() {
+        assert!(!group(0.0, 1.0, 0.0).is_valid(), "zero interval");
+        assert!(!group(10.0, 0.0, 1.0).is_valid(), "end before start");
+        assert!(!group(f64::NAN, 1.0, 1.0).is_valid(), "NaN");
+        assert!(!group(0.0, 1e9, 0.001).is_valid(), "too many groups");
+        assert!(group(0.0, 9_999.0, 1.0).is_valid());
+        assert_eq!(group(0.0, 1e9, 0.001).groups(), None);
     }
 }
 

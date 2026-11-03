@@ -6,7 +6,7 @@
 
 
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (gate #1 is owner-blocked because Excel is unlicensed here, so `cargo xtask oracle` — openpyxl as a foreign reader, WPS as a foreign application — stands in and already found a PivotTable part with an undeclared `r:` prefix, now refused by the package validator; corrected the timeline row: a selected date range has been modelled and written since 10-30, so a ranged timeline no longer stays on the pass-through path for that reason; the range drag itself is UI-only and changes no bytes) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (PivotTable number grouping is modelled and written as `rangePr`'s start/end/interval with `groupBy="range"`; gate #1 is owner-blocked because Excel is unlicensed here, so `cargo xtask oracle` — openpyxl as a foreign reader, WPS as a foreign application — stands in and already found a PivotTable part with an undeclared `r:` prefix, now refused by the package validator; corrected the timeline row: a selected date range has been modelled and written since 10-30, so a ranged timeline no longer stays on the pass-through path for that reason; the range drag itself is UI-only and changes no bytes) · **Target:** Microsoft Excel (Microsoft 365), Excel for Mac 16.113.4
 
 
 
@@ -291,6 +291,7 @@ relationship graph walked from an owner, refused when it reaches content GridCra
 
 
 | Timelines and timeline caches | modelled for a plain cache, with or without a selected date range; anything else same | worksheet and workbook | name, caption, style, time unit (`level`), anchor and selected range (`<state><selection>` + `dateBetween`) are modelled and written; a range in a form a save cannot reproduce (reversed, zoned, sub-second, outside the calendar) keeps the timeline set byte-identical; the on-sheet drawing shape is not written (the model keeps its anchor) |
+| Numeric grouping of a PivotTable field | modelled: `rangePr startNum`/`endNum`/`groupInterval` + `groupBy="range"` | pivot cache definition (`<fieldGroup>`) | a number field's grouping (`PivotField.number_group`) is written as [MS-XLSX] `CT_RangePr`'s three numbers with `groupBy="range"`, one `<groupItems>` child per caption (`<s v="0-9"/>`, `<s v="&lt;0"/>`, `<s v="&gt;100"/>`) and `numFmtId="0"` (not the date groups' 14); reading takes the three numbers back into the model. The cache field's `sharedItems` carries `containsNumber="1"` with `minValue`/`maxValue`. **Never opened in Excel** (gate #1): the group captions are derived from the range by `PivotNumberGroup::captions`, and whether Excel displays them from our `<s>` items or recomputes them is unverified; a grouping whose range/interval would produce more than 100,000 groups is ignored (the field renders ungrouped) rather than allocating the list |
 | Unmodelled `extLst` children | the `<ext>` element, with its relationship ids rewritten | workbook, worksheet, table, PivotTable, pivot cache definition | the extensions GridCraft writes itself (calc features, data bars, sparklines, x14 validations, the PivotTable's own x14 extensions) are written from the model, never kept from the source |
 
 

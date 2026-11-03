@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use gridcraft_core::{CellRef, RangeRef};
+use gridcraft_core::{CellRef, RangeRef, Value};
 use gridcraft_model::*;
 use serde_json::{Value as Json, json};
 
@@ -107,7 +107,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Group Field",
             ["PivotTable Analyze", "Group"],
             None,
-            "{pivot?, field, by: years|quarters|months|days|none, replace?}",
+            "{pivot?, field, by: years|quarters|months|days|none (a date field), or start?, end?, interval? (a number field; start/end default to its extent), replace?}",
             has_doc,
             group
         ),
@@ -749,6 +749,17 @@ fn summarize_table(s: &mut Session, p: &Json) -> Result<Json> {
 
 // ---------------------------------------------------------------- queries
 
+/// A row or column field: its area, sort, grouping and collapsed items.
+fn axis_json(f: &PivotField) -> Json {
+    json!({
+        "field": f.source_col,
+        "sort": sort_name(f.sort),
+        "group": group_name(f.date_group),
+        "numberGroup": f.number_group.map(|g| json!({"start": g.start, "end": g.end, "interval": g.interval})),
+        "collapsed": f.collapsed_items,
+    })
+}
+
 fn pivot_json(wb: &Workbook, si: usize, pt: &PivotTable) -> Json {
     json!({
         "id": pt.id,
@@ -757,8 +768,8 @@ fn pivot_json(wb: &Workbook, si: usize, pt: &PivotTable) -> Json {
         "anchor": pt.anchor.a1(),
         "range": pt.last_range.map(|r| r.a1()),
         "source": pt.source,
-        "rows": pt.rows.iter().map(|f| json!({"field": f.source_col, "sort": sort_name(f.sort), "group": group_name(f.date_group), "collapsed": f.collapsed_items})).collect::<Vec<_>>(),
-        "columns": pt.columns.iter().map(|f| json!({"field": f.source_col, "sort": sort_name(f.sort), "group": group_name(f.date_group), "collapsed": f.collapsed_items})).collect::<Vec<_>>(),
+        "rows": pt.rows.iter().map(axis_json).collect::<Vec<_>>(),
+        "columns": pt.columns.iter().map(axis_json).collect::<Vec<_>>(),
         "values": pt.values.iter().map(|v| json!({"field": v.source_col, "func": func_name(v.func), "name": v.name, "showAs": show_as_name(v.show_as), "numberFormat": v.number_format})).collect::<Vec<_>>(),
         "filters": pt.filters.iter().map(|f| json!({"field": f.source_col, "selected": f.selected, "report": !in_axes(pt, &f.source_col)})).collect::<Vec<_>>(),
         "layout": layout_name(pt.layout),
@@ -802,7 +813,7 @@ fn fields(s: &mut Session, p: &Json) -> Result<Json> {
                     "name": h,
                     "numeric": src.numeric.get(c).copied().unwrap_or(false),
                     "date": src.dates.get(c).copied().unwrap_or(false),
-                    "samples": pv::distinct_labels(&d.wb, src, c, PivotDateGroup::None, 5),
+                    "samples": pv::distinct_labels(&d.wb, src, c, crate::pivot::Grouping::default(), 5),
                     "areas": areas,
                 })
             })
@@ -1179,17 +1190,57 @@ fn group_param(v: Option<&str>) -> Option<PivotDateGroup> {
 fn group(s: &mut Session, p: &Json) -> Result<Json> {
     const C: &str = "pivot.group";
     let field = str_param(p, "field").ok_or_else(|| bad(C, "missing `field`"))?.to_string();
-    let raw = str_param(p, "by").unwrap_or("months");
+    // A numeric range is asked for by any of its three numbers; it replaces a date grouping.
+    let numeric = ["start", "end", "interval"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null()));
+    let raw = match str_param(p, "by") {
+        Some(b) => b,
+        None if numeric => "none",
+        None => "months",
+    };
     let by = group_param(Some(raw)).ok_or_else(|| bad(C, format!("unknown grouping `{raw}` (years|quarters|months|days|none)")))?;
+    if numeric && by != PivotDateGroup::None {
+        return Err(bad(C, "give either `by` (a date grouping) or a numeric range (`start`/`end`/`interval`)"));
+    }
+    if let Some(interval) = f64_param(p, "interval")
+        && !(interval.is_finite() && interval > 0.0)
+    {
+        return Err(bad(C, "`interval` must be a number past zero"));
+    }
     update(s, p, |pt, src, _| {
-        if by != PivotDateGroup::None {
-            let c = src.col(&field).ok_or_else(|| bad(C, format!("no field `{field}` in the source data")))?;
-            if !src.numeric.get(c).copied().unwrap_or(false) {
-                return Err(other("Cannot group that selection."));
-            }
+        let c = src.col(&field).ok_or_else(|| bad(C, format!("no field `{field}` in the source data")))?;
+        if !src.numeric.get(c).copied().unwrap_or(false) {
+            return Err(other("Cannot group that selection."));
         }
         let f = axis_field(C, pt, &field)?;
-        f.date_group = by;
+        f.date_group = PivotDateGroup::None;
+        f.number_group = None;
+        if numeric {
+            // Starting at/Ending at default to the field's own extent, floored/ceiled to whole
+            // numbers the way Excel's dialog fills them in.
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for row in &src.rows {
+                if let Some(Value::Number(n)) = row.get(c).map(Value::scalar)
+                    && n.is_finite()
+                {
+                    lo = lo.min(n);
+                    hi = hi.max(n);
+                }
+            }
+            let (default_start, default_end) = if lo.is_finite() && hi.is_finite() { (lo.floor(), hi.ceil()) } else { (0.0, 0.0) };
+            let start = f64_param(p, "start").unwrap_or(default_start);
+            let end = f64_param(p, "end").unwrap_or(default_end);
+            let interval = f64_param(p, "interval").ok_or_else(|| bad(C, "missing `interval` for a numeric grouping"))?;
+            let g = PivotNumberGroup { start, end, interval };
+            if !g.is_valid() {
+                return Err(other(format!(
+                    "The grouping range is not usable: `start` must be at most `end`, `interval` past zero, both finite, and at most {} groups.",
+                    PivotNumberGroup::MAX_GROUPS
+                )));
+            }
+            f.number_group = Some(g);
+        } else {
+            f.date_group = by;
+        }
         f.collapsed_items.clear();
         Ok(json!({}))
     })
@@ -1206,7 +1257,7 @@ fn collapse(s: &mut Session, p: &Json) -> Result<Json> {
             Some(v) => v.clone(),
             None => {
                 let f = pt.rows.iter().chain(pt.columns.iter()).find(|f| f.source_col.eq_ignore_ascii_case(&field));
-                let g = f.map(|f| f.date_group).unwrap_or_default();
+                let g = f.map(crate::pivot::Grouping::of).unwrap_or_default();
                 match src.col(&field) {
                     Some(c) => pv::distinct_labels(wb, src, c, g, 100_000),
                     None => vec![],
@@ -1471,7 +1522,7 @@ fn insert_pivot_chart(s: &mut Session, p: &Json) -> Result<Json> {
 fn suggestions(wb: &Workbook, src: &pv::Source) -> Vec<Json> {
     let n = src.headers.len();
     let h = |i: usize| src.headers.get(i).cloned().unwrap_or_default();
-    let distinct = |i: usize| pv::distinct_labels(wb, src, i, PivotDateGroup::None, 1001).len();
+    let distinct = |i: usize| pv::distinct_labels(wb, src, i, crate::pivot::Grouping::default(), 1001).len();
     let records = src.rows.len().max(1);
     let is_num = |i: usize| src.numeric.get(i).copied().unwrap_or(false);
     let is_date = |i: usize| src.dates.get(i).copied().unwrap_or(false);

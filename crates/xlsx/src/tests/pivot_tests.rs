@@ -125,8 +125,20 @@ fn workbook() -> Workbook {
         source: "SalesTbl".into(),
         anchor: at("K4"),
         rows: vec![
-            PivotField { source_col: "Date".into(), date_group: PivotDateGroup::Years, sort: PivotSort::None, collapsed_items: vec!["2024".into()] },
-            PivotField { source_col: "Date".into(), date_group: PivotDateGroup::Months, sort: PivotSort::Asc, collapsed_items: vec![] },
+            PivotField {
+                source_col: "Date".into(),
+                date_group: PivotDateGroup::Years,
+                sort: PivotSort::None,
+                collapsed_items: vec!["2024".into()],
+                ..PivotField::default()
+            },
+            PivotField {
+                source_col: "Date".into(),
+                date_group: PivotDateGroup::Months,
+                sort: PivotSort::Asc,
+                collapsed_items: vec![],
+                ..PivotField::default()
+            },
         ],
         columns: vec![PivotField { sort: PivotSort::Desc, ..field("Product") }],
         values: vec![
@@ -229,6 +241,55 @@ fn pivots_round_trip() {
     // A second trip is stable.
     let (again, _) = read_xlsx(&write_xlsx(&back).unwrap()).unwrap();
     assert_eq!(&again.sheet(1).unwrap().pivots, read);
+}
+
+#[test]
+fn number_grouping_writes_the_range_and_reads_it_back() {
+    // [MS-XLSX] CT_RangePr: a number field's group carries `startNum`/`endNum`/`groupInterval`
+    // with `groupBy="range"`, and one group item per caption. The Excel check is gate #1.
+    let mut wb = workbook();
+    let g = PivotNumberGroup { start: 0.0, end: 100.0, interval: 10.0 };
+    {
+        let sh = wb.sheet_mut(1).unwrap();
+        let p = &mut sh.pivots[0];
+        p.rows = vec![PivotField { source_col: "Units".into(), number_group: Some(g), ..PivotField::default() }];
+        p.columns.clear();
+        p.values = vec![PivotValue { source_col: "Sales".into(), func: PivotFunc::Sum, name: "Sum of Sales".into(), ..PivotValue::default() }];
+        p.last_range = Some(rr("A1:B20"));
+    }
+    let bytes = write_xlsx(&wb).unwrap();
+    let parts = unzip(&bytes);
+    let trels = xml::parse(parts.get("xl/pivotTables/_rels/pivotTable1.xml.rels").unwrap()).unwrap();
+    let target = crate::package::resolve("xl/pivotTables", trels.kids("Relationship").next().unwrap().attr("Target").unwrap());
+    let cache = xml::parse(parts.get(&target).unwrap()).unwrap();
+    let cf = cache.child("cacheFields").unwrap().kids("cacheField").find(|f| f.attr("name") == Some("Units")).unwrap();
+    let rp = cf.path(&["fieldGroup", "rangePr"]).unwrap();
+    assert_eq!(rp.attr("groupBy"), Some("range"));
+    assert_eq!(rp.attr_f64("startNum"), Some(0.0));
+    assert_eq!(rp.attr_f64("endNum"), Some(100.0));
+    assert_eq!(rp.attr_f64("groupInterval"), Some(10.0));
+    let items: Vec<&str> = cf.path(&["fieldGroup", "groupItems"]).unwrap().children.iter().filter_map(|e| e.attr("v")).collect();
+    // 0..=100 by 10 is eleven half-open buckets (`100` falls in `100-109`), plus the two tails.
+    assert_eq!(items.len(), 13, "{items:?}");
+    assert_eq!(items.first(), Some(&"<0"));
+    assert_eq!(items.get(1), Some(&"0-9"));
+    assert_eq!(items.get(11), Some(&"100-109"));
+    assert_eq!(items.last(), Some(&">100"));
+    assert_eq!(cf.attr_u32("numFmtId"), Some(0), "a number group is not a date format");
+    // The table's row field refers to those items only.
+    let t = xml::parse(parts.get("xl/pivotTables/pivotTable1.xml").unwrap()).unwrap();
+    let row_field = t.child("pivotFields").unwrap().kids("pivotField").find(|f| f.attr("axis") == Some("axisRow")).unwrap();
+    for it in row_field.kids("item") {
+        if let Some(x) = it.attr_u32("x") {
+            assert!((x as usize) < items.len());
+        }
+    }
+    // Reading keeps the range (and it is not a date grouping).
+    let (back, report) = read_xlsx(&bytes).unwrap();
+    assert!(report.warnings.iter().all(|w| !w.to_lowercase().contains("grouping")), "{:?}", report.warnings);
+    let p = &back.sheet(1).unwrap().pivots[0];
+    assert_eq!(p.rows[0].number_group, Some(g));
+    assert_eq!(p.rows[0].date_group, PivotDateGroup::None);
 }
 
 #[test]
@@ -482,7 +543,7 @@ fn with_pivot(table: &str, cache: Option<&str>) -> Vec<u8> {
     minimal("<sheetData/>", &extra, "", "")
 }
 
-const GOOD_CACHE: &str = r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="worksheet"><worksheetSource ref="A1:B3"/></cacheSource><cacheFields count="2"><cacheField name="K"><sharedItems><s v="x"/><n v="2"/><m/><b v="1"/><d v="2024-01-01T00:00:00"/></sharedItems></cacheField><cacheField name="V"><sharedItems/><fieldGroup base="0"><rangePr startNum="0" endNum="10" groupInterval="5"/><groupItems><s v="0-4"/></groupItems></fieldGroup></cacheField></cacheFields></pivotCacheDefinition>"#;
+const GOOD_CACHE: &str = r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="worksheet"><worksheetSource ref="A1:B3"/></cacheSource><cacheFields count="2"><cacheField name="K"><sharedItems><s v="x"/><n v="2"/><m/><b v="1"/><d v="2024-01-01T00:00:00"/></sharedItems></cacheField><cacheField name="V"><sharedItems/><fieldGroup base="0"><rangePr startNum="0" endNum="10" groupInterval="5" groupBy="seconds"/><groupItems><s v="0-4"/></groupItems></fieldGroup></cacheField></cacheFields></pivotCacheDefinition>"#;
 
 #[test]
 fn hostile_pivot_parts_warn_not_panic() {
