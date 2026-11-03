@@ -2836,6 +2836,10 @@ fn toolpak_fields(tool: &str) -> Vec<Field> {
             v.extend([labels(), Text { key: "alpha", label: "Alpha:" }]);
             v
         }
+        "anovaTwoFactor" => vec![range(), labels(), Text { key: "alpha", label: "Alpha:" }],
+        "anovaTwoFactorRep" => {
+            vec![range(), Text { key: "rowsPerSample", label: "Rows per sample:" }, labels(), Text { key: "alpha", label: "Alpha:" }]
+        }
         "zTest" => {
             let mut v = two();
             v.extend([
@@ -2864,7 +2868,7 @@ fn toolpak_defaults(sel: &str, tool: &str) -> Map<String, Json> {
     let mut v = json!({
         "tool": tool, "range": sel, "inputY": "", "inputX": "", "range1": sel, "range2": "", "bins": "",
         "groupedBy": "columns", "labels": false, "summary": true, "confidence": "", "kthLargest": "", "kthSmallest": "",
-        "interval": "3", "damping": "0.3", "alpha": "0.05", "hypothesizedDifference": "0", "variance1": "", "variance2": "",
+        "interval": "3", "damping": "0.3", "alpha": "0.05", "hypothesizedDifference": "0", "variance1": "", "variance2": "", "rowsPerSample": "",
         "outputTo": "newSheet", "output": "", "newSheet": "",
     });
     if tool == "regression" {

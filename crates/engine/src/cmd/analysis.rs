@@ -35,6 +35,8 @@ pub const OVERWRITE_ERROR: &str = "already holds data";
 /// (id, label) of every tool, in the order of Excel's Analysis Tools list.
 pub const TOOLS: &[(&str, &str)] = &[
     ("anovaSingle", "Anova: Single Factor"),
+    ("anovaTwoFactor", "Anova: Two-Factor Without Replication"),
+    ("anovaTwoFactorRep", "Anova: Two-Factor With Replication"),
     ("correlation", "Correlation"),
     ("covariance", "Covariance"),
     ("descriptive", "Descriptive Statistics"),
@@ -56,7 +58,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Data Analysis…",
         ["Data", "Analysis"],
         None,
-        "{tool: anovaSingle|correlation|covariance|descriptive|exponentialSmoothing|fTest|histogram|movingAverage|rankPercentile|regression|tTestPaired|tTestEqual|tTestUnequal (or the tool's label), output?: \"E1\" (top-left of the report; default a new sheet), newSheet?: name, outputTo?: range|newSheet (picks between the two), overwrite?: bool (else non-empty output cells are refused), labels?: bool (first row/column holds names), groupedBy?: columns|rows, …tool params} — range tools take `range`; descriptive: summary? (default true), confidence?: 95, kthLargest?, kthSmallest?; histogram: bins?: range (default evenly spaced), pareto?, cumulative?; regression: inputY, inputX, constantZero?, confidence?: 95, residuals?, standardizedResiduals?, normalProbability?; movingAverage: interval? (3), standardErrors?; exponentialSmoothing: damping? (0.3), standardErrors?; t-tests and fTest: range1, range2, alpha? (0.05), hypothesizedDifference? (0); zTest: range1, range2, variance1, variance2 (the known variances), alpha? (0.05), hypothesizedDifference? (0); anovaSingle: alpha?. Writes static values. No `tool` → {tools} (the menu opens the dialog).",
+        "{tool: anovaSingle|correlation|covariance|descriptive|exponentialSmoothing|fTest|histogram|movingAverage|rankPercentile|regression|tTestPaired|tTestEqual|tTestUnequal (or the tool's label), output?: \"E1\" (top-left of the report; default a new sheet), newSheet?: name, outputTo?: range|newSheet (picks between the two), overwrite?: bool (else non-empty output cells are refused), labels?: bool (first row/column holds names), groupedBy?: columns|rows, …tool params} — range tools take `range`; descriptive: summary? (default true), confidence?: 95, kthLargest?, kthSmallest?; histogram: bins?: range (default evenly spaced), pareto?, cumulative?; regression: inputY, inputX, constantZero?, confidence?: 95, residuals?, standardizedResiduals?, normalProbability?; movingAverage: interval? (3), standardErrors?; exponentialSmoothing: damping? (0.3), standardErrors?; t-tests and fTest: range1, range2, alpha? (0.05), hypothesizedDifference? (0); zTest: range1, range2, variance1, variance2 (the known variances), alpha? (0.05), hypothesizedDifference? (0); anovaSingle: alpha?; anovaTwoFactor: labels?, alpha? (two-factor without replication); anovaTwoFactorRep: range (factor A down the first column, factor B across the top, one block of rows per A level), rowsPerSample: r (the replicates per cell), labels?, alpha?. Writes static values. No `tool` → {tools} (the menu opens the dialog).",
         has_doc,
         run
     )]
@@ -1105,6 +1107,244 @@ fn anova_single(s: &Session, p: &Json) -> Result<Grid> {
     Ok(g)
 }
 
+/// The cells of a range as a dense matrix (row-major), without any header handling.
+fn read_matrix(s: &Session, si: usize, r: RangeRef) -> Result<Vec<Vec<Value>>> {
+    let d = s.doc()?;
+    let sh = d.wb.sheet(si).ok_or(EngineError::NoDocument)?;
+    Ok((0..r.height()).map(|i| (0..r.width()).map(|j| sh.value(CellRef::new(r.start.row + i, r.start.col + j))).collect()).collect())
+}
+
+/// The name of a header cell, or `fallback` when it is blank.
+fn name_of(v: Option<&Value>, fallback: impl FnOnce() -> String) -> String {
+    let t = v.map(Value::display).unwrap_or_default();
+    if t.trim().is_empty() { fallback() } else { t.trim().to_string() }
+}
+
+/// The numbers of a matrix, refusing anything that is not a number (a two-factor Anova's cells
+/// are replicates, so a blank would change the design).
+fn matrix_numbers(m: &[Vec<Value>]) -> Result<Vec<Vec<f64>>> {
+    let mut out = Vec::with_capacity(m.len());
+    for row in m {
+        let mut r = Vec::with_capacity(row.len());
+        for v in row {
+            match v {
+                Value::Number(n) => r.push(*n),
+                _ => return Err(non_numeric()),
+            }
+        }
+        out.push(r);
+    }
+    Ok(out)
+}
+
+/// The Anova table row of an F test: the label, its sums of squares, df, mean square, F, p and
+/// the critical value. `f` (with its two degrees of freedom) is omitted for the error and within
+/// rows, which have none.
+fn anova_row(g: &mut Grid, row: u32, label: &str, ss: f64, df: f64, ms: Value, f: Option<(f64, f64, f64)>, alpha: f64) {
+    g.txt(row, 0, label);
+    g.num(row, 1, ss);
+    g.num(row, 2, df);
+    g.put(row, 3, ms);
+    if let Some((f, df1, df2)) = f {
+        g.put(row, 4, n_or_div0(f));
+        g.put(row, 5, if f.is_finite() && df1 > 0.0 && df2 > 0.0 { callf("F.DIST.RT", &[f, df1, df2]) } else { div0() });
+        g.put(row, 6, if df1 > 0.0 && df2 > 0.0 { callf("F.INV.RT", &[alpha, df1, df2]) } else { div0() });
+    }
+}
+
+fn row_mean(m: &[f64], i: usize) -> f64 {
+    m.get(i).copied().unwrap_or(f64::NAN)
+}
+
+fn col_mean(m: &[f64], j: usize) -> f64 {
+    m.get(j).copied().unwrap_or(f64::NAN)
+}
+
+/// Two-factor Anova, with or without replication.
+///
+/// Without replication each matrix cell is one observation: the row means give the Rows effect,
+/// the column means the Columns effect, and the residual is the remainder. With replication each
+/// cell is `r` observations (`rowsPerSample`), so the design also has an interaction term and a
+/// within-cells error.
+fn anova_two_factor(s: &Session, p: &Json, replication: bool) -> Result<Grid> {
+    let alpha = alpha(p)?;
+    let (si, r) = input_range(s, p, &["range", "input"])?;
+    let labels = flag(p, "labels");
+    let raw = read_matrix(s, si, r)?;
+    let mut g = Grid::default();
+    if !replication {
+        // The matrix rows and columns are the two factors; the labels name them.
+        let (row_names, col_names, cells): (Vec<String>, Vec<String>, Vec<Vec<Value>>) = if labels {
+            let row_names: Vec<String> = (1..raw.len()).map(|i| name_of(raw.get(i).and_then(|r| r.first()), || format!("Row {i}"))).collect();
+            let col_names: Vec<String> =
+                (1..raw.first().map_or(0, Vec::len)).map(|j| name_of(raw.first().and_then(|r| r.get(j)), || format!("Column {j}"))).collect();
+            let cells = raw.iter().skip(1).map(|row| row.iter().skip(1).cloned().collect()).collect();
+            (row_names, col_names, cells)
+        } else {
+            let a = raw.len();
+            let b = raw.first().map_or(0, Vec::len);
+            ((1..=a).map(|i| format!("Row {i}")).collect(), (1..=b).map(|j| format!("Column {j}")).collect(), raw)
+        };
+        let x = matrix_numbers(&cells)?;
+        let a = x.len();
+        let b = x.first().map_or(0, Vec::len);
+        if a < 2 || b < 2 || x.iter().any(|row| row.len() != b) {
+            return Err(EngineError::Other("A two-factor Anova needs a rectangle of at least two rows and two columns.".into()));
+        }
+        let grand = mean(&x.iter().flat_map(|row| row.iter().copied()).collect::<Vec<_>>());
+        let row_means: Vec<f64> = x.iter().map(|row| mean(row)).collect();
+        let col_means: Vec<f64> = (0..b).map(|j| mean(&x.iter().map(|row| *row.get(j).unwrap_or(&0.0)).collect::<Vec<_>>())).collect();
+        let ss_total: f64 = x.iter().flat_map(|row| row.iter()).map(|v| (v - grand) * (v - grand)).sum();
+        let ss_rows: f64 = b as f64 * row_means.iter().map(|m| (m - grand) * (m - grand)).sum::<f64>();
+        let ss_cols: f64 = a as f64 * col_means.iter().map(|m| (m - grand) * (m - grand)).sum::<f64>();
+        let ss_err = ss_total - ss_rows - ss_cols;
+        let (df_rows, df_cols, df_err) = (a as f64 - 1.0, b as f64 - 1.0, (a as f64 - 1.0) * (b as f64 - 1.0));
+        let ms_err = ratio(ss_err, df_err);
+        // SUMMARY: the rows, then the columns, each with count, sum, average and variance.
+        g.txt(0, 0, "Anova: Two-Factor Without Replication");
+        g.txt(2, 0, "SUMMARY");
+        g.labels(2, 1, &["Count", "Sum", "Average", "Variance"]);
+        let mut row = 3u32;
+        for (i, values) in x.iter().enumerate() {
+            g.txt(row, 0, row_names.get(i).cloned().unwrap_or_default());
+            g.num(row, 1, values.len() as f64);
+            g.num(row, 2, values.iter().sum());
+            g.num(row, 3, row_means.get(i).copied().unwrap_or(f64::NAN));
+            g.put(row, 4, n_or_div0(var_s(values)));
+            row += 1;
+        }
+        for j in 0..b {
+            let values: Vec<f64> = x.iter().map(|r| *r.get(j).unwrap_or(&0.0)).collect();
+            g.txt(row, 0, col_names.get(j).cloned().unwrap_or_default());
+            g.num(row, 1, values.len() as f64);
+            g.num(row, 2, values.iter().sum());
+            g.num(row, 3, col_means.get(j).copied().unwrap_or(f64::NAN));
+            g.put(row, 4, n_or_div0(var_s(&values)));
+            row += 1;
+        }
+        row += 1;
+        g.txt(row, 0, "ANOVA");
+        g.labels(row + 1, 0, &["Source of Variation", "SS", "df", "MS", "F", "P-value", "F crit"]);
+        row += 2;
+        let f = |ss: f64, df: f64| ms_err.as_f64().map(|e| ratio(ss, df).as_f64().map_or(f64::NAN, |m| m / e));
+        anova_row(&mut g, row, "Rows", ss_rows, df_rows, ratio(ss_rows, df_rows), f(ss_rows, df_rows).map(|f| (f, df_rows, df_err)), alpha);
+        anova_row(&mut g, row + 1, "Columns", ss_cols, df_cols, ratio(ss_cols, df_cols), f(ss_cols, df_cols).map(|f| (f, df_cols, df_err)), alpha);
+        anova_row(&mut g, row + 2, "Error", ss_err, df_err, ms_err, None, alpha);
+        g.txt(row + 4, 0, "Total");
+        g.num(row + 4, 1, ss_total);
+        g.num(row + 4, 2, a as f64 * b as f64 - 1.0);
+        return Ok(g);
+    }
+
+    // With replication: `r` rows per row level, one column per column level.
+    let reps = num(p, "rowsPerSample").or_else(|| num(p, "replicates")).map(|v| v.round()).filter(|v| *v >= 2.0 && v.fract() == 0.0);
+    let Some(reps) = reps else {
+        return Err(bad(CMD, "anovaTwoFactorRep needs `rowsPerSample`, the number of rows in each sample (at least 2)"));
+    };
+    let reps = reps as usize;
+    let (header_rows, header_cols) = if labels { (1, 1) } else { (0, 0) };
+    let data_rows = raw.len().saturating_sub(header_rows);
+    let data_cols = raw.first().map_or(0, Vec::len).saturating_sub(header_cols);
+    if data_rows == 0 || data_cols == 0 || data_rows % reps != 0 {
+        return Err(EngineError::Other(format!("The input range must hold whole {reps}-row blocks of replicates.")));
+    }
+    let a = data_rows / reps;
+    let b = data_cols;
+    if a < 2 || b < 2 {
+        return Err(EngineError::Other("A two-factor Anova needs at least two rows and two columns of samples.".into()));
+    }
+    let a_names: Vec<String> = (0..a).map(|i| name_of(raw.get(header_rows + i * reps).and_then(|r| r.first()), || format!("Row {i}"))).collect();
+    let b_names: Vec<String> = (0..b).map(|j| name_of(raw.first().and_then(|r| r.get(header_cols + j)), || format!("Column {j}"))).collect();
+    // cells[i][j] = the r observations of (row level i, column level j).
+    let mut cells: Vec<Vec<Vec<f64>>> = Vec::with_capacity(a);
+    for i in 0..a {
+        let mut row = Vec::with_capacity(b);
+        for j in 0..b {
+            let mut block = Vec::with_capacity(reps);
+            for ri in 0..reps {
+                let r0 = header_rows + i * reps + ri;
+                let c0 = header_cols + j;
+                match raw.get(r0).and_then(|r| r.get(c0)) {
+                    Some(Value::Number(n)) => block.push(*n),
+                    _ => return Err(non_numeric()),
+                }
+            }
+            row.push(block);
+        }
+        cells.push(row);
+    }
+    let all: Vec<f64> = cells.iter().flat_map(|row| row.iter()).flat_map(|b| b.iter().copied()).collect();
+    let grand = mean(&all);
+    let cell_means: Vec<Vec<f64>> = cells.iter().map(|row| row.iter().map(|b| mean(b)).collect()).collect();
+    let row_means: Vec<f64> = cell_means.iter().map(|row| mean(row)).collect();
+    let col_means: Vec<f64> = (0..b).map(|j| mean(&cell_means.iter().map(|row| *row.get(j).unwrap_or(&0.0)).collect::<Vec<_>>())).collect();
+    let ss_total: f64 = all.iter().map(|v| (v - grand) * (v - grand)).sum();
+    let ss_a: f64 = (b * reps) as f64 * row_means.iter().map(|m| (m - grand) * (m - grand)).sum::<f64>();
+    let ss_b: f64 = (a * reps) as f64 * col_means.iter().map(|m| (m - grand) * (m - grand)).sum::<f64>();
+    let mut ss_ab = 0.0;
+    for (i, row) in cell_means.iter().enumerate() {
+        for (j, m) in row.iter().enumerate() {
+            let v = m - row_mean(&row_means, i) - col_mean(&col_means, j) + grand;
+            ss_ab += v * v;
+        }
+    }
+    ss_ab *= reps as f64;
+    let mut ss_within = 0.0;
+    for (i, row) in cells.iter().enumerate() {
+        for (j, block) in row.iter().enumerate() {
+            let m = cell_means.get(i).and_then(|r| r.get(j)).copied().unwrap_or(f64::NAN);
+            ss_within += block.iter().map(|v| (v - m) * (v - m)).sum::<f64>();
+        }
+    }
+    let (df_a, df_b, df_ab, df_w) = (a as f64 - 1.0, b as f64 - 1.0, (a as f64 - 1.0) * (b as f64 - 1.0), (a * b * (reps - 1)) as f64);
+    let ms_w = ratio(ss_within, df_w);
+    // SUMMARY: one block per row level, its column levels and a Total column.
+    g.txt(0, 0, "Anova: Two-Factor With Replication");
+    g.txt(2, 0, "SUMMARY");
+    let mut row = 3u32;
+    for i in 0..a {
+        g.txt(row, 0, a_names.get(i).cloned().unwrap_or_default());
+        for j in 0..b {
+            g.txt(row, 1 + idx(j), b_names.get(j).cloned().unwrap_or_default());
+        }
+        g.txt(row, 1 + idx(b), "Total");
+        row += 1;
+        let base = row;
+        for (k, label) in ["Count", "Sum", "Average", "Variance"].iter().enumerate() {
+            g.txt(base + idx(k), 0, *label);
+        }
+        let mut total: Vec<f64> = Vec::new();
+        for j in 0..b {
+            let block = cells.get(i).and_then(|r| r.get(j)).cloned().unwrap_or_default();
+            total.extend(block.iter().copied());
+            let col = 1 + idx(j);
+            g.num(base, col, block.len() as f64);
+            g.num(base + 1, col, block.iter().sum());
+            g.num(base + 2, col, mean(&block));
+            g.put(base + 3, col, n_or_div0(var_s(&block)));
+        }
+        let col = 1 + idx(b);
+        g.num(base, col, total.len() as f64);
+        g.num(base + 1, col, total.iter().sum());
+        g.num(base + 2, col, mean(&total));
+        g.put(base + 3, col, n_or_div0(var_s(&total)));
+        row = base + 5;
+    }
+    row += 1;
+    g.txt(row, 0, "ANOVA");
+    g.labels(row + 1, 0, &["Source of Variation", "SS", "df", "MS", "F", "P-value", "F crit"]);
+    row += 2;
+    let f = |ss: f64, df: f64| ms_w.as_f64().map(|e| ratio(ss, df).as_f64().map_or(f64::NAN, |m| m / e));
+    anova_row(&mut g, row, "Sample", ss_a, df_a, ratio(ss_a, df_a), f(ss_a, df_a).map(|f| (f, df_a, df_w)), alpha);
+    anova_row(&mut g, row + 1, "Columns", ss_b, df_b, ratio(ss_b, df_b), f(ss_b, df_b).map(|f| (f, df_b, df_w)), alpha);
+    anova_row(&mut g, row + 2, "Interaction", ss_ab, df_ab, ratio(ss_ab, df_ab), f(ss_ab, df_ab).map(|f| (f, df_ab, df_w)), alpha);
+    anova_row(&mut g, row + 3, "Within", ss_within, df_w, ms_w, None, alpha);
+    g.txt(row + 5, 0, "Total");
+    g.num(row + 5, 1, ss_total);
+    g.num(row + 5, 2, (a * b * reps) as f64 - 1.0);
+    Ok(g)
+}
+
 // ---------------------------------------------------------------- output
 
 /// Writes the report at `output` (refusing to overwrite data unless `overwrite`) or on a new
@@ -1218,6 +1458,8 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
         "zTest" => z_test(s, p)?,
         "fTest" => f_test(s, p)?,
         "anovaSingle" => anova_single(s, p)?,
+        "anovaTwoFactor" => anova_two_factor(s, p, false)?,
+        "anovaTwoFactorRep" => anova_two_factor(s, p, true)?,
         _ => return Err(bad(CMD, format!("unknown tool `{t}`"))),
     };
     write_report(s, p, tool, g)
@@ -1561,5 +1803,146 @@ mod z_test_tests {
         // The tool list names it (the dialog lists what the command reports).
         let tools = s.execute("data.analysisToolPak", json!({})).unwrap();
         assert!(tools["tools"].as_array().is_some_and(|a| a.iter().any(|t| t["id"] == "zTest")));
+    }
+}
+
+#[cfg(test)]
+mod anova_two_factor_tests {
+    use gridcraft_core::Value;
+    use serde_json::{Value as Json, json};
+
+    use crate::Session;
+
+    fn session() -> Session {
+        let mut s = Session::new();
+        s.new_workbook();
+        s
+    }
+    fn value(s: &Session, a: &str) -> Value {
+        let d = s.doc().unwrap();
+        let (sh, body) = crate::cmd::split_sheet(a);
+        let si = sh.map(|n| d.wb.sheet_index(&n).unwrap()).unwrap_or(d.wb.active_sheet);
+        d.wb.sheet(si).unwrap().value(gridcraft_core::CellRef::parse(body).unwrap())
+    }
+    fn num(s: &Session, a: &str) -> f64 {
+        value(s, a).as_f64().unwrap_or(f64::NAN)
+    }
+    fn eval(s: &mut Session, f: &str) -> f64 {
+        s.execute("cell.set", json!({"cell": "Z1000", "input": f})).unwrap();
+        let x = num(s, "Z1000");
+        s.execute("cell.set", json!({"cell": "Z1000", "input": ""})).unwrap();
+        x
+    }
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-9
+    }
+
+    #[test]
+    fn a_two_factor_anova_without_replication_reports_rows_columns_and_error() {
+        let mut s = session();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2], [2, 4], [5, 6]]})).unwrap();
+        s.execute("data.analysisToolPak", json!({"tool": "anovaTwoFactor", "range": "A1:B3", "output": "I1"})).unwrap();
+        assert_eq!(value(&s, "I1"), Value::text("Anova: Two-Factor Without Replication"));
+        // SUMMARY: rows then columns.
+        assert_eq!((value(&s, "I3"), value(&s, "J3"), value(&s, "M3")), (Value::text("SUMMARY"), Value::text("Count"), Value::text("Variance")));
+        assert_eq!(
+            (value(&s, "I4"), value(&s, "J4"), value(&s, "K4"), num(&s, "L4")),
+            (Value::text("Row 1"), Value::number(2.0), Value::number(3.0), 1.5)
+        );
+        assert!(close(num(&s, "M4"), 0.5));
+        assert_eq!((value(&s, "I7"), value(&s, "K7")), (Value::text("Column 1"), Value::number(8.0)));
+        assert!(close(num(&s, "L7"), 8.0 / 3.0));
+        assert!(close(num(&s, "M7"), 13.0 / 3.0));
+        // ANOVA: SS_rows 49/3, SS_columns 8/3, SS_error 1/3, SS_total 58/3; F rows 98, columns 16.
+        assert_eq!((value(&s, "I10"), value(&s, "I12")), (Value::text("ANOVA"), Value::text("Rows")));
+        assert!(close(num(&s, "J12"), 49.0 / 3.0));
+        assert_eq!((num(&s, "K12"), num(&s, "K13"), num(&s, "K14"), num(&s, "K16")), (2.0, 1.0, 2.0, 5.0));
+        assert!(close(num(&s, "M12"), 49.0));
+        assert!(close(num(&s, "J13"), 8.0 / 3.0));
+        assert!(close(num(&s, "M13"), 16.0));
+        assert!(close(num(&s, "J14"), 1.0 / 3.0));
+        assert!(close(num(&s, "J16"), 58.0 / 3.0));
+        // P-values and critical values agree with the worksheet functions.
+        assert!(close(num(&s, "N12"), eval(&mut s, "=F.DIST.RT(M12,K12,K14)")));
+        assert!(close(num(&s, "O12"), eval(&mut s, "=F.INV.RT(0.05,K12,K14)")));
+        assert!(close(num(&s, "N13"), eval(&mut s, "=F.DIST.RT(M13,K13,K14)")));
+    }
+
+    #[test]
+    fn a_two_factor_anova_without_replication_reads_labels() {
+        let mut s = session();
+        s.execute("range.setValues", json!({"range": "A20", "values": [["", "B1", "B2"], ["A1", 1, 2], ["A2", 3, 5]]})).unwrap();
+        s.execute("data.analysisToolPak", json!({"tool": "anovaTwoFactor", "range": "A20:C22", "labels": true, "output": "A24"})).unwrap();
+        assert_eq!((value(&s, "A24"), value(&s, "A26")), (Value::text("Anova: Two-Factor Without Replication"), Value::text("SUMMARY")));
+        // The row and column names come from the labels.
+        assert_eq!((value(&s, "A27"), value(&s, "A29")), (Value::text("A1"), Value::text("B1")));
+        assert_eq!((value(&s, "A32"), value(&s, "A34")), (Value::text("ANOVA"), Value::text("Rows")));
+        // SS_rows 6.25, SS_columns 2.25, SS_error 0.25; F rows 25, columns 9.
+        assert!(close(num(&s, "B34"), 6.25));
+        assert!(close(num(&s, "B35"), 2.25));
+        assert!(close(num(&s, "B36"), 0.25));
+        assert!(close(num(&s, "E34"), 25.0));
+        assert!(close(num(&s, "E35"), 9.0));
+        assert!(close(num(&s, "F34"), eval(&mut s, "=F.DIST.RT(E34,C34,C36)")));
+        assert!(close(num(&s, "G34"), eval(&mut s, "=F.INV.RT(0.05,C34,C36)")));
+    }
+
+    #[test]
+    fn a_two_factor_anova_with_replication_reports_sample_columns_interaction_within() {
+        let mut s = session();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["", "B1", "B2"], ["A1", 1, 3], ["", 2, 4], ["A2", 5, 7], ["", 6, 8]]}))
+            .unwrap();
+        s.execute("data.analysisToolPak", json!({"tool": "anovaTwoFactorRep", "range": "A1:C5", "rowsPerSample": 2, "labels": true, "output": "G1"}))
+            .unwrap();
+        assert_eq!(value(&s, "G1"), Value::text("Anova: Two-Factor With Replication"));
+        // One SUMMARY block per row level, with the column levels and a Total column.
+        assert_eq!(
+            (value(&s, "G3"), value(&s, "G4"), value(&s, "H4"), value(&s, "J4")),
+            (Value::text("SUMMARY"), Value::text("A1"), Value::text("B1"), Value::text("Total"))
+        );
+        assert_eq!((value(&s, "G5"), value(&s, "H5"), value(&s, "J5")), (Value::text("Count"), Value::number(2.0), Value::number(4.0)));
+        assert_eq!((num(&s, "H6"), num(&s, "J6")), (3.0, 10.0));
+        assert_eq!((num(&s, "H7"), num(&s, "J7")), (1.5, 2.5));
+        assert!(close(num(&s, "J8"), 5.0 / 3.0));
+        assert_eq!(value(&s, "G10"), Value::text("A2"));
+        assert_eq!((num(&s, "H11"), num(&s, "H12")), (2.0, 11.0));
+        assert_eq!(value(&s, "G17"), Value::text("ANOVA"));
+        // Sample SS 32 (df 1, F 64); Columns SS 8 (df 1, F 16); Interaction SS 0; Within SS 2
+        // (df 4, MS 0.5); Total SS 42 (df 7).
+        assert_eq!((value(&s, "G19"), value(&s, "G20")), (Value::text("Sample"), Value::text("Columns")));
+        assert!(close(num(&s, "H19"), 32.0));
+        assert_eq!((num(&s, "I19"), num(&s, "J19"), num(&s, "K19")), (1.0, 32.0, 64.0));
+        assert!(close(num(&s, "H20"), 8.0));
+        assert!(close(num(&s, "K20"), 16.0));
+        assert!(close(num(&s, "H21"), 0.0));
+        assert_eq!(num(&s, "K21"), 0.0);
+        assert!(close(num(&s, "H22"), 2.0));
+        assert_eq!((num(&s, "I22"), num(&s, "J22")), (4.0, 0.5));
+        assert_eq!((num(&s, "H24"), num(&s, "I24")), (42.0, 7.0));
+        assert!(close(num(&s, "L19"), eval(&mut s, "=F.DIST.RT(K19,I19,I22)")));
+        assert!(close(num(&s, "M19"), eval(&mut s, "=F.INV.RT(0.05,I19,I22)")));
+        assert!(close(num(&s, "L20"), eval(&mut s, "=F.DIST.RT(K20,I20,I22)")));
+        assert!(close(num(&s, "L21"), eval(&mut s, "=F.DIST.RT(K21,I21,I22)")));
+    }
+
+    #[test]
+    fn two_factor_anova_refuses_broken_shapes() {
+        fn err(s: &mut Session, p: Json) -> String {
+            s.execute("data.analysisToolPak", p).unwrap_err().to_string()
+        }
+        let mut s = session();
+        s.execute("range.setValues", json!({"range": "A1", "values": [[1, 2]]})).unwrap();
+        assert!(err(&mut s, json!({"tool": "anovaTwoFactor", "range": "A1:B1", "output": "D1"})).contains("rectangle"));
+        s.execute("range.setValues", json!({"range": "A1", "values": [["x", 2], [2, 4]]})).unwrap();
+        assert!(err(&mut s, json!({"tool": "anovaTwoFactor", "range": "A1:B2", "output": "D1"})).contains("non-numeric"));
+        s.execute("range.setValues", json!({"range": "A1", "values": [[1, 3], [2, 4], [5, 7], [6, 8]]})).unwrap();
+        // The replicate count is required and must divide the data rows.
+        assert!(err(&mut s, json!({"tool": "anovaTwoFactorRep", "range": "A1:B4", "output": "D1"})).contains("rowsPerSample"));
+        assert!(err(&mut s, json!({"tool": "anovaTwoFactorRep", "range": "A1:B4", "rowsPerSample": 3, "output": "D1"})).contains("blocks"));
+        assert!(err(&mut s, json!({"tool": "anovaTwoFactorRep", "range": "A1:B4", "rowsPerSample": 1, "output": "D1"})).contains("rowsPerSample"));
+        // The tool list names both.
+        let tools = s.execute("data.analysisToolPak", json!({})).unwrap();
+        let ids: Vec<&str> = tools["tools"].as_array().map(|a| a.iter().filter_map(|t| t["id"].as_str()).collect()).unwrap_or_default();
+        assert!(ids.contains(&"anovaTwoFactor") && ids.contains(&"anovaTwoFactorRep"), "{ids:?}");
     }
 }
