@@ -347,7 +347,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus once Excel is
   available. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls` reads everything but CF12; RC4 encryption cannot be written (FF)
+### 7. Legacy `.xls`: charts and pictures; RC4 encryption cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
@@ -389,29 +389,37 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   (`HLINK`/`HLINKTOOLTIP` through [MS-OSHARED] URL, file and composite monikers with the tooltip) and
   freeze panes (`Pane` + `Window2`, plus the scrolled top-left cell and the active sheet from
   `Window1`). Each is asserted equal to what the `.xlsx` reader produces for the same model, and every
-  fixture is a byte array built in code. **Spec-derived and fixture-tested only — no `.xls` corpus and
-  no Excel on this machine.** Still refused, with the reason recorded: **CF12** colour
-  scales/data bars/icon sets (the specification's diagram and its field text disagree on
-  `rgbTemplateParms`' length, so the tail's offset is undetermined — a guessed offset would be
-  invention), and BIFF5, whose record layouts are simply **not in [MS-XLS]** (§1.6 specifies BIFF8
-  only), so a second reader would be ~1,000–1,500 lines from a source we do not have. An 11-02
-  attempt to settle the layout from a **WPS-authored** `.xls` did not help: WPS 12.0 writes its own
-  `0x087C`/`0x087D` extension records for a colour scale, data bar and icon set instead of Excel's
-  `CF12`, so an **Excel-authored** `.xls` (gate #1) is still the only source that can resolve it.
-- **Still missing:** `.xls` conditional formats of the **CF12** kinds (colour scales, data bars, icon
-  sets) — everything older is read now; BIFF5 is refused with a clear message; hyperlinks and
-  freeze panes; charts, pictures, OLE objects and PivotTables are dropped with a warning; `.xls` is
-  never written.
+  fixture is a byte array built in code. BIFF5 is refused with a clear message, because its record
+  layouts are **not in [MS-XLS]** (§1.6 specifies BIFF8 only).
+- **Landed 11-02 (CF12):** `.xls` colour scales, data bars and icon sets are read. The earlier block
+  was the `CF12` record's tail: `rgbTemplateParms` is **16 bytes** ([MS-XLS] 2.4.43 says
+  `cbTemplateParm` MUST be 16), and `rgbCT` follows it as a `CFGradient` (2 control points of
+  `CFGradientInterpItem` + `CFGradientItem`, 2 or 3 points), a `CFDatabar` (`CFColor` + two `CFVO`s)
+  or a `CFMultistate` (icon set index + one `CFMStateItem` per icon). Thresholds come back as
+  `CfValueKind` (min/max, number, percent, percentile, formula), colours as `Color` (RGB, palette or
+  theme with a tint), and the icon-set index maps through the 17 ECMA `ST_IconSetType` names.
+  Settled by giving Excel 16 the workbook and reading the bytes it wrote: a colour scale, a data bar
+  and an icon set, then variants with number/percent bounds, 5 icons, reverse, icon-only and
+  `ShowValue = false`. Two findings the specification alone would have got wrong: Excel writes a
+  percentile it was given as a **type-7 threshold with no formula and the number itself** (read as
+  that number), and its data-bar `fShowValue` bit is set when the value is **hidden** (the opposite
+  of the field's description; `ShowValue = false` wrote `0x02`, the default `0x00`, and Excel shows
+  the values on reopening the file). The reader was checked end-to-end by opening three
+  Excel-authored `.xls` files and comparing the rules with the `.xlsx` copies Excel wrote for the
+  same workbooks.
+- **Still missing:** `.xls` charts, pictures and OLE objects (dropped with a warning); BIFF5 is
+  refused; `.xls` is never written.
 - **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
-  formats, merges, sizes, names); fonts, fills, borders, charts, pictures, comments, conditional
-  formats, validation and BIFF5 files are not read, and `.xls` is never written. Password-encrypted
+  formats, merges, sizes, names, styles, comments, validation, conditional formats (including
+  colour scales, data bars and icon sets), hyperlinks and frozen panes); charts, pictures and OLE
+  objects are not read, BIFF5 is refused and `.xls` is never written. Password-encrypted
   `.xlsx` workbooks (Agile and Standard encryption) open with their password since #11, but are
   saved without it: GridCraft can't write an encrypted file yet. Encrypted `.xls` (FILEPASS) and
   RC4-encrypted files are still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 7–16 h (CF12 3–5 once its tail length is settled, charts/pictures 2–4, RC4 write 1,
-  an Excel run over a `.xls` 1–6). [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 4–11 h (charts/pictures 2–4, RC4 write 1, an Excel run over a `.xls` 1–6).
+  [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: data-model pivots and a real-world corpus (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
@@ -722,6 +730,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §7: `.xls` **CF12** landed — colour scales, data bars and icon sets are read from `CondFmt12` + `CF12` (`rgbTemplateParms` is 16 bytes, `rgbCT` a `CFGradient`/`CFDatabar`/`CFMultistate`, thresholds as `CfValueKind`, colours as `Color`, the 17 ECMA icon-set names). Settled against Excel 16-authored files, which also showed that Excel writes a percentile as a type-7 literal and that its data-bar show-value bit is inverted; three Excel `.xls` files read end-to-end and match the `.xlsx` copies Excel wrote. §7 is down to charts/pictures and RC4 writing (4–11 h) |
 | 2026-11-02 | minor | §8: calculated items landed (`pivot.calculatedItem`, item captions as the field's last shared items with `f="1"`, `<calculatedItems>` on the cache with the `Field[item]` formula, the item sorted last and evaluated on the cell's item aggregates, out of the grand totals), **verified in Excel 16**: the oracle pivot carries `Region[East]+Region[West]`, Excel keeps the definition, computes 116,320 and re-saves with every cell equal. §8 is now only data-model pivots and the corpus |
 | 2026-11-02 | major | §1: Excel 16 is activated and `cargo xtask oracle` now uses it as the gate probe (open, refresh every PivotTable, recalc, save, re-read, compare every cell) on all five fixtures — no repair, no lost content; the corpus half is still missing. §8: the probe found and pinned the number-group encoding (no `refreshOnLoad`, base values in `sharedItems`, next-boundary tail, min-extent anchoring); calculated items are now observable in Excel |
 | 2026-11-02 | minor | §8: recorded why calculated items wait (no primary source here settles `calculatedItems`' placement and index rules, and a guessed part risks an Excel repair prompt); the engine half is understood |

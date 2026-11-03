@@ -225,7 +225,7 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     // The overview comes first.
     report.warnings.insert(
         0,
-        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats, hyperlinks, frozen panes and defined names were read. Colour scales, data bars, icon sets, charts, pictures and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
+        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats (including colour scales, data bars and icon sets), hyperlinks, frozen panes and defined names were read. Charts, pictures and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
     );
     Ok((wb, report))
 }
@@ -449,6 +449,12 @@ struct SheetState<'g> {
     dv_expected: Option<usize>,
     dv_seen: usize,
     dv_overflow: bool,
+    /// The `CondFmt12` whose `CF12` records follow ([MS-XLS] 2.4.57).
+    cf12_group: Option<condfmt::Group>,
+    /// How many `CF12` records the group still expects.
+    cf12_left: usize,
+    /// A `CF12` rule reached through a `CFEx` record, which this reader does not follow.
+    cf12_via_cfex: bool,
     /// Hyperlinks and their tooltips, paired once the whole sheet has been read.
     links: Vec<hyperlink::Link>,
     tooltips: Vec<(RangeRef, String)>,
@@ -459,8 +465,6 @@ struct SheetState<'g> {
     frozen: bool,
     /// `Window2.rwTop` and `colLeft`: the first visible row and column.
     scrolled_to: Option<(u16, u16)>,
-    /// A `CF12` rule (a colour scale, data bar or icon set) was skipped.
-    cf12: bool,
 }
 
 impl SheetState<'_> {
@@ -571,6 +575,9 @@ fn worksheet(
         cf_left: 0,
         cf_ids: HashMap::new(),
         cf_seq: 0,
+        cf12_group: None,
+        cf12_left: 0,
+        cf12_via_cfex: false,
         dv_expected: None,
         dv_seen: 0,
         dv_overflow: false,
@@ -580,7 +587,6 @@ fn worksheet(
         pane: None,
         frozen: false,
         scrolled_to: None,
-        cf12: false,
     };
     let mut depth = 1usize;
     while let Some(rec) = recs.next_record()? {
@@ -679,8 +685,8 @@ fn worksheet(
             }
         }
     }
-    if st.cf12 {
-        report.warn("Colour scales, data bars and icon sets in .xls files are not imported yet (their CF12 record's layout is not determined); other conditional formats were read.");
+    if st.cf12_via_cfex {
+        report.warn("A colour scale, data bar or icon set introduced by a CFEx record was skipped; the other conditional formats were read.");
     }
     Ok(Some((st.sheet, st.calc)))
 }
@@ -963,7 +969,7 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             let ext = soft(report, "conditional format extension", condfmt::cfex(&mut c, &st.g.styles.palette, &st.g.styles.formats))?;
             if let Some(ext) = ext {
                 if ext.cf12 {
-                    st.cf12 = true;
+                    st.cf12_via_cfex = true;
                 } else {
                     let at = st.cf_ids.get(&ext.id).and_then(|v| v.get(ext.icf)).copied();
                     if let Some(cf) = at.and_then(|i| st.sheet.cond_formats.get_mut(i)) {
@@ -980,7 +986,29 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             }
         }
         // CondFmt12 / CF12: colour scales, data bars and icon sets.
-        0x0879 | 0x087A => st.cf12 = true,
+        0x0879 => {
+            if let Some(group) = soft(report, "conditional format", condfmt::condfmt12(&mut c))? {
+                st.cf12_left = group.count;
+                st.cf12_group = Some(group);
+            }
+        }
+        0x087A => {
+            let Some(group) = st.cf12_group.as_ref() else { return Ok(()) };
+            if group.ranges.is_empty() || st.cf12_left == 0 || st.sheet.cond_formats.len() >= MAX_CONDFMTS {
+                return Ok(());
+            }
+            let base = group.ranges.first().map_or_else(CellRef::default, |r| r.start);
+            let (ranges, count) = (group.ranges.clone(), st.cf12_left);
+            st.cf12_left = count - 1;
+            let rule = soft(report, "conditional format", condfmt::cf12(&mut c, base, &st.g.links, &st.g.styles.palette))?;
+            match rule {
+                Some(Some(rule)) => {
+                    st.sheet.cond_formats.push(CondFormat { ranges, rule: rule.rule, priority: rule.priority, stop_if_true: rule.stop_if_true })
+                }
+                Some(None) => report.warn("A conditional format whose rule type could not be read was skipped."),
+                None => {}
+            }
+        }
         0x01B2 => {
             if let Some(count) = soft(report, "data validation count", validation::dval(&mut c))? {
                 if count > validation::MAX_DV_COUNT {

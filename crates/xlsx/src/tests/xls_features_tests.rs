@@ -6,7 +6,9 @@
 //! structures; no Excel-produced file is used.
 
 use gridcraft_core::{CellRef, RangeRef};
-use gridcraft_model::{Cell, CfOperator, CfRule, Color, CondFormat, ErrorStyle, Fill, Font, Hyperlink, Style, Validation, ValidationKind, Workbook};
+use gridcraft_model::{
+    Cell, CfOperator, CfRule, CfValueKind, Color, CondFormat, ErrorStyle, Fill, Font, Hyperlink, Style, Validation, ValidationKind, Workbook,
+};
 
 use super::xls_tests::{bof, cat, cell, compound, eof, palette, rec, u16s, xlstr};
 use crate::{read_xls, read_xlsx, write_xlsx};
@@ -450,19 +452,177 @@ fn conditional_formats_match_the_xlsx_reader() {
     assert!(!report.warnings.iter().any(|w| w.contains("CF12")), "{:?}", report.warnings);
 }
 
+/// `CondFmt12` ([MS-XLS] 2.4.57): the `FrtRefHeaderU`, then a `CondFmtStructure`.
+fn condfmt12(nid: u16, ranges: &[(u16, u16, u16, u16)]) -> Vec<u8> {
+    let (r0, r1, c0, c1) = ranges.first().copied().unwrap_or((0, 0, 0, 0));
+    let mut p = 0x0879u16.to_le_bytes().to_vec();
+    p.extend(1u16.to_le_bytes()); // grbitFrt.fFrtRef
+    p.extend(u16s(&[r0, r1, c0, c1]));
+    p.extend((ranges.len() as u16).to_le_bytes()); // ccf
+    p.extend((nid << 1).to_le_bytes());
+    p.extend(u16s(&[r0, r1, c0, c1])); // refBound
+    p.extend((ranges.len() as u16).to_le_bytes()); // sqref.cref
+    for (r0, r1, c0, c1) in ranges {
+        p.extend(u16s(&[*r0, *r1, *c0, *c1]));
+    }
+    rec(0x0879, &p)
+}
+
+/// `CF12` ([MS-XLS] 2.4.43): the header, an empty differential format and formula, the priority
+/// and a 16-byte template-parameter block before the `rgbCT` payload.
+fn cf12(ct: u8, priority: u16, icf: u16, rgb_ct: &[u8]) -> Vec<u8> {
+    let mut p = 0x087Au16.to_le_bytes().to_vec();
+    p.extend(0u16.to_le_bytes()); // grbitFrt
+    p.extend([0u8; 8]); // ref8, unused for these rule types
+    p.push(ct);
+    p.push(0); // cp
+    p.extend(0u16.to_le_bytes()); // cce1
+    p.extend(0u16.to_le_bytes()); // cce2
+    p.extend(0u32.to_le_bytes()); // cbDxf
+    p.extend(0u16.to_le_bytes()); // DXFN12's reserved word (cbDxf == 0)
+    p.extend(0u16.to_le_bytes()); // fmlaActive.cce
+    p.push(0); // flags
+    p.extend(priority.to_le_bytes());
+    p.extend(icf.to_le_bytes());
+    p.push(16); // cbTemplateParm
+    p.extend([0u8; 16]);
+    p.extend(rgb_ct);
+    rec(0x087A, &p)
+}
+
+/// `CFColor` (2.5.21) as an RGB colour: type 2, then LongRGBA.
+fn cf_rgb(r: u8, g: u8, b: u8) -> Vec<u8> {
+    let mut v = 2u32.to_le_bytes().to_vec();
+    v.extend((u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)).to_le_bytes());
+    v.extend(0f64.to_le_bytes());
+    v
+}
+
+/// `CFVO` (2.5.39) for min/max (`[0x02]`/`[0x03]`); `number`, `percent` and `percentile` add a
+/// value after the empty formula length.
+fn cfvo(kind: u8, value: Option<f64>) -> Vec<u8> {
+    let mut v = vec![kind, 0, 0];
+    if let Some(n) = value {
+        v.extend(n.to_le_bytes());
+    }
+    v
+}
+
+/// `CFGradient` (2.5.32): the two curves; each stop pairs an interpolation point with a colour.
+fn gradient(stops: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let n = stops.len() as u8;
+    let mut v = vec![0, 0, 0, n, n, 3]; // unused, reserved1, cInterp, cGradient, flags
+    for (i, (kind, _)) in stops.iter().enumerate() {
+        v.extend(kind);
+        v.extend((i as f64 / (n as f64 - 1.0)).to_le_bytes()); // numDomain
+    }
+    for (i, (_, color)) in stops.iter().enumerate() {
+        v.extend((i as f64 / (n as f64 - 1.0)).to_le_bytes()); // numGrange
+        v.extend(color);
+    }
+    v
+}
+
 #[test]
-fn a_cf12_rule_warns_and_the_file_still_opens() {
-    // CondFmt12 + CF12: a colour scale, data bar or icon set. The record's tail is not decodable
-    // from the specification, so the rule is refused and the rest of the sheet is read.
+fn cf12_rules_read_excels_encoding() {
+    // The three shapes an Excel-authored .xls carries (checked against one): a colour scale with
+    // min/percentile/max, a data bar and an icon set (4 traffic lights, reversed, icon only).
+    let scale = gradient(&[
+        (cfvo(0x02, None), cf_rgb(0xFF, 0x00, 0x00)),
+        (cfvo(0x05, Some(50.0)), cf_rgb(0xFF, 0xEB, 0x84)),
+        (cfvo(0x03, None), cf_rgb(0x63, 0xBE, 0x7B)),
+    ]);
+    let mut bar = vec![0, 0, 0]; // unused, reserved1
+    bar.push(0x02); // fShowValue: Excel sets this bit when the value is hidden
+    bar.extend([0, 100]); // iPercentMin, iPercentMax
+    bar.extend(cf_rgb(0x63, 0x8E, 0xC6));
+    bar.extend(cfvo(0x02, None));
+    bar.extend(cfvo(0x03, None));
+    let mut icons = vec![0, 0, 0, 4, 0x0C]; // unused, reserved1, cStates, iIconSet = 4TrafficLights
+    icons.push(0x05); // fIconOnly | fReverse
+    for (n, equal) in [(0.0, 1u8), (25.0, 1), (50.0, 1), (75.0, 1)] {
+        icons.extend(cfvo(0x04, Some(n)));
+        icons.push(equal);
+        icons.extend([0u8; 4]); // unused
+    }
     let records = cat(&[
-        &rec(0x0879, &cat(&[&[0u8; 12], &2u16.to_le_bytes(), &0u16.to_le_bytes(), &[0u8; 8], &1u16.to_le_bytes()])),
-        &rec(0x087A, &[0u8; 40]),
+        &condfmt12(1, &[(0, 9, 0, 0)]),
+        &cf12(0x03, 1, 2, &scale),
+        &condfmt12(2, &[(0, 9, 1, 1)]),
+        &cf12(0x04, 2, 3, &bar),
+        &condfmt12(3, &[(0, 9, 2, 2)]),
+        &cf12(0x06, 3, 4, &icons),
         &rec(0x0203, &cat(&[&cell(0, 0, 0), &7.0f64.to_le_bytes()])),
     ]);
     let (wb, report) = read_xls(&book(&[], &records)).unwrap();
     assert_eq!(wb.sheets[0].value(CellRef::new(0, 0)), gridcraft_core::Value::Number(7.0));
+    let rules = &wb.sheets[0].cond_formats;
+    assert_eq!(rules.len(), 3, "{:?}", report.warnings);
+    assert!(!report.warnings.iter().any(|w| w.contains("CF12") || w.contains("Colour scales")), "{:?}", report.warnings);
+    // The colour scale keeps its thresholds, their order and their colours.
+    let CfRule::ColorScale { stops } = &rules[0].rule else { panic!("rule 0 is not a colour scale") };
+    assert_eq!(
+        stops,
+        &vec![
+            (CfValueKind::Min, Color::Rgb(0xFF0000)),
+            (CfValueKind::Percentile(50.0), Color::Rgb(0xFFEB84)),
+            (CfValueKind::Max, Color::Rgb(0x63BE7B)),
+        ]
+    );
+    assert_eq!(
+        &rules[1].rule,
+        &CfRule::DataBar { min: CfValueKind::Min, max: CfValueKind::Max, color: Color::Rgb(0x638EC6), gradient: true, show_value: false },
+        "the hidden-value bit"
+    );
+    assert_eq!(
+        &rules[2].rule,
+        &CfRule::IconSet {
+            set: "4TrafficLights".into(),
+            thresholds: vec![CfValueKind::Percent(0.0), CfValueKind::Percent(25.0), CfValueKind::Percent(50.0), CfValueKind::Percent(75.0)],
+            reverse: true,
+            show_value: false,
+        }
+    );
+    assert_eq!(rules[0].priority, 1);
+    assert_eq!(rules[2].priority, 3);
+    assert_eq!(rules[0].ranges, vec![RangeRef::parse("A1:A10").unwrap()]);
+    assert_eq!(rules[2].ranges, vec![RangeRef::parse("C1:C10").unwrap()]);
+}
+
+#[test]
+fn a_broken_cf12_rule_warns_and_the_file_still_opens() {
+    let records = cat(&[&condfmt12(1, &[(0, 9, 0, 0)]), &rec(0x087A, &[0u8; 40]), &rec(0x0203, &cat(&[&cell(0, 0, 0), &7.0f64.to_le_bytes()]))]);
+    let (wb, report) = read_xls(&book(&[], &records)).unwrap();
+    assert_eq!(wb.sheets[0].value(CellRef::new(0, 0)), gridcraft_core::Value::Number(7.0));
     assert!(wb.sheets[0].cond_formats.is_empty());
-    assert!(report.warnings.iter().any(|w| w.contains("Colour scales")), "{:?}", report.warnings);
+    assert!(report.warnings.iter().any(|w| w.contains("conditional format")), "{:?}", report.warnings);
+}
+
+#[test]
+fn a_cf12_rule_with_excels_own_bytes_matches() {
+    // The rgbCT of an Excel 16-authored colour scale (min / number 50 / max, red-yellow-green),
+    // copied byte for byte: 119 bytes after the 16-byte template parameters.
+    let rgb_ct = [
+        0x85, 0x00, 0x00, 0x03, 0x03, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x3f, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0,
+        0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x3f, 0x02, 0x00, 0x00, 0x00, 0xff, 0xeb, 0x84, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, 0x02, 0x00, 0x00, 0x00, 0x63, 0xbe, 0x7b, 0xff, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+    let records = cat(&[&condfmt12(1, &[(0, 9, 0, 0)]), &cf12(0x03, 1, 2, &rgb_ct)]);
+    let (wb, report) = read_xls(&book(&[], &records)).unwrap();
+    assert!(!report.warnings.iter().any(|w| w.contains("was skipped")), "{:?}", report.warnings);
+    let CfRule::ColorScale { stops } = &wb.sheets[0].cond_formats[0].rule else { panic!("not a colour scale") };
+    assert_eq!(stops.len(), 3);
+    assert_eq!(stops[0].0, CfValueKind::Min);
+    // Excel writes the percentile it was given as a type-7 threshold with no tokens and the
+    // number itself, so it reads as that number.
+    assert_eq!(stops[1].0, CfValueKind::Number(50.0));
+    assert_eq!(stops[2].0, CfValueKind::Max);
+    assert_eq!(stops[0].1, Color::Rgb(0xFF0000));
+    assert_eq!(stops[1].1, Color::Rgb(0xFFEB84));
+    assert_eq!(stops[2].1, Color::Rgb(0x63BE7B));
 }
 
 #[test]
