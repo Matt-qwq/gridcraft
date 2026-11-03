@@ -19,6 +19,7 @@ mod dxf;
 mod formula;
 mod ftab;
 mod hyperlink;
+mod officeart;
 mod records;
 mod styles;
 mod validation;
@@ -149,6 +150,10 @@ struct Globals {
     precision_as_displayed: bool,
     /// `Window1.itabCur` ([MS-XLS] 2.4.345): the selected sheet, in BoundSheet8 order.
     itab_cur: Option<u16>,
+    /// The workbook's `MSODRAWINGGROUP` payload and the blips it stores: one picture store for
+    /// every sheet's drawings.
+    dgg: Vec<u8>,
+    blips: Vec<officeart::Blip>,
 }
 
 /// Reads an Excel 97-2003 workbook. Inspect the report's warnings for what was skipped.
@@ -225,7 +230,7 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     // The overview comes first.
     report.warnings.insert(
         0,
-        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats (including colour scales, data bars and icon sets), hyperlinks, frozen panes and defined names were read. Charts, pictures and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
+        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats (including colour scales, data bars and icon sets), hyperlinks, frozen panes and defined names, and pictures were read. Charts, shapes and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
     );
     Ok((wb, report))
 }
@@ -259,6 +264,8 @@ fn globals(stream: &[u8], budget: &mut Budget, report: &mut ReadReport) -> Resul
         let mut c = Cursor::new(&rec.parts);
         match rec.id {
             EOF => break,
+            // The drawing group (OfficeArt's blip store) belongs to the workbook, not a sheet.
+            0x00EB => g.dgg.extend(c.rest()),
             0x002F => return Err(invalid(ENCRYPTED)),
             0x0085 => {
                 if g.sheets.len() >= MAX_SHEETS {
@@ -328,6 +335,7 @@ fn globals(stream: &[u8], budget: &mut Budget, report: &mut ReadReport) -> Resul
             _ => {}
         }
     }
+    g.blips = officeart::read_blips(&g.dgg);
     // The same test `defined_names` applies, before any cell formula is decoded.
     let skipped = g.names.iter().map(|l| !l.rgce.is_empty() && decode(&l.rgce, &l.rgcb, CellRef::new(0, 0), Mode::Name, &g.links).is_err()).collect();
     g.links.skipped = skipped;
@@ -455,6 +463,8 @@ struct SheetState<'g> {
     cf12_left: usize,
     /// A `CF12` rule reached through a `CFEx` record, which this reader does not follow.
     cf12_via_cfex: bool,
+    /// The sheet's `MSODRAWING` payloads: the drawings, one OfficeArt tree when concatenated.
+    drawing: Vec<u8>,
     /// Hyperlinks and their tooltips, paired once the whole sheet has been read.
     links: Vec<hyperlink::Link>,
     tooltips: Vec<(RangeRef, String)>,
@@ -578,6 +588,7 @@ fn worksheet(
         cf12_group: None,
         cf12_left: 0,
         cf12_via_cfex: false,
+        drawing: vec![],
         dv_expected: None,
         dv_seen: 0,
         dv_overflow: false,
@@ -687,6 +698,15 @@ fn worksheet(
     }
     if st.cf12_via_cfex {
         report.warn("A colour scale, data bar or icon set introduced by a CFEx record was skipped; the other conditional formats were read.");
+    }
+    // Pictures are the one drawing object the model holds; charts, shapes, controls and vector
+    // (EMF/WMF) pictures are skipped, counted once.
+    if !st.drawing.is_empty() {
+        let (images, skipped) = officeart::read_images(&st.drawing, &st.g.blips, &st.sheet);
+        st.sheet.images = images;
+        if skipped > 0 {
+            report.warn("Some drawings in an .xls file (charts, shapes or vector pictures) were not imported.");
+        }
     }
     Ok(Some((st.sheet, st.calc)))
 }
@@ -933,7 +953,9 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
                 st.note_texts.push(text);
             }
         }
-        0x00EC => report.warn("Pictures, charts and shapes in .xls files are not imported yet."),
+        // The drawings: an OfficeArt tree whose records may be split across several records;
+        // concatenated, they make the one tree. The blip store is the workbook's.
+        0x00EC => st.drawing.extend(c.rest()),
         0x01B0 => {
             // CondFmt ([MS-XLS] 2.4.56): the ranges and the id its CF records are stored under.
             if let Some(group) = soft(report, "conditional format", condfmt::condfmt(&mut c))? {

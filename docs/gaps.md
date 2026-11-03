@@ -347,7 +347,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus once Excel is
   available. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls`: charts and pictures; RC4 encryption cannot be written (FF)
+### 7. Legacy `.xls`: charts; RC4 encryption cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
@@ -407,18 +407,30 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   the values on reopening the file). The reader was checked end-to-end by opening three
   Excel-authored `.xls` files and comparing the rules with the `.xlsx` copies Excel wrote for the
   same workbooks.
-- **Still missing:** `.xls` charts, pictures and OLE objects (dropped with a warning); BIFF5 is
+- **Landed 11-02 (pictures):** `.xls` pictures are read from OfficeArt: every sheet's drawings are
+  the concatenation of its `MSODRAWING` payloads (one `OfficeArtDgContainer` tree, possibly split
+  across records), and the workbook's `MSODRAWINGGROUP` holds the blip store
+  (`OfficeArtBStoreContainer` → `OfficeArtFBSE` → a PNG/JPEG/DIB/TIFF blip, whose payload is the
+  UID(s), a one-byte tag and the image bytes). A shape whose `OfficeArtFSP` names
+  `msosptPictureFrame` and whose `OfficeArtFOPT` `pib` names a blip becomes an `Image`: the
+  `OfficeArtClientAnchorSheet` gives the cell and the offsets in 1/1024 of a column width and 1/256
+  of a row height, and its move/size bits map to `AnchorMode` the way Excel writes them (0x0000 =
+  move and size, 0x0002 = move only, 0x0003 = free-floating — checked against Excel-authored
+  files; the field descriptions suggest the opposite, so the capture is the reference). Charts,
+  autoshapes, controls and vector (EMF/WMF) pictures are skipped with one warning; malformed or
+  truncated drawings are skipped, never a panic.
+- **Still missing:** `.xls` charts, shapes and OLE objects (dropped with a warning); BIFF5 is
   refused; `.xls` is never written.
 - **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
   formats, merges, sizes, names, styles, comments, validation, conditional formats (including
-  colour scales, data bars and icon sets), hyperlinks and frozen panes); charts, pictures and OLE
-  objects are not read, BIFF5 is refused and `.xls` is never written. Password-encrypted
+  colour scales, data bars and icon sets), hyperlinks, frozen panes and pictures); charts, shapes
+  and OLE objects are not read, BIFF5 is refused and `.xls` is never written. Password-encrypted
   `.xlsx` workbooks (Agile and Standard encryption) open with their password since #11, but are
   saved without it: GridCraft can't write an encrypted file yet. Encrypted `.xls` (FILEPASS) and
   RC4-encrypted files are still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 4–11 h (charts/pictures 2–4, RC4 write 1, an Excel run over a `.xls` 1–6).
+- **Estimate:** 4–11 h (charts 2–4, RC4 write 1, an Excel run over a `.xls` 1–6).
   [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: data-model pivots and a real-world corpus (F)
@@ -730,6 +742,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | minor | §7: `.xls` **pictures** landed — OfficeArt drawings (`MSODRAWING`, one `DgContainer` tree when concatenated) and the workbook's blip store (`MSODRAWINGGROUP` → `FBSE` → PNG/JPEG/DIB/TIFF), with `msosptPictureFrame` shapes turned into `Image`s at their `OfficeArtClientAnchorSheet` cell and offsets. The move/size bits map the way Excel writes them (0x0000 move+size, 0x0002 move only, 0x0003 free-floating), established from Excel-authored files. Charts, shapes, controls and vector pictures are skipped; malformed drawings never panic. §7 is down to charts and RC4 writing |
 | 2026-11-02 | minor | §7: `.xls` **CF12** landed — colour scales, data bars and icon sets are read from `CondFmt12` + `CF12` (`rgbTemplateParms` is 16 bytes, `rgbCT` a `CFGradient`/`CFDatabar`/`CFMultistate`, thresholds as `CfValueKind`, colours as `Color`, the 17 ECMA icon-set names). Settled against Excel 16-authored files, which also showed that Excel writes a percentile as a type-7 literal and that its data-bar show-value bit is inverted; three Excel `.xls` files read end-to-end and match the `.xlsx` copies Excel wrote. §7 is down to charts/pictures and RC4 writing (4–11 h) |
 | 2026-11-02 | minor | §8: calculated items landed (`pivot.calculatedItem`, item captions as the field's last shared items with `f="1"`, `<calculatedItems>` on the cache with the `Field[item]` formula, the item sorted last and evaluated on the cell's item aggregates, out of the grand totals), **verified in Excel 16**: the oracle pivot carries `Region[East]+Region[West]`, Excel keeps the definition, computes 116,320 and re-saves with every cell equal. §8 is now only data-model pivots and the corpus |
 | 2026-11-02 | major | §1: Excel 16 is activated and `cargo xtask oracle` now uses it as the gate probe (open, refresh every PivotTable, recalc, save, re-read, compare every cell) on all five fixtures — no repair, no lost content; the corpus half is still missing. §8: the probe found and pinned the number-group encoding (no `refreshOnLoad`, base values in `sharedItems`, next-boundary tail, min-extent anchoring); calculated items are now observable in Excel |

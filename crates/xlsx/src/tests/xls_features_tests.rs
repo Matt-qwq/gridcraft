@@ -7,7 +7,8 @@
 
 use gridcraft_core::{CellRef, RangeRef};
 use gridcraft_model::{
-    Cell, CfOperator, CfRule, CfValueKind, Color, CondFormat, ErrorStyle, Fill, Font, Hyperlink, Style, Validation, ValidationKind, Workbook,
+    AnchorMode, Cell, CfOperator, CfRule, CfValueKind, Color, CondFormat, ErrorStyle, Fill, Font, Hyperlink, Style, Validation, ValidationKind,
+    Workbook,
 };
 
 use super::xls_tests::{bof, cat, cell, compound, eof, palette, rec, u16s, xlstr};
@@ -844,5 +845,116 @@ fn hostile_feature_records_never_panic_and_keep_the_file_open() {
                 assert!(!report.warnings.is_empty() || len == 0, "{id:#06x} len {len}");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- pictures (OfficeArt)
+
+/// One OfficeArt record ([MS-ODRAW] 2.2.1): the version/instance word, the type and the payload.
+fn oa(ver: u8, inst: u16, ty: u16, data: &[u8]) -> Vec<u8> {
+    let mut v = ((inst << 4) | u16::from(ver)).to_le_bytes().to_vec();
+    v.extend(ty.to_le_bytes());
+    v.extend((data.len() as u32).to_le_bytes());
+    v.extend(data);
+    v
+}
+
+/// A one-pixel PNG, for the picture tests.
+const PIXEL_PNG: [u8; 70] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// `OfficeArtBlipPNG` (2.2.28): one UID and the one-byte tag before the picture.
+fn blip_png(data: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 16];
+    p.push(0xFF);
+    p.extend(data);
+    oa(0, 0x6E0, 0xF01E, &p)
+}
+
+/// `OfficeArtFBSE` (2.2.32): the 36-byte header (no name) and the embedded blip.
+fn fbse(data: &[u8]) -> Vec<u8> {
+    let mut p = vec![6u8, 6]; // btWin32, btMacOS
+    p.extend([0u8; 16]); // rgbUid
+    p.extend(0x00FFu16.to_le_bytes()); // tag
+    p.extend(((data.len() + 17) as u32).to_le_bytes()); // size
+    p.extend(1u32.to_le_bytes()); // cRef
+    p.extend(0u32.to_le_bytes()); // foDelay
+    p.extend([0u8, 0, 0, 0]); // unused1, cbName, unused2, unused3
+    p.extend(blip_png(data));
+    oa(2, 6, 0xF007, &p)
+}
+
+/// The workbook's `MSODRAWINGGROUP` record with one blip.
+fn drawing_group(data: &[u8]) -> Vec<u8> {
+    let store = oa(0xF, 1, 0xF001, &fbse(data));
+    rec(0x00EB, &oa(0xF, 0, 0xF000, &store))
+}
+
+/// The sheet's `MSODRAWING` record for one picture shape: its type, its `pib` and its anchor.
+fn drawing(pib: u32, anchor: &[u8]) -> Vec<u8> {
+    let mut spid = 1u32.to_le_bytes().to_vec();
+    spid.extend(0x0A00u32.to_le_bytes()); // flags
+    let fsp = oa(2, 0x004B, 0xF00A, &spid); // msosptPictureFrame
+    let mut props = 0x007Fu16.to_le_bytes().to_vec();
+    props.extend(0u32.to_le_bytes());
+    props.extend(0x4104u16.to_le_bytes()); // pib, fBid
+    props.extend(pib.to_le_bytes());
+    let fopt = oa(3, 2, 0xF00B, &props);
+    let sp = oa(0xF, 0, 0xF004, &cat(&[&fsp, &fopt, anchor]));
+    let group = oa(0xF, 0, 0xF003, &sp);
+    rec(0x00EC, &oa(0xF, 0, 0xF002, &group))
+}
+
+/// `OfficeArtClientAnchorSheet` ([MS-XLS] 2.5.193).
+fn client_anchor(flags: u16, col_l: u16, dx_l: u16, rw_t: u16, dy_t: u16, col_r: u16, dx_r: u16, rw_b: u16, dy_b: u16) -> Vec<u8> {
+    let mut p = flags.to_le_bytes().to_vec();
+    for v in [col_l, dx_l, rw_t, dy_t, col_r, dx_r, rw_b, dy_b] {
+        p.extend(v.to_le_bytes());
+    }
+    oa(0, 0, 0xF010, &p)
+}
+
+#[test]
+fn pictures_read_officeart_anchors_and_blips() {
+    // A picture from B1+half a column, R2+half a row to the top-left of D4.
+    let anchor = client_anchor(0x0000, 1, 512, 2, 128, 3, 0, 4, 0);
+    let records = drawing(1, &anchor);
+    let (wb, report) = read_xls(&book(&drawing_group(&PIXEL_PNG), &records)).unwrap();
+    let images = &wb.sheets[0].images;
+    assert_eq!(images.len(), 1, "{:?}", report.warnings);
+    assert_eq!(images[0].mime, "image/png");
+    assert_eq!(images[0].data.as_slice(), &PIXEL_PNG);
+    // Default geometry: 64px columns and 20px rows. B1 is x 64, half its width is 32; row 3 is
+    // y 40, half its height 10; the right edge is D4's top-left corner.
+    let a = &images[0].anchor;
+    assert_eq!(a.cell, CellRef::new(2, 1));
+    assert_eq!(a.dx, 32.0);
+    assert_eq!(a.dy, 10.0);
+    assert_eq!(a.width, 96.0);
+    assert_eq!(a.height, 30.0);
+    assert_eq!(a.mode, AnchorMode::MoveAndSize);
+    // The xlsx writer keeps it: the media and the drawing part are written from the model.
+    let (back, report) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(back.sheets[0].images, wb.sheets[0].images);
+    // A missing blip and a truncated drawing are skipped, never a panic.
+    let (wb, report) = read_xls(&book(&drawing_group(&PIXEL_PNG), &drawing(7, &anchor))).unwrap();
+    assert!(wb.sheets[0].images.is_empty());
+    assert!(report.warnings.iter().any(|w| w.contains("drawings")), "{:?}", report.warnings);
+    let (wb, _) = read_xls(&book(&drawing_group(&PIXEL_PNG), &rec(0x00EC, &[0xFF, 0xFF]))).unwrap();
+    assert!(wb.sheets[0].images.is_empty());
+}
+
+#[test]
+fn picture_placement_bits_match_excels_shapes() {
+    // Excel wrote 0x0000 for "move and size with cells", 0x0002 for "move but don't size" and
+    // 0x0003 for "don't move or size" (checked against an Excel-authored .xls).
+    for (flags, want) in [(0x0000u16, AnchorMode::MoveAndSize), (0x0002, AnchorMode::MoveOnly), (0x0003, AnchorMode::Absolute)] {
+        let anchor = client_anchor(flags, 0, 0, 0, 0, 1, 0, 1, 0);
+        let (wb, _) = read_xls(&book(&drawing_group(&PIXEL_PNG), &drawing(1, &anchor))).unwrap();
+        assert_eq!(wb.sheets[0].images[0].anchor.mode, want, "flags {flags:#06x}");
     }
 }
