@@ -6204,6 +6204,33 @@ fn pivot_number_grouping_buckets_values_and_round_trips() {
 }
 
 #[test]
+fn pivot_number_grouping_clamps_to_the_data_extent_as_excel_does() {
+    // Excel anchors a number group at the field's smallest value and re-anchors it there on a
+    // refresh, so a wider range only creates groups Excel drops. `pivot.group` clamps and says so.
+    let mut s = pivot_months_session();
+    s.execute("pivot.addField", json!({"pivot": "P1", "field": "Sales", "area": "rows"})).unwrap();
+    // Sales runs 100..250: asking for 0..1000 by 50 clamps to 100..250, buckets 100-149, 150-199,
+    // 200-249 (250 is the next boundary), plus the tails.
+    let r = s.execute("pivot.group", json!({"pivot": "P1", "field": "Sales", "start": 0, "end": 1000, "interval": 50})).unwrap();
+    assert_eq!(r["clamped"], json!(true), "{r}");
+    assert_eq!(r["numberGroup"], json!({"start": 100.0, "end": 250.0, "interval": 50.0}), "{r}");
+    {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(d.wb.sheet_index("Report").unwrap()).unwrap();
+        assert_eq!(
+            sh.pivots[0].rows.iter().find(|f| f.source_col == "Sales").and_then(|f| f.number_group),
+            Some(gridcraft_model::PivotNumberGroup { start: 100.0, end: 250.0, interval: 50.0 })
+        );
+    }
+    // Asking inside the extent is not clamped.
+    let r = s.execute("pivot.group", json!({"pivot": "P1", "field": "Sales", "start": 120, "end": 240, "interval": 40})).unwrap();
+    assert_eq!(r["clamped"], json!(false), "{r}");
+    // A range that misses the data entirely is refused.
+    let e = s.execute("pivot.group", json!({"pivot": "P1", "field": "Sales", "start": 1000, "end": 2000, "interval": 100})).unwrap_err().to_string();
+    assert!(e.contains("does not include"), "{e}");
+}
+
+#[test]
 fn pivot_number_grouping_refuses_bounds_it_cannot_lay_out() {
     let mut s = pivot_months_session();
     // A value field is not on an axis: move it to Rows so it can be grouped.
@@ -6211,8 +6238,8 @@ fn pivot_number_grouping_refuses_bounds_it_cannot_lay_out() {
     let e = |s: &mut Session, p: serde_json::Value| s.execute("pivot.group", p).unwrap_err().to_string();
     assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 0, "end": 10, "interval": 0})).contains("interval"));
     assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 10, "end": 0, "interval": 1})).contains("range"));
-    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 0, "end": 1e6, "interval": 1})).contains("range"));
-    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 0, "end": 10})).contains("interval"));
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 100, "end": 250, "interval": 0.0001})).contains("range"));
+    assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "start": 120, "end": 240})).contains("interval"));
     // A date grouping and a numeric range are different requests.
     assert!(e(&mut s, json!({"pivot": "P1", "field": "Sales", "by": "months", "start": 0, "end": 10, "interval": 5})).contains("either"));
     // A text field cannot be grouped by number.

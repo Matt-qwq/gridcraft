@@ -1426,8 +1426,17 @@ fn group(s: &mut Session, p: &Json) -> Result<Json> {
                 }
             }
             let (default_start, default_end) = if lo.is_finite() && hi.is_finite() { (lo.floor(), hi.ceil()) } else { (0.0, 0.0) };
-            let start = f64_param(p, "start").unwrap_or(default_start);
-            let end = f64_param(p, "end").unwrap_or(default_end);
+            // Excel anchors a number group at the data's own extent and re-anchors it there when
+            // the pivot is refreshed; a start below the minimum (or an end above it) only asks for
+            // empty leading/trailing buckets Excel drops. Clamp, and say so.
+            let asked_start = f64_param(p, "start");
+            let asked_end = f64_param(p, "end");
+            let start = asked_start.unwrap_or(default_start).max(default_start);
+            let end = asked_end.unwrap_or(default_end).min(default_end);
+            let clamped = asked_start.is_some_and(|s| s < default_start) || asked_end.is_some_and(|e| e > default_end);
+            if start > end {
+                return Err(other(format!("The grouping range does not include the field's values ({default_start}..{default_end}).")));
+            }
             let interval = f64_param(p, "interval").ok_or_else(|| bad(C, "missing `interval` for a numeric grouping"))?;
             let g = PivotNumberGroup { start, end, interval };
             if !g.is_valid() {
@@ -1437,6 +1446,8 @@ fn group(s: &mut Session, p: &Json) -> Result<Json> {
                 )));
             }
             f.number_group = Some(g);
+            f.collapsed_items.clear();
+            return Ok(json!({"field": field, "numberGroup": {"start": start, "end": end, "interval": interval}, "clamped": clamped}));
         } else {
             f.date_group = by;
         }

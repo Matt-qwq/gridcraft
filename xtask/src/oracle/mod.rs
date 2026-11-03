@@ -130,8 +130,15 @@ fn fixtures(only: Option<&str>) -> Result<Vec<Fixture>, String> {
         out.push(Fixture { name: "features".to_string(), wb: features_fixture()?, app_skips: vec![], app_text_skips: vec![] });
     }
     if only.is_none_or(|want| want == "pivot") {
-        let (wb, _report_sheet) = pivot_fixture()?;
-        out.push(Fixture { name: "pivot".to_string(), wb, app_skips: vec![], app_text_skips: vec!["Row Labels".into(), "Grand Total".into()] });
+        let (wb, report_sheet) = pivot_fixture()?;
+        out.push(Fixture {
+            name: "pivot".to_string(),
+            wb,
+            // WPS rewrites the report body in its own locale and drops items on a refresh; Excel
+            // is the gate probe and compares it.
+            app_skips: vec![report_sheet],
+            app_text_skips: vec!["Row Labels".into(), "Grand Total".into()],
+        });
     }
     if out.is_empty() {
         return Err(format!("no fixture matched {:?}", only.unwrap_or("")));

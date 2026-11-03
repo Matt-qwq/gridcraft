@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (the corpus half of gate #1 is recorded as impossible on this machine — no corpus URL, no checkout, no network; a fresh 100 × 200 soak after the PivotTable changes is green; PivotTable label and value filters keep the items whose captions or aggregates match; PivotTable number grouping buckets a number field into ranges, the way the Group Field dialog does; GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** major (Excel 16 is activated and the oracle verifies every fixture in it — open, refresh, recalc, save, re-read, compare — and a PivotTable number-group encoding bug it found is fixed; the corpus half of gate #1 is still recorded as impossible on this machine — no corpus URL, no checkout, no network; a fresh 100 × 200 soak after the PivotTable changes is green; PivotTable label and value filters keep the items whose captions or aggregates match; PivotTable number grouping buckets a number field into ranges, the way the Group Field dialog does; GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -17,17 +17,19 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 
 ### 1. XLSX output not proven in Excel or on real files (FF)
-- **Missing:** a run over a real-world XLSX corpus, and confirmation that Excel opens what we save
-  with no repair prompt (PivotTables, charts, CF, validation, dynamic arrays, tables).
-- **Evidence:** round-trip tests cover our own files only (`crates/xlsx/src/tests/`); PivotTable
-  round-trip noted as "unverified in real Excel" since 10-07; #64 (dynamic-array flag) shows the
-  class of bug. The non-Excel half now runs through [`cargo xtask oracle`](oracle.md) (openpyxl and
-  WPS) and `gridcraft-cli check`. **The corpus half cannot start on this machine (11-02):** the repo
-  records no corpus URL, `craftrules` is not checked out next to the repo, and there is no network
-  (github.com timed out), so the pinned corpus cannot be fetched here — 3–6 h still, on a machine
-  with the corpus and network.
+- **Missing:** a run over a real-world XLSX corpus and an Excel run over `.xls` files.
+- **Landed 11-02 (Excel half):** the owner activated **Excel 16**, and [`cargo xtask oracle`](oracle.md)
+  now opens every fixture in Excel as well as WPS: it refreshes every PivotTable, recalculates,
+  saves a copy and reads it back, comparing every cell, format, merge, table, CF/DV/chart count
+  and defined name with the model. **All five fixtures pass in both applications** — no repair
+  prompt, no lost content — including a PivotTable with a grouped numeric field, a value filter
+  and a slicer. The probe tolerates only Excel's own localized PivotTable chrome (`Row Labels`,
+  `Grand Total`) because Excel re-renders those in its UI language.
+- **Still missing:** the pinned real-world corpus (3–6 h). The repo records no corpus URL, there
+  is no `craftrules` checkout and no network on this machine, so it cannot be fetched here. An
+  Excel-authored `.xls` (now possible) is the other open item, under §7.
 - **Impact:** the main format; a repair prompt or silent loss destroys trust.
-- **Estimate:** 15–25 h, plus owner time in Excel. [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 3–6 h of corpus work (no Excel needed) after gate #7's `.xls` slice. [file-format-parity.md](file-format-parity.md)
 
 ### 2. Large workbooks: what remains of the open/save problem (P, H)
 - **Landed (10-24):** the read path streams a worksheet as it decompresses, decodes windows on
@@ -483,14 +485,17 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   by the parent item only in the layouts that put the subtotal on the item's row.
 - **Landed 11-02 (number grouping):** a number field can be grouped the way Excel's Group Field
   dialog does it — `pivot.group {start, end, interval}` on a field in Rows or Columns (start/end
-  default to the field's own extent) — and the report buckets its values in half-open steps:
-  whole steps read `0-9`, `10-19`, a fractional one shows the half-open end, and values outside
-  the bounds become `<start`/`>end` items, sorted outermost. The model holds the range
-  (`PivotField.number_group`), the cache writes [MS-XLSX] `rangePr startNum`/`endNum`/
-  `groupInterval` with `groupBy="range"` and one caption per group item, and a saved report reads
-  the range back and rebuilds the same labels on refresh. `pivot.fields` reports it; a range past
-  100,000 groups, a non-positive interval, a reversed range or a text field is refused by name.
-  **Never opened in Excel** — the caption question above is gate #1.
+  default to the field's own extent, and are **clamped** to it, reported as `clamped`, because
+  that is where Excel anchors and re-anchors a number group) — and the report buckets its values
+  in half-open steps: whole steps read `0-9`, `10-19`, a fractional one shows the half-open end,
+  values outside the bounds become `<start`/next-boundary items, sorted outermost. The model holds
+  the range (`PivotField.number_group`), the cache writes [MS-XLSX] `rangePr startNum`/`endNum`/
+  `groupInterval` (no `groupBy`; the default is `range`) with the base field's distinct values in
+  `sharedItems` and one caption per group item, and a saved report reads the range back and
+  rebuilds the same labels on refresh. `pivot.fields` reports it; a range past 100,000 groups, a
+  non-positive interval, a range that misses the data or a text field is refused by name.
+  **Verified in Excel 16 (11-02):** the oracle opens, refreshes and re-saves the grouped pivot
+  with every cell agreeing (only Excel's localized chrome differs).
 - **Landed 11-02 (label and value filters):** `pivot.filterByLabel` keeps the items of a row or
   column field whose caption matches — equals, not equals, begins/ends with, contains, does not
   contain, the four comparisons and between/not between, case-insensitively — and
@@ -506,15 +511,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   by value". A rule and an item selection on one field replace each other; a calculated field as
   the measure is refused by name. Guarded: between needs both bounds, and the field must be on an
   axis.
-- **Missing:** calculated items and data-model pivots; the PivotTable gate's Excel verification. (`insert.pivotChart` landed 10-11 and is in the catalog, so PivotCharts are
+- **Missing:** calculated items and data-model pivots; a real-world corpus for the PivotTable gate. (`insert.pivotChart` landed 10-11 and is in the catalog, so PivotCharts are
   no longer part of this gap.) The "Generate GetPivotData" click option (Excel writes a
   `GETPIVOTDATA` formula when a pivot cell is clicked) is not wired into the grid yet.
-  Calculated items are deliberately not started: they need a `calculatedItems` element whose exact
-  placement and item-index rules no primary source available here settles (openpyxl's schema model
-  has no calculated-item type, `craftrules` is not checked out and there is no network), and a
-  guessed part risks the Excel repair prompt the gate exists to prevent. The engine half (synthetic
-  items over the value fields' aggregates) is understood; it lands with the file shape once the
-  schema can be confirmed or Excel can open the result.
+  Calculated items were deferred while no primary source here settled the `calculatedItems`
+  element's placement and item-index rules; **Excel is now available**, so the shape can be
+  observed from an Excel-authored pivot instead of guessed (the next slice).
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
   is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
@@ -523,7 +525,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   opens, recalculates and re-saves the package), which proves the XML is well formed and tolerated,
   not that Excel accepts it.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 2–4 h for beta (18–27 h full).
+- **Estimate:** 2–4 h for beta (18–27 h full): calculated items (now observable in Excel) and a real-world corpus for the Excel check.
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
@@ -695,6 +697,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-02 | major | §1: Excel 16 is activated and `cargo xtask oracle` now uses it as the gate probe (open, refresh every PivotTable, recalc, save, re-read, compare every cell) on all five fixtures — no repair, no lost content; the corpus half is still missing. §8: the probe found and pinned the number-group encoding (no `refreshOnLoad`, base values in `sharedItems`, next-boundary tail, min-extent anchoring); calculated items are now observable in Excel |
 | 2026-11-02 | minor | §8: recorded why calculated items wait (no primary source here settles `calculatedItems`' placement and index rules, and a guessed part risks an Excel repair prompt); the engine half is understood |
 | 2026-11-02 | minor | §8: the `pivot` oracle fixture now carries a grouped numeric field (`rangePr` + 13 group captions) and a value filter's hidden items, and both probes pass (openpyxl readback; WPS opens, recalculates, re-saves) — well-formedness evidence, not the Excel check |
 | 2026-11-02 | minor | §1: the corpus half cannot start on this machine — no corpus URL in the repo, no `craftrules` checkout, no network (github.com timed out) — so it is recorded instead of attempted; §10: a fresh 100 seeds × 200 steps soak at `3574f5d2` (after the three PivotTable changes) is green, 131 s, 0 failures |

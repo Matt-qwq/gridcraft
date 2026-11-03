@@ -45,7 +45,7 @@ declares. That one is not a heuristic — a strict XML parser rejects the part o
 | `budget` | accounting formats (built-in id 44), totals, a second sheet |
 | `grades` | pass marks, averages, conditional formatting over a small grid |
 | `features` | a merge, a note, a hyperlink, a list validation, frozen panes, a defined name, a custom number code |
-| `pivot` | a table-sourced PivotTable plus a slicer cache linked to it; a numeric field in Rows grouped by `rangePr` (the cache's `startNum`/`endNum`/`groupInterval` + one caption per group item) and a value filter whose kept items are the field's hidden items |
+| `pivot` | a table-sourced PivotTable plus a slicer cache linked to it; a numeric field in Rows grouped by `rangePr` (the cache's `startNum`/`endNum`/`groupInterval` + one caption per group item) and a value filter whose kept items are the field's hidden items. Both probes refresh every PivotTable before saving, so the report is re-rendered from the cache as an application would |
 
 ## What it has found
 
@@ -78,6 +78,20 @@ declares. That one is not a heuristic — a strict XML parser rejects the part o
   re-saves the package. This does not prove Excel accepts the parts — gate #1 — but it does prove
   the XML is well formed and that a foreign application tolerates it.
 
+- **2026-11-02 — Excel is the gate probe.** The owner activated Excel 16 on the dev machine, so
+  `cargo xtask oracle` now opens every fixture in Excel (`Excel.Application`) as well as WPS: it
+  refreshes every PivotTable, recalculates, saves a copy and reads it back, comparing every cell,
+  format, merge, table, CF/DV/chart count and defined name with the model. All five fixtures pass
+  in both applications. What this does **not** prove is a real-world corpus (still 3–6 h, needs the
+  pinned files); it is a set of synthetic workbooks we wrote. The probe tolerates only the
+  application's own localized PivotTable chrome (`Row Labels`, `Grand Total`) on the pivot fixture,
+  because Excel re-renders those in its UI language; every value and item label is compared.
+- **2026-11-02 — the probe found a PivotTable grouping bug.** Excel opened our grouped-number
+  pivot but silently rebuilt its cache on load (`refreshOnLoad="1"` in the cache definition) and
+  re-anchored the buckets at the field's minimum, localizing the captions; a grouped number
+  field's base values were missing from `sharedItems`, and the upper tail was named after `end`
+  instead of the next boundary. With the encoding corrected (below) and a refresh added to the
+  probe, Excel and our model agree on the whole report. See `file-format-parity.md`.
 ## Adding a fixture
 
 A fixture is a `Workbook` in `xtask/src/oracle/mod.rs`. Samples come straight from

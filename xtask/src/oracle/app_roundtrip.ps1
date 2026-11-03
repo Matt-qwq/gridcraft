@@ -28,6 +28,14 @@ try {
     # Open with the normal load: a file that needs repair must go through Excel's repair path so
     # the content comparison below can catch what was lost.
     $wb = $application.Workbooks.Open($Src, 0, $false)
+    # Refresh every PivotTable first: the report body is static cells, and a refresh is where an
+    # application re-renders it from the cache. A grouping the cache cannot back would show up as
+    # different labels here.
+    foreach ($ws in $wb.Worksheets) {
+        try {
+            foreach ($pt in $ws.PivotTables()) { try { $pt.RefreshTable() | Out-Null } catch { } }
+        } catch { }
+    }
     try {
         try { $wb.Application.CalculateFullRebuild() } catch { $wb.Application.Calculate() }
     } catch {
