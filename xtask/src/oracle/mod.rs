@@ -163,7 +163,15 @@ fn pivot_fixture() -> Result<(Workbook, String), String> {
     exec(&mut s, "file.new", json!({"sample": "sales"}))?;
     exec(&mut s, "insert.pivotTable", json!({"source": "Sales", "destination": "new"}))?;
     exec(&mut s, "pivot.addField", json!({"field": "Region", "area": "rows"}))?;
+    // A numeric field in Rows, grouped into ranges, and summed in Values: the cache then carries a
+    // `<fieldGroup>` with `rangePr startNum/endNum/groupInterval groupBy="range"` and one caption
+    // per group item, which no other fixture exercises.
+    exec(&mut s, "pivot.addField", json!({"field": "Q1", "area": "rows"}))?;
+    exec(&mut s, "pivot.group", json!({"field": "Q1", "start": 0, "end": 100_000, "interval": 25_000}))?;
     exec(&mut s, "pivot.addField", json!({"field": "Q1", "area": "values", "func": "sum"}))?;
+    // A value filter keeps only the buckets whose sum passes; its kept items are written as the
+    // field's `item/@h` hidden items.
+    exec(&mut s, "pivot.filterByValue", json!({"field": "Q1", "op": "greaterThan", "value": 40_000}))?;
     let pivots = exec(&mut s, "pivot.list", json!({}))?;
     let name = pivots
         .as_array()

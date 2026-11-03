@@ -45,7 +45,7 @@ declares. That one is not a heuristic — a strict XML parser rejects the part o
 | `budget` | accounting formats (built-in id 44), totals, a second sheet |
 | `grades` | pass marks, averages, conditional formatting over a small grid |
 | `features` | a merge, a note, a hyperlink, a list validation, frozen panes, a defined name, a custom number code |
-| `pivot` | a table-sourced PivotTable plus a slicer cache linked to it |
+| `pivot` | a table-sourced PivotTable plus a slicer cache linked to it; a numeric field in Rows grouped by `rangePr` (the cache's `startNum`/`endNum`/`groupInterval` + one caption per group item) and a value filter whose kept items are the field's hidden items |
 
 ## What it has found
 
@@ -71,6 +71,12 @@ declares. That one is not a heuristic — a strict XML parser rejects the part o
   holds only a report body is skipped. The source data on the other sheet is still compared.
 - **Not covered yet:** `.xls` import, encrypted packages, ODS, and a real-world corpus of
   Excel-authored files (that needs the pinned corpus repo, see [gaps.md §1](gaps.md)).
+
+- **2026-11-02 — the new PivotTable encodings go through both probes.** The `pivot` fixture now
+  groups a numeric field (`rangePr ... groupBy="range"`, 13 group captions) and applies a value
+  filter (hidden `item/@h`); openpyxl reads every cell back and WPS 12.0 opens, recalculates and
+  re-saves the package. This does not prove Excel accepts the parts — gate #1 — but it does prove
+  the XML is well formed and that a foreign application tolerates it.
 
 ## Adding a fixture
 
