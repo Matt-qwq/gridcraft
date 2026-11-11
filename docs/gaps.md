@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 17: `.xls` **embedded charts, autoshapes and text boxes** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** (five chart kinds; five shapes with their text, fill and line); §7 loses its charts and shapes items and is met for beta, leaving OLE objects and chart sheets as full scope. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 18: a real-world corpus run — **3,084 workbooks opened, 635 save/reopen with 0 mismatches, 16 files identical in Excel 16** — so #1 is met for beta; the pinned corpus remains for CI. Round 17: `.xls` **embedded charts, autoshapes and text boxes** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** (five chart kinds; five shapes with their text, fill and line); §7 loses its charts and shapes items and is met for beta, leaving OLE objects and chart sheets as full scope. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -16,9 +16,9 @@ Kinds: **F** feature · **U** UI/UX · **FF** file format · **H** hardware · *
 No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-gate).
 
 
-### 1. XLSX output not proven on a real-world corpus (FF)
-- **Missing:** a run over the pinned real-world XLSX corpus. The Excel run itself is no longer
-  missing: every oracle fixture opens, refreshes, recalculates and re-reads in Excel 16 (below).
+### 1. XLSX proven on a local real-world corpus; the pinned corpus remains (FF)
+- **Missing:** the pinned, sha256-verified corpus for CI (0–1 h once a URL or checkout exists). The
+  real-world proof itself landed on 11-03 (below).
 - **Landed 11-02 (Excel half):** the owner activated **Excel 16**, and [`cargo xtask oracle`](oracle.md)
   now opens every fixture in Excel as well as WPS: it refreshes every PivotTable, recalculates,
   saves a copy and reads it back, comparing every cell, format, merge, table, CF/DV/chart count
@@ -26,16 +26,26 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   prompt, no lost content — including a PivotTable with a grouped numeric field, a value filter
   and a slicer. The probe tolerates only Excel's own localized PivotTable chrome (`Row Labels`,
   `Grand Total`) because Excel re-renders those in its UI language.
-- **Still missing:** the pinned real-world corpus (3–6 h). The repo records no corpus URL and
-  `storytold/craftrules` (which would name it) is a private repository — a clone answers
-  "Repository not found" — so the corpus cannot be fetched here. **The run is one command now:**
-  `cargo xtask corpus <dir>` opens every workbook, reports warnings, saves/reopens one in five with
-  a digest comparison and reads the copy back through openpyxl, never writing into the directory
-  (see [oracle.md](oracle.md#the-corpus-run)); on a fresh `cargo xtask oracle --keep` directory it
-  is green. The owner's manual checks are in [excel-checks.md](excel-checks.md). An Excel-authored
-  `.xls` is the other open item, under §7.
+- **Landed 11-03 (the real-world corpus run):** a local 9.6 GB synced work folder with 3,199
+  workbooks was run through `cargo xtask corpus`: **3,084 readable workbooks opened, no reader
+  failure on a valid file, and 635 save → reopen cycles with zero digest mismatches** (the digest
+  now covers values, formula text, styles, merges, comments, links, validation/conditional-format
+  ranges, tables, names, charts, shapes and pictures). **Excel 16 reopened GridCraft's copies and
+  found them identical**: 12 files compared every formula and constant, 4 more (in-cell picture,
+  comments, external links, a 3.4M-cell workbook) matched sheet names/used ranges/cells, and all 37
+  readable `.xls` files converted and compared equal in content (one differs only in
+  formatting-only columns, exactly as Excel's own `.xls`→`.xlsx` conversion does). The 115 failures
+  were 4 invalid/truncated files (openpyxl also refuses them) and 111 password-protected files; 449
+  cloud-only placeholders were skipped. Details: `plan/corpus-run-2026-11-03.md` (local).
+- **Still missing:** the pinned corpus as a durable, shareable artefact for CI (the repo records no
+  corpus URL, and `storytold/craftrules` is private). The run is one command:
+  `cargo xtask corpus <dir> [--recursive] [--all] [--keep <dir>]` opens every workbook, prints each
+  warning/error, saves/reopens (one in five by default), compares the digest and reads the copy back
+  through openpyxl, never writing into the directory; `--keep` keeps the saved copies and a
+  `saved-copies.tsv` for an Excel-side check (see [oracle.md](oracle.md#the-corpus-run)). The
+  owner's remaining manual checks are [excel-checks.md](excel-checks.md) #7/#8/#10.
 - **Impact:** the main format; a repair prompt or silent loss destroys trust.
-- **Estimate:** 3–6 h of corpus work. It is independent of `.xls` and of Excel; `cargo xtask corpus <dir>` is the whole run. [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 0–1 h to pin a corpus for CI; the proof itself is met. [file-format-parity.md](file-format-parity.md)
 
 ### 2. Large workbooks: what remains of the open/save problem (P, H)
 - **Landed (10-24):** the read path streams a worksheet as it decompresses, decodes windows on
@@ -806,6 +816,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-03 | minor | §1: a local real-world corpus (9.6 GB, 3,199 workbooks) was run: 3,084 readable workbooks opened with no reader failure, 635 save/reopen with 0 mismatches (digest now covers formula text, merges, comments, links, CF/DV, tables, names, charts, shapes, pictures), and Excel 16 found GridCraft's copies identical on 16 `.xlsx` files plus all 37 readable `.xls`. #1 is met for beta; 4 invalid files (openpyxl also refuses), 111 encrypted and 449 cloud placeholders were out of reach, and the pinned corpus remains for CI (0–1 h) |
 | 2026-11-03 | minor | §7: `.xls` autoshapes and text boxes are read — Excel 2007+'s DrawingML fragment when present (geometry, fill, line, text, formatting), otherwise the OfficeArt type and anchor — and verified in Excel 16 with five shapes (same text/fill/line/positions; a block arrow becomes the model's arrowheaded line). The reader now tolerates drawings split across records and a trailing shape stored in a text box's Continue records. #7 is met for beta; OLE objects and chart sheets are full scope |
 | 2026-11-03 | minor | §7: `.xls` charts are read (the chart substream: kind and variants, series `BRAI` ranges, cached names, title, legend, and the anchor from the `msosptChart` shape) and verified in Excel 16 — a five-kind workbook converts and reopens with the same kinds, titles and anchors. Shapes, OLE objects and chart sheets remain, so #7 falls to 1–3 h. RC4 is re-scoped: Excel refuses a hand-made RC4 `.xlsx` (ECMA-376 Standard requires AES), so encrypted `.xls` output waits for a `.xls` writer |
 | 2026-11-03 | minor | Beta-blocker bookkeeping after round 16: §1 loses the Excel half (Excel 16 verifies every fixture), §7's evidence no longer says encryption cannot be written, §8's slicer evidence is Excel-16-verified and its estimate drops to 0–1 h (the corpus is #1's), §9's object context menus landed, §14 and §18 are updated (the status-bar accessibility entry landed, print polish is what remains), and the beta blockers are down to the corpus, `.xls` charts/RC4 and the field machines. No score change |

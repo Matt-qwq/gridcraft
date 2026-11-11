@@ -1,8 +1,9 @@
 # The foreign-implementation oracle
 
-> **Last reviewed:** 2026-11-02 · **Status:** Excel 16 is activated and is the gate probe (open,
-> refresh every PivotTable, recalculate, save, re-read); the **real-world corpus** half of gate #1
-> is still missing — see [gaps.md §1](gaps.md).
+> **Last reviewed:** 2026-11-03 · **Status:** Excel 16 is activated and is the gate probe (open,
+> refresh every PivotTable, recalculate, save, re-read). The real-world corpus half of gate #1 ran
+> on 11-03 on a local 3,084-workbook folder (0 save/reopen mismatches, Excel 16-identical copies);
+> the pinned corpus remains the CI artefact — see [gaps.md §1](gaps.md).
 
 GridCraft's target consumer is Microsoft Excel, and the one question a self round-trip cannot answer
 is *"does somebody else's reader accept this package?"*. `cargo xtask oracle` answers it with three
@@ -16,6 +17,7 @@ cargo xtask oracle --no-app           # foreign reader only (no COM application 
 cargo xtask oracle --keep             # keep the .xlsx artifacts in target/oracle/
 cargo xtask corpus <dir>              # open every .xlsx in a directory, save/reopen a sample,
                                       # read it back with openpyxl (never writes into <dir>)
+cargo xtask corpus <dir> --keep <out> # the same, keeping saved copies + saved-copies.tsv for Excel
 ```
 
 It is a development tool, not part of `cargo xtask ci`: it needs `python` with `openpyxl`, and the
@@ -54,21 +56,37 @@ declares. That one is not a heuristic — a strict XML parser rejects the part o
 ## The corpus run
 
 `cargo xtask corpus <dir>` is the one-command version of the run that gate #1 needs on real-world
-files: it opens every `.xlsx` in the directory (skipping `~$` temporary files), reports each
-workbook's sheet and cell count and its warnings, saves and reopens one in five (or `--all`) and
-compares a digest of sheet names, cells, values, formulas and number formats, and — when python and
-openpyxl are installed — reads the saved copy back through openpyxl. It **never writes into the
-corpus directory**: saved copies go to a temporary directory that is removed afterwards, and a
-directory over the caps (2,000 files, 4 GB) is refused rather than sampled. `--recursive` descends
-into subdirectories (eight levels); `--no-openpyxl` skips the foreign readback.
+files: it opens every readable `.xlsx` in the directory (skipping `~$` temporary files and
+cloud-sync placeholders that are not stored locally), prints each workbook's sheet and cell count,
+its warnings and its error, saves and reopens one in five (or `--all`) and compares a digest of the
+sheet (names, state, freeze, merges, comments, links, validation and conditional-format ranges,
+tables, charts, shapes, pictures, defined names, every cell's value, formula text and style), and —
+when python and openpyxl are installed — reads the saved copy back through openpyxl. It **never
+writes into the corpus directory**: saved copies go to a temporary directory that is removed
+afterwards, and a directory over the caps (2,000 files, 4 GB; 200 MB per file) is refused rather
+than sampled. `--recursive` descends into subdirectories (eight levels); `--no-openpyxl` skips the
+foreign readback.
+
+`--keep <out>` keeps the saved copies in `<out>` and writes `saved-copies.tsv` there (source →
+saved), which is what an Excel-side check needs: open a source and its saved copy in Excel and
+compare. Saved names carry the row index, so two paths that sanitize alike cannot overwrite each
+other.
 
 `cargo xtask corpus target/oracle` on a fresh `cargo xtask oracle --keep` run is green (15 fixtures
-and their Excel/WPS copies, 0 failures, 0 save/reopen mismatches). When a pinned corpus is available,
-point the command at its directory: a nonzero exit means at least one workbook failed to open or did
-not survive the round trip.
+and their Excel/WPS copies, 0 failures, 0 save/reopen mismatches). A local real-world run on 11-03
+(9.6 GB, 3,199 workbooks) opened 3,084 readable workbooks with no reader failure, saved/reopened
+635 with 0 mismatches, and Excel 16 found the copies identical; the 115 failures were 4 invalid
+files and 111 password-protected ones, and 449 cloud placeholders were skipped. The run's details
+are in `plan/corpus-run-2026-11-03.md` (local).
 
 ## What it has found
 
+- **2026-11-03 — a real folder is a harsher input than a fixture.** The corpus run over a real work
+  folder found a panic on a non-ASCII path in the report, cloud placeholders counted as failures, a
+  weak digest that missed formula text and every non-cell feature, and two `.xls` files whose saved
+  copy grew its used range to column IV because a trailing styled column range (default width,
+  `fUserSet = 0`) was written as a custom-width partial `<col>`. All four are fixed (commits
+  `09397e79`, `011d7ec1`).
 - **2026-11-02 — an undeclared `r:` prefix in a PivotTable part.** `slicer::pivot_ext` wrote
   `<x14:slicerCache r:id="rId2"/>` into `xl/pivotTables/pivotTableN.xml` without `xmlns:r` on that
   element, so `lxml` refused the part ("Namespace prefix r for id is not defined") and WPS refused

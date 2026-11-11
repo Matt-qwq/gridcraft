@@ -1,10 +1,15 @@
 # Excel checks: the owner's half day
 
-> **Last reviewed:** 2026-11-02 · **Who:** the owner (or anyone with Excel 16 on their own machine).
+> **Last reviewed:** 2026-11-03 · **Who:** the owner (or anyone with Excel 16 on their own machine).
 > **Why:** `cargo xtask oracle` covers what can be automated — Excel opens, refreshes every
 > PivotTable, recalculates, saves and GridCraft re-reads the copy, cell by cell, on five fixtures.
 > This page covers what it cannot: the repair prompt on real workbooks, how the parts look in
 > Excel's own UI, and the things Excel only shows interactively.
+>
+> **Status 11-03:** the automated half is green, and a local real-world corpus (3,084 readable
+> workbooks) opened with no reader failure, saved/reopened with 0 mismatches, and Excel 16 found
+> the copies identical. The checks below are the remaining fixture-level ones; the corpus section
+> adds how to point the same run at your own files.
 
 Nothing here needs a build of GridCraft except the fixtures: the oracle writes them.
 
@@ -54,6 +59,27 @@ For each of the five `*.gc.xlsx` files:
    never writes into the directory, so the copies stay as Excel saved them.)
 
 Report one line per file: `fixture | opens? | repair prompt? | notes`.
+
+### Your own real workbooks (optional, and now one command)
+
+If you have a folder of real `.xlsx` files, the automated half of this gate runs on them:
+
+```text
+cargo xtask corpus "<folder>" --recursive --keep "<scratch>"
+```
+
+It never writes into the folder. It prints per-file sheets/cells/warnings and any error, skips
+`~$` files and cloud-only placeholders, saves and reopens one in five (add `--all` for every file),
+compares the stronger digest and reads the copies back through openpyxl. `--keep` leaves the saved
+copies and `saved-copies.tsv` in `<scratch>` so you can open a source and its copy in Excel and
+compare.
+
+- **Pass:** `0 failed` on valid files and `0 mismatch(es)`; open a handful of saved copies from
+  `saved-copies.tsv` in Excel, **no repair prompt**, same values and look.
+- Password-protected workbooks need their password (they are reported, not guessed); invalid or
+  truncated files are reported and also fail openpyxl; a 200 MB single-file guard and a 2,000-file /
+  4 GB per-directory cap are deliberate — split the folder or make the online-only files available
+  offline first.
 
 ## Gate #8 — the PivotTable, refreshed and looked at
 
