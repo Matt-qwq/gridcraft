@@ -10,10 +10,11 @@
 //! alignment and number format; cell comments are read with their author and text. Data
 //! validation (_DVAL_/_DV_), conditional formats (_CONDFMT_/_CF_/_CFEX_, the cell-value and
 //! formula rules), hyperlinks (_HLINK_/_HLINKTOOLTIP_) and frozen panes (_PANE_/_WINDOW1_/_WINDOW2_)
-//! are read into the same model objects the `.xlsx` reader builds. Pictures and embedded charts
-//! are read too (charts into the model's chart objects, with their series ranges, kind, title and
-//! legend); chart sheets, shapes, OLE objects and PivotTables are skipped with a warning. Files
-//! encrypted with FILEPASS and pre-BIFF8 workbooks are refused with a message.
+//! are read into the same model objects the `.xlsx` reader builds. Pictures, embedded charts,
+//! autoshapes and text boxes are read too (charts with their series ranges, kind, title and
+//! legend; shapes from Excel 2007+'s DrawingML fragment, or from the OfficeArt type and anchor
+//! for an older writer); chart sheets, OLE objects, controls and PivotTables are skipped with a
+//! warning. Files encrypted with FILEPASS and pre-BIFF8 workbooks are refused with a message.
 
 mod chart;
 mod condfmt;
@@ -55,8 +56,9 @@ const MAX_COMMENTS: usize = 65_536;
 const MAX_HYPERLINK_CELLS: usize = 10_000;
 /// Conditional format rules kept per sheet.
 const MAX_CONDFMTS: usize = 65_536;
-/// Embedded charts read from one sheet.
+/// Embedded charts and shapes read from one sheet.
 const MAX_CHARTS: usize = 1024;
+const MAX_SHAPES: usize = 4096;
 /// Records read from the whole Workbook stream at most (a 65,536 × 256 sheet has fewer). One
 /// allowance shared by every substream: many BoundSheet records pointing into one huge
 /// substream must not each get their own.
@@ -234,7 +236,7 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     // The overview comes first.
     report.warnings.insert(
         0,
-        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats (including colour scales, data bars and icon sets), hyperlinks, frozen panes and defined names, pictures and embedded charts were read. Chart sheets, shapes and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
+        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats (including colour scales, data bars and icon sets), hyperlinks, frozen panes and defined names, pictures, embedded charts, shapes and text boxes were read. Chart sheets, OLE objects and controls are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
     );
     Ok((wb, report))
 }
@@ -740,22 +742,47 @@ fn worksheet(
             }
         }
     }
-    // Pictures are the other drawing object the model holds; shapes, controls and vector (EMF/WMF)
-    // pictures are skipped, counted once.
+    // Pictures and autoshapes/text boxes are the drawing objects the model holds; vector pictures,
+    // OLE objects and controls are skipped, counted once.
     if !st.drawing.is_empty() {
-        let (images, skipped) = officeart::read_images(&st.drawing, &st.g.blips, &st.sheet);
+        let (images, vector) = officeart::read_images(&st.drawing, &st.g.blips, &st.sheet);
         st.sheet.images = images;
-        if skipped > 0 {
-            report.warn("Some drawings in an .xls file (shapes or vector pictures) were not imported.");
+        let (shapes, unsupported) = officeart::read_shapes(&st.drawing, &st.sheet);
+        for mut shape in shapes {
+            if st.sheet.shapes.len() >= MAX_SHAPES {
+                break;
+            }
+            shape.id = next_object_id(&st.sheet);
+            st.sheet.shapes.push(shape);
+        }
+        if vector + unsupported > 0 {
+            report.warn("Some drawings in an .xls file (vector pictures, OLE objects or controls) were not imported.");
         }
     }
     Ok(Some((st.sheet, st.calc)))
 }
 
-/// An object id not already used on the sheet: pictures and charts share the space, and the
-/// reader starts at 1.
+/// Where an OfficeArt container starts in a `Continue` tail left after a text box's text: the
+/// record header's first two bytes are `0x000F` and the type is a container (`0xF00x`) or one of
+/// `Sp`/`Fsp`/`Opt`/`ClientTextbox` (`0xF00A`–`0xF00D`).
+fn officeart_start(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| {
+        w.first() == Some(&0x0F) && w.get(1) == Some(&0) && w.get(3) == Some(&0xF0) && matches!(w.get(2), Some(0x00..=0x05 | 0x0A..=0x0D))
+    })
+}
+
+/// An object id not already used on the sheet: pictures, charts and shapes share the space, and
+/// the reader starts at 1.
 fn next_object_id(sheet: &Sheet) -> u32 {
-    sheet.charts.iter().map(|c| c.id).chain(sheet.images.iter().map(|i| i.id)).max().unwrap_or(0).saturating_add(1)
+    sheet
+        .charts
+        .iter()
+        .map(|c| c.id)
+        .chain(sheet.images.iter().map(|i| i.id))
+        .chain(sheet.shapes.iter().map(|s| s.id))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 /// The shortest WINDOW2 a file holds (the chart-sheet form); a shorter one is truncated.
@@ -998,6 +1025,13 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             let text = c.chars(cch, high)?;
             if st.note_texts.len() < MAX_COMMENTS {
                 st.note_texts.push(text);
+            }
+            // Excel can carry the last shape's drawing in the Continue records that follow a
+            // text box's text (after the text's formatting data): an OfficeArt container header
+            // marks where it starts.
+            let rest = c.rest();
+            if let Some(at) = officeart_start(&rest) {
+                st.drawing.extend_from_slice(rest.get(at..).unwrap_or_default());
             }
         }
         // The drawings: an OfficeArt tree whose records may be split across several records;

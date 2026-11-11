@@ -312,6 +312,17 @@ fn read_shape(obj: &El, anchor: Anchor) -> Option<Shape> {
     Some(Shape { id: 0, kind, anchor, fill, line, text, alt, format })
 }
 
+/// Reads one DrawingML shape fragment that Excel 2007+ writes into a legacy `.xls` drawing
+/// (`drs/shapexml.xml` inside a tertiary-opt record): an `xdr:anchor` holding one
+/// `xdr:twoCellAnchor` and an `xdr:sp`. Returns the model shape (id 0; the caller assigns the
+/// sheet's next object id).
+pub(crate) fn read_xls_shape_fragment(xml: &str, sheet: &Sheet) -> Option<Shape> {
+    let root = crate::xml::parse(xml.as_bytes()).ok()?;
+    let anchor_el = root.child("twoCellAnchor")?;
+    let anchor = read_anchor(anchor_el, sheet)?;
+    read_shape(anchor_el.child("sp")?, anchor)
+}
+
 /// A shape's text formatting: vertical anchor (`a:bodyPr anchor`), the first paragraph's
 /// alignment and direction (`a:pPr algn`, `rtl`) and the first run's properties (`a:rPr`: size,
 /// bold, italic, fill, outline, `a:latin` typeface).

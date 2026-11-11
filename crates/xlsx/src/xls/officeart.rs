@@ -11,8 +11,10 @@
 //! an [`Image`], so it is skipped with a warning, like charts and shapes (which the caller models
 //! only as plain cells today).
 
+use std::io::Read;
+
 use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS};
-use gridcraft_model::{Anchor, AnchorMode, Image, Sheet};
+use gridcraft_model::{Anchor, AnchorMode, Image, Shape, ShapeKind, Sheet};
 
 /// Deepest nesting of OfficeArt containers followed (the real tree is four levels).
 const MAX_DEPTH: usize = 8;
@@ -34,6 +36,10 @@ const FSP_PICTURE_FRAME: u16 = 0x004B;
 /// `msosptChart`: the shape an embedded chart hangs from.
 const FSP_CHART: u16 = 0x00C9;
 const PIB: u16 = 0x0104;
+/// `OfficeArtTertiaryFOPT`: vendor data; Excel 2007+ puts a DrawingML shape fragment here.
+const TERTIARY_OPT: u16 = 0xF122;
+const FSP_LINE: u16 = 0x0014;
+const FSP_TEXT_BOX: u16 = 0x00CA;
 
 /// One OfficeArt record's header and payload.
 struct Record<'a> {
@@ -50,7 +56,14 @@ fn records<'a>(buf: &'a [u8], at: &mut usize) -> Option<Record<'a>> {
     let ty = u16::from_le_bytes([h[2], h[3]]);
     let len = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
     let start = *at + 8;
-    let data = buf.get(start..start.checked_add(len)?)?;
+    // A drawing is split across `MSODRAWING`/`Continue` records, so a container's declared size
+    // may run past the bytes gathered here; take what is present instead of losing the whole tree.
+    // A leaf record that runs past the buffer still ends the walk (that is truncation).
+    let data = match buf.get(start..start.checked_add(len)?) {
+        Some(d) => d,
+        None if matches!(ty, DG_CONTAINER | DG_GROUP | SP_CONTAINER | DGG_CONTAINER | BSTORE_CONTAINER) => buf.get(start..)?,
+        None => return None,
+    };
     *at = start + len;
     Some(Record { inst: vi >> 4, ty, data })
 }
@@ -156,14 +169,9 @@ fn walk_shapes(buf: &[u8], blips: &[Blip], sheet: &Sheet, out: &mut Vec<Image>, 
         // A group shape's own SP record has `spid`/`flags`, not the picture frame type; it holds
         // the children the walk reaches through the group container, so it is not a skipped
         // object. Any other non-picture leaf (a chart, an autoshape, a control) is.
-        if r.inst == FSP_CHART {
-            // The chart itself is read from its substream; only its anchor is needed there.
-            continue;
-        }
+        // Charts and the shapes are read by their own readers; only pictures count here. A
+        // picture frame without a usable raster blip (a vector picture) is what is skipped.
         if r.inst != FSP_PICTURE_FRAME {
-            if !is_group(r.data) {
-                *skipped += 1;
-            }
             continue;
         }
         // The rest of the shape follows in the same container; look ahead for its properties and
@@ -219,9 +227,108 @@ fn collect_charts(buf: &[u8], sheet: &Sheet, depth: usize, out: &mut Vec<Anchor>
     }
 }
 
-/// Whether an `OfficeArtFSP` payload is a group shape (its flags' `fGroup` bit).
-fn is_group(p: &[u8]) -> bool {
-    p.get(4..8).is_some_and(|f| f[0] & 0x01 != 0)
+/// Reads the autoshapes and text boxes of a sheet's drawing. Excel 2007+ writes a DrawingML
+/// fragment (`drs/shapexml.xml` in an `OfficeArtTertiaryFOPT` record) for each shape, which keeps
+/// its geometry, fill, line, text and text formatting; a shape without one (an older writer) is
+/// rebuilt from its `OfficeArtFSP` type and anchor. Returns the shapes and how many drawings were
+/// skipped (OLE objects, controls and shape types the model cannot express).
+pub(super) fn read_shapes(drawing: &[u8], sheet: &Sheet) -> (Vec<Shape>, usize) {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let mut at = 0usize;
+    while let Some(r) = records(drawing, &mut at) {
+        if r.ty == DG_CONTAINER {
+            walk_shape_containers(r.data, sheet, &mut out, &mut skipped);
+        }
+    }
+    (out, skipped)
+}
+
+fn walk_shape_containers(buf: &[u8], sheet: &Sheet, out: &mut Vec<Shape>, skipped: &mut usize) {
+    let mut at = 0usize;
+    while let Some(r) = records(buf, &mut at) {
+        if out.len() >= MAX_PICTURES {
+            return;
+        }
+        if r.ty == DG_GROUP {
+            walk_shape_containers(r.data, sheet, out, skipped);
+        } else if r.ty == SP_CONTAINER {
+            read_shape_container(r.data, sheet, out, skipped);
+        }
+    }
+}
+
+/// One `OfficeArtSpContainer`: the shape's type (`OfficeArtFSP`), its anchor, and its DrawingML
+/// fragment when the writer left one.
+fn read_shape_container(container: &[u8], sheet: &Sheet, out: &mut Vec<Shape>, skipped: &mut usize) {
+    let mut inst = 0u16;
+    let mut anchor = None;
+    let mut fragment: Option<Shape> = None;
+    let mut at = 0usize;
+    while let Some(r) = records(container, &mut at) {
+        match r.ty {
+            SP => inst = r.inst,
+            CLIENT_ANCHOR_SHEET if anchor.is_none() => anchor = read_anchor(r.data, sheet),
+            TERTIARY_OPT if fragment.is_none() => fragment = shape_fragment(r.data, sheet),
+            _ => {}
+        }
+    }
+    if inst == FSP_PICTURE_FRAME || inst == FSP_CHART {
+        return;
+    }
+    // A group shape's own `OfficeArtFSP` is type 0 and has no anchor; its children are the shapes.
+    if inst == 0 && anchor.is_none() {
+        return;
+    }
+    if let Some(shape) = fragment {
+        out.push(shape);
+        return;
+    }
+    let Some(anchor) = anchor else {
+        *skipped += 1;
+        return;
+    };
+    let Some(kind) = primitive_kind(inst) else {
+        *skipped += 1;
+        return;
+    };
+    out.push(Shape {
+        id: 0,
+        kind,
+        anchor,
+        fill: gridcraft_model::Color::default(),
+        line: gridcraft_model::Color::default(),
+        text: String::new(),
+        alt: None,
+        format: gridcraft_model::ShapeFormat::default(),
+    });
+}
+
+/// A shape type the model has a kind for, when a file has no DrawingML fragment.
+fn primitive_kind(inst: u16) -> Option<ShapeKind> {
+    Some(match inst {
+        0x01 => ShapeKind::Rectangle,
+        0x02 => ShapeKind::RoundedRectangle,
+        0x03 => ShapeKind::Ellipse,
+        0x05 => ShapeKind::Triangle,
+        FSP_LINE => ShapeKind::Line,
+        0x0D => ShapeKind::Arrow,
+        FSP_TEXT_BOX => ShapeKind::TextBox,
+        _ => return None,
+    })
+}
+
+/// The DrawingML fragment in an `OfficeArtTertiaryFOPT` record: a small zip holding
+/// `drs/shapexml.xml` after a 12-byte header (the zip may start at any offset; its signature is
+/// what identifies it). Bounded so a hostile record cannot inflate without limit.
+fn shape_fragment(payload: &[u8], sheet: &Sheet) -> Option<Shape> {
+    const MAX_FRAGMENT: usize = 1 << 20;
+    let start = payload.windows(4).take(64).position(|w| w == b"PK")?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(payload.get(start..)?)).ok()?;
+    let file = zip.by_name("drs/shapexml.xml").ok()?;
+    let mut xml = String::new();
+    file.take(MAX_FRAGMENT as u64).read_to_string(&mut xml).ok()?;
+    crate::drawing::read_xls_shape_fragment(&xml, sheet)
 }
 
 /// The remaining records of the same `OfficeArtSpContainer`: the property table's `pib` and the
