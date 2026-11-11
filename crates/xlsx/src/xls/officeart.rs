@@ -31,6 +31,8 @@ const DGG_CONTAINER: u16 = 0xF000;
 const BSTORE_CONTAINER: u16 = 0xF001;
 const FBSE: u16 = 0xF007;
 const FSP_PICTURE_FRAME: u16 = 0x004B;
+/// `msosptChart`: the shape an embedded chart hangs from.
+const FSP_CHART: u16 = 0x00C9;
 const PIB: u16 = 0x0104;
 
 /// One OfficeArt record's header and payload.
@@ -154,6 +156,10 @@ fn walk_shapes(buf: &[u8], blips: &[Blip], sheet: &Sheet, out: &mut Vec<Image>, 
         // A group shape's own SP record has `spid`/`flags`, not the picture frame type; it holds
         // the children the walk reaches through the group container, so it is not a skipped
         // object. Any other non-picture leaf (a chart, an autoshape, a control) is.
+        if r.inst == FSP_CHART {
+            // The chart itself is read from its substream; only its anchor is needed there.
+            continue;
+        }
         if r.inst != FSP_PICTURE_FRAME {
             if !is_group(r.data) {
                 *skipped += 1;
@@ -175,6 +181,41 @@ fn walk_shapes(buf: &[u8], blips: &[Blip], sheet: &Sheet, out: &mut Vec<Image>, 
         };
         let id = next_id(out);
         out.push(Image { id, anchor, data: blip.data.clone().into(), mime: blip.mime.to_string(), alt: String::new() });
+    }
+}
+
+/// The anchors of the `msosptChart` shapes in a sheet's drawing, in document order. An embedded
+/// chart has no pointer to its shape: the chart substreams appear in the same order as the chart
+/// shapes in the drawing ([MS-XLS] 2.2.3.1), so the caller pairs the n-th chart with the n-th
+/// anchor. A drawing split across several `MSODRAWING` records is one tree: the caller passes the
+/// concatenated payloads.
+pub(super) fn chart_anchors(drawing: &[u8], sheet: &Sheet) -> Vec<Anchor> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(r) = records(drawing, &mut at) {
+        if r.ty == DG_CONTAINER {
+            collect_charts(r.data, sheet, 0, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_charts(buf: &[u8], sheet: &Sheet, depth: usize, out: &mut Vec<Anchor>) {
+    if depth > MAX_DEPTH || out.len() >= MAX_PICTURES {
+        return;
+    }
+    let mut at = 0usize;
+    while let Some(r) = records(buf, &mut at) {
+        if r.ty == DG_GROUP || r.ty == SP_CONTAINER {
+            collect_charts(r.data, sheet, depth + 1, out);
+            continue;
+        }
+        if r.ty == SP && r.inst == FSP_CHART {
+            let (_, anchor) = shape_head(buf, at, sheet);
+            if let Some(anchor) = anchor {
+                out.push(anchor);
+            }
+        }
     }
 }
 

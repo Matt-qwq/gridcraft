@@ -10,10 +10,12 @@
 //! alignment and number format; cell comments are read with their author and text. Data
 //! validation (_DVAL_/_DV_), conditional formats (_CONDFMT_/_CF_/_CFEX_, the cell-value and
 //! formula rules), hyperlinks (_HLINK_/_HLINKTOOLTIP_) and frozen panes (_PANE_/_WINDOW1_/_WINDOW2_)
-//! are read into the same model objects the `.xlsx` reader builds. Charts, pictures, OLE objects
-//! and PivotTables are skipped with a warning, as are the `CF12` rules (colour scales, data bars,
-//! icon sets). Files encrypted with FILEPASS and pre-BIFF8 workbooks are refused with a message.
+//! are read into the same model objects the `.xlsx` reader builds. Pictures and embedded charts
+//! are read too (charts into the model's chart objects, with their series ranges, kind, title and
+//! legend); chart sheets, shapes, OLE objects and PivotTables are skipped with a warning. Files
+//! encrypted with FILEPASS and pre-BIFF8 workbooks are refused with a message.
 
+mod chart;
 mod condfmt;
 mod dxf;
 mod formula;
@@ -53,6 +55,8 @@ const MAX_COMMENTS: usize = 65_536;
 const MAX_HYPERLINK_CELLS: usize = 10_000;
 /// Conditional format rules kept per sheet.
 const MAX_CONDFMTS: usize = 65_536;
+/// Embedded charts read from one sheet.
+const MAX_CHARTS: usize = 1024;
 /// Records read from the whole Workbook stream at most (a 65,536 × 256 sheet has fewer). One
 /// allowance shared by every substream: many BoundSheet records pointing into one huge
 /// substream must not each get their own.
@@ -230,7 +234,7 @@ pub(crate) fn read_xls_with(bytes: &[u8], mut budget: Budget) -> Result<(Workboo
     // The overview comes first.
     report.warnings.insert(
         0,
-        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats (including colour scales, data bars and icon sets), hyperlinks, frozen panes and defined names, and pictures were read. Charts, shapes and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
+        "Imported from an Excel 97-2003 (.xls) workbook: values, formulas, fonts, fills, borders, alignment, number formats, merged cells, column widths, row heights, comments, data validation, conditional formats (including colour scales, data bars and icon sets), hyperlinks, frozen panes and defined names, pictures and embedded charts were read. Chart sheets, shapes and OLE objects are not imported yet. Save as .xlsx; saving .xls is not supported.".into(),
     );
     Ok((wb, report))
 }
@@ -465,6 +469,11 @@ struct SheetState<'g> {
     cf12_via_cfex: bool,
     /// The sheet's `MSODRAWING` payloads: the drawings, one OfficeArt tree when concatenated.
     drawing: Vec<u8>,
+    /// How many chart substreams the sheet held so far (skipped ones count: a chart's anchor is
+    /// the shape at its substream's position).
+    chart_index: usize,
+    /// The substream position of each chart kept, parallel to `sheet.charts`.
+    chart_anchor_index: Vec<usize>,
     /// Hyperlinks and their tooltips, paired once the whole sheet has been read.
     links: Vec<hyperlink::Link>,
     tooltips: Vec<(RangeRef, String)>,
@@ -589,6 +598,8 @@ fn worksheet(
         cf12_left: 0,
         cf12_via_cfex: false,
         drawing: vec![],
+        chart_index: 0,
+        chart_anchor_index: vec![],
         dv_expected: None,
         dv_seen: 0,
         dv_overflow: false,
@@ -604,8 +615,28 @@ fn worksheet(
         budget.record()?;
         match rec.id {
             BOF => {
-                // An embedded chart's substream.
+                // An embedded chart's substream: read it as a chart, then continue the sheet.
+                let (_, dt) = bof(&rec)?;
                 depth += 1;
+                if depth == 2 && dt == 0x0020 {
+                    let at = st.chart_index;
+                    st.chart_index = st.chart_index.saturating_add(1);
+                    match chart::read(&mut recs, budget, &st.g.links, None) {
+                        Ok(Some(mut chart)) => {
+                            if st.sheet.charts.len() < MAX_CHARTS {
+                                chart.id = next_object_id(&st.sheet);
+                                st.sheet.charts.push(chart);
+                                st.chart_anchor_index.push(at);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(IoError::Format(_)) => {
+                            report.warn("An embedded chart in an .xls file could not be imported (an unsupported kind or damaged records).")
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    depth -= 1;
+                }
                 continue;
             }
             EOF => {
@@ -699,16 +730,32 @@ fn worksheet(
     if st.cf12_via_cfex {
         report.warn("A colour scale, data bar or icon set introduced by a CFEx record was skipped; the other conditional formats were read.");
     }
-    // Pictures are the one drawing object the model holds; charts, shapes, controls and vector
-    // (EMF/WMF) pictures are skipped, counted once.
+    // A chart's anchor lives in the sheet drawing, not in the chart substream. The drawing is one
+    // tree split across `MSODRAWING` records, and the substreams are in the shapes' order.
+    if !st.sheet.charts.is_empty() {
+        let anchors = officeart::chart_anchors(&st.drawing, &st.sheet);
+        for (chart, at) in st.sheet.charts.iter_mut().zip(&st.chart_anchor_index) {
+            if let Some(anchor) = anchors.get(*at) {
+                chart.anchor = *anchor;
+            }
+        }
+    }
+    // Pictures are the other drawing object the model holds; shapes, controls and vector (EMF/WMF)
+    // pictures are skipped, counted once.
     if !st.drawing.is_empty() {
         let (images, skipped) = officeart::read_images(&st.drawing, &st.g.blips, &st.sheet);
         st.sheet.images = images;
         if skipped > 0 {
-            report.warn("Some drawings in an .xls file (charts, shapes or vector pictures) were not imported.");
+            report.warn("Some drawings in an .xls file (shapes or vector pictures) were not imported.");
         }
     }
     Ok(Some((st.sheet, st.calc)))
+}
+
+/// An object id not already used on the sheet: pictures and charts share the space, and the
+/// reader starts at 1.
+fn next_object_id(sheet: &Sheet) -> u32 {
+    sheet.charts.iter().map(|c| c.id).chain(sheet.images.iter().map(|i| i.id)).max().unwrap_or(0).saturating_add(1)
 }
 
 /// The shortest WINDOW2 a file holds (the chart-sheet form); a shorter one is truncated.
