@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (the beta blockers shrink to three external items: the pinned corpus (#1), `.xls` charts and RC4 writing (#7) and the field machines (#10); the entries' "still missing" lists, evidence and estimates are brought up to what landed in round 16 — `.xls` pictures and `CF12`, calculated items verified in Excel 16, the Analysis ToolPak at 19/19, keyboard object menus, the status-bar accessibility entry and shaped wrapped/shape text — and the stale "GridCraft can't write an encrypted file" and "the slicer has never been opened in Excel" claims are removed; no score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 17: `.xls` **embedded charts** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** on a five-kind workbook; §7 loses its charts item and its estimate falls to 1–3 h for shapes/OLE/chart sheets. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -364,7 +364,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus; Excel 16 is
   available now, the corpus is gate #1's. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls`: charts and shapes; RC4 encryption cannot be written (FF)
+### 7. Legacy `.xls`: shapes and OLE objects; encrypted `.xls` cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
@@ -436,20 +436,36 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   files; the field descriptions suggest the opposite, so the capture is the reference). Charts,
   autoshapes, controls and vector (EMF/WMF) pictures are skipped with one warning; malformed or
   truncated drawings are skipped, never a panic.
-- **Still missing:** `.xls` charts, shapes and OLE objects (dropped with a warning); BIFF5 is
-  refused; `.xls` is never written, and no Excel run has compared a written file against it.
+- **Landed 11-03 (charts):** embedded charts are read from their chart substream inside the
+  worksheet ([MS-XLS] 2.1.7.20.1): the chart group's kind (`Bar`/`Line`/`Pie`/`Area`/`Scatter`/
+  `Radar`, with the transpose/stacked/percentage/doughnut variants), each `Series` with its four
+  `BRAI` reference formulas (name, values, categories, bubble sizes) decoded through the same
+  formula reader as cells, the cached `SeriesText` name, the chart title from the `ObjectLink` with
+  `wLinkObj = 1`, and the legend. A chart's anchor comes from the `msosptChart` shape in the sheet
+  drawing — the drawing is one tree split across `MSODRAWING` records, and the substreams are in
+  shape order. 3-D, surface, bar-of-pie, chart sheets, shapes and OLE objects stay out with a
+  warning. **Verified in Excel 16:** an Excel-authored `.xls` with five kinds (stacked column, bar,
+  area, doughnut, radar) converts to `.xlsx` and reopens with the same chart count, kinds, titles
+  and cell anchors (radar comes back as radar-with-markers, the writer's style); a three-chart
+  workbook's exported chart renders with its title, series, category labels and legend.
+- **Still missing:** `.xls` shapes, OLE objects and chart sheets (dropped with a warning); BIFF5 is
+  refused; `.xls` is never written. RC4/encrypted `.xls` output needs a `.xls` writer and is not
+  scheduled.
 - **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
   formats, merges, sizes, names, styles, comments, validation, conditional formats (including
-  colour scales, data bars and icon sets), hyperlinks, frozen panes and pictures); charts, shapes
-  and OLE objects are not read, BIFF5 is refused and `.xls` is never written. Password-encrypted
-  `.xlsx` workbooks (Agile and Standard encryption) open with their password since #11 and are
-  **saved back protected** with the scheme they had; RC4, Extensible and certificate encryption
-  are not written. Encrypted `.xls` (FILEPASS) and RC4-encrypted packages are still refused with a
-  message.
+  colour scales, data bars and icon sets), hyperlinks, frozen panes, pictures and embedded charts);
+  shapes, OLE objects and chart sheets are not read, BIFF5 is refused and `.xls` is never written.
+  Password-encrypted `.xlsx` workbooks (Agile and Standard encryption) open with their password
+  since #11 and are **saved back protected** with the scheme they had. RC4 is **not** an ECMA-376
+  Standard cipher: [MS-OFFCRYPTO] 2.3.4.5 requires AES for an OOXML package, and Excel refuses a
+  hand-made RC4 package at both 40 and 128 bits (tested 11-03), so RC4 belongs to Office binary
+  documents (2.3.5/2.3.6) and an encrypted `.xls` write waits for a `.xls` writer. Encrypted `.xls`
+  (FILEPASS) is still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 4–11 h (charts 2–4, RC4 write 1, an Excel run over a `.xls` 1–6).
-  [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 1–3 h left (shapes and OLE objects; a chart-sheet reader is a further 2–4 h and not
+  a beta gate). Charts landed 11-03 and are verified in Excel 16; encrypted `.xls` write is out of
+  scope without an `.xls` writer. [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: data-model pivots and a real-world corpus (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
@@ -775,6 +791,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-03 | minor | §7: `.xls` charts are read (the chart substream: kind and variants, series `BRAI` ranges, cached names, title, legend, and the anchor from the `msosptChart` shape) and verified in Excel 16 — a five-kind workbook converts and reopens with the same kinds, titles and anchors. Shapes, OLE objects and chart sheets remain, so #7 falls to 1–3 h. RC4 is re-scoped: Excel refuses a hand-made RC4 `.xlsx` (ECMA-376 Standard requires AES), so encrypted `.xls` output waits for a `.xls` writer |
 | 2026-11-03 | minor | Beta-blocker bookkeeping after round 16: §1 loses the Excel half (Excel 16 verifies every fixture), §7's evidence no longer says encryption cannot be written, §8's slicer evidence is Excel-16-verified and its estimate drops to 0–1 h (the corpus is #1's), §9's object context menus landed, §14 and §18 are updated (the status-bar accessibility entry landed, print polish is what remains), and the beta blockers are down to the corpus, `.xls` charts/RC4 and the field machines. No score change |
 | 2026-11-02 | minor | §1: the corpus run is one command — `cargo xtask corpus <dir>` (open every workbook, per-file warnings, save/reopen digest of names/cells/values/formulas/formats, openpyxl readback, temp-only writes, caps) and it is green on a fresh oracle directory; the real-world corpus itself is still missing because `storytold/craftrules` is private. Added `docs/excel-checks.md`, the owner's executable checklist for #1/#7/#8/#10 |
 | 2026-11-02 | minor | §13: the Analysis ToolPak is **complete (19/19)** — Sampling (periodic/random with a seed), Random Number Generation (uniform, normal, Bernoulli, binomial, Poisson, pattern, discrete; one seeded SplitMix64) and Fourier Analysis (power-of-two real or `a+bi` input, radix-2 FFT, complex text out) joined the z-Test and the two-factor ANOVAs. Remaining in the gap: Solver refinements and the Forecast Sheet options |
