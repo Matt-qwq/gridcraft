@@ -691,6 +691,22 @@ fn a_zero_default_column_width_round_trips() {
     assert_eq!(b.cols, s.cols, "cols differ after reload");
 }
 
+/// A column run that ends at the 256th column is "all remaining columns": Excel's own `.xls`
+/// conversion writes `max="16384"`, and a partial range (28..256) would make Excel count those
+/// columns as used and grow the sheet's used range.
+#[test]
+fn a_trailing_column_run_reaches_the_sheet_end() {
+    let body = r#"<sheetFormatPr defaultRowHeight="15"/>
+      <cols><col min="256" max="256" width="20" customWidth="1" style="1"/></cols>
+      <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    let bytes = crate::write_xlsx(&wb).unwrap();
+    let mut pkg = crate::package::Package::open(&bytes).unwrap();
+    let sheet = pkg.read_xml("xl/worksheets/sheet1.xml").unwrap().unwrap();
+    let cols: Vec<_> = sheet.child("cols").unwrap().kids("col").map(|c| (c.attr_u32("min"), c.attr_u32("max"))).collect();
+    assert_eq!(cols, [(Some(256), Some(16384))]);
+}
+
 /// `customWidth="1"` pins a column even when its width rounds to the default: Standard Width does not
 /// move it, and a save must keep its `<col>` (openpyxl writes 9.08 for Excel's 8.43, #1607).
 #[test]

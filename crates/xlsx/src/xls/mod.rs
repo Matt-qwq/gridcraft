@@ -934,7 +934,11 @@ fn sheet_record(rec: &Record<'_>, st: &mut SheetState<'_>, budget: &mut Budget, 
             }
             let mut info = LineInfo::default();
             let px = col_width_to_px(f64::from(width) / 256.0);
-            if flags & 0x0002 != 0 || px != st.sheet.default_col_width {
+            // The width is only the column's own when the user set it (`fUserSet`) or Excel
+            // fitted it (`fBestFit`). A default-width range that merely carries a style (Excel
+            // writes one for all columns after the last used one) must not become a custom width:
+            // Excel would then treat those columns as used and grow the sheet's used range.
+            if flags & 0x0006 != 0 {
                 info.size = Some(px);
             }
             info.hidden = flags & 0x0001 != 0;

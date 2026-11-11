@@ -264,7 +264,13 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
         s.push_str("<cols>");
         let mut run: Option<(u32, u32, LineInfo)> = None;
         let flush = |s: &mut String, r: (u32, u32, LineInfo)| {
-            let (a, b, i) = r;
+            let (a, mut b, i) = r;
+            // A run that ends at the 256th column means "all remaining columns": Excel's own
+            // .xls conversion writes max="16384" for the trailing style, and a partial range
+            // (28..256) makes Excel treat those columns as used and grow the used range.
+            if b + 1 == 256 {
+                b = gridcraft_core::MAX_COLS - 1;
+            }
             let w = i.size.unwrap_or(sheet.default_col_width);
             let _ = write!(s, "<col min=\"{}\" max=\"{}\" width=\"{}\"", a + 1, b + 1, num(px_to_col_width(w)));
             if let Some(st) = i.style {

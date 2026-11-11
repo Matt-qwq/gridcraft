@@ -375,6 +375,27 @@ fn text_result_of_a_formula_kept_as_its_value() {
 }
 
 #[test]
+fn a_styled_column_range_without_a_user_width_keeps_no_custom_width() {
+    // COLINFO flags 0: not user-set and not best-fit. Excel writes one trailing range for all
+    // columns after the data with a style but no user width; turning its default width into a
+    // custom one makes Excel count those columns as used (the used range grew to IV).
+    let globals = |pos: u32| {
+        cat(&[
+            &bof(0x0005),
+            &rec(0x0085, &cat(&[&pos.to_le_bytes(), &[0, 0, 6, 0], b"Sheet1"])),
+            &rec(0x00E0, &cat(&[&u16s(&[0, 0, 0]), &[0; 14]])),
+            &eof(),
+        ])
+    };
+    let sheet =
+        cat(&[&bof(0x0010), &rec(0x007D, &u16s(&[0, 255, 2304, 0, 0, 0])), &rec(0x0203, &cat(&[&cell(0, 0, 0), &1.0f64.to_le_bytes()])), &eof()]);
+    let pos = globals(0).len() as u32;
+    let file = compound("Workbook", &cat(&[&globals(pos), &sheet]));
+    let (wb, _) = read_xls(&file).unwrap();
+    assert!(wb.sheets[0].cols.get(&40).is_none_or(|i| i.size.is_none()), "no column in the range gets a custom width");
+}
+
+#[test]
 fn refuses_encrypted_old_and_foreign_files() {
     // FILEPASS in the globals: an encrypted workbook.
     let mut stream = bof(0x0005);
