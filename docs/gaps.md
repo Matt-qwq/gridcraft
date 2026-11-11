@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** major (Excel 16 is activated and the oracle verifies every fixture in it — open, refresh, recalc, save, re-read, compare — and a PivotTable number-group encoding bug it found is fixed; the corpus half of gate #1 is still recorded as impossible on this machine — no corpus URL, no checkout, no network; a fresh 100 × 200 soak after the PivotTable changes is green; PivotTable label and value filters keep the items whose captions or aggregates match; PivotTable number grouping buckets a number field into ranges, the way the Group Field dialog does; GETPIVOTDATA reads a report cell by its field items; the owner recorded that Excel is unlicensed on the dev machine, so gate #1 stays open and owner-blocked; `cargo xtask oracle` reads our output back through openpyxl and WPS as the accepted substitute and found a PivotTable part with an undeclared `r:` prefix, now fixed and guarded by the package validator; a timeline's range handles drag on the sheet, a chart series moves to the secondary axis, combo series keep their order across save/reopen, and a 100 × 200 command-sequence soak is green) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (the beta blockers shrink to three external items: the pinned corpus (#1), `.xls` charts and RC4 writing (#7) and the field machines (#10); the entries' "still missing" lists, evidence and estimates are brought up to what landed in round 16 — `.xls` pictures and `CF12`, calculated items verified in Excel 16, the Analysis ToolPak at 19/19, keyboard object menus, the status-bar accessibility entry and shaped wrapped/shape text — and the stale "GridCraft can't write an encrypted file" and "the slicer has never been opened in Excel" claims are removed; no score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -16,8 +16,9 @@ Kinds: **F** feature · **U** UI/UX · **FF** file format · **H** hardware · *
 No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-gate).
 
 
-### 1. XLSX output not proven in Excel or on real files (FF)
-- **Missing:** a run over a real-world XLSX corpus and an Excel run over `.xls` files.
+### 1. XLSX output not proven on a real-world corpus (FF)
+- **Missing:** a run over the pinned real-world XLSX corpus. The Excel run itself is no longer
+  missing: every oracle fixture opens, refreshes, recalculates and re-reads in Excel 16 (below).
 - **Landed 11-02 (Excel half):** the owner activated **Excel 16**, and [`cargo xtask oracle`](oracle.md)
   now opens every fixture in Excel as well as WPS: it refreshes every PivotTable, recalculates,
   saves a copy and reads it back, comparing every cell, format, merge, table, CF/DV/chart count
@@ -34,7 +35,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   is green. The owner's manual checks are in [excel-checks.md](excel-checks.md). An Excel-authored
   `.xls` is the other open item, under §7.
 - **Impact:** the main format; a repair prompt or silent loss destroys trust.
-- **Estimate:** 3–6 h of corpus work (no Excel needed) after gate #7's `.xls` slice. [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 3–6 h of corpus work. It is independent of `.xls` and of Excel; `cargo xtask corpus <dir>` is the whole run. [file-format-parity.md](file-format-parity.md)
 
 ### 2. Large workbooks: what remains of the open/save problem (P, H)
 - **Landed (10-24):** the read path streams a worksheet as it decompresses, decodes windows on
@@ -360,10 +361,10 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   transcription error resolved by the documented rule. An Excel-computed corpus run stays part of
   gate #1.
 - **Impact:** wrong numbers are worse than missing features.
-- **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus once Excel is
-  available. [function-parity.md](function-parity.md#formula-language)
+- **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus; Excel 16 is
+  available now, the corpus is gate #1's. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls`: charts; RC4 encryption cannot be written (FF)
+### 7. Legacy `.xls`: charts and shapes; RC4 encryption cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
@@ -436,14 +437,15 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   autoshapes, controls and vector (EMF/WMF) pictures are skipped with one warning; malformed or
   truncated drawings are skipped, never a panic.
 - **Still missing:** `.xls` charts, shapes and OLE objects (dropped with a warning); BIFF5 is
-  refused; `.xls` is never written.
+  refused; `.xls` is never written, and no Excel run has compared a written file against it.
 - **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
   formats, merges, sizes, names, styles, comments, validation, conditional formats (including
   colour scales, data bars and icon sets), hyperlinks, frozen panes and pictures); charts, shapes
   and OLE objects are not read, BIFF5 is refused and `.xls` is never written. Password-encrypted
-  `.xlsx` workbooks (Agile and Standard encryption) open with their password since #11, but are
-  saved without it: GridCraft can't write an encrypted file yet. Encrypted `.xls` (FILEPASS) and
-  RC4-encrypted files are still refused with a message.
+  `.xlsx` workbooks (Agile and Standard encryption) open with their password since #11 and are
+  **saved back protected** with the scheme they had; RC4, Extensible and certificate encryption
+  are not written. Encrypted `.xls` (FILEPASS) and RC4-encrypted packages are still refused with a
+  message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
 - **Estimate:** 4–11 h (charts 2–4, RC4 write 1, an Excel run over a `.xls` 1–6).
@@ -577,16 +579,15 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   pivot cell is clicked) is not wired into the grid yet.
 - **Evidence:** `parity-checklist.md` missing `insert.pivotChart`, `data.relationships`; the slicer
   evidence is `crates/model/src/slicer.rs`, `crates/xlsx/src/slicer.rs` (the modelled-vs-kept contract
-  is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part has
-  never been opened in Excel — gate #1. The number-grouping, hidden-item and calculated-item
-  encodings do pass [`cargo xtask oracle`](oracle.md) on the `pivot` fixture **in Excel 16**
+  is documented at the top), `slicer_tests.rs`, engine `cmd/slicer.rs`. The written slicer part is
+  opened, refreshed and re-read in Excel 16 on the `pivot` fixture; the number-grouping, hidden-item
+  and calculated-item encodings do pass [`cargo xtask oracle`](oracle.md) on the `pivot` fixture **in Excel 16**
   (open, refresh every pivot, recalculate, save, re-read: every compared cell equal, and Excel's own
   copy still carries the `<calculatedItems>` definition and the recomputed item), as well as
   openpyxl's readback and WPS 12.0's open/recalculate/save.
 - **Impact:** pivots are the analyst's main tool.
-- **Estimate:** 3–6 h to close beta: a real-world corpus for the PivotTable gate (no corpus URL in
-  the repo and no network here). The full scope keeps data-model (OLAP) pivots and writing Excel's
-  own `<filters>` rules.
+- **Estimate:** 0–1 h for beta (the real-world corpus is counted once under #1). The full scope
+  keeps data-model (OLAP) pivots and writing Excel's own `<filters>` rules.
 
 ### 9. Keyboard-first users: key tips, shortcuts, context menus (U)
 - **Landed (10-29):** key tips now cover the whole ribbon — 417 sequences across every tab, group
@@ -600,12 +601,15 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   selection, and Space cannot start an edit behind the menu. Six Excel shortcuts were added on
   commands that already existed (`Alt+;`, `Ctrl+Shift+O`, `Ctrl+F2`, `Ctrl+Shift+F12`, `Alt+F5`,
   `Ctrl+Alt+F5`). The full Excel → command-id → status audit is in [ui-parity.md](ui-parity.md).
+- **Landed 11-03 (object menus):** `Shift+F10` with a chart, picture or shape selected opens the
+  same menu the mouse does (delete, alternative text, size and position, bring to front, reset),
+  navigable with arrows/Enter/Esc, with focus staying on the object; the cell menu is used when
+  nothing is selected.
 - **Still missing:** the Menu key itself (egui-winit 0.36 drops `KeyCode::ContextMenu` before the app
-  and egui has no `Key` variant for it), context menus for charts/pictures/shapes from the keyboard,
-  QAT/title bar/Backstage badges, the View tab's two combo boxes, and per-item badges in menus whose
-  items share one command id. Remaining Excel shortcuts map to features we do not have yet (Quick
-  Analysis, extend mode, pane cycling, sheet groups, Paste Name, Repeat, outline symbols, formula-bar
-  expand, window keys).
+  and egui has no `Key` variant for it), QAT/title bar/Backstage badges, the View tab's two combo
+  boxes, and per-item badges in menus whose items share one command id. Remaining Excel shortcuts
+  map to features we do not have yet (Quick Analysis, extend mode, pane cycling, sheet groups, Paste
+  Name, Repeat, outline symbols, formula-bar expand, window keys).
 - **Estimate:** 0–6 h of the 12–20 left (the missing extras above). [ui-parity.md](ui-parity.md)
 
 ### 10. Crashes and freezes reported from the field (S)
@@ -692,7 +696,10 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 ### 14. Page Layout view and print polish (U, F)
 - Page Layout view landed (#329): paper view with rulers and in-place header/footer editing.
-  Margins are dragged on the rulers (#792). Remaining: pictures in headers/footers, Different First Page / Odd & Even pages. Desktop now submits directly through craft-print with printer choice, copies, duplex and grayscale; browser printing stays available. Print ranges and driver tray/options UI remain. **Estimate:** 5–10 h.
+  Margins are dragged on the rulers (#792). Remaining: pictures in headers/footers, Different First
+  Page / Odd & Even pages, print ranges and driver tray/options UI. Desktop submits directly through
+  craft-print with printer choice, copies, duplex and grayscale; browser printing stays available.
+  **Estimate:** 5–10 h (the two page-parity options are the beta-visible part).
 
 ### 15. Remaining functions and an oracle suite (F)
 - **9 missing by name** (514 of Microsoft's 523 present, 505 working): DETECTLANGUAGE, TRANSLATE,
@@ -734,7 +741,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   a yellow selection border and header highlight, cyan accents, and a white sheet page that keeps
   its own black text (as Excel's high-contrast themes do — the document is not the chrome). egui's
   own widgets go dark with it so menus and dialogs stay readable. The preference is kept across
-  restarts (`ui.json`). Remaining: an accessibility entry in the status bar. **Estimate:** 1–2 h. [ui-parity.md](ui-parity.md#accessibility)
+  restarts (`ui.json`).
+- **Landed 11-03 (the status bar):** an Accessibility entry shows the issue count from
+  `review.checkAccessibility` (cached per document revision, since the check walks every sheet) and
+  opens the same dialog as the Review tab; it is focusable and keyboard reachable. **Estimate:**
+  0–1 h, none of it blocking beta. [ui-parity.md](ui-parity.md#accessibility)
 
 ### 19. XLSB/ODS beyond values; minor formats (FF)
 - XLSB and ODS import values only, no write; no `.prn`, `.dif`, `.slk`, XML Spreadsheet 2003; CSV
@@ -764,6 +775,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-03 | minor | Beta-blocker bookkeeping after round 16: §1 loses the Excel half (Excel 16 verifies every fixture), §7's evidence no longer says encryption cannot be written, §8's slicer evidence is Excel-16-verified and its estimate drops to 0–1 h (the corpus is #1's), §9's object context menus landed, §14 and §18 are updated (the status-bar accessibility entry landed, print polish is what remains), and the beta blockers are down to the corpus, `.xls` charts/RC4 and the field machines. No score change |
 | 2026-11-02 | minor | §1: the corpus run is one command — `cargo xtask corpus <dir>` (open every workbook, per-file warnings, save/reopen digest of names/cells/values/formulas/formats, openpyxl readback, temp-only writes, caps) and it is green on a fresh oracle directory; the real-world corpus itself is still missing because `storytold/craftrules` is private. Added `docs/excel-checks.md`, the owner's executable checklist for #1/#7/#8/#10 |
 | 2026-11-02 | minor | §13: the Analysis ToolPak is **complete (19/19)** — Sampling (periodic/random with a seed), Random Number Generation (uniform, normal, Bernoulli, binomial, Poisson, pattern, discrete; one seeded SplitMix64) and Fourier Analysis (power-of-two real or `a+bi` input, radix-2 FFT, complex text out) joined the z-Test and the two-factor ANOVAs. Remaining in the gap: Solver refinements and the Forecast Sheet options |
 | 2026-11-02 | minor | §13: both **two-factor ANOVAs** landed (`anovaTwoFactor` without replication: Rows/Columns/Error and a rows-then-columns SUMMARY; `anovaTwoFactorRep` with replication: Sample/Columns/Interaction/Within/Total and one SUMMARY block per row level, `rowsPerSample` replicates per cell). 16 of 19 tools; Fourier Analysis, Random Number Generation and Sampling remain |

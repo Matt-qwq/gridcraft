@@ -5,7 +5,7 @@ GridCraft is a clean-room, open-source, Rust-native spreadsheet targeting Micros
 Standards and learnings shared across the crafting apps live in `../../craftrules` (checked out next to the craft apps, or `storytold/craftrules`). Read its `AGENTS.md` at the start of a session, follow its standards, and contribute reusable learnings back there. Never code: repos don't share code.
 
 ## Start every session here
-1. Read `plan/STATUS.md` (current milestone, next task), then the task in `plan/execution-plan.md` and the relevant `plan/architecture.md` section. Behaviour reference: `plan/excel/*.md` (`observed-ui.md` holds measured observations of the running app).
+1. Read `plan/STATUS.md` (current state, what landed, the next task), then the current round in `plan/ROUND-*.md` (its exit checklist says what is left) and `plan/HANDOVER.md` for the design notes behind a subsystem. Behaviour reference: `plan/excel/*.md` (`observed-ui.md` holds measured observations of the running app) and `plan/oracle/` (the captured Excel probes).
 2. Follow the autonomous operation protocol (`plan/execution-plan.md` §7). Don't stop to ask unless §7 lists the decision as the user's.
 
 `plan/` is gitignored (local only).

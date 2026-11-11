@@ -203,13 +203,14 @@ egui frontend is a separate crate, so the UI can be swapped without touching the
 
 ## Roadmap
 
-GridCraft is in **alpha**: the core workflow works end to end, but depth, fidelity and file
-compatibility are still rough. It covers 89% of standard ribbon commands in our catalog
-([`docs/parity-checklist.md`](docs/parity-checklist.md)) and 513 standard worksheet functions
-([`docs/function-parity.md`](docs/function-parity.md)); this is a parity inventory, not a count of working implementations. Weighted by what spreadsheet users rely on, we
-estimate it is about 50% ready for real work. Next up: XLSX fidelity on real-world files, very large
-workbooks and multi-threaded recalc, chart depth, text in every script, and `.xls` import. Stage,
-numbers and estimates are in [ROADMAP.md](ROADMAP.md); the ranked work list is [`docs/gaps.md`](docs/gaps.md).
+GridCraft is in **alpha**: the core workflow works end to end, and the beta gates are closed
+except the ones that need outside material. It covers 280 of 295 standard ribbon commands in our
+catalog ([`docs/parity-checklist.md`](docs/parity-checklist.md)) and 514 standard worksheet
+functions ([`docs/function-parity.md`](docs/function-parity.md)); this is a parity inventory, not a
+count of working implementations. Weighted by what spreadsheet users rely on, we estimate it is
+about 55% ready for real work. Next up: the pinned real-world XLSX corpus, `.xls` charts and RC4
+writing, and the hardware behind the field crash reports. Stage, numbers and estimates are in
+[ROADMAP.md](ROADMAP.md); the ranked work list is [`docs/gaps.md`](docs/gaps.md).
 
 ## Downloads
 

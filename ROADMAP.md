@@ -1,8 +1,8 @@
 # GridCraft roadmap
 
-**Stage: alpha** · large-workbook beta gate met · next: beta, ~24 points of "ready for real work" and ~65–115 h away
+**Stage: alpha** · large-workbook beta gate met · next: beta, ~20 points of "ready for real work" and ~25–50 h away (most of it verification that needs the pinned corpus and the machines the field reports came from)
 
-> **Last reviewed:** 2026-11-02 · **Last updated:** 2026-11-02 · **Change:** minor (the corpus run is one command — `cargo xtask corpus <dir>` opens every workbook, reports warnings, save/reopens a sample and reads it back with openpyxl without writing into the directory — and `docs/excel-checks.md` is the owner's executable checklist for #1/#7/#8/#10; before it, word-wrapped cells and chart labels are shaped — each line shaped and aligned on its own, RTL general text aligned right, chart layout measured shaped; printable ASCII keeps the unshaped wrap; before it, `.xls` **pictures** are read from OfficeArt — the blip store, `msosptPictureFrame` shapes, `pib`, client anchors and Excel's placement bits; before it, `.xls` **CF12** rules are read — colour scales, data bars and icon sets — settled against Excel 16-authored files, which also showed Excel's percentile-as-type-7 threshold and its inverted data-bar show-value bit; three Excel `.xls` files read end to end match Excel's own `.xlsx` copies; #7 falls to 4–11 h. Before it, PivotTable calculated items are in — `pivot.calculatedItem` computes an item of a row or column field from that field's own items, sorted last and out of the grand totals, written in Excel's own encoding (the caption as the field's last shared item with `f="1"`, `<item f="1" x>`, `<calculatedItems>` on the cache with the `Field[item]` formula) and verified in Excel 16, which keeps the definition across open/refresh and recomputes the item (116,320) with every compared cell equal; gate #8 is met for beta, leaving the corpus under #1) · **Previous change:** major (Excel 16 is activated: the oracle opens/refreshes/re-saves every fixture in it and all agree, finding and fixing a PivotTable number-group encoding bug; PivotTable label and value filters keep items by caption or aggregate; PivotTables gain number grouping — `pivot.group` start/end/interval, half-open buckets, `rangePr` in the cache, model and save/reopen; GETPIVOTDATA reads a report cell by its field items, in every layout and with Σ Values in Rows, subtotals and page filters, and a refresh recalculates it; gate #1's Excel half is met (the owner activated Excel 16) and `cargo xtask oracle` opens, refreshes, recalculates and re-saves every fixture in Excel as well as openpyxl and WPS — all five agree, and the run found and fixed a PivotTable number-group encoding bug; high contrast: a black/white/yellow chrome from View ▸ Show; a screen reader can walk the sheet — the visible cells are an AccessKit grid; alternative text for charts and shapes with a checker that navigates to each issue; a PivotTable filter records its area, so a page filter on an axis field keeps its row; a data label's own font — size, bold, colour — is modelled at the chart, series and point level; a click on a chart element selects it; a chart point carries its own marker size; custom error-bar references are editable in the pane; a timeline's selected range handles drag on the sheet; a chart series moves to the secondary axis; chart edits patch the kept part, unmodelled kinds kept whole; **gate #4 is met**, so only the corpus (3–6 h), gate #7 4–11 h and #8's corpus remainder (0–1 h) remain; beta ~65–115 h) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 16 closed the owner-free half of the beta tail: `.xls` pictures and `CF12` rules are read; PivotTable calculated items are modelled, written in Excel's own encoding and **verified in Excel 16**; the Analysis ToolPak is **19/19**; `Shift+F10` opens a selected object's menu; the status bar counts accessibility issues; wrapped cell text, chart labels and shape text are shaped; and `cargo xtask corpus <dir>` plus `docs/excel-checks.md` make the owner's Excel half day one command and one checklist. What is left of beta is the pinned corpus (3–6 h), `.xls` charts and RC4 writing (4–11 h) and the field machines (#10, 8–12 h). This pass syncs the status pages to that state and to the 10-30 consolidated re-score — no score change) · **Previous change:** major (Excel 16 is activated: the oracle opens, refreshes, recalculates, saves and re-reads every fixture in it and all five agree, and the PivotTable number-group encoding bug it found is fixed; gate #1's Excel half, gate #4 and gate #8 for beta are met) · **Target:** Microsoft Excel (Microsoft 365)
 
 GridCraft aims at full Microsoft Excel parity, and at being better in places: faster, open (XLSX
 is the native format), fully scriptable by agents (MCP, control channel, CLI), and on the web.
@@ -23,17 +23,17 @@ This page is the summary. The detail is in:
 |---|---|---|
 | 2026-10-14 | Editing a cell with text that would read back as a number, boolean, date or formula (entered with a leading apostrophe) shows the apostrophe in the editor and formula bar, so Enter unchanged keeps it text (#1362) |
 | **Feature breadth** (weighted) | **~78%** | estimated, anchored on two measurements: ribbon catalog 280 / 295 (94.9%), worksheet functions 514 / 523 (98.3%; 505 working, 96.6%) |
-| **Ready for real work** | **~55%** | estimated from written weights (54.6), re-measured 2026-10-30 after the ten-29/30 wave; [target-app-parity.md](docs/target-app-parity.md) |
+| **Ready for real work** | **~55%** | estimated from written weights (54.8), re-measured 2026-10-30 after the ten-29/30 wave; [target-app-parity.md](docs/target-app-parity.md) |
 | **Mainstream practitioner** | **~56%** | estimated: typical analyst/finance user, weekly features, 73.6 depth × 0.92 interaction × 0.92 stability × 0.90 file exchange; [method](docs/target-app-parity.md#mainstream-practitioner) |
 | **Essentials user** | **~67%** | estimated: core features only, 82.0 depth × 0.92 launch/stability × 0.96 clarity × 0.92 opening sent files; [method](docs/target-app-parity.md#essentials-user) |
-| Remaining to **beta** | **~65–115 Opus 5.5 agent-hours** | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates); large-workbook gate met; pass-through (#3), keyboard (#9), **charts (#4, closed 11-02)**, the PDF half of #5, slicers/timelines, grouping, filters and **calculated items (#8, met 11-02)** landed, and gates #6 (oracle suite) and #7 (encryption hardening) moved |
+| Remaining to **beta** | **~15–38 Opus 5.5 agent-hours** + an 8–12 h release run | estimated; itemized in [roadmap.md](docs/roadmap.md#beta-gates). Gates #2–#6, #8 and #9 are met for beta (charts and PivotTables verified in Excel 16); what is left is the pinned corpus (#1, 3–6 h), `.xls` charts and RC4 writing (#7, 4–11 h), the field machines (#10, 8–12 h) and #5's coverage tail (0–3 h). Most of it needs the owner's corpus and machines |
 | Remaining to **full parity** | **~627–1,020 Opus 5.5 agent-hours** | estimated; sum of the dimension rows below |
 
 | Audience | Ready % | Opus 5.5 agent wall-clock hours to ~95% | Work that dominates |
 |---|---|---|---|
 | Full target (ready for real work) | ~55% | ~600–980 | Get & Transform and the data model, localization (twelve languages), charts depth, file fidelity (`.xls`, corpus, pass-through), PivotTables, collaboration, mobile |
-| Mainstream practitioner | ~56% | ~180–285 | File exchange with Excel users (corpus and Excel verification, pass-through, large files, `.xls`, encryption: 63–97 h), common-chart depth (30–45 h), PivotTables (20–30 h), keyboard and interaction (18–28 h), calc correctness and functions (20–33 h) |
-| Essentials user | ~67% | ~45–80 | Opening files people send (`.xls` import and saving with a password 24–36 h; macOS Finder open 2–4 h), launch stability (6–10 h), basic chart resize and polish (6–10 h), print and Page Layout (8–12 h), small editing and UI fixes (10–16 h) |
+| Mainstream practitioner | ~56% | ~180–285 | File exchange with Excel users (the pinned corpus, `.xls` charts, RC4 writing), common-chart depth, PivotTable detail (data-model pivots), keyboard and interaction, calc correctness and functions |
+| Essentials user | ~67% | ~45–80 | Opening files people send (`.xls` charts; macOS Finder open 2–4 h), launch stability (6–10 h), print polish (8–12 h), small editing and UI fixes (10–16 h) |
 
 Each tier is a subset of the one above, so its hours are too. Calibrated as in [Effort and
 calibration](docs/target-app-parity.md#effort-and-calibration) (~6–10 h per readiness point for the remaining, verification-heavy
@@ -45,13 +45,14 @@ Why alpha: all six core workflows in the [alpha gate](docs/roadmap.md#alpha-gate
 on macOS with save and reopen, and the large-workbook beta gate is now met: 100M cells open with
 16.7 MiB live / 183 MiB peak, independent formulas recalculate on the machine's threads (100k edit
 20–25 ms), row and column structural edits are maps rather than cell moves, and whole-sheet data
-commands are bounded. The remaining beta work is evidence and fidelity: nobody has yet confirmed
-that **Excel** opens our output without a repair prompt across a real corpus (#1) — Excel itself is
-not licensed on the dev machine, so a foreign reader (openpyxl) and a foreign application (WPS) stand
-in for it ([oracle.md](docs/oracle.md)) and one Excel run stays the owner's — there is no
-`.xls` or password support (#7), Arabic/Devanagari/Thai text is not shaped and non-Latin PDF is
-weak (#5), charts lose options (#4), PivotTables lack slicers (#8), keyboard key tips remain (#9),
-and the stability soak is not final (#10). Beta needs those closed (see
+commands are bounded. The remaining beta work is evidence and fidelity, not features: nobody has run GridCraft over the
+pinned real-world corpus (#1) — Excel 16 itself now opens, refreshes, recalculates, saves and
+re-reads every oracle fixture without a repair prompt ([oracle.md](docs/oracle.md)), and
+`cargo xtask corpus <dir>` makes the corpus run one command — a `.xls` file loses its charts and
+shapes and RC4 encryption is read but not written (#7), and the field reports of GPU crashes and
+freezes still need the machines they came from (#10). Everything else that blocked beta is met:
+pass-through (#3), charts (#4), all-script text (#5, with a font-coverage caveat), calculation
+correctness (#6), PivotTables (#8) and keyboard access (#9). Beta needs those closed (see
 [beta gates](docs/roadmap.md#beta-gates)).
 
 The 2026-10-07 numbers (catalog 89%, "feature depth ~65%", "~215 h to full parity") were
@@ -64,34 +65,34 @@ collaboration, mobile, AI).
 
 | Dimension | Ready for real work | Hours to parity | Doc |
 |---|---|---|---|
-| Features (13 areas, table below) | ~59% (breadth ~75%) | 300–485 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
-| UI/UX fidelity | ~55% | 50–80 | [ui-parity.md](docs/ui-parity.md) |
-| File formats | ~50% | 80–120 | [file-format-parity.md](docs/file-format-parity.md) |
-| Performance | ~35% (conservative; gate met) | 20–35 | large-workbook gate met (100M cells 16.7 MiB live, 100k edit 20–25 ms, 1M rows, bounded commands); M20/M19 polish, zone maps and paging hardening remain; re-scored at beta exit. [target-app-parity.md](docs/target-app-parity.md#performance) |
-| Stability | ~60% | 15–25 | [gaps.md](docs/gaps.md) |
-| Localization | ~10% (ribbon in 6 languages) | 100–165 | [localization-parity.md](docs/localization-parity.md) |
+| Features (13 areas, table below) | ~64% (breadth ~78%) | 269–433 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
+| UI/UX fidelity | ~58% | 45–72 | [ui-parity.md](docs/ui-parity.md) |
+| File formats | ~54% | 65–98 | [file-format-parity.md](docs/file-format-parity.md) |
+| Performance | ~35% (conservative; gate met) | 20–35 | large-workbook gate met (100M cells 16.7 MiB live, 100k edit 20–25 ms, 1M rows, bounded commands); M20/M19 base closed (page-file rewrite and streaming save deferred post-beta), zone maps and paging hardening remain; re-scored at beta exit. [target-app-parity.md](docs/target-app-parity.md#performance) |
+| Stability | ~62% | 13–22 | [gaps.md](docs/gaps.md) |
+| Localization | ~15% (ribbon in 6 languages; shaping landed, RTL layout missing) | 100–165 | [localization-parity.md](docs/localization-parity.md) |
 | Hardware (multi-core calc, GPU, pen, multi-window) | ~40% | 25–40 | [hardware-parity.md](docs/hardware-parity.md) |
 | Platforms | ~80% (no iOS/Android; ahead on Linux, BSD, RISC-V) | 30–60 | [target-app-parity.md](docs/target-app-parity.md#platforms) |
 | Ecosystem / add-ins | ~10% (VBA out of scope; own scripts, MCP, CLI) | 25–40 | [target-app-parity.md](docs/target-app-parity.md#ecosystem-and-ai) |
 | AI features | ~15% (agent control strong; no in-app assistant) | 30–50 | [target-app-parity.md](docs/target-app-parity.md#ecosystem-and-ai) |
-| **Total** | **~50%** | **~700–1,100** | |
+| **Total** | **~55%** | **~627–1,020** | |
 
 ## Features
 
 | Area | Breadth | Ready | Hours | Doc |
 |---|---|---|---|---|
-| Formula language and calculation | ~92% | ~72% | 20–30 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
-| Worksheet functions | 96.6% measured | ~82% | 16–26 | [function-parity.md](docs/function-parity.md) |
-| Editing, navigation, clipboard, fill | ~90% | ~70% | 15–25 | [ui-parity.md](docs/ui-parity.md) |
+| Formula language and calculation | ~93% | ~78% | 16–24 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
+| Worksheet functions | 98.3% measured | ~86% | 12–20 | [function-parity.md](docs/function-parity.md) |
+| Editing, navigation, clipboard, fill | ~92% | ~73% | 14–23 | [ui-parity.md](docs/ui-parity.md) |
 | Cell formatting, styles, conditional formatting | ~95% | ~80% | 8–14 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | Sort, filter, tables, validation, outline | ~82% | ~70% | 10–16 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
-| PivotTables | ~65% | ~45% | 25–40 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
-| Charts and sparklines | ~50% | ~30% | 40–60 | [chart-parity.md](docs/chart-parity.md) |
-| Page layout, print, PDF | ~80% | ~55% | 12–20 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
+| PivotTables | ~70% | ~56% | 20–32 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
+| Charts and sparklines | ~52% | ~55% | 28–42 | [chart-parity.md](docs/chart-parity.md) |
+| Page layout, print, PDF | ~86% | ~62% | 10–17 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | What-if and analysis (Goal Seek, Solver, ToolPak, Forecast) | ~50% | ~40% | 22–35 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | Get & Transform, external data, data model | ~15% | ~10% | 60–100 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | Insert objects (pictures, shapes, ink, SmartArt, equations) | ~55% | ~45% | 25–40 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
-| Review, comments, protection, collaboration | ~55% | ~40% | 35–55 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
+| Review, comments, protection, collaboration | ~55% | ~44% | 32–50 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | Automation (recorded scripts; no VBA) | ~30% | ~20% | 12–20 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 
 ## Languages
@@ -111,7 +112,7 @@ Localized German formulas and numbers are in PR #163. Detail: [localization-pari
 | Simplified Chinese | zh-Hans | menus only | ~12% |
 | Spanish | es | none | 0% |
 | Hindi | hi | none | 0% |
-| Arabic | ar | none (no RTL layout, no shaping) | 0% |
+| Arabic | ar | none (no Arabic UI strings; shaping landed, RTL layout missing) | 0% |
 | French | fr | none | 0% |
 | Portuguese | pt-BR | menus, File view, dialogs | ~43% |
 | Indonesian | id | none | 0% |
@@ -122,22 +123,22 @@ Localized German formulas and numbers are in PR #163. Detail: [localization-pari
 
 Other shipped languages: 3 (Russian and German, menus only, ~12%; Dutch, menus, File view and dialog titles, ~24%).
 
-## Next (ordered, 2026-10-29)
+## Next (ordered, 2026-11-03)
 
 The detailed queue with dependencies and the parallel plan is in
 [docs/roadmap.md#execution-queue](docs/roadmap.md#execution-queue). In order:
 
 | Wave | Work | Hours | Notes |
 |---|---|---|---|
-| **0** | Close the base: page-file rewrite (deferred); save streaming (S4c) is post-beta | **0–8** | S1–S4b landed 10-29; wave 0 base closed. Start wave 1 (XLSX corpus/Excel). |
+| **0** | Close the base: page-file rewrite (deferred); save streaming (S4c) is post-beta | **0** | **Closed 10-29**: M20 complete, M19 S1–S4b landed and the save peak measured (100M 28.4 s / 1.81 GiB). Page-file rewrite and streaming save are deferred post-beta. |
 | **0b** | Stability soak and field crash/freeze list (#10) | 8–12 | Parallel; Windows GPU machines. |
-| **1** | **XLSX corpus + Excel acceptance** (#1) | 15–25 | **Owner: half a day in Excel.** The only external gate; start early. #3's pass-through half landed 10-29, so this is the corpus run plus Excel acceptance. |
-| **1b** | Calculation correctness (#6) | 10–15 | Parallel with 1. |
-| **2** | Charts depth (#4) | 8–18 | **Model half landed 10-29** (axis scaling, labels, error bars, per-point, four commands, catalog 279/295); field-level pass-through, secondary axes and the Format pane + resize remain. |
-| **2b** | All-script text (#5) | 0–3 | **Met for beta 10-30/11-02**: shaping and bidi on the grid, in the editor, in PDF and (11-02) in wrapped cells and chart labels; what remains is coverage (CJK + Arabic in one document, per-platform fonts, per-run fallback), text boxes, a shaped PDF `text_width` and mirrored printing. |
-| **2c** | Keyboard/key tips (#9) | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; leftovers are the Menu key (upstream) and menus for non-cell objects. |
+| **1** | **XLSX corpus + Excel acceptance** (#1) | 3–6 | **Excel half met 11-02**: Excel 16 opens, refreshes, recalculates, saves and re-reads every fixture with no repair. What is left is the pinned real-world corpus — `cargo xtask corpus <dir>` runs it as one command and `docs/excel-checks.md` is the owner's checklist; the corpus URL/network is the external blocker. |
+| **1b** | Calculation correctness (#6) | 0 | **Met 10-30**: the five reports are closed, iterative calculation is in, and a 595-example / 275-function documented oracle suite runs through the real calc path. Re-running it against an Excel-computed corpus is counted under #1. |
+| **2** | Charts: options round-trip, axes, labels, error bars, per-point formatting, resize | 0 | **Closed 11-02**: model, round-trip and render; an edit patches the kept part; unmodelled kinds kept whole; secondary axis; Format pane; eight-handle resize; click-to-select; a label's own font; per-point marker size. Chartex granularity and a per-shape pane are outside the gate. |
+| **2b** | All-script text (#5) | 0–3 | **Met for beta 10-30/11-02**: shaping and bidi on the grid, in the editor, in PDF, in wrapped cells, chart labels and (11-03) shape/text-box text. What remains is coverage (CJK + Arabic in one document, per-platform fonts, per-run fallback), a shaped PDF `text_width` and mirrored printing. |
+| **2c** | Keyboard/key tips (#9) | 0–6 | **met 10-29**: 417 key-tip sequences, keyboard context menus, six shortcuts; 11-03 added `Shift+F10` on a selected object. Leftovers: the Menu key (upstream) and the View tab's combo badges. |
 | **3** | `.xls` + password-protected books (#7) | 4–11 | **Encryption write (Agile and Standard) and `.xls` styles, comments, validation, conditional formats (including CF12), hyperlinks, frozen panes and pictures landed 10-29/30/11-02**; charts, BIFF5 and RC4 writing remain. |
-| **3b** | PivotTables, verified in Excel (#8) | 0–1 | Slicers and timelines landed 10-30 (model, XLSX, drawn, a selection filters the pivot, a timeline range through `slicer.setRange`), the timeline's range handles drag 11-02, and number grouping, label/value filters and calculated items landed 11-02: `pivot.calculatedItem` computes an item from the field's own items, sorts it last, leaves the grand totals alone and writes Excel's own `f="1"`/`<calculatedItems>` encoding. **Excel 16 keeps the definition on open/refresh, recomputes the item (116,320) and re-saves with every cell equal.** What is left is the real-world corpus, counted under #1; data-model pivots are full scope. |
+| **3b** | PivotTables, verified in Excel (#8) | 0 | **Met for beta 11-02**: slicers and timelines (model, XLSX, drawn, a selection filters the pivot, timeline range drag), number grouping, label/value filters and calculated items; **Excel 16 keeps the calculated-item definition, recomputes 116,320 and re-saves with every cell equal**. The real-world corpus is counted under #1; data-model pivots are full scope. |
 | **4** | **Beta exit**: gates green, full `cargo xtask ci`, corpus re-run, release | 8–12 | After 0–3b. |
 | **Post-beta** | M21 Parquet read/linked tables (20–30) · M17 zone maps (8–12) · localization (100–165) · Get & Transform/data model (60–100) · full charts/collaboration/mobile/AI · M22 only on a measured trigger | — | Not beta blockers. |
 
@@ -148,6 +149,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | What landed |
 |---|---|
+| 2026-11-03 | **The owner-free half of the beta tail is closed, and the ToolPak is complete.** `.xls` pictures are read from OfficeArt (blip store, `msosptPictureFrame`, client anchors and Excel's placement bits); `.xls` `CF12` colour scales, data bars and icon sets are read; PivotTable calculated items are modelled, written in Excel's own encoding and **verified in Excel 16**; the **Analysis ToolPak is 19/19** (Fourier analysis, random numbers, sampling, z-Test, both two-factor ANOVAs); `Shift+F10` opens a selected chart/picture/shape menu and the status bar carries the accessibility issue count; wrapped cell text, chart labels and shape/text-box text are shaped; and `cargo xtask corpus <dir>` plus `docs/excel-checks.md` make the corpus run one command and the owner's Excel day one checklist. What is left of beta: the pinned corpus, `.xls` charts and RC4 writing, and the field machines |
 | 2026-11-02 | **High contrast, and the sheet is walkable by a screen reader.** View ▸ Show ▸ **High Contrast** (`view.highContrast`, keytip WVI — Excel takes this from the OS, GridCraft makes it a preference kept in `ui.json`) repaints the chrome black, white and yellow: white text and yellow separators on a black window, ribbon, tab bar and status bar, a yellow selection border and header highlight, cyan accents, and the sheet keeping its own white page and black text as Excel's high-contrast themes do; egui's own widgets (menus, dialogs, tooltips) are darkened with it so their text stays readable. Earlier the same day the **visible cells became an AccessKit grid** for screen readers: one `GridCell` per visible cell (value, address and formula, row/column index, the active cell selected and named as the grid's active descendant), `ColumnHeader`/`RowHeader` nodes for the visible headers, frozen panes included, rebuilt only while a reader is attached and capped at 2,000 cells |
 | 2026-11-02 | **A screen reader can walk a sheet.** The grid is painted as one surface, so AccessKit used to see a single node; now, **while a reader is attached**, the visible cells become an AccessKit grid: one `GridCell` per cell with its displayed value, its address and formula in the description, its row and column index, the active cell marked selected and named as the grid's **active descendant** (so a reader announces the cell as the container's active item), and the grid labelled with the sheet, the active cell and the selection count. Frozen rows and columns are included and the tree follows scrolling; with no reader attached nothing is built beyond a probe (one branch a frame), and the walk is capped at 2,000 cells so a large window costs bounded work — a reader scrolls for the rest as a sighted user does. The header row and column are `ColumnHeader`/`RowHeader` nodes (letters, numbers, indexes) and the grid node carries its own bounds. The cells are hover-only nodes, so clicks, drags, the fill handle and the scroll wheel keep going to the grid's own pointer handling, which the pointer tests re-check |
 | 2026-11-02 | **Charts, pictures and shapes can be described, and the check goes to what it finds.** Alternative text is modelled for charts (`Chart::alt`) and shapes (`Shape::alt`) as pictures already were, written as `xdr:cNvPr/@descr` on every drawing frame the writer makes (a chart, a kept chart, a shape and a picture; escaped, so a quote or an angle bracket in a description cannot break the part) and read back, with `object.setAltText` to set or clear it. **Review ▸ Check Accessibility** now reports charts, pictures, shapes with no text of their own and pictures in cells without alt text, tables without a header row, merged cells and sheets still on their default name, each with its sheet and object or range; its dialog lists them, **goes to** each one (selecting the object or the range) and takes alt text inline, so a screen reader's description is set from where the problem is seen. The accessible tree for the grid itself (cells, headers, the selection) is still to come |
@@ -295,6 +297,7 @@ queue is no longer a separate wave; land/rebase any still-open PR into the gap i
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-03 | minor | Status sync after round 16: beta gates #2–#6, #8 and #9 met and the remaining work falls to ~15–38 h (#1 corpus 3–6, #7 4–11, #10 8–12, #5 tail 0–3) plus an 8–12 h release run; the dimension and feature tables were brought back in line with the 10-30 consolidated re-score (features ~64%, ready ~55%, mainstream ~56%, essentials ~67%), and the stale "Excel is unlicensed", "slicers missing", "charts can't be resized" and "text is not shaped" claims are gone. No score change |
 | 2026-11-02 | minor | `cargo xtask corpus <dir>`: open every `.xlsx` in a directory, per-file sheets/cells/warnings, save and reopen one in five and compare a digest of names, cells, values, formulas and number formats, and read the saved copy back with openpyxl; temp-only writes, 2,000-file/4 GB caps, recursive and `--all`/`--no-openpyxl` flags. Green on a fresh oracle directory. `docs/excel-checks.md` gives the owner the manual #1/#7/#8/#10 checks, naming only fixtures the oracle writes |
 | 2026-11-02 | minor | **Wrapped cell text and chart labels are shaped.** A wrapped paragraph is shaped once to measure its clusters, broken after spaces/tabs/hyphens and between CJK characters, and each line is shaped on its own (bidi, Arabic joining and marks resolved per line); each line is aligned on its own and general right-to-left wrapped text aligns right, as Excel does. Chart labels go through the same engine and the chart layout measures them with the shaped width. Printable ASCII keeps the unshaped `LayoutJob` wrap bit for bit (and text over 16 KB or without a covering face falls back to it). Gate #5's shaping half is closed; text boxes, a shaped PDF `text_width`, coverage and mirrored printing remain |
 | 2026-11-02 | minor | **`.xls` pictures are read**: OfficeArt drawings (`MSODRAWING`, concatenated into one `DgContainer` tree), the workbook's `MSODRAWINGGROUP` blip store (`FBSE` → PNG/JPEG/DIB/TIFF), `msosptPictureFrame` shapes selected by their `pib`, and `OfficeArtClientAnchorSheet` cell/offset anchors. The placement bits map the way Excel writes them (0x0000 move and size, 0x0002 move only, 0x0003 free-floating), established from Excel-authored files; charts, shapes, controls and vector pictures are skipped with one warning, malformed drawings never panic. #7 keeps 4–11 h (charts, RC4, an Excel run) |
