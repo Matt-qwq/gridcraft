@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 17: `.xls` **embedded charts** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** on a five-kind workbook; §7 loses its charts item and its estimate falls to 1–3 h for shapes/OLE/chart sheets. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 17: `.xls` **embedded charts, autoshapes and text boxes** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** (five chart kinds; five shapes with their text, fill and line); §7 loses its charts and shapes items and is met for beta, leaving OLE objects and chart sheets as full scope. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -364,7 +364,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 2–5 h, all of it re-running the suite against an Excel-computed corpus; Excel 16 is
   available now, the corpus is gate #1's. [function-parity.md](function-parity.md#formula-language)
 
-### 7. Legacy `.xls`: shapes and OLE objects; encrypted `.xls` cannot be written (FF)
+### 7. Legacy `.xls`: OLE objects and chart sheets; encrypted `.xls` cannot be written (FF)
 - **Landed 10-29 (encryption write):** `file.save`/`file.saveAs`/`file.saveBytes` write **Agile**
   encryption (AES-256-CBC, SHA-512, spin count 100,000, random salts, HMAC-SHA512 integrity, a
   version-3 compound file), and a workbook opened with a password re-encrypts with it on a plain
@@ -448,13 +448,27 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   area, doughnut, radar) converts to `.xlsx` and reopens with the same chart count, kinds, titles
   and cell anchors (radar comes back as radar-with-markers, the writer's style); a three-chart
   workbook's exported chart renders with its title, series, category labels and legend.
-- **Still missing:** `.xls` shapes, OLE objects and chart sheets (dropped with a warning); BIFF5 is
-  refused; `.xls` is never written. RC4/encrypted `.xls` output needs a `.xls` writer and is not
-  scheduled.
+- **Landed 11-03 (shapes):** autoshapes and text boxes are read into model shapes. Excel 2007+
+  writes a DrawingML fragment (`drs/shapexml.xml` in an `OfficeArtTertiaryFOPT` record) for each
+  shape, which carries the preset geometry, fill, line, text and text formatting; it goes through
+  the same shape reader as an `.xlsx` drawing part. A shape without one (an older writer) is
+  rebuilt from its `OfficeArtFSP` type and `OfficeArtClientAnchorSheet`: rectangle, rounded
+  rectangle, ellipse, triangle, line, arrow and text box; an unknown type is skipped with a
+  warning. The reader also handles two layout facts: a drawing is split across `MSODRAWING`
+  records at arbitrary points (a container takes the bytes present), and the last shape's OfficeArt
+  can follow a text box's text in `Continue` records (the text reader appends an OfficeArt tail
+  found there). **Verified in Excel 16:** an Excel-authored `.xls` with a rectangle ("Box", red
+  fill, blue line), an oval, a right arrow, a text box ("Note") and a line converts to `.xlsx` and
+  reopens with 5 shapes at the same left/top, the same text, fill and line (a block arrow becomes
+  the model's arrowheaded line; a right edge inside a column rounds by a few points).
+- **Still missing:** OLE objects, controls and chart sheets (dropped with a warning; OLE has no
+  model object); BIFF5 is refused; `.xls` is never written. RC4/encrypted `.xls` output needs a
+  `.xls` writer and is not scheduled.
 - **Evidence:** #121: Excel 97-2003 (BIFF8) `.xls` files now open (values, formulas, number
   formats, merges, sizes, names, styles, comments, validation, conditional formats (including
-  colour scales, data bars and icon sets), hyperlinks, frozen panes, pictures and embedded charts);
-  shapes, OLE objects and chart sheets are not read, BIFF5 is refused and `.xls` is never written.
+  colour scales, data bars and icon sets), hyperlinks, frozen panes, pictures, embedded charts,
+  autoshapes and text boxes); OLE objects, controls and chart sheets are not read, BIFF5 is refused
+  and `.xls` is never written.
   Password-encrypted `.xlsx` workbooks (Agile and Standard encryption) open with their password
   since #11 and are **saved back protected** with the scheme they had. RC4 is **not** an ECMA-376
   Standard cipher: [MS-OFFCRYPTO] 2.3.4.5 requires AES for an OOXML package, and Excel refuses a
@@ -463,9 +477,10 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   (FILEPASS) is still refused with a message.
 - **Impact:** common in finance, government and anything older than 2007; encrypted files are
   routine in business.
-- **Estimate:** 1–3 h left (shapes and OLE objects; a chart-sheet reader is a further 2–4 h and not
-  a beta gate). Charts landed 11-03 and are verified in Excel 16; encrypted `.xls` write is out of
-  scope without an `.xls` writer. [file-format-parity.md](file-format-parity.md)
+- **Estimate:** 0–2 h for beta (`.xls` import is met: values, formats, pictures, charts and
+  shapes are read and verified in Excel 16). OLE objects need a model object the app does not
+  have, and a chart-sheet reader is 2–4 h, both full scope rather than gate work; encrypted `.xls`
+  write is out of scope without an `.xls` writer. [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: data-model pivots and a real-world corpus (F)
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
@@ -791,6 +806,7 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-11-03 | minor | §7: `.xls` autoshapes and text boxes are read — Excel 2007+'s DrawingML fragment when present (geometry, fill, line, text, formatting), otherwise the OfficeArt type and anchor — and verified in Excel 16 with five shapes (same text/fill/line/positions; a block arrow becomes the model's arrowheaded line). The reader now tolerates drawings split across records and a trailing shape stored in a text box's Continue records. #7 is met for beta; OLE objects and chart sheets are full scope |
 | 2026-11-03 | minor | §7: `.xls` charts are read (the chart substream: kind and variants, series `BRAI` ranges, cached names, title, legend, and the anchor from the `msosptChart` shape) and verified in Excel 16 — a five-kind workbook converts and reopens with the same kinds, titles and anchors. Shapes, OLE objects and chart sheets remain, so #7 falls to 1–3 h. RC4 is re-scoped: Excel refuses a hand-made RC4 `.xlsx` (ECMA-376 Standard requires AES), so encrypted `.xls` output waits for a `.xls` writer |
 | 2026-11-03 | minor | Beta-blocker bookkeeping after round 16: §1 loses the Excel half (Excel 16 verifies every fixture), §7's evidence no longer says encryption cannot be written, §8's slicer evidence is Excel-16-verified and its estimate drops to 0–1 h (the corpus is #1's), §9's object context menus landed, §14 and §18 are updated (the status-bar accessibility entry landed, print polish is what remains), and the beta blockers are down to the corpus, `.xls` charts/RC4 and the field machines. No score change |
 | 2026-11-02 | minor | §1: the corpus run is one command — `cargo xtask corpus <dir>` (open every workbook, per-file warnings, save/reopen digest of names/cells/values/formulas/formats, openpyxl readback, temp-only writes, caps) and it is green on a fresh oracle directory; the real-world corpus itself is still missing because `storytold/craftrules` is private. Added `docs/excel-checks.md`, the owner's executable checklist for #1/#7/#8/#10 |

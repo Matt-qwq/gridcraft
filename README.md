@@ -208,8 +208,8 @@ except the ones that need outside material. It covers 280 of 295 standard ribbon
 catalog ([`docs/parity-checklist.md`](docs/parity-checklist.md)) and 514 standard worksheet
 functions ([`docs/function-parity.md`](docs/function-parity.md)); this is a parity inventory, not a
 count of working implementations. Weighted by what spreadsheet users rely on, we estimate it is
-about 55% ready for real work. Next up: the pinned real-world XLSX corpus, `.xls` shapes/OLE and
-encrypted `.xls` output, and the hardware behind the field crash reports. Stage, numbers and estimates are in
+about 55% ready for real work. Next up: the pinned real-world XLSX corpus and the hardware behind
+the field crash reports (`.xls` OLE objects and encrypted `.xls` output are full scope). Stage, numbers and estimates are in
 [ROADMAP.md](ROADMAP.md); the ranked work list is [`docs/gaps.md`](docs/gaps.md).
 
 ## Downloads
