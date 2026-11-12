@@ -16,9 +16,11 @@ use crate::editor::{EditState, REF_COLORS};
 use crate::theme::{self, Tokens};
 
 pub const COL_HEADER_H: f32 = 21.0;
-/// Sheet units are 96-dpi pixels (as in XLSX); on screen one unit is drawn at this many points,
-/// which matches desktop spreadsheet density (a default 20 px row is 16 pt tall).
-pub const DISPLAY_SCALE: f32 = 0.8;
+/// Sheet units are 96-dpi pixels (as in XLSX), drawn one for one on screen, so a default 20 px row
+/// is 20 pt tall and 11 pt text sits in it exactly as it does in Excel at 100%. (This used to be
+/// 0.8, which made the grid 20% denser than Excel while the text stayed 11 pt: the glyphs filled
+/// the row and every cell looked cramped.)
+pub const DISPLAY_SCALE: f32 = 1.0;
 
 /// The zoom percentages a Ctrl+wheel notch steps between: four per doubling (about 20% apart),
 /// so 25, 50, 100, 200 and 400 are on it. Excel steps 15 points a notch instead; the status bar's
@@ -3891,17 +3893,28 @@ fn object_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
         });
     });
     // A click inside an open submenu (Slicer Styles) lands outside this area and must not close
-    // the menu before the submenu's item handles it.
+    // the menu before the submenu's item handles it. The frame the menu opens is never a dismissal
+    // either: its area is placed at the click point and rounds its top-left by a fraction of a
+    // point, so the press that opened it can sit a hair outside and close it at once.
+    let first_frame = {
+        let key = egui::Id::new("gridcraft.object_menu_frame");
+        let frame = ui.ctx().cumulative_frame_nr();
+        let fresh = ui.data(|d| d.get_temp::<u64>(key)).is_none_or(|shown| shown != frame);
+        ui.data_mut(|d| d.insert_temp(key, frame));
+        fresh
+    };
     let submenu_open = egui::Popup::is_any_open(ui.ctx());
     if close
         || ui.input(|i| i.key_pressed(egui::Key::Escape))
-        || (!submenu_open
+        || (!first_frame
+            && !submenu_open
             && ui.input(|i| i.pointer.any_pressed())
             && !resp.response.contains_pointer()
             && !resp.response.hovered()
             && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !resp.response.rect.contains(p)))
     {
         app.grid.object_menu = None;
+        ui.data_mut(|d| d.remove_temp::<u64>(egui::Id::new("gridcraft.object_menu_frame")));
     }
 }
 
