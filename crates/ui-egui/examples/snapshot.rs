@@ -1,7 +1,7 @@
 //! Renders the whole GridCraft window offscreen (wgpu, no window) to a PNG.
 //!
 //! `cargo run --release -p gridcraft-ui-egui --example snapshot -- [--sample sales] [--in file.xlsx]
-//!  [--size 1440x900] [--scale 2] [--cmd 'id={json}']... [--tab Insert] [--dark] [--high-contrast] [--language en|es|zh|ja|ko|ru|pt|de|cs|fr|tr]
+//!  [--size 1440x900] [--scale 2] [--fonts] [--cmd 'id={json}']... [--tab Insert] [--dark] [--high-contrast] [--language en|es|zh|ja|ko|ru|pt|de|cs|fr|tr]
 //!  [--dialog 'name={json}'] [--hf-edit header|footer] [--pane formatChart] [--chart <id>|last]
 //!  [--drag se=120x60] [--format chart|axisX|axisY|seriesN] [--expand 'Axis Options'] out.png
 //!
@@ -31,6 +31,7 @@ fn main() {
     let mut dialog: Option<String> = None;
     let mut language: Option<String> = None;
     let mut hf_edit: Option<String> = None;
+    let mut wait_fonts = false;
     let mut out = "snapshot.png".to_string();
     let mut i = 0;
     while i < args.len() {
@@ -49,6 +50,7 @@ fn main() {
                     size = (w.parse().unwrap_or(1440.0), h.parse().unwrap_or(900.0));
                 }
             }
+            "--fonts" => wait_fonts = true,
             "--scale" => {
                 i += 1;
                 scale = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(2.0);
@@ -119,6 +121,11 @@ fn main() {
         if let Err(e) = session.execute(&id, p) {
             eprintln!("{id}: {e}");
         }
+    }
+    // `--fonts` waits for the installed-font scan, so workbook fonts (宋体, Cambria, …) are bound
+    // before the first frame instead of the snapshot falling back to a generic face.
+    if wait_fonts {
+        gridcraft_ui_egui::fonts::catalog();
     }
     let mut harness =
         egui_kittest::Harness::builder().with_size(egui::vec2(size.0, size.1)).with_pixels_per_point(scale).with_max_steps(12).wgpu().build_ui_state(

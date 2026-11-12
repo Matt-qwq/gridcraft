@@ -913,6 +913,9 @@ pub fn symbol_face_installed() -> bool {
     }
 }
 
+/// How much the glyph coverage is gamma-corrected on light backgrounds (see [`apply`]).
+pub const TEXT_GAMMA: f32 = 1.4;
+
 pub fn apply(ctx: &egui::Context, dark: bool) {
     // Install both palettes before System can switch between the style slots.
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
@@ -936,6 +939,18 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
         v.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: t.shadow };
         ctx.set_visuals_of(theme, v);
     }
+    // Text: egui maps glyph coverage to alpha directly on light backgrounds, which draws the
+    // antialiased edges darker than Windows does — cell text looked like a bolded Excel. DirectWrite
+    // (Excel, and WPS's fallback) gamma-corrects the coverage instead, so the edges stay light and
+    // the strokes read thin. 1.4 is the usual desktop value; dark text keeps egui's default, which
+    // is tuned for light-on-dark.
+    ctx.all_styles_mut(|st| {
+        st.visuals.text_options.color_transfer_function = if dark {
+            egui::epaint::image::FontColorTransferFunction::DARK_MODE_DEFAULT
+        } else {
+            egui::epaint::image::FontColorTransferFunction::Gamma(TEXT_GAMMA)
+        };
+    });
     ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
     ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
     ctx.all_styles_mut(|s| {
@@ -1012,6 +1027,18 @@ mod font_binding_tests {
 mod tests {
     use super::*;
     use crate::i18n::Language;
+
+    /// Glyph coverage is gamma-corrected on light backgrounds, so antialiased edges stay light and
+    /// cell text does not read as bold (see `apply`); dark text keeps egui's light-on-dark curve.
+    #[test]
+    fn light_text_is_gamma_corrected() {
+        use egui::epaint::image::FontColorTransferFunction as F;
+        let ctx = egui::Context::default();
+        apply(&ctx, false);
+        assert_eq!(ctx.style_of(egui::Theme::Light).visuals.text_options.color_transfer_function, F::Gamma(TEXT_GAMMA));
+        apply(&ctx, true);
+        assert_eq!(ctx.style_of(egui::Theme::Dark).visuals.text_options.color_transfer_function, F::DARK_MODE_DEFAULT);
+    }
 
     #[test]
     fn the_high_contrast_palette_is_black_white_and_yellow() {
