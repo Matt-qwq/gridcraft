@@ -140,6 +140,29 @@ pub struct Theme {
     pub minor_font_scripts: Vec<(String, String)>,
 }
 
+impl Theme {
+    /// The East Asian typeface body text uses: the minor scheme's `<a:ea>` when the theme sets
+    /// one, else its per-script entry (`script="Hans"` → 宋体 in a Chinese Excel file), else the
+    /// major scheme's. `None` when the file named none, as GridCraft's own theme does.
+    pub fn body_ea_font(&self, script: &str) -> Option<&str> {
+        if !self.minor_font_ea.is_empty() {
+            return Some(&self.minor_font_ea);
+        }
+        if let Some(font) = scripted(&self.minor_font_scripts, script) {
+            return Some(font);
+        }
+        if !self.major_font_ea.is_empty() {
+            return Some(&self.major_font_ea);
+        }
+        scripted(&self.major_font_scripts, script)
+    }
+}
+
+/// The typeface a font scheme names for `script`, if it names one.
+fn scripted<'a>(list: &'a [(String, String)], script: &str) -> Option<&'a str> {
+    list.iter().find(|(s, font)| s.eq_ignore_ascii_case(script) && !font.is_empty()).map(|(_, font)| font.as_str())
+}
+
 impl Default for Theme {
     /// GridCraft's own default theme ("Craft"): original palette. The East Asian and
     /// complex-script typefaces stay empty: the file did not set one.
@@ -529,5 +552,30 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("major_font_ea") && json.contains("游ゴシック"), "{json}");
         assert_eq!(serde_json::from_str::<Theme>(&json).unwrap(), t);
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    /// Excel's font scheme names the East Asian typeface separately from the Latin one; a Chinese
+    /// workbook says `script="Hans"` → 宋体 and draws its Chinese with it while `fonts[0]` says
+    /// Calibri.
+    #[test]
+    fn a_font_scheme_names_its_east_asian_face() {
+        let mut theme = Theme::default();
+        assert_eq!(theme.body_ea_font("Hans"), None, "GridCraft's own theme names none");
+        theme.minor_font_scripts = vec![("Jpan".into(), "游ゴシック".into()), ("Hans".into(), "宋体".into())];
+        assert_eq!(theme.body_ea_font("Hans"), Some("宋体"));
+        assert_eq!(theme.body_ea_font("jpan"), Some("游ゴシック"), "script names are case-insensitive");
+        assert_eq!(theme.body_ea_font("Hang"), None);
+        // <a:ea> wins over the per-script entries, and the major scheme only when minor has none.
+        theme.minor_font_ea = "微软雅黑".into();
+        assert_eq!(theme.body_ea_font("Hans"), Some("微软雅黑"));
+        theme.minor_font_ea = String::new();
+        theme.major_font_ea = "黑体".into();
+        assert_eq!(theme.body_ea_font("Hang"), Some("黑体"));
+        assert_eq!(theme.body_ea_font("Hans"), Some("宋体"), "a minor script entry beats the major <a:ea>");
     }
 }

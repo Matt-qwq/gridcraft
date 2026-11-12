@@ -518,13 +518,17 @@ impl HanOrder {
 
 /// Builds the font set with the Han fallback faces ordered for the interface language.
 pub fn font_definitions_for_language(language: crate::i18n::Language) -> FontDefinitions {
-    font_definitions_with(language, &[])
+    font_definitions_with(language, &[], &[])
 }
 
 /// [`font_definitions_for_language`] that also binds the workbook fonts in `used` that are
 /// installed, so cells set in them render with them; the rest fall back to the roles. The bound
 /// families are recorded in [`crate::fonts`] so [`cell_family`] only names a family egui has.
-pub fn font_definitions_with(language: crate::i18n::Language, used: &[String]) -> FontDefinitions {
+///
+/// `ea` names the workbook's East Asian typeface (the theme's 宋体, see
+/// [`gridcraft_model::Theme::body_ea_font`]): its faces go behind every workbook family, so the
+/// Chinese in a Calibri cell is drawn in 宋体 the way Excel and WPS draw it.
+pub fn font_definitions_with(language: crate::i18n::Language, used: &[String], ea: &[String]) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let base_prop: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let base_mono: Vec<String> = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
@@ -556,9 +560,15 @@ pub fn font_definitions_with(language: crate::i18n::Language, used: &[String]) -
         fonts.families.insert(FontFamily::Name(role.into()), chain);
         bound.push(role.to_string());
     }
-    // Installed workbook fonts, so a cell's chosen font actually renders in it.
+    // Installed workbook fonts, so a cell's chosen font actually renders in it. The workbook's
+    // East Asian face follows each of them, for the scripts the Latin face has no glyphs for.
+    let script: Vec<crate::fonts::Face> = ea.iter().flat_map(|name| crate::fonts::faces_of(name)).collect();
     for family in crate::fonts::installed_among(used) {
-        bound.extend(crate::fonts::bind_family(&mut fonts, &family));
+        bound.extend(if script.is_empty() {
+            crate::fonts::bind_family(&mut fonts, &family)
+        } else {
+            crate::fonts::bind_family_with_script(&mut fonts, &family, &script)
+        });
     }
     // Interface text (formula bar, name box, dialogs) falls back to the cell font before the
     // script faces: whatever a cell can draw, the formula bar can draw too, even where no script

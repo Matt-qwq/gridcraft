@@ -381,10 +381,19 @@ impl SheetApp {
             names.extend(d.wb.styles.iter().map(|(_, s)| s.font.name.clone()));
             names.push(d.wb.theme.major_font.clone());
             names.push(d.wb.theme.minor_font.clone());
+            names.extend(self.ea_fonts());
             // Text boxes and shapes name their own typefaces.
             names.extend(d.wb.sheets.iter().flat_map(|sh| sh.shapes.iter().filter_map(|s| s.format.font.clone())));
         }
         names
+    }
+
+    /// The workbook theme's East Asian typeface (`script="Hans"` → 宋体 in a Chinese Excel file):
+    /// Excel draws the Chinese in a Calibri cell with it, and so does GridCraft (see
+    /// [`theme::font_definitions_with`]).
+    pub fn ea_fonts(&self) -> Vec<String> {
+        let Some(d) = self.session.active() else { return Vec::new() };
+        d.wb.theme.body_ea_font(self.ui.language.east_asian_script()).map(|f| vec![f.to_string()]).unwrap_or_default()
     }
 
     /// Runs an engine command (or a UI command) and handles UI requests it makes.
@@ -1201,7 +1210,7 @@ impl SheetApp {
                 let used = self.used_fonts();
                 self.fonts_seen = seen;
                 if used != self.fonts_bound {
-                    ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used));
+                    ctx.set_fonts(theme::font_definitions_with(self.ui.language, &used, &self.ea_fonts()));
                     self.fonts_bound = used;
                     self.fonts_rebind = true;
                     ctx.request_repaint();

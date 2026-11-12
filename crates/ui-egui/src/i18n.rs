@@ -112,6 +112,16 @@ impl Language {
         }
     }
 
+    /// The script name Excel's font scheme uses for this language's East Asian text
+    /// (`<a:font script="Hans" typeface="宋体"/>` in a Chinese workbook's theme).
+    pub const fn east_asian_script(self) -> &'static str {
+        match self {
+            Self::Ja => "Jpan",
+            Self::Ko => "Hang",
+            _ => "Hans",
+        }
+    }
+
     /// The font Excel opens new workbooks with in this language: 等线 (DengXian) on a Chinese
     /// install, Calibri elsewhere. A name only: the renderer substitutes an installed face, and
     /// the value is what the file's Normal style carries.

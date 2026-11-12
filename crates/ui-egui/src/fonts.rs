@@ -315,9 +315,13 @@ fn face_key(face: &Face) -> String {
 /// no role is ever left pointing at missing data (egui panics on that). A family with no faces
 /// binds nothing.
 ///
+/// `script` holds the workbook's East Asian faces (the theme's 宋体): they sit right after the
+/// family's own faces, so a Calibri cell draws Latin in Calibri and Chinese in 宋体, as Excel does,
+/// instead of falling through to the generic CJK face. They come before `base` for the same reason.
+///
 /// Each role's chain ends with egui's default proportional fonts, so glyphs the installed font
 /// lacks (emoji, a stray script) still render.
-pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face]) -> Vec<String> {
+pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face], script: &[Face]) -> Vec<String> {
     if faces.is_empty() {
         return Vec::new();
     }
@@ -326,8 +330,7 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
     for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
         let Some(primary) = pick_face(faces, bold, italic) else { continue };
         let mut chain: Vec<String> = Vec::new();
-        for face in [Some(primary), pick_face(faces, false, false)] {
-            let Some(face) = face else { continue };
+        for face in [Some(primary), pick_face(faces, false, false)].into_iter().flatten().chain(script.iter()) {
             let key = face_key(face);
             if chain.contains(&key) {
                 continue;
@@ -353,7 +356,13 @@ pub fn bind_faces(fonts: &mut egui::FontDefinitions, family: &str, faces: &[Face
 
 /// Bind every installed face of `family`, found by any of its names (see [`bind_faces`]).
 pub fn bind_family(fonts: &mut egui::FontDefinitions, family: &str) -> Vec<String> {
-    bind_faces(fonts, family, &faces_of(family))
+    bind_faces(fonts, family, &faces_of(family), &[])
+}
+
+/// Bind every installed face of `family` with `script` (the workbook's East Asian faces) behind
+/// them (see [`bind_faces`]).
+pub fn bind_family_with_script(fonts: &mut egui::FontDefinitions, family: &str, script: &[Face]) -> Vec<String> {
+    bind_faces(fonts, family, &faces_of(family), script)
 }
 
 /// The role families currently bound to font data. `cell_family` consults this, so it never names a
@@ -462,14 +471,14 @@ mod tests {
         let face = Face { family: "Ubuntu".into(), names: vec!["Ubuntu".into()], path, index: 0, weight: 300.0, italic: false };
 
         let mut fonts = egui::FontDefinitions::default();
-        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face));
+        let bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&face), &[]);
         assert_eq!(bound.len(), 4, "regular, bold, italic and bold-italic roles");
         for key in &bound {
             let chain = fonts.families.get(&egui::FontFamily::Name(key.as_str().into())).expect("role family");
             assert!(chain.iter().all(|k| fonts.font_data.contains_key(k)), "every chained key has data");
         }
         // A family with no faces binds nothing and never touches the map.
-        assert!(bind_faces(&mut fonts, "No Such Font", &[]).is_empty());
+        assert!(bind_faces(&mut fonts, "No Such Font", &[], &[]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -601,11 +610,36 @@ mod tests {
 
         let mut fonts = egui::FontDefinitions::default();
         let before = fonts.font_data.len();
-        let mut bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&f));
-        bound.extend(bind_faces(&mut fonts, "우분투", std::slice::from_ref(&f)));
+        let mut bound = bind_faces(&mut fonts, "Ubuntu", std::slice::from_ref(&f), &[]);
+        bound.extend(bind_faces(&mut fonts, "우분투", std::slice::from_ref(&f), &[]));
         assert!(bound.contains(&role_key("우분투", false, false)), "bound under the workbook's name");
         assert!(bound.contains(&role_key("Ubuntu", true, true)));
         assert_eq!(fonts.font_data.len(), before + 1, "one file, loaded once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The workbook's East Asian face (the theme's 宋体) sits right behind the cell font: Latin in
+    /// the cell font, Chinese in 宋体, as Excel and WPS draw a Calibri cell.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_workbook_east_asian_face_sits_behind_the_cell_font() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-fonts-script-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let latin = dir.join("Carlito-Regular.ttf");
+        let han = dir.join("simsun.ttc");
+        std::fs::write(&latin, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
+        std::fs::write(&han, epaint_default_fonts::UBUNTU_LIGHT).expect("write");
+        let cell = Face { family: "Carlito".into(), names: vec!["Carlito".into()], path: latin, index: 0, weight: 400.0, italic: false };
+        let ea = Face { family: "SimSun".into(), names: vec!["SimSun".into(), "宋体".into()], path: han, index: 0, weight: 400.0, italic: false };
+
+        let mut fonts = egui::FontDefinitions::default();
+        let bound = bind_faces(&mut fonts, "Calibri", std::slice::from_ref(&cell), std::slice::from_ref(&ea));
+        let chain = fonts.families.get(&egui::FontFamily::Name(role_key("Calibri", false, false).into())).expect("bound");
+        assert_eq!(chain.first().map(String::as_str), Some(face_key(&cell).as_str()), "the cell font draws what it has");
+        assert_eq!(chain.get(1).map(String::as_str), Some(face_key(&ea).as_str()), "the workbook's 宋体 draws the rest");
+        assert_eq!(fonts.font_data.len(), egui::FontDefinitions::default().font_data.len() + 2, "both files loaded once");
+        assert!(bound.contains(&role_key("Calibri", true, true)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
