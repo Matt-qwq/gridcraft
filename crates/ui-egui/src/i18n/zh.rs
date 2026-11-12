@@ -1202,6 +1202,8 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "共有 {n} 条引擎命令可用，参见 docs/mcp.md 和 docs/control-protocol.md。"
         }
         "Only the first {n} values are listed." => "仅列出前 {n} 个值。",
+        "(Select All Search Results)" => "（全选搜索结果）",
+        "(Select All)" => "（全选）",
         _ => return None,
     })
 }
