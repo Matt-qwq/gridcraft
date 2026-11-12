@@ -10,7 +10,7 @@ use crate::theme::{self, Tokens};
 
 /// Translates a label or tooltip for the language of the frame being drawn (English if untranslated).
 /// Ribbon chrome all flows through these widgets, so translating here localises it in one place.
-fn tr<'a>(ui: &Ui, text: &'a str) -> &'a str {
+pub(crate) fn tr<'a>(ui: &Ui, text: &'a str) -> &'a str {
     i18n::current(ui.ctx()).tr(text)
 }
 
@@ -385,7 +385,7 @@ fn palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str, more_colors:
     if more_colors {
         ui.separator();
     }
-    if more_colors && ui.button("More Colors…").clicked() {
+    if more_colors && ui.button(tr(ui, "More Colors…")).clicked() {
         let start = recent.first().and_then(|h| parse_hex(h)).unwrap_or([0x44, 0x72, 0xC4]);
         more = Some(MoreColors::new(start));
     }
@@ -397,7 +397,7 @@ fn palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str, more_colors:
             m.hex = hex_of(m.hsva.to_srgb());
         }
         ui.horizontal(|ui| {
-            let label = ui.label("Hex");
+            let label = ui.label(tr(ui, "Hex"));
             let r = ui.add(egui::TextEdit::singleline(&mut m.hex).desired_width(72.0).char_limit(7)).labelled_by(label.id);
             if r.changed()
                 && let Some(c) = parse_hex(&m.hex)
@@ -408,10 +408,10 @@ fn palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str, more_colors:
             let (sw, _) = ui.allocate_exact_size(vec2(36.0, 18.0), Sense::hover());
             ui.painter().rect_filled(sw, 1.0, Color32::from_rgb(c[0], c[1], c[2]));
             ui.painter().rect_stroke(sw, 1.0, Stroke::new(1.0, Color32::from_gray(160)), StrokeKind::Inside);
-            ui.label(egui::RichText::new("New").small());
+            ui.label(egui::RichText::new(tr(ui, "New")).small());
         });
         ui.horizontal(|ui| {
-            if ui.button("  OK  ").clicked() {
+            if ui.button(tr(ui, "  OK  ")).clicked() {
                 // A hex still being typed that is not a colour falls back to the picker's.
                 let c = parse_hex(&m.hex).unwrap_or_else(|| m.hsva.to_srgb());
                 let hex = hex_of(c);
@@ -451,7 +451,7 @@ pub fn message_box(app: &mut SheetApp, ctx: &egui::Context) {
         });
         ui.add_space(8.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("  OK  ").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)) {
+            if ui.button(tr(ui, "  OK  ")).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)) {
                 close = true;
             }
         });

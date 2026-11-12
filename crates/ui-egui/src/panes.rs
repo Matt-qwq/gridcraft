@@ -29,7 +29,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                 "formatChart" => "Format Chart Area",
                 _ => "",
             };
-            ui.label(egui::RichText::new(title).font(theme::ui_bold(15.0)));
+            ui.label(egui::RichText::new(crate::widgets::tr(ui, title)).font(theme::ui_bold(15.0)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if crate::widgets::icon_button(ui, crate::icons::Icon::Close, t.text_dim, "Close", vec2(22.0, 22.0)).clicked() {
                     if pane == "comments" {
@@ -55,7 +55,7 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
     let Some(sh) = d.wb.active() else { return };
     let list: Vec<(String, gridcraft_engine::model::Comment)> = sh.comments.iter().map(|(c, m)| (c.a1(), m.clone())).collect();
     if list.is_empty() {
-        ui.label(egui::RichText::new("No comments on this sheet yet. Select a cell and choose New Comment.").italics());
+        ui.label(egui::RichText::new(crate::widgets::tr(ui, "No comments on this sheet yet. Select a cell and choose New Comment.")).italics());
     }
     for (cell, c) in list {
         egui::Frame::NONE
@@ -85,14 +85,16 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
                 // a field sized by a guess wider than the row pushes the resizable pane wider every frame.
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Delete").clicked() {
+                        if ui.small_button(crate::widgets::tr(ui, "Delete")).clicked() {
                             app.run_or_alert("review.deleteComment", json!({"cell": cell}));
                         }
                         if ui.small_button(if c.resolved { "Reopen" } else { "Resolve" }).clicked() {
                             app.run_or_alert("review.resolveComment", json!({"cell": cell, "resolved": !c.resolved}));
                         }
-                        let send = ui.small_button("Send").clicked();
-                        let r = ui.add(egui::TextEdit::singleline(&mut draft).hint_text("Reply…").desired_width(ui.available_width()));
+                        let send = ui.small_button(crate::widgets::tr(ui, "Send")).clicked();
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut draft).hint_text(crate::widgets::tr(ui, "Reply…")).desired_width(ui.available_width()),
+                        );
                         if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) || send) && !draft.is_empty() {
                             app.run_or_alert("review.replyComment", json!({"cell": cell, "text": draft}));
                             draft.clear();
@@ -106,7 +108,7 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
 }
 
 fn watch(app: &mut SheetApp, ui: &mut Ui) {
-    if ui.button("Add Watch (active cell)").clicked()
+    if ui.button(crate::widgets::tr(ui, "Add Watch (active cell)")).clicked()
         && let Some(d) = app.session.active()
         && let Some(sh) = d.wb.active()
     {
@@ -169,7 +171,7 @@ fn selection(app: &mut SheetApp, ui: &mut Ui) {
             if ui.small_button("▼").on_hover_text("Send Backward").clicked() {
                 app.run_or_alert("arrange.sendBackward", json!({"kind": kind, "id": id}));
             }
-            if ui.small_button("✕").on_hover_text("Delete").clicked() {
+            if ui.small_button("✕").on_hover_text(crate::widgets::tr(ui, "Delete")).clicked() {
                 app.run_or_alert("object.delete", json!({"kind": kind, "id": id}));
             }
         });

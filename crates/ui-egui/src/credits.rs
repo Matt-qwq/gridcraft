@@ -215,14 +215,14 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
     let id = egui::Id::new("credits_view");
     let mut v = ui.data_mut(|d| d.get_temp::<View>(id)).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        ui.label("Show");
+        ui.label(crate::widgets::tr(ui, "Show"));
         for m in NameMode::ALL {
             if ui.selectable_label(v.names == m, m.label()).clicked() {
                 v.names = m;
             }
         }
         ui.separator();
-        ui.label("Sort");
+        ui.label(crate::widgets::tr(ui, "Sort"));
         egui::ComboBox::from_id_salt("credits_sort").selected_text(v.key.label().0).show_ui(ui, |ui| {
             for k in SortKey::ALL {
                 if ui.selectable_label(v.key == k, k.label().0).clicked() {
@@ -238,7 +238,7 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
         if ui.selectable_label(!v.table, "Grab bag").clicked() {
             v.table = false;
         }
-        if ui.selectable_label(v.table, "Table").clicked() {
+        if ui.selectable_label(v.table, crate::widgets::tr(ui, "Table")).clicked() {
             v.table = true;
         }
     });
@@ -247,7 +247,7 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
     ui.separator();
     egui::ScrollArea::both().auto_shrink([false, false]).max_height(340.0).show(ui, |ui| {
         if list.is_empty() {
-            ui.label("No contributor data was built into this copy.");
+            ui.label(crate::widgets::tr(ui, "No contributor data was built into this copy."));
         } else if v.table {
             table(ui, &list, &mut v);
         } else {
@@ -297,7 +297,7 @@ fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View) {
 /// About ▸ Models: AI models credited in Co-Authored-By trailers.
 pub fn models_ui(ui: &mut egui::Ui) {
     if MODELS.is_empty() {
-        ui.label("No model credits were built into this copy.");
+        ui.label(crate::widgets::tr(ui, "No model credits were built into this copy."));
         return;
     }
     let assisted: u64 = MODELS.iter().map(|m| m.commits).max().unwrap_or(0).max(1);

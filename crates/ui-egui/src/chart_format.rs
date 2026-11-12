@@ -19,6 +19,7 @@ use serde_json::{Map, Value as Json, json};
 
 use crate::SheetApp;
 use crate::theme::{self, Tokens};
+use crate::widgets::tr;
 
 /// Why a chartex chart offers no formatting here.
 const CHARTEX: &str = "This chart type keeps its options in a chartex part, which GridCraft does not model.";
@@ -409,7 +410,7 @@ fn chart_area(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
             app.run_or_alert("chart.set", json!({"chart": id, "dataLabels": dl}));
         }
         let mut gl = chart.gridlines;
-        if ui.checkbox(&mut gl, "Gridlines").changed() {
+        if ui.checkbox(&mut gl, crate::widgets::tr(ui, "Gridlines")).changed() {
             app.run_or_alert("chart.set", json!({"chart": id, "gridlines": gl}));
         }
         for (label, current, key) in
@@ -468,7 +469,7 @@ fn series_fill(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, i: usize
     ui.collapsing("Series Fill", |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&s.values).small().color(Tokens::get(ui.ctx()).text_dim));
-            ui.menu_button("Fill…", |ui| {
+            ui.menu_button(tr(ui, "Fill…"), |ui| {
                 if let Some(c) = crate::widgets::color_palette_fixed(ui, &theme.colors, "Automatic") {
                     app.run_or_alert(
                         "chart.formatSelection",
@@ -546,7 +547,7 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
         }
         if reason(AxisOption::Crossing).is_none() {
             ui.horizontal(|ui| {
-                ui.label("Crosses at");
+                ui.label(tr(ui, "Crosses at"));
                 let current = match o.crosses {
                     AxisCrossing::AutoZero => "Automatic",
                     AxisCrossing::Min => "Minimum",
@@ -584,7 +585,7 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
         }
         if group.is_none() {
             ui.horizontal(|ui| {
-                ui.label("Display units");
+                ui.label(tr(ui, "Display units"));
                 let current = o.display_units.map_or("None", DisplayUnits::label);
                 egui::ComboBox::from_id_salt(("chart_axis_units", id, value_axis)).selected_text(current).show_ui(ui, |ui| {
                     if ui.selectable_label(o.display_units.is_none(), "None").clicked() {
@@ -615,7 +616,7 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
             return;
         }
         ui.horizontal(|ui| {
-            ui.label("Format code");
+            ui.label(tr(ui, "Format code"));
             let field = egui::Id::new(("gridcraft.chart_axis_numfmt", id, value_axis));
             if let Some(code) = crate::widgets::committed_text(ui, field, o.number_format.as_deref().unwrap_or(""), None) {
                 run_axis(app, id, axis_name, json!({"numberFormat": code}));
@@ -668,7 +669,7 @@ fn bound(ui: &mut Ui, id: egui::Id, value: Option<f64>, label: &str, start: f64,
     let mut auto = value.is_none();
     ui.horizontal(|ui| {
         ui.label(label);
-        let boxed = ui.checkbox(&mut auto, "Auto");
+        let boxed = ui.checkbox(&mut auto, crate::widgets::tr(ui, "Auto"));
         if boxed.changed() {
             action = Some(if auto { Bound::Auto } else { Bound::Set(start) });
         }
@@ -735,7 +736,7 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
                 }
             }
             ui.horizontal(|ui| {
-                ui.label("Position");
+                ui.label(tr(ui, "Position"));
                 let current = position_label(o.position);
                 egui::ComboBox::from_id_salt(("chart_label_pos", id, series)).selected_text(current).show_ui(ui, |ui| {
                     for (label, params) in [
@@ -757,14 +758,14 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
                 });
             });
             ui.horizontal(|ui| {
-                ui.label("Separator");
+                ui.label(tr(ui, "Separator"));
                 let field = egui::Id::new(("gridcraft.chart_label_sep", id, series));
                 if let Some(text) = crate::widgets::committed_text(ui, field, o.separator.as_deref().unwrap_or(", "), Some(60.0)) {
                     run_labels(app, id, series, json!({"separator": text}));
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("Number format");
+                ui.label(tr(ui, "Number format"));
                 let field = egui::Id::new(("gridcraft.chart_label_numfmt", id, series));
                 if let Some(text) = crate::widgets::committed_text(ui, field, o.number_format.as_deref().unwrap_or(""), Some(90.0)) {
                     run_labels(app, id, series, json!({"numberFormat": text}));
@@ -826,7 +827,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
     };
     section(ui, "Error Bars", error_bar_reason(chart), |ui| {
         ui.horizontal(|ui| {
-            ui.label("Type");
+            ui.label(crate::widgets::tr(ui, "Type"));
             let current = match kind_name {
                 "fixed" => "Fixed amount",
                 "percentage" => "Percentage",
@@ -849,7 +850,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                 }
                 // Custom bars need a plus or minus reference; the fields below supply them.
                 if plus_ref.trim().is_empty() && minus_ref.trim().is_empty() {
-                    ui.add_enabled(false, egui::Button::new("Custom"))
+                    ui.add_enabled(false, egui::Button::new(crate::widgets::tr(ui, "Custom")))
                         .on_disabled_hover_text("Custom error bars need a plus or minus reference; type one below (a range or an array constant).");
                 } else if ui.selectable_label(current == "Custom", "Custom").clicked() {
                     run_error_bars(app, id, series, json!({"type": "custom", "plus": plus_ref, "minus": minus_ref}));
@@ -872,7 +873,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                 }
             }
             ui.horizontal(|ui| {
-                ui.label("Direction");
+                ui.label(tr(ui, "Direction"));
                 for (label, value) in [("Both", ErrorBarDirection::Both), ("Plus", ErrorBarDirection::Plus), ("Minus", ErrorBarDirection::Minus)] {
                     if ui.selectable_label(direction == value, label).clicked() {
                         run_error_bars(
@@ -897,7 +898,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
         ui.separator();
         ui.label(RichText::new("Custom references (a range or an array constant)").small().color(t.text_dim));
         ui.horizontal(|ui| {
-            ui.label("Plus reference");
+            ui.label(tr(ui, "Plus reference"));
             if let Some(v) = crate::widgets::committed_text(ui, egui::Id::new(("chart_errbars_ref", id, series, "plus")), &plus_ref, None) {
                 plus_ref = v;
                 if !plus_ref.trim().is_empty() || !minus_ref.trim().is_empty() {
@@ -906,7 +907,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Minus reference");
+            ui.label(tr(ui, "Minus reference"));
             if let Some(v) = crate::widgets::committed_text(ui, egui::Id::new(("chart_errbars_ref", id, series, "minus")), &minus_ref, None) {
                 minus_ref = v;
                 if !plus_ref.trim().is_empty() || !minus_ref.trim().is_empty() {
@@ -949,7 +950,7 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
         let key = point_key(id, scope);
         let index = ui.data(|d| d.get_temp::<usize>(key)).unwrap_or(0).min(count.saturating_sub(1));
         ui.horizontal(|ui| {
-            ui.label("Point");
+            ui.label(crate::widgets::tr(ui, "Point"));
             let mut shown = index + 1;
             if ui.add(egui::DragValue::new(&mut shown).range(1..=count as i64)).changed() {
                 ui.data_mut(|d| d.insert_temp(key, shown.saturating_sub(1).min(count - 1)));
@@ -965,7 +966,7 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
         ui.add_enabled_ui(marker.is_none(), |ui| {
             point_colour(app, ui, &theme, id, scope, index, "Marker", "marker", pt.marker);
             ui.horizontal(|ui| {
-                ui.label("Marker size");
+                ui.label(tr(ui, "Marker size"));
                 if let Some(v) = number(
                     ui,
                     egui::Id::new(("gridcraft.chart_point_marker_size", id, scope, index)),
@@ -996,7 +997,7 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
             app.run_or_alert("chart.formatPoint", Json::Object(m));
         }
         label_font_controls(app, ui, id, Some(scope), Some(index as u32), s.point_label(index).and_then(|l| l.font));
-        if ui.button("Clear point formatting").clicked() {
+        if ui.button(tr(ui, "Clear point formatting")).clicked() {
             let mut m = Map::new();
             m.insert("chart".into(), json!(id));
             m.insert("series".into(), json!(scope));
@@ -1044,7 +1045,7 @@ fn colour_row(
                 ui.label(RichText::new("Automatic colour").small().color(t.text_dim));
             }
         }
-        ui.menu_button("Colour…", |ui| {
+        ui.menu_button(tr(ui, "Colour…"), |ui| {
             if let Some(c) = crate::widgets::color_palette_fixed(ui, &wb_theme.colors, "") {
                 ui.close();
                 let mut m = params.clone();
@@ -1089,7 +1090,7 @@ fn label_font_controls(app: &mut SheetApp, ui: &mut Ui, id: u32, series: Option<
         params.insert("point".into(), json!(p));
     }
     ui.horizontal(|ui| {
-        ui.label("Label size");
+        ui.label(tr(ui, "Label size"));
         let field = egui::Id::new(("gridcraft.chart_label_font_size", id, series, point));
         if let Some(v) = number(ui, field, f64::from(f.size.unwrap_or(9.0)), 1.0..=400.0, "") {
             let mut m = params.clone();
@@ -1114,7 +1115,7 @@ fn chart_scope(ui: &mut Ui, chart: &Chart, id: u32) -> usize {
     let mut scope: usize = ui.data(|d| d.get_temp(key)).unwrap_or(0);
     let n = chart.series.len();
     ui.horizontal(|ui| {
-        ui.label("Series");
+        ui.label(crate::widgets::tr(ui, "Series"));
         let mut shown = scope + 1;
         if ui.add(egui::DragValue::new(&mut shown).range(1..=n.max(1) as i64)).changed() {
             scope = shown.saturating_sub(1).min(n.saturating_sub(1));

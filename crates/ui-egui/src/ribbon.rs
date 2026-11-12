@@ -8,7 +8,7 @@ use crate::SheetApp;
 use crate::icons::{self, Icon};
 use crate::keytips::keytip_table;
 use crate::theme::{self, Tokens};
-use crate::widgets::{big_button, color_palette, icon_button, small_button, split_button, toggle_button};
+use crate::widgets::{big_button, color_palette, icon_button, small_button, split_button, toggle_button, tr};
 
 pub const TABS: &[&str] = &["Home", "Insert", "Draw", "Page Layout", "Formulas", "Data", "Review", "View", "Automate"];
 
@@ -84,7 +84,7 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                 let labels: Vec<String> =
                     app.session.active().map(|d| d.undo.iter().rev().take(20).map(|e| e.label.clone()).collect()).unwrap_or_default();
                 if labels.is_empty() {
-                    ui.label("Can't Undo");
+                    ui.label(tr(ui, "Can't Undo"));
                 }
                 for (i, l) in labels.iter().enumerate() {
                     if ui.button(format!("Undo {l}")).clicked() {
@@ -108,7 +108,7 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                         app.run_or_alert(id, json!({}));
                     }
                 }
-                if ui.button("Print…").clicked() {
+                if ui.button(tr(ui, "Print…")).clicked() {
                     app.print_now(json!({}));
                 }
             });
@@ -122,7 +122,7 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                 }
                 let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);
                 egui::Popup::menu(&share).show(|ui| {
-                    if ui.button("Export as PDF…").clicked() {
+                    if ui.button(tr(ui, "Export as PDF…")).clicked() {
                         app.run_or_alert("file.exportPdf", json!({}));
                     }
                     for (label, fmt) in
@@ -501,7 +501,7 @@ fn combo_popup(
         }
         if filter {
             let text_id = anchor.id.with(salt).with("__combo_text");
-            let te = ui.add(egui::TextEdit::singleline(&mut st.text).id(text_id).desired_width(220.0).hint_text("Type to filter…"));
+            let te = ui.add(egui::TextEdit::singleline(&mut st.text).id(text_id).desired_width(220.0).hint_text(tr(ui, "Type to filter…")));
             if open_now && !te.has_focus() {
                 ui.ctx().memory_mut(|m| m.request_focus(text_id));
                 // Select all once focus lands so typing replaces the filter.
@@ -766,7 +766,7 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
                     }
                 }
                 ui.separator();
-                if ui.button("More Borders…").clicked() {
+                if ui.button(tr(ui, "More Borders…")).clicked() {
                     app.open_dialog("formatCells", json!({"tab": "Border"}));
                 }
             });
@@ -1061,7 +1061,7 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
                     }
                 }
                 ui.separator();
-                if ui.button("More Functions…").clicked() {
+                if ui.button(tr(ui, "More Functions…")).clicked() {
                     app.open_dialog("insertFunction", json!({}));
                 }
             });
@@ -1281,23 +1281,23 @@ fn number_combo(app: &mut SheetApp, ui: &mut Ui, st: &Style) {
 }
 
 fn cf_menu(app: &mut SheetApp, ui: &mut Ui) {
-    ui.menu_button("Highlight Cells Rules", |ui| {
+    ui.menu_button(tr(ui, "Highlight Cells Rules"), |ui| {
         for (label, op) in [("Greater Than…", "greater"), ("Less Than…", "less"), ("Between…", "between"), ("Equal To…", "equal")] {
-            if ui.button(label).clicked() {
+            if ui.button(tr(ui, label)).clicked() {
                 app.open_dialog("cfQuick", json!({"type": "cellIs", "operator": op, "title": label}));
             }
         }
-        if ui.button("Text that Contains…").clicked() {
+        if ui.button(tr(ui, "Text that Contains…")).clicked() {
             app.open_dialog("cfQuick", json!({"type": "containsText", "title": "Text that Contains"}));
         }
-        if ui.button("A Date Occurring…").clicked() {
+        if ui.button(tr(ui, "A Date Occurring…")).clicked() {
             app.open_dialog("cfQuick", json!({"type": "timePeriod", "title": "A Date Occurring"}));
         }
-        if ui.button("Duplicate Values…").clicked() {
+        if ui.button(tr(ui, "Duplicate Values…")).clicked() {
             act(app, "home.conditionalFormat", json!({"rule": {"type": "duplicate"}}));
         }
     });
-    ui.menu_button("Top/Bottom Rules", |ui| {
+    ui.menu_button(tr(ui, "Top/Bottom Rules"), |ui| {
         menu_items(
             app,
             ui,
@@ -1349,10 +1349,10 @@ fn cf_menu(app: &mut SheetApp, ui: &mut Ui) {
         }
     });
     ui.separator();
-    if ui.button("New Rule…").clicked() {
+    if ui.button(tr(ui, "New Rule…")).clicked() {
         app.open_dialog("cfQuick", json!({"type": "expression", "title": "New Formatting Rule"}));
     }
-    ui.menu_button("Clear Rules", |ui| {
+    ui.menu_button(tr(ui, "Clear Rules"), |ui| {
         menu_items(
             app,
             ui,
@@ -1362,7 +1362,7 @@ fn cf_menu(app: &mut SheetApp, ui: &mut Ui) {
             ],
         );
     });
-    if ui.button("Manage Rules…").clicked() {
+    if ui.button(tr(ui, "Manage Rules…")).clicked() {
         app.open_dialog("manageRules", json!({}));
     }
 }
