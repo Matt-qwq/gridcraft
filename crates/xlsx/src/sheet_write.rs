@@ -334,16 +334,23 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
     let mut store = sheet.cells.iter_scan(RangeRef::all()).peekable();
     let mut sparse = additions.into_iter().peekable();
     let mut info_rows = sheet.rows.iter().peekable();
+    let mut filter_rows = sheet.filter_hidden.rows().peekable();
     loop {
         let next_store = store.peek().map(|(at, _)| at.row);
         let next_sparse = sparse.peek().map(|(r, _)| *r);
         let next_info = info_rows.peek().map(|(r, _)| *r);
-        let Some(row) = [next_store, next_sparse, next_info].into_iter().flatten().min() else { break };
-        let info = if next_info == Some(row) {
+        let next_filter = filter_rows.peek().copied();
+        let Some(row) = [next_store, next_sparse, next_info, next_filter].into_iter().flatten().min() else { break };
+        let mut info = if next_info == Some(row) {
             info_rows.next().map(|(_, i)| *i).unwrap_or_default()
         } else {
             sheet.rows.get(&row).copied().unwrap_or_default()
         };
+        // A row the filter hides lives in the bitmap, not in the line map.
+        if next_filter == Some(row) {
+            filter_rows.next();
+            info.hidden = true;
+        }
         let mut adds: std::iter::Peekable<std::vec::IntoIter<(u32, Additions<'_>)>> = if next_sparse == Some(row) {
             sparse.next().map(|(_, v)| v).unwrap_or_default().into_iter().peekable()
         } else {

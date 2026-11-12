@@ -1,15 +1,15 @@
 //! Reading worksheet parts.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use gridcraft_core::date::{serial_from_ymd, time_fraction};
 use gridcraft_core::{CellError, CellRef, DateSystem, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_formula::Expr;
 use gridcraft_model::{
-    AutoFilter, Cell, CfOperator, CfRule, CfValueKind, Comment, CondFormat, EditRange, ErrorStyle, FilterCriterion, Formula, Hyperlink, LineInfo,
-    NoteBox, NoteCorner, Orientation, PasswordHash, Sheet, SheetProtection, Sparkline, SparklineKind, Table, TableColumn, TotalsFn, Validation,
-    ValidationKind, XmlColumnPr,
+    AutoFilter, Cell, CfOperator, CfRule, CfValueKind, Comment, CondFormat, EditRange, ErrorStyle, FilterCriterion, FilterHidden, Formula, Hyperlink,
+    LineInfo, NoteBox, NoteCorner, Orientation, PasswordHash, Sheet, SheetProtection, Sparkline, SparklineKind, Table, TableColumn, TotalsFn,
+    Validation, ValidationKind, XmlColumnPr,
 };
 
 use crate::IoError;
@@ -325,7 +325,27 @@ pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: &R
             }
         }
     }
+    heal_filter_hidden(&mut sheet);
     Ok(sheet)
+}
+
+/// A file stores a row its filter hides as `hidden="1"` on the row. Read that way, a million-row
+/// filter becomes a million line infos, which every scroll and every frame then walks; the sheet
+/// keeps them in its filter bitmap instead and gives them back when the filter is cleared.
+fn heal_filter_hidden(sheet: &mut Sheet) {
+    let by_a_filter = |row: u32| {
+        let sheet_filter = sheet.autofilter.as_ref().is_some_and(|af| !af.criteria.is_empty() && row > af.range.start.row && row <= af.range.end.row);
+        sheet_filter || sheet.tables.iter().any(|t| !t.filter.is_empty() && t.data_range().is_some_and(|r| row >= r.start.row && row <= r.end.row))
+    };
+    let only_hidden = LineInfo { hidden: true, ..Default::default() };
+    let moved: Vec<u32> = sheet.rows.iter().filter(|(r, i)| **i == only_hidden && by_a_filter(*r)).map(|(r, _)| r).collect();
+    if moved.is_empty() {
+        return;
+    }
+    for row in &moved {
+        sheet.rows.remove(row);
+    }
+    sheet.filter_hidden = FilterHidden::build(moved, BTreeMap::new());
 }
 
 /// A protection password hash: the iterated attributes (`algorithmName`, `hashValue`,

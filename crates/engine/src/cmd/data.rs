@@ -1,6 +1,7 @@
 //! Data tab: sort, filter, remove duplicates, text to columns, data validation, outline.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, RangeRef, Value, sort_compare};
@@ -518,7 +519,12 @@ fn toggle_filter(s: &mut Session, p: &Json) -> Result<Json> {
     if has {
         return edit(s, |cx| {
             let sh = cx.sheet_mut(sheet)?;
-            // Reveal only rows the filter hid; rows hidden by hand or by a collapsed group stay hidden.
+            // The filter's own rows come back with it; rows hidden by hand or by a collapsed group
+            // stay hidden, and so do a table's (its filter is still on).
+            let mut gone = std::mem::take(&mut sh.filter_hidden);
+            for (r, info) in gone.take_saved() {
+                sh.rows.insert(r, info);
+            }
             let filtered: Vec<u32> = sh.rows.keys().filter(|r| sh.is_row_filtered(*r)).collect();
             sh.autofilter = None;
             for r in filtered {
@@ -622,7 +628,7 @@ fn filter_by(s: &mut Session, p: &Json) -> Result<Json> {
         cx.structural = true;
         Ok(Json::Null)
     })?;
-    let hidden = s.doc()?.wb.sheet(sheet).map(|sh| sh.rows.values().filter(|r| r.hidden).count()).unwrap_or(0);
+    let hidden = s.doc()?.wb.sheet(sheet).map(|sh| sh.rows.values().filter(|r| r.hidden).count() + sh.filter_hidden.count() as usize).unwrap_or(0);
     Ok(json!({"hiddenRows": hidden}))
 }
 
@@ -747,13 +753,24 @@ pub(crate) fn apply_filter(wb: &mut Workbook, sheet: usize) {
         hide.push((row, !visible));
     }
     let Some(shm) = wb.sheet_mut(sheet) else { return };
+    // The previous filter gives back what it took off the rows it hid.
+    let mut previous = std::mem::take(&mut shm.filter_hidden);
+    for (row, info) in previous.take_saved() {
+        shm.rows.insert(row, info);
+    }
+    // The answer is a bitmap, not a line-info entry per row: a filtered id column hides a
+    // million rows, and an entry each made every scroll walk all of them (see FilterHidden).
+    let mut hidden = FilterHidden::build(hide.iter().filter(|(_, h)| *h).map(|(row, _)| *row), BTreeMap::new());
     for (row, h) in hide {
-        if h {
-            shm.rows.entry(row).or_default().hidden = true;
-        } else if let Some(e) = shm.rows.get_mut(&row) {
-            e.hidden = false;
+        if !h {
+            continue;
+        }
+        if let Some(info) = shm.rows.remove(&row) {
+            // A height, a whole-row style or a hand-hidden flag: kept for when the row returns.
+            hidden.save(row, info);
         }
     }
+    shm.filter_hidden = hidden;
 }
 
 fn clear_filter(s: &mut Session, _: &Json) -> Result<Json> {
@@ -1634,6 +1651,57 @@ mod tests {
         assert_eq!(get(&mut s, "B7")["value"], json!(100.0), "the grand total counts every data row");
     }
 
+    /// A filter hides rows as a bitmap, not as a line info each. Five thousand hidden rows used
+    /// to leave five thousand map entries behind — a million of them made every frame seven times
+    /// slower (200 ms against 27) and stayed after the filter was cleared.
+    #[test]
+    fn a_filter_hides_rows_without_a_line_info_each() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let values: Vec<Json> = (0..5_000).map(|i| json!([i % 50])).collect();
+        s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+        s.execute("data.filter", json!({"range": "A1:A5000"})).unwrap();
+        let r = s.execute("data.filterBy", json!({"column": "A", "values": ["7"]})).unwrap();
+        let visible = (1..5_000).filter(|i| i % 50 == 7).count() as u64;
+        assert_eq!(r["hiddenRows"], 4_999 - visible);
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert_eq!(sh.filter_hidden.count() as u64, r["hiddenRows"].as_u64().unwrap());
+        assert!(sh.rows.is_empty(), "no line info per hidden row");
+        assert!(sh.is_row_hidden(1));
+        assert!(!sh.is_row_hidden(7), "row 7 is the value the filter keeps");
+        assert!(sh.is_row_filtered(1));
+        // row_top counts the visible rows only, without walking the hidden ones.
+        let hidden_below = (1..9).filter(|r| sh.is_row_hidden(*r)).count() as f64;
+        let want = (9.0 - hidden_below) * sh.default_row_height as f64;
+        assert!((sh.row_top(9) - want).abs() < 0.01, "row_top(9) = {}", sh.row_top(9));
+        // Clearing gives the rows back and leaves nothing behind.
+        s.execute("data.clearFilter", json!({})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert!(sh.filter_hidden.is_empty());
+        assert!(sh.rows.is_empty());
+        assert!((sh.row_top(9) - 9.0 * sh.default_row_height as f64).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_filter_keeps_the_line_info_it_hides() {
+        // A row with its own height that the filter hides gives the height back when revealed.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["N"], [1], [2]]})).unwrap();
+        s.execute("data.filter", json!({"range": "A1:A3"})).unwrap();
+        s.execute("home.rowHeight", json!({"rows": "3:3", "height": 44})).unwrap();
+        s.execute("data.filterBy", json!({"column": "A", "values": ["1"]})).unwrap();
+        {
+            let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+            assert!(sh.is_row_hidden(2));
+            assert_eq!(sh.row_height(2), 0.0);
+            assert_eq!(sh.filter_hidden.count(), 1);
+        }
+        s.execute("data.clearFilter", json!({})).unwrap();
+        let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+        assert!(!sh.is_row_hidden(2));
+        assert_eq!(sh.row_height(2), 44.0, "the height came back with the row");
+    }
     /// An id column has a value per row. The dropdown lists the first 1,000 (as Excel does) and
     /// says there are more, instead of formatting a million values on every frame the menu opens.
     #[test]

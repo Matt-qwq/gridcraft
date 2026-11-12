@@ -670,9 +670,172 @@ pub(crate) fn default_rows() -> LineMap {
     LineMap::rows()
 }
 
+/// Rows hidden by an applied filter, as a bitmap rather than one LineInfo per row.
+///
+/// A filtered id column hides a value per row — a million rows on a full sheet — and a line-info
+/// entry each made Sheet::row_top walk a million entries on every scroll and every frame.
+/// Measured on a million-row sheet: 55 MB, about a second per filter change, and the entries
+/// stayed behind after the filter was cleared. The bitmap costs 125 KB for the same rows, answers
+/// "hidden?" in constant time, and carries a rank index so row_top subtracts hidden rows in
+/// constant time too.
+///
+/// A row the filter hides keeps no line info of its own: whatever it had (a height, a whole-row
+/// style, a hand-hidden flag) is parked in saved and put back when the filter lets it go. That
+/// keeps row_top exact — a hidden row contributes nothing but the default height it loses.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "FilterHiddenRepr", into = "FilterHiddenRepr")]
+pub struct FilterHidden {
+    /// Bit row set = the filter hides that row.
+    words: Vec<u64>,
+    /// ranks[i] = hidden rows in words[..i * RANK_BLOCK].
+    ranks: Vec<u32>,
+    /// Hidden rows in total.
+    count: u32,
+    /// Line info the filter took off the rows it hides, put back when they are revealed.
+    saved: BTreeMap<u32, LineInfo>,
+}
+
+/// Words per rank entry: 8 x 64 = 512 rows between two rank entries.
+const RANK_BLOCK: usize = 8;
+
+/// The document shape: the bitmap words and the parked line info. The rank index is rebuilt.
+#[derive(Serialize, Deserialize)]
+struct FilterHiddenRepr {
+    #[serde(default)]
+    words: Vec<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    saved: BTreeMap<u32, LineInfo>,
+}
+
+impl From<FilterHiddenRepr> for FilterHidden {
+    fn from(r: FilterHiddenRepr) -> FilterHidden {
+        FilterHidden::from_words(r.words, r.saved)
+    }
+}
+
+impl From<FilterHidden> for FilterHiddenRepr {
+    fn from(f: FilterHidden) -> FilterHiddenRepr {
+        FilterHiddenRepr { words: f.words, saved: f.saved }
+    }
+}
+
+impl FilterHidden {
+    /// A set holding rows (ascending, no duplicates) and the line info each one gave up.
+    pub fn build(rows: impl IntoIterator<Item = u32>, saved: BTreeMap<u32, LineInfo>) -> FilterHidden {
+        let mut words = Vec::new();
+        for row in rows {
+            let w = (row / 64) as usize;
+            if words.len() <= w {
+                words.resize(w + 1, 0);
+            }
+            words[w] |= 1u64 << (row % 64);
+        }
+        FilterHidden::from_words(words, saved)
+    }
+
+    fn from_words(words: Vec<u64>, saved: BTreeMap<u32, LineInfo>) -> FilterHidden {
+        let mut ranks = Vec::with_capacity(words.len().div_ceil(RANK_BLOCK) + 1);
+        let mut n = 0u32;
+        for (i, w) in words.iter().enumerate() {
+            if i % RANK_BLOCK == 0 {
+                ranks.push(n);
+            }
+            n = n.saturating_add(w.count_ones());
+        }
+        if !words.len().is_multiple_of(RANK_BLOCK) {
+            ranks.push(n);
+        }
+        FilterHidden { words, ranks, count: n, saved }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    pub fn contains(&self, row: u32) -> bool {
+        self.words.get((row / 64) as usize).is_some_and(|w| w & (1u64 << (row % 64)) != 0)
+    }
+
+    /// Hidden rows below row: what row_top subtracts.
+    pub fn count_before(&self, row: u32) -> u32 {
+        let block = (row / 64) as usize / RANK_BLOCK;
+        let Some(&base) = self.ranks.get(block) else { return self.count };
+        let mut n = base;
+        let first = block * RANK_BLOCK;
+        let last = ((row / 64) as usize).min(self.words.len());
+        for &w in &self.words[first.min(last)..last] {
+            n = n.saturating_add(w.count_ones());
+        }
+        if let Some(&w) = self.words.get((row / 64) as usize) {
+            let bits = row % 64;
+            if bits > 0 {
+                n = n.saturating_add((w & ((1u64 << bits) - 1)).count_ones());
+            }
+        }
+        n
+    }
+
+    /// The hidden rows, ascending.
+    pub fn rows(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(i, &w)| {
+            let mut bits = w;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                Some(i as u32 * 64 + bit)
+            })
+        })
+    }
+
+    /// Take the parked line info back (the caller puts it into the line map).
+    pub fn take_saved(&mut self) -> BTreeMap<u32, LineInfo> {
+        std::mem::take(&mut self.saved)
+    }
+
+    /// Park the line info of a row the filter is about to hide.
+    pub fn save(&mut self, row: u32, info: LineInfo) {
+        self.saved.insert(row, info);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bitmap answers the same as a set, ranks included, at the block boundaries.
+    #[test]
+    fn filter_hidden_matches_a_set() {
+        let rows: Vec<u32> = vec![0, 1, 63, 64, 511, 512, 513, 1000, 4095, 1_000_000];
+        let fh = FilterHidden::build(rows.iter().copied(), BTreeMap::new());
+        assert_eq!(fh.count(), rows.len() as u32);
+        assert_eq!(fh.rows().collect::<Vec<_>>(), rows);
+        for probe in [0u32, 1, 2, 63, 64, 100, 511, 512, 1000, 4095, 1_000_000, 1_048_575] {
+            let want = rows.iter().filter(|r| **r < probe).count() as u32;
+            assert_eq!(fh.count_before(probe), want, "count_before({probe})");
+            assert_eq!(fh.contains(probe), rows.contains(&probe), "contains({probe})");
+        }
+        // Past the bitmap (a filter over a short range on a full column) counts everything.
+        assert_eq!(fh.count_before(1_048_575), rows.len() as u32);
+        assert!(FilterHidden::default().is_empty());
+        assert_eq!(FilterHidden::default().count_before(7), 0);
+    }
+
+    #[test]
+    fn filter_hidden_round_trips_through_json() {
+        let fh = FilterHidden::build([3u32, 700, 70_000], BTreeMap::from([(70_000u32, LineInfo { hidden: true, ..Default::default() })]));
+        let json = serde_json::to_string(&fh).expect("serialize");
+        let back: FilterHidden = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, fh);
+        assert_eq!(back.rows().collect::<Vec<_>>(), vec![3, 700, 70_000]);
+        assert_eq!(back.count_before(70_001), 3);
+    }
 
     /// Deterministic xorshift32 so a failure reproduces without a random-number dependency.
     struct Rng(u32);

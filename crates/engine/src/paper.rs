@@ -86,7 +86,7 @@ impl PageGrid {
             col_bands,
             data_rows,
             data_cols,
-            ri: LineIndex::new(&sh.rows, sh.default_row_height, MAX_ROWS),
+            ri: LineIndex::with_hidden(&sh.rows, &sh.filter_hidden, sh.default_row_height, MAX_ROWS),
             ci: LineIndex::new(&sh.cols, sh.default_col_width, MAX_COLS),
         })
     }

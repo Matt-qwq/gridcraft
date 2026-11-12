@@ -222,7 +222,7 @@ impl LineGeo {
     fn of(sh: &Sheet) -> LineGeo {
         LineGeo {
             key: (0, 0, 0),
-            ri: Arc::new(LineIndex::new(&sh.rows, sh.default_row_height, MAX_ROWS)),
+            ri: Arc::new(LineIndex::with_hidden(&sh.rows, &sh.filter_hidden, sh.default_row_height, MAX_ROWS)),
             ci: Arc::new(LineIndex::new(&sh.cols, sh.default_col_width, MAX_COLS)),
             row_outline: Arc::new(crate::outline::Axis::new(&sh.rows)),
             col_outline: Arc::new(crate::outline::Axis::new(&sh.cols)),

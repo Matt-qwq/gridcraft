@@ -1105,7 +1105,8 @@ fn filter_top10_two_criteria_on_one_column() {
         ];
     }
     s.execute("data.reapply", json!({})).unwrap();
-    let hidden: Vec<u32> = s.active().unwrap().wb.sheet(0).unwrap().rows.iter().filter(|(_, r)| r.hidden).map(|(k, _)| k).collect();
+    let sh = s.active().unwrap().wb.sheet(0).unwrap();
+    let hidden: Vec<u32> = (0..=5).filter(|r| sh.is_row_hidden(*r)).collect();
     // Rows are 0-based: values 1, 2 and 5 sit on rows 1, 2 and 5.
     assert_eq!(hidden, vec![1, 2, 5]);
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cell::{Cell, CellPicture};
 use crate::features::*;
-use crate::line::LineMap;
+use crate::line::{FilterHidden, LineMap};
 use crate::store::CellStore;
 use crate::style::{Color, StyleId};
 
@@ -67,6 +67,9 @@ pub struct Sheet {
     pub cols: LineMap,
     #[serde(default = "crate::line::default_rows", deserialize_with = "crate::line::deserialize_rows")]
     pub rows: LineMap,
+    /// Rows the applied filter hides, as a bitmap rather than a line-info entry each.
+    #[serde(default, skip_serializing_if = "FilterHidden::is_empty")]
+    pub filter_hidden: FilterHidden,
     /// Default column width and row height in pixels at 96 dpi (a file stores row heights in points).
     pub default_col_width: f32,
     pub default_row_height: f32,
@@ -147,6 +150,7 @@ impl Sheet {
             spill_ranges: BTreeMap::new(),
             cols: LineMap::cols(),
             rows: LineMap::rows(),
+            filter_hidden: FilterHidden::default(),
             default_col_width: DEFAULT_COL_WIDTH,
             default_row_height: DEFAULT_ROW_HEIGHT,
             merges: vec![],
@@ -309,6 +313,9 @@ impl Sheet {
         }
     }
     pub fn row_height(&self, row: u32) -> f32 {
+        if self.filter_hidden.contains(row) {
+            return 0.0;
+        }
         match self.rows.get(&row) {
             Some(i) if i.hidden => 0.0,
             Some(LineInfo { size: Some(h), .. }) => *h,
@@ -316,30 +323,36 @@ impl Sheet {
         }
     }
     pub fn is_row_hidden(&self, row: u32) -> bool {
-        self.rows.get(&row).is_some_and(|r| r.hidden)
+        self.filter_hidden.contains(row) || self.rows.get(&row).is_some_and(|r| r.hidden)
     }
     /// Whether `row` is hidden by an applied filter: a hidden row below the header of the
     /// sheet AutoFilter while it has criteria, or a hidden data row of a filtered table.
     /// Other hidden rows were hidden by hand.
     pub fn is_row_filtered(&self, row: u32) -> bool {
+        if self.filter_hidden.contains(row) {
+            return true;
+        }
         if !self.is_row_hidden(row) {
             return false;
         }
-        let in_sheet_filter =
-            self.autofilter.as_ref().is_some_and(|af| !af.criteria.is_empty() && row > af.range.start.row && row <= af.range.end.row);
-        in_sheet_filter || self.tables.iter().any(|t| !t.filter.is_empty() && t.data_range().is_some_and(|r| row >= r.start.row && row <= r.end.row))
+        // A table filter still writes its hidden rows as line info; the sheet AutoFilter's are
+        // the bitmap above.
+        self.tables.iter().any(|t| !t.filter.is_empty() && t.data_range().is_some_and(|r| row >= r.start.row && row <= r.end.row))
     }
     pub fn is_col_hidden(&self, col: u32) -> bool {
         self.cols.get(&col).is_some_and(|r| r.hidden)
     }
     /// Y offset (points) of the top of `row`.
     pub fn row_top(&self, row: u32) -> f64 {
-        let mut y = row as f64 * self.default_row_height as f64;
+        let default = self.default_row_height as f64;
+        let mut y = row as f64 * default;
         for (_, info) in self.rows.range(..row) {
             let h = if info.hidden { 0.0 } else { info.size.unwrap_or(self.default_row_height) };
-            y += h as f64 - self.default_row_height as f64;
+            y += h as f64 - default;
         }
-        y
+        // Filter-hidden rows keep no line info, so they are not in the map: take their height off
+        // in one step instead of walking them (a million-row filter would walk a million rows).
+        y - self.filter_hidden.count_before(row) as f64 * default
     }
     pub fn col_left(&self, col: u32) -> f64 {
         let mut x = col as f64 * self.default_col_width as f64;
@@ -351,7 +364,21 @@ impl Sheet {
     }
     /// Row containing y (points from the top), clamped.
     pub fn row_at(&self, y: f64) -> u32 {
-        line_at(y, self.default_row_height as f64, &self.rows, gridcraft_core::MAX_ROWS)
+        if self.filter_hidden.is_empty() {
+            return line_at(y, self.default_row_height as f64, &self.rows, gridcraft_core::MAX_ROWS);
+        }
+        // Filter-hidden rows take no space, so the uniform-line break is wrong: the answer is the
+        // last row whose top is at or above y, found on row_top (monotone in row).
+        let (mut lo, mut hi) = (0u32, gridcraft_core::MAX_ROWS - 1);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if self.row_top(mid) <= y {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
     }
     pub fn col_at(&self, x: f64) -> u32 {
         line_at(x, self.default_col_width as f64, &self.cols, gridcraft_core::MAX_COLS)
@@ -382,12 +409,21 @@ impl Sheet {
 pub struct LineIndex {
     default: f64,
     max: u32,
-    /// (line, start position of that line, its size), sorted by line.
+    /// (line, start position of that line, its size), sorted by line. A row a filter hides is
+    /// not here: it lives in `hidden`.
     lines: Vec<(u32, f64, f64)>,
+    /// Rows a filter hides: they take no space, and a million of them cost a bitmap, not an
+    /// entry each (the grid rebuilds this index per edit, not per frame).
+    hidden: FilterHidden,
 }
 
 impl LineIndex {
     pub fn new(custom: &LineMap, default: f32, max: u32) -> LineIndex {
+        LineIndex::with_hidden(custom, &FilterHidden::default(), default, max)
+    }
+    /// An index over `custom` that also closes the rows a filter hides: they have no line info
+    /// to count, so the bitmap answers for them.
+    pub fn with_hidden(custom: &LineMap, hidden: &FilterHidden, default: f32, max: u32) -> LineIndex {
         let default = default as f64;
         let mut lines = Vec::with_capacity(custom.len());
         let mut pos = 0.0;
@@ -399,10 +435,20 @@ impl LineIndex {
             pos += size;
             prev = line + 1;
         }
-        LineIndex { default, max, lines }
+        LineIndex { default, max, lines, hidden: hidden.clone() }
     }
     /// Start position of `line`.
     pub fn start(&self, line: u32) -> f64 {
+        if self.hidden.is_empty() {
+            return self.start_of_custom(line);
+        }
+        let mut y = line as f64 * self.default;
+        for &(_, _, size) in self.lines.iter().take_while(|e| e.0 < line) {
+            y += size - self.default;
+        }
+        y - self.hidden.count_before(line) as f64 * self.default
+    }
+    fn start_of_custom(&self, line: u32) -> f64 {
         match self.lines.binary_search_by(|e| e.0.cmp(&line)) {
             Ok(i) => self.lines.get(i).map_or(0.0, |e| e.1),
             Err(0) => line as f64 * self.default,
@@ -416,6 +462,20 @@ impl LineIndex {
     pub fn at(&self, pos: f64) -> u32 {
         if pos <= 0.0 {
             return 0;
+        }
+        if !self.hidden.is_empty() {
+            // Filter-hidden lines take no space, so positions are not uniform: the answer is the
+            // last line whose start is at or above `pos`, found on the (monotone) start.
+            let (mut lo, mut hi) = (0u32, self.max - 1);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if self.start(mid) <= pos {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            return lo;
         }
         // Last custom line starting at or before pos.
         let i = self.lines.partition_point(|e| e.1 <= pos);
@@ -471,6 +531,25 @@ fn line_at(pos: f64, default: f64, custom: &LineMap, max: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::cell::Formula;
+
+    /// The grid places rows through LineIndex, not row_top: after a filter hides rows it must
+    /// close them too, or a filtered sheet draws blank (the visible row sits a thousand points
+    /// below the header, where the old line-info entries used to put it).
+    #[test]
+    fn line_index_closes_filter_hidden_rows() {
+        let mut s = Sheet::new("S");
+        s.rows.insert(3, LineInfo { size: Some(30.0), ..Default::default() });
+        s.filter_hidden = FilterHidden::build([1u32, 2, 5], BTreeMap::new());
+        let idx = LineIndex::with_hidden(&s.rows, &s.filter_hidden, s.default_row_height, gridcraft_core::MAX_ROWS);
+        for row in [0u32, 1, 2, 3, 4, 5, 6, 10, 1000] {
+            assert!((idx.start(row) - s.row_top(row)).abs() < 1e-6, "start({row}) = {}, row_top = {}", idx.start(row), s.row_top(row));
+        }
+        assert_eq!(idx.at(idx.start(4)), 4);
+        assert_eq!(idx.at(idx.start(1000) + 1.0), 1000);
+        // Without a filter the index is the plain line map.
+        let plain = LineIndex::new(&s.rows, s.default_row_height, gridcraft_core::MAX_ROWS);
+        assert_eq!(plain.start(4), 4.0 * s.default_row_height as f64 + 10.0);
+    }
 
     #[test]
     fn line_index_matches_linear() {
