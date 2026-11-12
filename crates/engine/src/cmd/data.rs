@@ -778,13 +778,20 @@ fn reapply(s: &mut Session, _: &Json) -> Result<Json> {
     })
 }
 
-/// Distinct display values of a filter column (for the dropdown list).
-pub fn filter_values(wb: &Workbook, sheet: usize, col: u32) -> Vec<(String, bool)> {
-    let Some(sh) = wb.sheet(sheet) else { return vec![] };
-    let Some(af) = &sh.autofilter else { return vec![] };
+/// Most distinct values the filter dropdown lists, as Excel's own list stops at 1,000. An id
+/// column has one value per row, so an uncapped list meant a million strings — built by walking
+/// and formatting a million cells, on every frame the menu was open.
+pub const FILTER_VALUES_MAX: usize = 1_000;
+
+/// Distinct display values of a filter column (for the dropdown list), and whether the column has
+/// more than [`FILTER_VALUES_MAX`] of them.
+pub fn filter_values(wb: &Workbook, sheet: usize, col: u32) -> (Vec<(String, bool)>, bool) {
+    let Some(sh) = wb.sheet(sheet) else { return (vec![], false) };
+    let Some(af) = &sh.autofilter else { return (vec![], false) };
     let off = col.saturating_sub(af.range.start.col);
     let selected: Option<&FilterCriterion> = af.criteria.iter().find(|(o, _)| *o == off).map(|(_, c)| c);
     let mut seen = std::collections::BTreeMap::new();
+    let mut truncated = false;
     for row in af.range.start.row + 1..=af.range.end.row.min(af.range.start.row + 1_000_000) {
         let c = CellRef::new(row, col);
         let v = sh.value(c);
@@ -802,8 +809,17 @@ pub fn filter_values(wb: &Workbook, sheet: usize, col: u32) -> Vec<(String, bool
         };
         let key = if blank { sort_key(&Value::Empty) } else { sort_key(&v) };
         seen.entry((key, t)).or_insert(on);
+        if seen.len() > FILTER_VALUES_MAX {
+            // One past the cap tells us the column has more; the extra value is not listed.
+            truncated = true;
+            break;
+        }
     }
-    seen.into_iter().map(|((_, t), on)| (t, on)).collect()
+    let mut out: Vec<(String, bool)> = seen.into_iter().map(|((_, t), on)| (t, on)).collect();
+    if truncated {
+        out.truncate(FILTER_VALUES_MAX);
+    }
+    (out, truncated)
 }
 
 /// Case-sensitive tie-break for text that is equal ignoring case: as in Excel, lowercase sorts
@@ -1579,7 +1595,7 @@ mod tests {
         s.execute("data.filter", json!({"range": "A1:B5"})).unwrap();
         let r = s.execute("data.filterBy", json!({"column": "B", "values": [], "blanks": true})).unwrap();
         assert_eq!(r["hiddenRows"], json!(2));
-        let vals = filter_values(&s.doc().unwrap().wb, 0, 1);
+        let (vals, _more) = filter_values(&s.doc().unwrap().wb, 0, 1);
         // The `=""` result joins (Blanks) instead of showing as its own empty entry.
         assert!(!vals.iter().any(|(t, _)| t.is_empty()), "{vals:?}");
         let blanks: Vec<_> = vals.into_iter().filter(|(t, _)| t == "(Blanks)").collect();
@@ -1616,6 +1632,31 @@ mod tests {
         assert_eq!(get(&mut s, "B3")["value"], json!(30.0), "East's subtotal counts both East rows");
         assert_eq!(get(&mut s, "A7")["text"], json!("Grand Total"));
         assert_eq!(get(&mut s, "B7")["value"], json!(100.0), "the grand total counts every data row");
+    }
+
+    /// An id column has a value per row. The dropdown lists the first 1,000 (as Excel does) and
+    /// says there are more, instead of formatting a million values on every frame the menu opens.
+    #[test]
+    fn a_filter_list_of_distinct_ids_stops_at_the_cap() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let n = FILTER_VALUES_MAX as u32 + 5;
+        let values: Vec<Json> = (0..n).map(|i| json!([i])).collect();
+        s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+        s.execute("data.filter", json!({"range": format!("A1:A{n}")})).unwrap();
+        let (list, more) = filter_values(&s.doc().unwrap().wb, 0, 0);
+        assert!(more, "{} distinct ids must report more than the cap", n);
+        assert_eq!(list.len(), FILTER_VALUES_MAX);
+        assert_eq!(list[0].0, "1", "row 1 is the header");
+        // A column under the cap lists every value and reports no more.
+        let mut small = Session::new();
+        small.new_workbook();
+        let nine: Vec<Json> = (0..10).map(|i| json!([i])).collect();
+        small.execute("range.setValues", json!({"range": "A1", "values": nine})).unwrap();
+        small.execute("data.filter", json!({"range": "A1:A10"})).unwrap();
+        let (list, more) = filter_values(&small.doc().unwrap().wb, 0, 0);
+        assert!(!more);
+        assert_eq!(list.len(), 9, "row 1 is the header");
     }
 
     #[test]

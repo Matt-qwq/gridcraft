@@ -1201,6 +1201,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "{n} engine commands are available. See docs/mcp.md and docs/control-protocol.md." => {
             "共有 {n} 条引擎命令可用，参见 docs/mcp.md 和 docs/control-protocol.md。"
         }
+        "Only the first {n} values are listed." => "仅列出前 {n} 个值。",
         _ => return None,
     })
 }

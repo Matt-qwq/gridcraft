@@ -3530,7 +3530,19 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
         }
     }
     let wb = app.session.active().map(|d| d.wb.clone()).unwrap_or(wb);
-    let values = gridcraft_engine::cmd::data::filter_values(&wb, si, col);
+    // The list is built once per sheet revision, not once per frame: an id column is a value per
+    // row, and formatting a million of them for a menu that shows a thousand took most of a second
+    // on every frame the menu stayed open.
+    let revision = app.session.active().map(|d| (d.uid, d.revision)).unwrap_or((0, 0));
+    let values_key = egui::Id::new(("filter_values", si, col, revision));
+    let (values, more_values): (Vec<(String, bool)>, bool) = ui.ctx().data_mut(|d| match d.get_temp(values_key) {
+        Some(v) => v,
+        None => {
+            let v = gridcraft_engine::cmd::data::filter_values(&wb, si, col);
+            d.insert_temp(values_key, v.clone());
+            v
+        }
+    });
     let key = egui::Id::new(("filter_sel", col));
     let search_key = egui::Id::new(("filter_search", col));
     let buttons_key = egui::Id::new(("filter_buttons", col));
@@ -3575,11 +3587,19 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
             }
             // Full width: shrunk to the longest value, the scroll bar sat mid-menu and the wheel only
             // worked over the values themselves (#432).
-            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                for (v, on) in checks.iter_mut().filter(|(v, _)| matches(v)) {
+            let matching: Vec<usize> = (0..checks.len()).filter(|i| matches(&checks[*i].0)).collect();
+            let row_h = ui.spacing().interact_size.y.max(18.0);
+            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show_rows(ui, row_h, matching.len(), |ui, range| {
+                for &i in &matching[range] {
+                    let (v, on) = &mut checks[i];
                     ui.checkbox(on, v.as_str());
                 }
             });
+            if more_values {
+                let note = crate::widgets::tr(ui, "Only the first {n} values are listed.")
+                    .replace("{n}", &gridcraft_engine::cmd::data::FILTER_VALUES_MAX.to_string());
+                ui.label(egui::RichText::new(note).small());
+            }
             ui.ctx().data_mut(|d| {
                 d.insert_temp(key, checks.clone());
                 d.insert_temp(search_key, search.clone());
