@@ -112,6 +112,16 @@ impl Language {
         }
     }
 
+    /// The font Excel opens new workbooks with in this language: 等线 (DengXian) on a Chinese
+    /// install, Calibri elsewhere. A name only: the renderer substitutes an installed face, and
+    /// the value is what the file's Normal style carries.
+    pub const fn default_cell_font(self) -> &'static str {
+        match self {
+            Self::Zh => "等线",
+            _ => "Calibri",
+        }
+    }
+
     /// The language's code, as saved in `ui.json` and taken by `app.language.set`.
     pub const fn code(self) -> &'static str {
         match self {
@@ -557,6 +567,15 @@ mod tests {
         assert_eq!(Language::Ro.tr("Options|General"), "General");
         assert_eq!(Language::Ro.tr("Options|Save"), "Salvare");
         assert_eq!(Language::Ro.tr("Sheet Options|View"), "Vizualizare");
+    }
+
+    #[test]
+    fn the_default_cell_font_follows_the_language() {
+        // Excel's Chinese install creates workbooks in 等线 11; the rest use Calibri.
+        assert_eq!(Language::Zh.default_cell_font(), "等线");
+        for language in Language::ALL.into_iter().filter(|l| *l != Language::Zh) {
+            assert_eq!(language.default_cell_font(), "Calibri", "{}", language.code());
+        }
     }
 
     #[test]

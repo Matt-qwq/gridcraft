@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cell::Formula;
 use crate::sheet::Sheet;
-use crate::style::{StyleTable, Theme};
+use crate::style::{Font, Style, StyleTable, Theme};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CalcMode {
@@ -235,6 +235,23 @@ impl Workbook {
             source_dir: None,
             source_path: None,
         }
+    }
+
+    /// A new workbook whose Normal style uses `font` at `size`: Excel's "When creating new
+    /// workbooks, use this as the default font".
+    ///
+    /// The theme keeps its own Latin fonts, as Excel's files do: a Chinese Excel workbook carries
+    /// 等线 in `fonts[0]` (what every default-formatted cell shows) while `theme1.xml` still names
+    /// Calibri for the Latin scheme. Names and sizes outside what a file may hold are ignored
+    /// rather than written into the Normal style.
+    pub fn with_default_font(font: &str, size: f32) -> Workbook {
+        let mut wb = Workbook::new();
+        if font.trim().is_empty() || !(1.0..=409.0).contains(&size) {
+            return wb;
+        }
+        let normal = Style { font: Font { name: font.into(), size, ..Font::default() }, ..Style::default() };
+        wb.styles = StyleTable::with_default(normal);
+        wb
     }
     pub fn sheet(&self, i: usize) -> Option<&Sheet> {
         self.sheets.get(i).map(|s| s.as_ref())

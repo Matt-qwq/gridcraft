@@ -13,6 +13,26 @@ fn v(s: &Session, a: &str) -> Value {
     s.doc().unwrap().wb.active().unwrap().value(CellRef::parse(a).unwrap())
 }
 
+/// A new workbook's Normal style is the default font from the preferences: File ▸ Options' "when
+/// creating new workbooks", which the desktop app sets from its language (等线 on a Chinese
+/// install, as Excel's own Chinese default does).
+#[test]
+fn a_new_workbook_uses_the_default_font_from_the_preferences() {
+    let mut s = Session::new();
+    s.new_workbook();
+    let font = |s: &Session| s.doc().unwrap().wb.styles.get(gridcraft_model::StyleId::DEFAULT).font.clone();
+    assert_eq!((font(&s).name.as_str(), font(&s).size), ("Calibri", 11.0));
+    s.prefs.default_font = "等线".into();
+    s.prefs.default_font_size = 11.0;
+    s.execute("file.new", json!({})).unwrap();
+    assert_eq!((font(&s).name.as_str(), font(&s).size), ("等线", 11.0), "a new workbook takes the pref's Normal font");
+    // A nonsense pref is ignored rather than written into the style.
+    s.prefs.default_font = String::new();
+    s.prefs.default_font_size = 0.0;
+    s.execute("file.new", json!({})).unwrap();
+    assert_eq!((font(&s).name.as_str(), font(&s).size), ("Calibri", 11.0));
+}
+
 #[test]
 fn entering_empty_cells_preserves_whole_sheet_formatting() {
     let mut s = s();

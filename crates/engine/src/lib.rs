@@ -395,10 +395,13 @@ impl Session {
             }
         }
     }
-    /// A new blank workbook titled `BookN`.
+    /// A new blank workbook titled `BookN`, its Normal style in the default font from the
+    /// preferences (File ▸ Options ▸ when creating new workbooks).
     pub fn new_workbook(&mut self) -> usize {
         let n = (1..).find(|n| !self.docs.iter().any(|d| d.title == format!("Book{n}") && d.path.is_none())).unwrap_or(1);
-        let mut wb = Workbook::new();
+        let font = self.prefs.default_font.clone();
+        let size = self.prefs.default_font_size;
+        let mut wb = Workbook::with_default_font(&font, size);
         for _ in 1..self.prefs.sheets_in_new_workbook.clamp(1, 255) {
             let name = wb.next_sheet_name();
             wb.sheets.push(Arc::new(gridcraft_model::Sheet::new(name)));

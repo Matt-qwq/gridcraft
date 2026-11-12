@@ -17,6 +17,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod native_menu;
 mod print;
+mod window;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,41 +26,66 @@ use gridcraft_engine::Session;
 use gridcraft_ui_egui::{Services, SheetApp};
 use serde_json::json;
 
-struct App(SheetApp, #[cfg(target_os = "macos")] Option<native_menu::NativeMenu>, #[cfg(target_os = "macos")] fmv_macos_events::Inbox);
+struct App {
+    sheet: SheetApp,
+    /// The window geometry kept for the next start (see [`window`]).
+    window: window::WindowState,
+    /// Set until the window has been asked to maximize: see the first `logic` frame.
+    start_maximized: bool,
+    #[cfg(target_os = "macos")]
+    menu: Option<native_menu::NativeMenu>,
+    #[cfg(target_os = "macos")]
+    events: fmv_macos_events::Inbox,
+}
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Maximize once the window exists, never at creation: on Windows a `with_maximized(true)`
+        // in the viewport builder races egui's own `request_inner_size`, which lands after it and
+        // leaves the window with the maximize flag but the restored rectangle. This is the same
+        // path as clicking the maximize button, and it keeps the created size as the restore size.
+        if self.start_maximized {
+            self.start_maximized = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+        // Remember the size a restore returns to; the window always starts maximized (`window.rs`).
+        let (maximized, inner) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (viewport.maximized, viewport.inner_rect.map(|r| (r.width(), r.height())))
+        });
+        self.window.observe(maximized, inner);
         #[cfg(target_os = "macos")]
         {
-            if self.1.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
-                self.1 = Some(native_menu::NativeMenu::install(ctx));
+            if self.menu.is_none() && std::env::var_os("GRIDCRAFT_NO_NATIVE_MENU").is_none() {
+                self.menu = Some(native_menu::NativeMenu::install(ctx));
             }
-            if let Some(m) = &self.1 {
-                m.poll(&mut self.0, ctx);
+            if let Some(m) = &self.menu {
+                m.poll(&mut self.sheet, ctx);
             }
-            apple_events::poll(&self.2, &mut self.0, ctx);
+            apple_events::poll(&self.events, &mut self.sheet, ctx);
         }
-        self.0.logic(ctx);
-        self.0.poll_printing(ctx);
-        if ctx.input(|input| input.viewport().close_requested()) && self.0.printing.busy() {
+        self.sheet.logic(ctx);
+        self.sheet.poll_printing(ctx);
+        if ctx.input(|input| input.viewport().close_requested()) && self.sheet.printing.busy() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.0.raw_input_hook(raw);
+        self.sheet.raw_input_hook(raw);
         // Files dropped on the window open as workbooks.
         for f in std::mem::take(&mut raw.dropped_files) {
             if let Some(p) = f.path().to_str().map(str::to_string).filter(|p| !p.is_empty()) {
-                self.0.open_path(&p);
+                self.sheet.open_path(&p);
             }
         }
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.0.ui(ui);
+        self.sheet.ui(ui);
     }
     fn on_exit(&mut self) {
         print::finish_pending_jobs();
-        save_prefs(&self.0);
+        save_prefs(&self.sheet);
+        save_window(&self.window);
         // macOS (#117): end the process here, before eframe tears the window down. AccessKit's
         // macOS adapter subclasses the window's content view and restores its class on teardown;
         // AppKit's Touch Bar support observes that view (KVO), so in the next display cycle
@@ -119,6 +145,13 @@ fn load_prefs(app: &mut SheetApp) {
     {
         app.session.prefs = p;
     }
+    // The Normal style of new workbooks follows the app's language, as Excel's does (a Chinese
+    // install creates workbooks in 等线 11). prefs.json written before this option did anything
+    // holds the built-in Calibri, which only means "never chosen", so it moves to the language's.
+    let built_in = gridcraft_engine::Prefs::default();
+    if app.session.prefs.default_font == built_in.default_font && app.session.prefs.default_font_size == built_in.default_font_size {
+        app.session.prefs.default_font = app.ui.language.default_cell_font().to_string();
+    }
 }
 
 fn save_prefs(app: &SheetApp) {
@@ -133,6 +166,22 @@ fn save_prefs(app: &SheetApp) {
     if let Ok(b) = serde_json::to_vec_pretty(&app.session.prefs) {
         let _ = std::fs::write(dir.join("prefs.json"), b);
     }
+}
+
+/// The window geometry the last run left behind, so a maximized window comes back maximized.
+fn load_window() -> window::WindowState {
+    if !prefs_enabled() {
+        return window::WindowState::default();
+    }
+    window::WindowState::load(config_dir().as_deref())
+}
+
+fn save_window(state: &window::WindowState) {
+    if !prefs_enabled() {
+        return;
+    }
+    let Some(dir) = config_dir() else { return };
+    let _ = state.save(&dir);
 }
 
 /// Read the system clipboard through the shared handle, creating it on first use.
@@ -288,20 +337,21 @@ fn main() -> eframe::Result<()> {
             None => logger.no_file(),
         }
     }
-    let mut session = Session::new();
+    // The preferences come first: they decide the UI language, and the Normal style of the blank
+    // workbook created below (等线 on a Chinese install, as Excel's own default is).
+    let mut app = SheetApp::new(Session::new(), services());
+    app.watch_desktop_theme();
+    let control_port = control_port;
+    load_prefs(&mut app);
     if let Some(s) = &sample
-        && let Err(e) = session.execute("file.new", json!({"sample": s}))
+        && let Err(e) = app.session.execute("file.new", json!({"sample": s}))
     {
         log::warn!("sample {s}: {e}");
     }
-    if session.documents().is_empty() {
-        session.new_workbook();
+    if app.session.documents().is_empty() {
+        app.session.new_workbook();
     }
-    let mut app = SheetApp::new(session, services());
-    app.watch_desktop_theme();
-    app.after_engine(); // Show warnings from the sample.
-    let control_port = control_port;
-    load_prefs(&mut app);
+    app.after_engine(); // Show the sample's warnings before the window opens.
     // Files named on the command line (a double-click on Windows and Linux) open as File › Open
     // opens them: a password-protected one asks for its password, and errors are shown, not
     // only logged. Each replaces the untouched blank Book1, as a file opened from Finder does.
@@ -320,6 +370,9 @@ fn main() -> eframe::Result<()> {
     if let Some(i) = icon() {
         viewport = viewport.with_icon(i);
     }
+    // Maximized on every start; the saved size is where a restore returns to.
+    let window_state = load_window();
+    viewport = window_state.apply(viewport);
     let options = eframe::NativeOptions { viewport, ..Default::default() };
     // Before eframe creates the wgpu instance: Windows starts on DirectX 12, or OpenGL when
     // DirectX 12 has no GPU driver, and never touches Vulkan unless asked (see graphics.rs).
@@ -357,13 +410,15 @@ fn main() -> eframe::Result<()> {
                         Err(e) => log::error!("control channel on port {port}: {e}"),
                     }
                 }
-                Ok(Box::new(App(
-                    app,
+                Ok(Box::new(App {
+                    sheet: app,
+                    window: window_state.clone(),
+                    start_maximized: true,
                     #[cfg(target_os = "macos")]
-                    None,
+                    menu: None,
                     #[cfg(target_os = "macos")]
-                    apple_events.connect(&cc.egui_ctx),
-                )))
+                    events: apple_events.connect(&cc.egui_ctx),
+                }))
             }),
         )
     };
