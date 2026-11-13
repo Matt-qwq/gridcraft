@@ -121,21 +121,25 @@ impl Contributor {
         i128::from(self.lines_added) - i128::from(self.lines_deleted)
     }
 
-    /// One line with everything we know, for tooltips.
-    pub fn summary(&self) -> String {
-        format!(
-            "@{}: {} PRs, {} commits, +{} / −{} lines (Δ {}), +{} / −{} binary assets, {} – {}",
-            self.login,
-            self.prs,
-            self.commits,
+    /// One line with everything we know, for tooltips, in the interface language. The template's
+    /// placeholders are filled by hand, in the order they appear.
+    pub fn summary(&self, lang: crate::i18n::Language) -> String {
+        let mut text = lang.tr("@{}: {} PRs, {} commits, +{} / −{} lines (Δ {}), +{} / −{} binary assets, {} – {}").to_string();
+        for value in [
+            format!("@{}", self.login),
+            self.prs.to_string(),
+            self.commits.to_string(),
             group(self.lines_added),
             group(self.lines_deleted),
             signed(self.lines_delta()),
-            self.binary_added,
-            self.binary_deleted,
-            day(self.first_commit),
-            day(self.last_commit),
-        )
+            self.binary_added.to_string(),
+            self.binary_deleted.to_string(),
+            day(self.first_commit).to_string(),
+            day(self.last_commit).to_string(),
+        ] {
+            text = text.replacen("{}", &value, 1);
+        }
+        text
     }
 }
 
@@ -217,25 +221,25 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.label(crate::widgets::tr(ui, "Show"));
         for m in NameMode::ALL {
-            if ui.selectable_label(v.names == m, m.label()).clicked() {
+            if ui.selectable_label(v.names == m, crate::widgets::tr(ui, m.label())).clicked() {
                 v.names = m;
             }
         }
         ui.separator();
         ui.label(crate::widgets::tr(ui, "Sort"));
-        egui::ComboBox::from_id_salt("credits_sort").selected_text(v.key.label().0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("credits_sort").selected_text(crate::widgets::tr(ui, v.key.label().0)).show_ui(ui, |ui| {
             for k in SortKey::ALL {
-                if ui.selectable_label(v.key == k, k.label().0).clicked() {
+                if ui.selectable_label(v.key == k, crate::widgets::tr(ui, k.label().0)).clicked() {
                     v.key = k;
                     v.ascending = k.default_ascending();
                 }
             }
         });
-        if ui.button(if v.ascending { "▲" } else { "▼" }).on_hover_text("Reverse the order").clicked() {
+        if ui.button(if v.ascending { "▲" } else { "▼" }).on_hover_text(crate::widgets::tr(ui, "Reverse the order")).clicked() {
             v.ascending = !v.ascending;
         }
         ui.separator();
-        if ui.selectable_label(!v.table, "Grab bag").clicked() {
+        if ui.selectable_label(!v.table, crate::widgets::tr(ui, "Grab bag")).clicked() {
             v.table = false;
         }
         if ui.selectable_label(v.table, crate::widgets::tr(ui, "Table")).clicked() {
@@ -243,7 +247,9 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
         }
     });
     let list = sorted(CONTRIBUTORS, v.names, v.key, v.ascending);
-    ui.label(RichText::new(format!("{} contributors · {} commits", list.len(), group(TOTAL_COMMITS))).small().weak());
+    let counts =
+        crate::widgets::tr(ui, "{} contributors · {} commits").replacen("{}", &list.len().to_string(), 1).replacen("{}", &group(TOTAL_COMMITS), 1);
+    ui.label(RichText::new(counts).small().weak());
     ui.separator();
     egui::ScrollArea::both().auto_shrink([false, false]).max_height(340.0).show(ui, |ui| {
         if list.is_empty() {
@@ -256,7 +262,8 @@ pub fn contributors_ui(ui: &mut egui::Ui) {
                     if i > 0 {
                         ui.label(RichText::new("·").weak());
                     }
-                    ui.hyperlink_to(c.name(v.names), format!("https://github.com/{}", c.login)).on_hover_text(c.summary());
+                    ui.hyperlink_to(c.name(v.names), format!("https://github.com/{}", c.login))
+                        .on_hover_text(c.summary(crate::i18n::current(ui.ctx())));
                 }
             });
         }
@@ -268,7 +275,8 @@ fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View) {
     egui::Grid::new("credits_table").striped(true).num_columns(SortKey::ALL.len()).show(ui, |ui| {
         for k in SortKey::ALL {
             let arrow = if v.key == k { if v.ascending { " ▲" } else { " ▼" } } else { "" };
-            if ui.button(RichText::new(format!("{}{arrow}", k.label().1)).strong()).on_hover_text(k.label().0).clicked() {
+            let header = format!("{}{arrow}", crate::widgets::tr(ui, k.label().1));
+            if ui.button(RichText::new(header).strong()).on_hover_text(crate::widgets::tr(ui, k.label().0)).clicked() {
                 if v.key == k {
                     v.ascending = !v.ascending;
                 } else {
@@ -279,7 +287,7 @@ fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View) {
         }
         ui.end_row();
         for c in list {
-            ui.hyperlink_to(c.name(v.names), format!("https://github.com/{}", c.login)).on_hover_text(c.summary());
+            ui.hyperlink_to(c.name(v.names), format!("https://github.com/{}", c.login)).on_hover_text(c.summary(crate::i18n::current(ui.ctx())));
             ui.label(group(c.prs));
             ui.label(group(c.commits));
             ui.label(group(c.lines_added));
@@ -304,7 +312,7 @@ pub fn models_ui(ui: &mut egui::Ui) {
     egui::ScrollArea::both().auto_shrink([false, false]).max_height(340.0).show(ui, |ui| {
         egui::Grid::new("credits_models").striped(true).num_columns(6).show(ui, |ui| {
             for h in ["Company", "Model", "Version", "Commits", "% of all commits", "Lines +/−"] {
-                ui.label(RichText::new(h).strong());
+                ui.label(RichText::new(crate::widgets::tr(ui, h)).strong());
             }
             ui.end_row();
             for m in MODELS {

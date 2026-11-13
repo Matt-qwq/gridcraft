@@ -70,6 +70,15 @@ impl Selection {
             other => other.label().to_string(),
         }
     }
+
+    /// The label the pane draws, in the frame's language: `text()` keys the translation and a
+    /// series number is substituted by hand, since `format!` needs a literal template.
+    fn localized(self, ui: &Ui) -> String {
+        match self {
+            Selection::Series(i) => tr(ui, "Series {}").replace("{}", &(i + 1).to_string()),
+            other => tr(ui, &other.text()).to_string(),
+        }
+    }
 }
 
 /// The `Data Point` section's selected point for `series`, kept in the UI's temporary store so a
@@ -291,11 +300,11 @@ pub fn clear_axis_params(chart: &Chart, value_axis: bool, axis_name: &str, drop:
 pub fn show(app: &mut SheetApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(id) = app.selected_chart else {
-        ui.label(RichText::new("Select a chart to format it.").italics().color(t.text_dim));
+        ui.label(RichText::new(crate::widgets::tr(ui, "Select a chart to format it.")).italics().color(t.text_dim));
         return;
     };
     let Some(chart) = app.session.active().and_then(|d| d.wb.active().and_then(|s| s.charts.iter().find(|c| c.id == id).cloned())) else {
-        ui.label(RichText::new("The chart no longer exists.").italics().color(t.text_dim));
+        ui.label(RichText::new(crate::widgets::tr(ui, "The chart no longer exists.")).italics().color(t.text_dim));
         return;
     };
     // A series selection can go stale (Select Data removed one).
@@ -305,18 +314,18 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
         app.format_selection = Selection::Chart;
     }
     let mut selection = app.format_selection;
-    egui::ComboBox::from_id_salt(("gridcraft.format_selection", id)).selected_text(selection.text()).width(ui.available_width().min(260.0)).show_ui(
-        ui,
-        |ui| {
+    egui::ComboBox::from_id_salt(("gridcraft.format_selection", id))
+        .selected_text(selection.localized(ui))
+        .width(ui.available_width().min(260.0))
+        .show_ui(ui, |ui| {
             for option in
                 std::iter::once(Selection::Chart).chain([Selection::AxisX, Selection::AxisY]).chain((0..chart.series.len()).map(Selection::Series))
             {
-                if ui.selectable_label(selection == option, option.text()).clicked() {
+                if ui.selectable_label(selection == option, option.localized(ui)).clicked() {
                     selection = option;
                 }
             }
-        },
-    );
+        });
     app.format_selection = selection;
     ui.add_space(2.0);
     match selection {
@@ -342,9 +351,9 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
 /// stored and then ignored (or refused by the command).
 fn section(ui: &mut Ui, title: &str, reason: Option<&'static str>, body: impl FnOnce(&mut Ui)) {
     let t = Tokens::get(ui.ctx());
-    ui.collapsing(title, |ui| {
+    ui.collapsing(tr(ui, title), |ui| {
         if let Some(r) = reason {
-            ui.label(RichText::new(r).small().color(t.text_dim));
+            ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
             return;
         }
         body(ui);
@@ -354,59 +363,64 @@ fn section(ui: &mut Ui, title: &str, reason: Option<&'static str>, body: impl Fn
 /// One series' axis: the pane side of `chart.setSeriesAxis` (Change Chart Type → Secondary Axis).
 fn series_axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, i: usize) {
     let Some(ser) = chart.series.get(i) else { return };
-    ui.collapsing("Series Options", |ui| {
+    ui.collapsing(tr(ui, "Series Options"), |ui| {
         let mut secondary = ser.secondary;
-        if ui.checkbox(&mut secondary, "Plot on secondary axis").changed()
+        if ui.checkbox(&mut secondary, crate::widgets::tr(ui, "Plot on secondary axis")).changed()
             && let Err(e) = app.run("chart.setSeriesAxis", json!({"chart": id, "series": i, "secondary": secondary}))
         {
             app.message = Some(("GridCraft".into(), crate::clean_error(&e)));
         }
         if secondary {
-            ui.label(RichText::new("On the right-hand value axis; the chart becomes a combo chart.").small().color(Tokens::get(ui.ctx()).text_dim));
+            ui.label(
+                RichText::new(crate::widgets::tr(ui, "On the right-hand value axis; the chart becomes a combo chart."))
+                    .small()
+                    .color(Tokens::get(ui.ctx()).text_dim),
+            );
         }
     });
 }
 
 /// The chart object itself: title, type, legend, elements, palettes and size.
 fn chart_area(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
-    ui.collapsing("Chart Title", |ui| {
+    ui.collapsing(tr(ui, "Chart Title"), |ui| {
         let field = egui::Id::new(("gridcraft.chart_title", id));
         if let Some(title) = crate::widgets::committed_text(ui, field, chart.title.as_deref().unwrap_or(""), None) {
             app.run_or_alert("chart.set", json!({"chart": id, "title": title}));
         }
     });
-    ui.collapsing("Chart Type", |ui| {
+    ui.collapsing(tr(ui, "Chart Type"), |ui| {
         ui.horizontal_wrapped(|ui| {
+            // The chart type's name is the label; the kind and subtype stay the command's ids.
             for (l, k, s) in [
                 ("Column", "column", ""),
                 ("Stacked", "column", "stacked"),
                 ("Bar", "bar", ""),
-                ("Line", "line", "markers"),
+                ("chart|Line", "line", "markers"),
                 ("Area", "area", ""),
                 ("Pie", "pie", ""),
                 ("Doughnut", "doughnut", ""),
                 ("Scatter", "scatter", ""),
                 ("Radar", "radar", ""),
             ] {
-                if ui.button(l).clicked() {
+                if ui.button(tr(ui, l)).clicked() {
                     app.run_or_alert("chart.set", json!({"chart": id, "type": k, "subtype": s}));
                 }
             }
         });
     });
-    ui.collapsing("Legend", |ui| {
+    ui.collapsing(tr(ui, "Legend"), |ui| {
         ui.horizontal_wrapped(|ui| {
             for (l, v) in [("None", "none"), ("Bottom", "bottom"), ("Top", "top"), ("Left", "left"), ("Right", "right")] {
                 let cur = format!("{:?}", chart.legend).eq_ignore_ascii_case(v);
-                if ui.selectable_label(cur, l).clicked() {
+                if ui.selectable_label(cur, position_text(ui, l)).clicked() {
                     app.run_or_alert("chart.set", json!({"chart": id, "legend": v}));
                 }
             }
         });
     });
-    ui.collapsing("Elements", |ui| {
+    ui.collapsing(tr(ui, "Elements"), |ui| {
         let mut dl = chart.data_labels;
-        if ui.checkbox(&mut dl, "Data Labels").changed() {
+        if ui.checkbox(&mut dl, crate::widgets::tr(ui, "Data Labels")).changed() {
             app.run_or_alert("chart.set", json!({"chart": id, "dataLabels": dl}));
         }
         let mut gl = chart.gridlines;
@@ -417,7 +431,7 @@ fn chart_area(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
             [("Horizontal axis title:", chart.x_title.as_deref(), "xTitle"), ("Vertical axis title:", chart.y_title.as_deref(), "yTitle")]
         {
             ui.horizontal(|ui| {
-                ui.label(label);
+                ui.label(tr(ui, label));
                 let field = egui::Id::new(("gridcraft.chart_axis_title", id, key));
                 if let Some(text) = crate::widgets::committed_text(ui, field, current.unwrap_or(""), None) {
                     app.run_or_alert("chart.set", json!({"chart": id, key: if text.is_empty() { Json::Null } else { json!(text) }}));
@@ -425,30 +439,32 @@ fn chart_area(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
             });
         }
     });
-    ui.collapsing("Colors & Layout", |ui| {
+    ui.collapsing(tr(ui, "Colors & Layout"), |ui| {
         ui.horizontal_wrapped(|ui| {
+            // The palette's name is the label; the id is what the command receives.
             for p in ["colorful", "monochrome", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6"] {
-                if ui.button(p).clicked() {
+                if ui.button(tr(ui, p)).clicked() {
                     app.run_or_alert("chart.changeColors", json!({"chart": id, "palette": p}));
                 }
             }
         });
         ui.horizontal_wrapped(|ui| {
             for n in 1..=6 {
-                if ui.button(format!("Layout {n}")).clicked() {
+                let label = tr(ui, "Layout {n}").replace("{n}", &n.to_string());
+                if ui.button(label).clicked() {
                     app.run_or_alert("chart.quickLayout", json!({"chart": id, "layout": n}));
                 }
             }
         });
     });
-    ui.collapsing("Size", |ui| {
+    ui.collapsing(tr(ui, "chart|Size"), |ui| {
         // Keep the value being typed or dragged between frames; reloading it from the chart every
         // frame threw the edit away.
         let draft = egui::Id::new(("gridcraft.chart_size_draft", id));
         let min = crate::chartview::OBJECT_MIN_SIZE;
         let (mut w, mut h) = ui.data_mut(|d| d.get_temp::<(f32, f32)>(draft)).unwrap_or((chart.anchor.width, chart.anchor.height));
-        let a = ui.add(egui::DragValue::new(&mut w).prefix("Width ").range(min..=4000.0));
-        let b = ui.add(egui::DragValue::new(&mut h).prefix("Height ").range(min..=4000.0));
+        let a = ui.add(egui::DragValue::new(&mut w).prefix(tr(ui, "Width ")).range(min..=4000.0));
+        let b = ui.add(egui::DragValue::new(&mut h).prefix(tr(ui, "Height ")).range(min..=4000.0));
         if a.drag_stopped() || a.lost_focus() || b.drag_stopped() || b.lost_focus() {
             ui.data_mut(|d| d.remove::<(f32, f32)>(draft));
             if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -466,11 +482,11 @@ fn chart_area(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
 fn series_fill(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, i: usize) {
     let theme = app.session.active().map(|d| d.wb.theme.clone()).unwrap_or_default();
     let Some(s) = chart.series.get(i) else { return };
-    ui.collapsing("Series Fill", |ui| {
+    ui.collapsing(tr(ui, "Series Fill"), |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&s.values).small().color(Tokens::get(ui.ctx()).text_dim));
             ui.menu_button(tr(ui, "Fill…"), |ui| {
-                if let Some(c) = crate::widgets::color_palette_fixed(ui, &theme.colors, "Automatic") {
+                if let Some(c) = crate::widgets::color_palette_fixed(ui, &theme.colors, tr(ui, "Automatic")) {
                     app.run_or_alert(
                         "chart.formatSelection",
                         json!({"chart": id, "series": i, "color": if c == "none" { Json::Null } else { json!(c) }}),
@@ -497,9 +513,9 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
     let t = Tokens::get(ui.ctx());
     let (lo, hi) = data_bounds(app, chart);
 
-    ui.collapsing("Axis Options", |ui| {
+    ui.collapsing(tr(ui, "Axis Options"), |ui| {
         if let Some(r) = group {
-            ui.label(RichText::new(r).small().color(t.text_dim));
+            ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
         }
         if group.is_none() {
             if let Some(b) = bound(ui, egui::Id::new(("chart_axis_min", id, value_axis)), o.min, "Minimum", lo.floor(), -1e15..=1e15) {
@@ -529,7 +545,7 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
         if group.is_none() {
             ui.horizontal(|ui| {
                 let mut log = o.log_base.is_some();
-                if ui.checkbox(&mut log, "Logarithmic scale").changed() {
+                if ui.checkbox(&mut log, crate::widgets::tr(ui, "Logarithmic scale")).changed() {
                     run_axis(app, id, axis_name, json!({"logBase": if log { 10.0 } else { 0.0 }}));
                 }
                 if let Some(base) = o.log_base
@@ -541,7 +557,7 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
         }
         if reason(AxisOption::Reversed).is_none() {
             let mut rev = o.reversed;
-            if ui.checkbox(&mut rev, "Values in reverse order").changed() {
+            if ui.checkbox(&mut rev, crate::widgets::tr(ui, "Values in reverse order")).changed() {
                 run_axis(app, id, axis_name, json!({"reversed": rev}));
             }
         }
@@ -554,24 +570,27 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
                     AxisCrossing::Max => "Maximum",
                     AxisCrossing::At(_) => "Axis value",
                 };
-                egui::ComboBox::from_id_salt(("chart_axis_crosses", id, value_axis)).selected_text(current).show_ui(ui, |ui| {
-                    for (label, params) in [
-                        ("Automatic", json!({"crosses": "autoZero"})),
-                        ("Minimum", json!({"crosses": "min"})),
-                        ("Maximum", json!({"crosses": "max"})),
-                    ] {
-                        if ui.selectable_label(current == label, label).clicked() {
-                            run_axis(app, id, axis_name, params);
+                egui::ComboBox::from_id_salt(("chart_axis_crosses", id, value_axis)).selected_text(crate::widgets::tr(ui, current)).show_ui(
+                    ui,
+                    |ui| {
+                        for (label, params) in [
+                            ("Automatic", json!({"crosses": "autoZero"})),
+                            ("Minimum", json!({"crosses": "min"})),
+                            ("Maximum", json!({"crosses": "max"})),
+                        ] {
+                            if ui.selectable_label(current == label, crate::widgets::tr(ui, label)).clicked() {
+                                run_axis(app, id, axis_name, params);
+                            }
                         }
-                    }
-                    let at = match o.crosses {
-                        AxisCrossing::At(v) => v,
-                        _ => 0.0,
-                    };
-                    if ui.selectable_label(current == "Axis value", "Axis value").clicked() {
-                        run_axis(app, id, axis_name, json!({"crosses": at}));
-                    }
-                });
+                        let at = match o.crosses {
+                            AxisCrossing::At(v) => v,
+                            _ => 0.0,
+                        };
+                        if ui.selectable_label(current == crate::widgets::tr(ui, "Axis value"), crate::widgets::tr(ui, "Axis value")).clicked() {
+                            run_axis(app, id, axis_name, json!({"crosses": at}));
+                        }
+                    },
+                );
             });
             if let AxisCrossing::At(v) = o.crosses
                 && let Some(v) = number(ui, egui::Id::new(("chart_axis_cross_value", id, value_axis)), v, -1e15..=1e15, "value")
@@ -581,14 +600,14 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
         } else if group.is_none()
             && let Some(r) = reason(AxisOption::Crossing)
         {
-            ui.label(RichText::new(r).small().color(t.text_dim));
+            ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
         }
         if group.is_none() {
             ui.horizontal(|ui| {
                 ui.label(tr(ui, "Display units"));
                 let current = o.display_units.map_or("None", DisplayUnits::label);
-                egui::ComboBox::from_id_salt(("chart_axis_units", id, value_axis)).selected_text(current).show_ui(ui, |ui| {
-                    if ui.selectable_label(o.display_units.is_none(), "None").clicked() {
+                egui::ComboBox::from_id_salt(("chart_axis_units", id, value_axis)).selected_text(crate::widgets::tr(ui, current)).show_ui(ui, |ui| {
+                    if ui.selectable_label(o.display_units.is_none(), crate::widgets::tr(ui, "None")).clicked() {
                         run_axis(app, id, axis_name, json!({"displayUnits": "none"}));
                     }
                     for (label, name) in [
@@ -602,7 +621,7 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
                         ("Billions", "billions"),
                         ("Trillions", "trillions"),
                     ] {
-                        if ui.selectable_label(current == label, label).clicked() {
+                        if ui.selectable_label(current == label, crate::widgets::tr(ui, label)).clicked() {
                             run_axis(app, id, axis_name, json!({"displayUnits": name}));
                         }
                     }
@@ -610,9 +629,9 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
             });
         }
     });
-    ui.collapsing("Axis Number Format", |ui| {
+    ui.collapsing(tr(ui, "Axis Number Format"), |ui| {
         if let Some(r) = reason(AxisOption::NumberFormat) {
-            ui.label(RichText::new(r).small().color(t.text_dim));
+            ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
             return;
         }
         ui.horizontal(|ui| {
@@ -622,7 +641,7 @@ fn axis(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, value_axis: boo
                 run_axis(app, id, axis_name, json!({"numberFormat": code}));
             }
         });
-        ui.label(RichText::new("Empty follows the plotted values, as in Excel.").small().color(t.text_dim));
+        ui.label(RichText::new(crate::widgets::tr(ui, "Empty follows the plotted values, as in Excel.")).small().color(t.text_dim));
     });
 }
 
@@ -668,7 +687,7 @@ fn bound(ui: &mut Ui, id: egui::Id, value: Option<f64>, label: &str, start: f64,
     let mut action = None;
     let mut auto = value.is_none();
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(tr(ui, label));
         let boxed = ui.checkbox(&mut auto, crate::widgets::tr(ui, "Auto"));
         if boxed.changed() {
             action = Some(if auto { Bound::Auto } else { Bound::Set(start) });
@@ -687,7 +706,7 @@ fn bound(ui: &mut Ui, id: egui::Id, value: Option<f64>, label: &str, start: f64,
 /// to commit (`None` while typing). Escape cancels.
 fn number(ui: &mut Ui, id: egui::Id, value: f64, range: RangeInclusive<f64>, label: &str) -> Option<f64> {
     if !label.is_empty() {
-        ui.label(label);
+        ui.label(tr(ui, label));
     }
     let mut commit = None;
     let mut draft = ui.data_mut(|d| d.get_temp::<f64>(id)).unwrap_or(value);
@@ -716,11 +735,11 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
     let shown = chart.data_labels && !o.hidden;
     section(ui, "Data Labels", labels_reason(chart), |ui| {
         let mut on = shown;
-        if ui.checkbox(&mut on, if series.is_some() { "Show labels for this series" } else { "Show labels" }).changed() {
+        if ui.checkbox(&mut on, tr(ui, if series.is_some() { "Show labels for this series" } else { "Show labels" })).changed() {
             run_labels(app, id, series, json!({"on": on}));
         }
         if !shown {
-            ui.label(RichText::new("Turn the labels on to choose what they show.").small().color(t.text_dim));
+            ui.label(RichText::new(crate::widgets::tr(ui, "Turn the labels on to choose what they show.")).small().color(t.text_dim));
         }
         ui.add_enabled_ui(shown, |ui| {
             for (label, key, on) in [
@@ -731,14 +750,14 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
                 ("Legend key", "legendKey", o.show_legend_key),
             ] {
                 let mut checked = on;
-                if ui.checkbox(&mut checked, label).changed() {
+                if ui.checkbox(&mut checked, tr(ui, label)).changed() {
                     run_labels(app, id, series, json!({key: checked}));
                 }
             }
             ui.horizontal(|ui| {
                 ui.label(tr(ui, "Position"));
                 let current = position_label(o.position);
-                egui::ComboBox::from_id_salt(("chart_label_pos", id, series)).selected_text(current).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(("chart_label_pos", id, series)).selected_text(position_text(ui, current)).show_ui(ui, |ui| {
                     for (label, params) in [
                         ("Automatic", "auto"),
                         ("Center", "center"),
@@ -751,7 +770,7 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
                         ("Above", "top"),
                         ("Below", "bottom"),
                     ] {
-                        if ui.selectable_label(current == label, label).clicked() {
+                        if ui.selectable_label(current == label, position_text(ui, label)).clicked() {
                             run_labels(app, id, series, json!({"position": params}));
                         }
                     }
@@ -788,6 +807,16 @@ fn position_label(p: LabelPosition) -> &'static str {
         LabelPosition::Right => "Right",
         LabelPosition::Top => "Above",
         LabelPosition::Bottom => "Below",
+    }
+}
+
+/// A legend or label position's name. "Left" and "Right" carry their own keys: the ribbon's
+/// alignment "Left"/"Right" read 左对齐/右对齐 in Chinese, a position 靠左/靠右.
+fn position_text<'a>(ui: &Ui, label: &'a str) -> &'a str {
+    match label {
+        "Left" => tr(ui, "chart|Left"),
+        "Right" => tr(ui, "chart|Right"),
+        other => tr(ui, other),
     }
 }
 
@@ -836,7 +865,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                 "custom" => "Custom",
                 _ => "None",
             };
-            egui::ComboBox::from_id_salt(("chart_errbars_kind", id, series)).selected_text(current).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(("chart_errbars_kind", id, series)).selected_text(crate::widgets::tr(ui, current)).show_ui(ui, |ui| {
                 for (label, params) in [
                     ("None", json!({"type": "none"})),
                     ("Fixed amount", json!({"type": "fixed", "value": amount.unwrap_or(1.0)})),
@@ -844,21 +873,23 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                     ("Standard deviation", json!({"type": "stdDev", "value": amount.unwrap_or(1.0)})),
                     ("Standard error", json!({"type": "stdErr"})),
                 ] {
-                    if ui.selectable_label(current == label, label).clicked() {
+                    if ui.selectable_label(current == label, crate::widgets::tr(ui, label)).clicked() {
                         run_error_bars(app, id, series, params);
                     }
                 }
                 // Custom bars need a plus or minus reference; the fields below supply them.
                 if plus_ref.trim().is_empty() && minus_ref.trim().is_empty() {
-                    ui.add_enabled(false, egui::Button::new(crate::widgets::tr(ui, "Custom")))
-                        .on_disabled_hover_text("Custom error bars need a plus or minus reference; type one below (a range or an array constant).");
-                } else if ui.selectable_label(current == "Custom", "Custom").clicked() {
+                    ui.add_enabled(false, egui::Button::new(crate::widgets::tr(ui, "Custom"))).on_disabled_hover_text(crate::widgets::tr(
+                        ui,
+                        "Custom error bars need a plus or minus reference; type one below (a range or an array constant).",
+                    ));
+                } else if ui.selectable_label(current == "Custom", crate::widgets::tr(ui, "Custom")).clicked() {
                     run_error_bars(app, id, series, json!({"type": "custom", "plus": plus_ref, "minus": minus_ref}));
                 }
             });
         });
         if kind_name == "custom" {
-            ui.label(RichText::new("Custom amounts come from these references.").small().color(t.text_dim));
+            ui.label(RichText::new(crate::widgets::tr(ui, "Custom amounts come from these references.")).small().color(t.text_dim));
         }
         ui.add_enabled_ui(kind_name != "none" && kind_name != "custom", |ui| {
             if let Some(amount) = amount {
@@ -875,7 +906,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
             ui.horizontal(|ui| {
                 ui.label(tr(ui, "Direction"));
                 for (label, value) in [("Both", ErrorBarDirection::Both), ("Plus", ErrorBarDirection::Plus), ("Minus", ErrorBarDirection::Minus)] {
-                    if ui.selectable_label(direction == value, label).clicked() {
+                    if ui.selectable_label(direction == value, crate::widgets::tr(ui, label)).clicked() {
                         run_error_bars(
                             app,
                             id,
@@ -886,7 +917,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                 }
             });
             let mut caps_on = caps;
-            if ui.checkbox(&mut caps_on, "End caps").changed() {
+            if ui.checkbox(&mut caps_on, crate::widgets::tr(ui, "End caps")).changed() {
                 run_error_bars(
                     app,
                     id,
@@ -896,7 +927,7 @@ fn error_bars(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
             }
         });
         ui.separator();
-        ui.label(RichText::new("Custom references (a range or an array constant)").small().color(t.text_dim));
+        ui.label(RichText::new(crate::widgets::tr(ui, "Custom references (a range or an array constant)")).small().color(t.text_dim));
         ui.horizontal(|ui| {
             ui.label(tr(ui, "Plus reference"));
             if let Some(v) = crate::widgets::committed_text(ui, egui::Id::new(("chart_errbars_ref", id, series, "plus")), &plus_ref, None) {
@@ -950,16 +981,16 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
         let key = point_key(id, scope);
         let index = ui.data(|d| d.get_temp::<usize>(key)).unwrap_or(0).min(count.saturating_sub(1));
         ui.horizontal(|ui| {
-            ui.label(crate::widgets::tr(ui, "Point"));
+            ui.label(tr(ui, "chart|Point"));
             let mut shown = index + 1;
             if ui.add(egui::DragValue::new(&mut shown).range(1..=count as i64)).changed() {
                 ui.data_mut(|d| d.insert_temp(key, shown.saturating_sub(1).min(count - 1)));
             }
-            ui.label(RichText::new(format!("of {count}")).small().color(t.text_dim));
+            ui.label(RichText::new(crate::widgets::tr(ui, "of {count}").replace("{count}", &count.to_string())).small().color(t.text_dim));
         });
         let pt = s.points.iter().find(|p| p.index as usize == index).copied().unwrap_or_default();
         let theme = app.session.active().map(|d| d.wb.theme.clone()).unwrap_or_default();
-        for (label, key) in [("Fill", "fill"), ("Line", "line")] {
+        for (label, key) in [("Fill", "fill"), ("point|Line", "line")] {
             point_colour(app, ui, &theme, id, scope, index, label, key, colour_of(&pt, key));
         }
         let marker = marker_reason(chart, scope);
@@ -981,14 +1012,14 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
                     m.insert("markerSize".into(), json!(v.round() as u32));
                     app.run_or_alert("chart.formatPoint", Json::Object(m));
                 }
-                ui.label(RichText::new("pt").small().color(t.text_dim));
+                ui.label(RichText::new(tr(ui, "pt")).small().color(t.text_dim));
             });
         });
         if let Some(r) = marker {
-            ui.label(RichText::new(r).small().color(t.text_dim));
+            ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
         }
         let mut no_label = pt.no_label;
-        if ui.checkbox(&mut no_label, "Hide this point's label").changed() {
+        if ui.checkbox(&mut no_label, crate::widgets::tr(ui, "Hide this point's label")).changed() {
             let mut m = Map::new();
             m.insert("chart".into(), json!(id));
             m.insert("series".into(), json!(scope));
@@ -1033,7 +1064,7 @@ fn colour_row(
 ) {
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(tr(ui, label));
         match current.and_then(|c| c.resolve(wb_theme)).map(theme::color32) {
             Some(c) => {
                 let (r, _) = ui.allocate_exact_size(vec2(16.0, 14.0), egui::Sense::hover());
@@ -1042,7 +1073,7 @@ fn colour_row(
             }
             None => {
                 // Not "Automatic": that word is the position combo's own value in this pane.
-                ui.label(RichText::new("Automatic colour").small().color(t.text_dim));
+                ui.label(RichText::new(crate::widgets::tr(ui, "Automatic colour")).small().color(t.text_dim));
             }
         }
         ui.menu_button(tr(ui, "Colour…"), |ui| {
@@ -1097,10 +1128,10 @@ fn label_font_controls(app: &mut SheetApp, ui: &mut Ui, id: u32, series: Option<
             m.insert("fontSize".into(), json!(v));
             app.run_or_alert("chart.setDataLabels", Json::Object(m));
         }
-        ui.label(RichText::new("pt").small().color(Tokens::get(ui.ctx()).text_dim));
+        ui.label(RichText::new(tr(ui, "pt")).small().color(Tokens::get(ui.ctx()).text_dim));
     });
     let mut bold = f.bold.unwrap_or(false);
-    if ui.checkbox(&mut bold, "Bold label").changed() {
+    if ui.checkbox(&mut bold, crate::widgets::tr(ui, "Bold label")).changed() {
         let mut m = params.clone();
         m.insert("bold".into(), json!(bold));
         app.run_or_alert("chart.setDataLabels", Json::Object(m));

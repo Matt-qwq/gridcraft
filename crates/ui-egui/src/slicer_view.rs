@@ -544,7 +544,11 @@ fn paint_slicer(app: &SheetApp, p: &Painter, geo: &Geo, t: &theme::Tokens, sl: &
     if let Some(f) = lay.footer {
         let first = lay.first_row.saturating_mul(sl.columns.clamp(1, 64) as usize);
         let last = lay.tiles.last().map_or(first, |(i, _)| i + 1);
-        let msg = format!("{first}–{last} of {}", lay.total);
+        let msg = crate::i18n::current(p.ctx())
+            .tr("{first}–{last} of {}")
+            .replacen("{first}", &first.to_string(), 1)
+            .replacen("{last}", &last.to_string(), 1)
+            .replacen("{}", &lay.total.to_string(), 1);
         let fp = p.with_clip_rect(f.intersect(p.clip_rect()));
         fp.text(f.left_bottom(), Align2::LEFT_BOTTOM, msg, theme::ui_font(10.5 * z), t.text_dim);
     }
@@ -574,7 +578,7 @@ fn paint_timeline(app: &SheetApp, p: &Painter, geo: &Geo, t: &theme::Tokens, tl:
     cp.text(lay.header.left_center() + vec2(PAD * z, 0.0), Align2::LEFT_CENTER, caption, theme::ui_bold(12.5 * z), t.accent_dark);
     // The time unit the timeline groups by ("Months", "Quarters", …).
     let up = fp.with_clip_rect(lay.unit.intersect(fp.clip_rect()));
-    up.text(lay.unit.left_center(), Align2::LEFT_CENTER, unit_name(tl.unit), theme::ui_font(11.0 * z), t.text_dim);
+    up.text(lay.unit.left_center(), Align2::LEFT_CENTER, crate::i18n::current(p.ctx()).tr(unit_name(tl.unit)), theme::ui_font(11.0 * z), t.text_dim);
     // The track is the field's full date axis; the selected range is a band on it. A band is only
     // drawn when the axis is known (the grid's per-revision cache), because without it its place
     // would be made up.

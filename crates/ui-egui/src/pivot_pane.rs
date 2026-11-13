@@ -50,7 +50,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                         app.run("pivot.removeField", json!({"pivot": name, "field": fname}))
                     };
                     if let Err(e) = res {
-                        app.message = Some(("PivotTable".into(), crate::clean_error(&e)));
+                        app.message = Some((lang.tr("PivotTable").to_string(), crate::clean_error(&e)));
                     }
                 }
                 let samples: Vec<String> =
@@ -91,8 +91,11 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                     ui.set_min_size(vec2(ui.available_width(), 60.0));
                     for f in area_with_values(key) {
                         let is_values = f == VALUES_FIELD;
+                        // Σ Values is the pane's own pseudo-field name, not a source field's, so the
+                        // button shows it in this language while the command still gets the English.
+                        let shown = if is_values { lang.tr(VALUES_FIELD) } else { f.as_str() };
                         let b = ui.add(
-                            egui::Button::new(egui::RichText::new(format!("{f} ▾")).font(theme::ui_font(12.0)))
+                            egui::Button::new(egui::RichText::new(format!("{shown} ▾")).font(theme::ui_font(12.0)))
                                 .fill(t.ribbon)
                                 .min_size(vec2(ui.available_width(), 20.0)),
                         );

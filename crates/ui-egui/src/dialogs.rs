@@ -189,7 +189,7 @@ impl Dialog {
                     vec![
                         Number { key: "to", label: "Before sheet (position, 0 = first):" },
                         Check { key: "copy", label: "Create a copy" },
-                        Note(format!("Sheets: {}", sheets.join(", "))),
+                        Note(app.ui.language.tr("Sheets: {sheets}").replace("{sheets}", &sheets.join(", "))),
                     ],
                     json!({"to": 0, "copy": false}),
                 );
@@ -220,6 +220,7 @@ impl Dialog {
                 json!({"selectLockedCells": true, "selectUnlockedCells": true}),
             ),
             "allowEditRanges" => {
+                let lang = app.ui.language;
                 let list = app.session.run("review.allowEditRanges", json!({})).unwrap_or(Json::Null);
                 let rows: Vec<String> = list
                     .as_array()
@@ -227,8 +228,8 @@ impl Dialog {
                         a.iter()
                             .map(|r| {
                                 let lock = match (r["password"].as_bool(), r["unlocked"].as_bool()) {
-                                    (Some(true), Some(true)) => " (password, unlocked)",
-                                    (Some(true), _) => " (password)",
+                                    (Some(true), Some(true)) => lang.tr(" (password, unlocked)"),
+                                    (Some(true), _) => lang.tr(" (password)"),
                                     _ => "",
                                 };
                                 format!("{}: {}{lock}", r["title"].as_str().unwrap_or(""), r["range"].as_str().unwrap_or(""))
@@ -236,13 +237,13 @@ impl Dialog {
                             .collect()
                     })
                     .unwrap_or_default();
-                let summary = if rows.is_empty() { "No ranges yet.".to_string() } else { rows.join("\n") };
+                let summary = if rows.is_empty() { lang.tr("No ranges yet.").to_string() } else { rows.join("\n") };
                 Dialog::form(
                     "allowEditRanges",
                     "Allow Edit Ranges",
                     "review.allowEditRanges",
                     vec![
-                        Note(format!("Ranges that stay editable when the sheet is protected:\n{summary}")),
+                        Note(format!("{}\n{summary}", lang.tr("Ranges that stay editable when the sheet is protected:"))),
                         Choice {
                             key: "action",
                             label: "Action",
@@ -306,7 +307,10 @@ impl Dialog {
                     "unhideSheet",
                     "Unhide",
                     "sheet.unhide",
-                    vec![Text { key: "sheet", label: "Unhide sheet:" }, Note(format!("Hidden: {}", opts.join(", ")))],
+                    vec![
+                        Text { key: "sheet", label: "Unhide sheet:" },
+                        Note(app.ui.language.tr("Hidden: {sheets}").replace("{sheets}", &opts.join(", "))),
+                    ],
                     json!({"sheet": first}),
                 );
                 d.values.insert("sheet".into(), json!(first));
@@ -1232,7 +1236,7 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                     }
                     if app.services.pick_picture_async.is_some() {
                         let name = d.values.get("alt").and_then(Json::as_str).unwrap_or("No picture selected");
-                        ui.label(name);
+                        ui.label(crate::widgets::tr(ui, name));
                     } else {
                         ui.label(crate::widgets::tr(ui, "Picture file path (PNG or JPEG):"));
                         let mut path = d.values.get("path").and_then(Json::as_str).unwrap_or("").to_string();
@@ -1261,7 +1265,7 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                         d.values.insert("alt".into(), json!(alt));
                     }
                     if d.values.get("placement").and_then(Json::as_str) == Some("cell") {
-                        ui.label(egui::RichText::new("Fits inside the selected cell and moves with its content.").small());
+                        ui.label(egui::RichText::new(crate::widgets::tr(ui, "Fits inside the selected cell and moves with its content.")).small());
                     }
                     ok_cancel(ui, &mut confirm, &mut open);
                 }
@@ -1766,7 +1770,7 @@ fn accessibility(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
     ui.add_space(6.0);
     let items: Vec<Json> = d.result.as_ref().and_then(Json::as_array).cloned().unwrap_or_default();
     if items.is_empty() {
-        ui.weak("No accessibility issues found.");
+        ui.weak(crate::widgets::tr(ui, "No accessibility issues found."));
         return;
     }
     let mut refresh = false;
@@ -1781,7 +1785,7 @@ fn accessibility(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
                 .or_else(|| issue["range"].as_str().map(|r| format!("{sheet}!{r}")))
                 .unwrap_or_else(|| sheet.to_string());
             ui.horizontal(|ui| {
-                ui.label(format!("{} — {what}", issue["issue"].as_str().unwrap_or("")));
+                ui.label(format!("{} — {what}", crate::widgets::tr(ui, issue["issue"].as_str().unwrap_or(""))));
                 if ui.button(crate::widgets::tr(ui, "Go to")).clicked() {
                     go = Some(issue.clone());
                 }
@@ -1846,7 +1850,7 @@ fn macros(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
     // Scripts that came with a file stay disabled until the user trusts the workbook (#2178).
     if items.iter().any(|it| it.get("trusted").and_then(Json::as_bool) == Some(false)) {
         ui.horizontal(|ui| {
-            ui.weak("Scripts in this workbook came from a file and are disabled.");
+            ui.weak(crate::widgets::tr(ui, "Scripts in this workbook came from a file and are disabled."));
             if ui
                 .button(crate::widgets::tr(ui, "Trust Scripts"))
                 .on_hover_text(crate::widgets::tr(ui, "Let this workbook's scripts run for the rest of this session"))
@@ -1863,12 +1867,17 @@ fn macros(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
             let name = it.get("name").and_then(Json::as_str).unwrap_or("(unnamed)");
             let is_vba = it.get("kind").and_then(Json::as_str) == Some("vba");
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(name).strong());
+                ui.label(egui::RichText::new(crate::widgets::tr(ui, name)).strong());
                 if is_vba {
                     ui.weak(crate::widgets::tr(ui, "— VBA project (preserved, not run)"));
                 } else {
                     let steps = it.get("steps").and_then(Json::as_u64).unwrap_or(0);
-                    ui.weak(format!("— {steps} step{}", if steps == 1 { "" } else { "s" }));
+                    let steps = if steps == 1 {
+                        crate::widgets::tr(ui, "— 1 step").to_string()
+                    } else {
+                        crate::widgets::tr(ui, "— {steps} steps").replace("{steps}", &steps.to_string())
+                    };
+                    ui.weak(steps);
                 }
             });
         }
@@ -2172,7 +2181,7 @@ fn function_category_label(id: &str) -> &str {
 fn find(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
     ui.horizontal(|ui| {
         for tab in ["Find", "Replace"] {
-            if ui.selectable_label(d.tab == tab, tab).clicked() {
+            if ui.selectable_label(d.tab == tab, crate::widgets::tr(ui, tab)).clicked() {
                 d.tab = tab.into();
             }
         }
@@ -2215,7 +2224,12 @@ fn find(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
                 p["with"] = json!(with);
                 p["all"] = json!(true);
                 match app.run("edit.replace", p) {
-                    Ok(r) => app.toast = Some((format!("All done. We made {} replacements.", r["replaced"]), crate::now_ms())),
+                    Ok(r) => {
+                        app.toast = Some((
+                            crate::widgets::tr(ui, "All done. We made {} replacements.").replace("{}", &r["replaced"].to_string()),
+                            crate::now_ms(),
+                        ))
+                    }
                     Err(e) => app.message = Some(("Find and Replace".into(), crate::clean_error(&e))),
                 }
             }
@@ -2243,7 +2257,7 @@ fn find(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog) {
         && let Some(list) = r["results"].as_array()
     {
         ui.separator();
-        ui.label(format!("{} cell(s) found", list.len()));
+        ui.label(crate::widgets::tr(ui, "{} cell(s) found").replace("{}", &list.len().to_string()));
         egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
             for item in list {
                 let label = format!(
@@ -2375,14 +2389,14 @@ fn sort(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &mut boo
             let mut by = lv["by"].as_str().unwrap_or("values").to_string();
             egui::ComboBox::from_id_salt(("by", i))
                 .selected_text(match by.as_str() {
-                    "cellColor" => "Cell Color",
-                    "fontColor" => "Font Color",
+                    "cellColor" => crate::widgets::tr(ui, "Cell Color"),
+                    "fontColor" => crate::widgets::tr(ui, "Font Color"),
                     _ => crate::widgets::tr(ui, "Cell Values"),
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut by, "values".into(), crate::widgets::tr(ui, "Cell Values"));
-                    ui.selectable_value(&mut by, "cellColor".into(), "Cell Color");
-                    ui.selectable_value(&mut by, "fontColor".into(), "Font Color");
+                    ui.selectable_value(&mut by, "cellColor".into(), crate::widgets::tr(ui, "Cell Color"));
+                    ui.selectable_value(&mut by, "fontColor".into(), crate::widgets::tr(ui, "Font Color"));
                 });
             lv["by"] = json!(by);
             let mut desc = lv["order"].as_str() == Some("desc");
@@ -2450,13 +2464,13 @@ fn name_manager(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, open: &mu
     ui.add_space(4.0);
     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
         egui::Grid::new("names").striped(true).num_columns(4).show(ui, |ui| {
-            ui.strong("Name");
-            ui.strong("Value");
-            ui.strong("Refers To");
-            ui.strong("Scope");
+            ui.strong(crate::widgets::tr(ui, "Name"));
+            ui.strong(crate::widgets::tr(ui, "Value"));
+            ui.strong(crate::widgets::tr(ui, "Refers To"));
+            ui.strong(crate::widgets::tr(ui, "Scope"));
             ui.end_row();
             if names.is_empty() {
-                ui.label(egui::RichText::new("No names defined").italics());
+                ui.label(egui::RichText::new(crate::widgets::tr(ui, "No names defined")).italics());
                 ui.end_row();
             }
             for (i, n) in names.iter().enumerate() {
@@ -2536,7 +2550,7 @@ fn chart_icon(t: &str) -> Icon {
 fn recommended_charts(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &mut bool, open: &mut bool) {
     ui.horizontal(|ui| {
         for tab in ["Recommended Charts", "All Charts"] {
-            if ui.selectable_label(d.tab == tab, tab).clicked() && d.tab != tab {
+            if ui.selectable_label(d.tab == tab, crate::widgets::tr(ui, tab)).clicked() && d.tab != tab {
                 d.tab = tab.to_string();
                 select_chart(d, 0);
             }
@@ -2554,7 +2568,7 @@ fn recommended_charts(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, con
                         .horizontal(|ui| {
                             let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
                             icons::paint(ui.painter(), r.shrink(2.0), chart_icon(kind), t.text);
-                            ui.selectable_label(i == d.list_index, label.as_str())
+                            ui.selectable_label(i == d.list_index, crate::widgets::tr(ui, label.as_str()))
                         })
                         .inner;
                     if resp.clicked() {
@@ -2570,7 +2584,7 @@ fn recommended_charts(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, con
         ui.add_space(12.0);
         ui.vertical(|ui| {
             let label = choices.get(d.list_index).map(|c| c.2.clone()).unwrap_or_default();
-            ui.strong(label);
+            ui.strong(crate::widgets::tr(ui, &label));
             let (rect, _) = ui.allocate_exact_size(vec2(360.0, 216.0), Sense::hover());
             ui.painter().rect_filled(rect, 2.0, Color32::WHITE);
             ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, t.separator), StrokeKind::Inside);
@@ -2601,7 +2615,7 @@ fn recommended_charts(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, con
 fn select_data(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &mut bool, open: &mut bool) {
     let text = |d: &Dialog, k: &str| d.values.get(k).and_then(Json::as_str).unwrap_or("").to_string();
     let edit = |ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str| {
-        ui.label(label);
+        ui.label(crate::widgets::tr(ui, label));
         let mut v = text(d, key);
         if ui.add(egui::TextEdit::singleline(&mut v).desired_width(420.0)).changed() {
             d.values.insert(key.into(), json!(v));
@@ -2609,7 +2623,7 @@ fn select_data(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &
     };
     edit(ui, d, "range", "Chart data range:");
     ui.add_space(6.0);
-    ui.strong("Legend Entries (Series)");
+    ui.strong(crate::widgets::tr(ui, "Legend Entries (Series)"));
     let names: Vec<String> =
         d.values.get("names").and_then(Json::as_array).map(|a| a.iter().map(|n| n.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default();
     let mut remove: Vec<u64> =
@@ -2620,7 +2634,7 @@ fn select_data(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &
             let i = i as u64;
             let removed = remove.contains(&i);
             ui.horizontal(|ui| {
-                let label = if name.is_empty() { format!("Series{}", i + 1) } else { name.clone() };
+                let label = if name.is_empty() { crate::widgets::tr(ui, "Series{n}").replace("{n}", &(i + 1).to_string()) } else { name.clone() };
                 ui.label(if removed { egui::RichText::new(label).strikethrough().weak() } else { egui::RichText::new(label) });
                 if removed {
                     if ui.small_button(crate::widgets::tr(ui, "Keep")).clicked() {
@@ -2670,11 +2684,13 @@ fn manage_rules(app: &mut SheetApp, ui: &mut egui::Ui) {
     for (i, r) in rules.iter().enumerate() {
         ui.horizontal(|ui| {
             let kind = r["rule"].as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_default();
-            ui.label(format!(
-                "{}. {kind}  applies to {}",
-                i + 1,
-                r["ranges"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default()
-            ));
+            let ranges = r["ranges"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+            ui.label(
+                crate::widgets::tr(ui, "{n}. {kind}  applies to {ranges}")
+                    .replace("{n}", &(i + 1).to_string())
+                    .replace("{kind}", &kind)
+                    .replace("{ranges}", &ranges),
+            );
             if ui.small_button("▲").clicked() {
                 app.run_or_alert("home.manageRules", json!({"moveUp": i}));
             }
@@ -2700,7 +2716,9 @@ fn command_search(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm
         )
     });
     let width = ui.available_width();
-    let r = ui.add(egui::TextEdit::singleline(&mut d.search).desired_width(width).hint_text("Type a command, e.g. freeze, chart, bold…"));
+    let r = ui.add(
+        egui::TextEdit::singleline(&mut d.search).desired_width(width).hint_text(crate::widgets::tr(ui, "Type a command, e.g. freeze, chart, bold…")),
+    );
 
     if !d.focus_initialized {
         r.request_focus();
@@ -2798,7 +2816,12 @@ fn goal_seek(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &mu
     ok_cancel(ui, confirm, &mut open);
     if *confirm {
         match app.run("data.goalSeek", json!({"set": set, "to": to.parse::<f64>().unwrap_or(0.0), "changing": changing})) {
-            Ok(r) => app.toast = Some((format!("Goal Seeking found a solution: {}", r["value"]), crate::now_ms())),
+            Ok(r) => {
+                app.toast = Some((
+                    crate::widgets::tr(ui, "Goal Seeking found a solution: {value}").replace("{value}", &r["value"].to_string()),
+                    crate::now_ms(),
+                ))
+            }
             Err(e) => app.message = Some(("Goal Seek".into(), crate::clean_error(&e))),
         }
     }
@@ -2982,11 +3005,11 @@ fn analysis_toolpak(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confi
     d.fields = toolpak_fields(&tool);
     form_fields(ui, d);
     ui.separator();
-    ui.label(egui::RichText::new("Output options").strong());
+    ui.label(egui::RichText::new(crate::widgets::tr(ui, "Output options")).strong());
     let to = d.values.get("outputTo").and_then(Json::as_str).unwrap_or("newSheet").to_string();
     for (key, choice, text_label) in [("output", "range", "Output Range:"), ("newSheet", "newSheet", "New Worksheet Ply:")] {
         ui.horizontal(|ui| {
-            if ui.radio(to == choice, text_label).clicked() {
+            if ui.radio(to == choice, crate::widgets::tr(ui, text_label)).clicked() {
                 d.values.insert("outputTo".into(), json!(choice));
             }
             let mut t = d.values.get(key).and_then(Json::as_str).unwrap_or("").to_string();
@@ -3133,7 +3156,7 @@ fn statistics_view(ui: &mut egui::Ui, d: &Dialog) {
     let r = d.result.clone().unwrap_or(Json::Null);
     let n = |v: &str| r["workbook"][v].as_u64();
     if r.get("workbook").is_some() {
-        row_label(ui, "Workbook", crate::widgets::tr(ui, "此工作簿"));
+        row_label(ui, "Workbook", crate::widgets::tr(ui, "This workbook"));
         for (key, label) in
             [("sheets", "Sheets"), ("cellsWithData", "Cells with data"), ("tables", "Tables"), ("charts", "Charts"), ("names", "Names")]
         {
@@ -3215,7 +3238,12 @@ fn comments_view(app: &mut SheetApp, ui: &mut egui::Ui) {
     }
     egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
         for (cell, m) in &sh.comments {
-            ui.label(format!("{}（{}）：{}", cell.a1(), m.author, m.text));
+            ui.label(
+                crate::widgets::tr(ui, "{cell} ({author}): {text}")
+                    .replace("{cell}", &cell.a1())
+                    .replace("{author}", &m.author)
+                    .replace("{text}", &m.text),
+            );
         }
     });
 }
@@ -3223,7 +3251,7 @@ fn comments_view(app: &mut SheetApp, ui: &mut egui::Ui) {
 /// Solver Results: the outcome, and keeping or restoring the variable cells.
 fn solver_results(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, open: &mut bool) {
     let message = d.values.get("message").and_then(Json::as_str).unwrap_or("").to_string();
-    ui.label(message);
+    ui.label(crate::widgets::tr(ui, &message));
     let changed = d.values.get("changed").and_then(Json::as_bool).unwrap_or(false);
     let restore = d.values.get("restore").and_then(Json::as_bool).unwrap_or(false);
     if changed {
@@ -3242,7 +3270,7 @@ fn solver_results(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, open: &
         ui.label(crate::widgets::tr(ui, "Reports:"));
         for (key, label) in [("answerReport", "Answer"), ("limitsReport", "Limits")] {
             let mut on = d.values.get(key).and_then(Json::as_bool).unwrap_or(false);
-            if ui.checkbox(&mut on, label).changed() {
+            if ui.checkbox(&mut on, crate::widgets::tr(ui, label)).changed() {
                 d.values.insert(key.into(), json!(on));
             }
         }
@@ -3284,7 +3312,7 @@ fn spelling(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, open: &mut bo
     };
     let word = it["word"].as_str().unwrap_or("").to_string();
     let cell = it["cell"].as_str().unwrap_or("").to_string();
-    ui.label(format!("Not in Dictionary ({cell}):"));
+    ui.label(crate::widgets::tr(ui, "Not in Dictionary ({cell}):").replace("{cell}", &cell));
     ui.label(egui::RichText::new(&word).strong().color(Color32::from_rgb(0xC4, 0x2B, 0x1C)));
     let sugg: Vec<String> =
         it["suggestions"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
@@ -3296,7 +3324,7 @@ fn spelling(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, open: &mut bo
         }
     }
     if sugg.is_empty() {
-        ui.label(egui::RichText::new("(No suggestions)").italics());
+        ui.label(egui::RichText::new(crate::widgets::tr(ui, "(No suggestions)")).italics());
     }
     d.values.insert("pick".into(), json!(pick.clone()));
     let _ = app.session.run("selection.set", json!({"cell": cell}));

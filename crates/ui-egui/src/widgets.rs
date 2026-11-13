@@ -318,10 +318,10 @@ fn palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str, more_colors:
         });
         ui.data_mut(|d| d.remove_temp::<Option<(usize, usize)>>(pal_id));
     }
-    if ui.button(none_label).clicked() {
+    if ui.button(tr(ui, none_label)).clicked() {
         picked = Some("none".to_string());
     }
-    ui.label(egui::RichText::new("Theme Colors").small());
+    ui.label(egui::RichText::new(crate::widgets::tr(ui, "Theme Colors")).small());
     let order = [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     let tints = [0.0f64, 0.8, 0.6, 0.4, -0.25, -0.5];
     egui::Grid::new(ui.id().with("theme_grid")).spacing(vec2(2.0, 2.0)).show(ui, |ui| {
@@ -344,7 +344,7 @@ fn palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str, more_colors:
             ui.end_row();
         }
     });
-    ui.label(egui::RichText::new("Standard Colors").small());
+    ui.label(egui::RichText::new(crate::widgets::tr(ui, "Standard Colors")).small());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for (col, hex) in std_hex.iter().enumerate() {
@@ -365,7 +365,7 @@ fn palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str, more_colors:
     // Recent Colors: the custom colours picked below, newest first.
     let mut recent: Vec<String> = ui.ctx().data(|d| d.get_temp(recent_colors_id())).unwrap_or_default();
     if !recent.is_empty() {
-        ui.label(egui::RichText::new("Recent Colors").small());
+        ui.label(egui::RichText::new(crate::widgets::tr(ui, "Recent Colors")).small());
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for hex in &recent {
@@ -419,7 +419,7 @@ fn palette(ui: &mut Ui, theme_colors: &[u32; 12], none_label: &str, more_colors:
                 picked = Some(hex);
                 done = true;
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button(tr(ui, "Cancel")).clicked() {
                 done = true;
             }
         });
@@ -513,13 +513,13 @@ pub fn notice_bar(app: &mut SheetApp, ui: &mut Ui) {
                 border,
             );
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(&notice.text).font(theme::ui_font(12.5)).color(t.text));
+            ui.label(egui::RichText::new(tr(ui, &notice.text)).font(theme::ui_font(12.5)).color(t.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, Icon::Close, t.text_dim, "Dismiss", vec2(20.0, 20.0)).clicked() {
                     dismiss = true;
                 }
                 if let Some((label, dialog)) = &notice.action
-                    && ui.button(egui::RichText::new(label).font(theme::ui_font(12.5))).clicked()
+                    && ui.button(egui::RichText::new(tr(ui, label)).font(theme::ui_font(12.5))).clicked()
                 {
                     action = Some((label.clone(), dialog.clone()));
                 }

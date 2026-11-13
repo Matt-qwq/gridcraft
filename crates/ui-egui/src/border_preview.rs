@@ -9,6 +9,7 @@ use crate::theme::{self, Tokens};
 /// A labelled menu button with a two-by-two diagram to distinguish inside edges
 /// from the selection outline. Labels stay available to accessibility tools.
 pub(crate) fn preset_button(ui: &mut Ui, label: &str, preset: &str) -> Response {
+    let label = crate::widgets::tr(ui, label);
     let response = ui.add(egui::Button::new("").frame(false).min_size(vec2(254.0, 26.0)));
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
     let t = Tokens::get(ui.ctx());

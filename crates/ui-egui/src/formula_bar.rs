@@ -44,8 +44,13 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
                 if app.editor.is_some() {
                     editor_widget(app, &mut child, id, theme::ui_font(13.0), expanded, field.width() - 12.0);
                 } else {
-                    // Show the active cell's content; clicking starts editing in the bar.
-                    let text = active_input(app);
+                    // Show the active cell's content; clicking starts editing in the bar. A picture
+                    // in the cell shows its own placeholder, in the frame's language.
+                    let text = match active_picture(app) {
+                        Some(alt) if alt.is_empty() => crate::widgets::tr(ui, "Picture in cell").to_string(),
+                        Some(alt) => crate::widgets::tr(ui, "Picture: {}").replace("{}", &alt),
+                        None => active_input(app),
+                    };
                     let color = if read_only { t.text_disabled } else { t.text };
                     let resp = child
                         .add(egui::Label::new(egui::RichText::new(text).font(theme::ui_font(13.0)).color(color)).truncate().sense(Sense::click()));
@@ -75,9 +80,6 @@ fn active_input(app: &SheetApp) -> String {
     let Some(d) = app.session.active() else { return String::new() };
     let Some(sh) = d.wb.active() else { return String::new() };
     let a = sh.merge_at(d.selection.active).map(|m| m.start).unwrap_or(d.selection.active);
-    if let Some(picture) = sh.cell_pictures.get(&a) {
-        return if picture.alt.is_empty() { "Picture in cell".into() } else { format!("Picture: {}", picture.alt) };
-    }
     if let Some(anchor) = sh.spill_anchor(a) {
         if gridcraft_engine::display::formula_hidden(&d.wb, sh, anchor) {
             return String::new();
@@ -100,6 +102,15 @@ fn active_input(app: &SheetApp) -> String {
         };
     }
     String::new()
+}
+
+/// The alt text of the picture the active cell holds, when the bar shows a placeholder instead of
+/// a value. The wording is translated where it is drawn.
+fn active_picture(app: &SheetApp) -> Option<String> {
+    let d = app.session.active()?;
+    let sh = d.wb.active()?;
+    let a = sh.merge_at(d.selection.active).map(|m| m.start).unwrap_or(d.selection.active);
+    sh.cell_pictures.get(&a).map(|picture| picture.alt.clone())
 }
 
 fn name_box(app: &mut SheetApp, ui: &mut egui::Ui, t: &Tokens) {
@@ -150,7 +161,7 @@ fn name_box(app: &mut SheetApp, ui: &mut egui::Ui, t: &Tokens) {
     let r = ui.interact(mb, id.with("drop"), Sense::click());
     egui::Popup::menu(&r).show(|ui| {
         if names.is_empty() {
-            ui.label(egui::RichText::new("No names defined").italics());
+            ui.label(egui::RichText::new(crate::widgets::tr(ui, "No names defined")).italics());
         }
         for n in names {
             if ui.button(&n).clicked() {

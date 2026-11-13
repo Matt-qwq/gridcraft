@@ -2686,7 +2686,12 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             }
             Drag::ResizeRow { row, start, orig } => {
                 let h = (orig + (p.y - start) / geo.z).max(0.0);
-                app.toast = Some((format!("Height: {:.2} ({} pixels)", h * 0.75, h.round()), crate::now_ms()));
+                app.toast = Some((
+                    crate::widgets::tr(ui, "Height: {:.2} ({} pixels)")
+                        .replace("{:.2}", &format!("{:.2}", h * 0.75))
+                        .replace("{}", &h.round().to_string()),
+                    crate::now_ms(),
+                ));
                 let rows = if sel.ranges.iter().any(|r| r.is_full_rows() && row >= r.start.row && row <= r.end.row) {
                     sel.ranges
                         .iter()

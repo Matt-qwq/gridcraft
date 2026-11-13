@@ -72,7 +72,7 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
                     }
                     ui.label(egui::RichText::new(&c.author).color(Color32::from_gray(90)));
                     if c.resolved {
-                        ui.label(egui::RichText::new("Resolved").small().color(Color32::from_rgb(0x10, 0x7C, 0x41)));
+                        ui.label(egui::RichText::new(crate::widgets::tr(ui, "Resolved")).small().color(Color32::from_rgb(0x10, 0x7C, 0x41)));
                     }
                 });
                 ui.label(&c.text);
@@ -88,7 +88,7 @@ fn comments(app: &mut SheetApp, ui: &mut Ui) {
                         if ui.small_button(crate::widgets::tr(ui, "Delete")).clicked() {
                             app.run_or_alert("review.deleteComment", json!({"cell": cell}));
                         }
-                        if ui.small_button(if c.resolved { "Reopen" } else { "Resolve" }).clicked() {
+                        if ui.small_button(crate::widgets::tr(ui, if c.resolved { "Reopen" } else { "Resolve" })).clicked() {
                             app.run_or_alert("review.resolveComment", json!({"cell": cell, "resolved": !c.resolved}));
                         }
                         let send = ui.small_button(crate::widgets::tr(ui, "Send")).clicked();
@@ -117,9 +117,9 @@ fn watch(app: &mut SheetApp, ui: &mut Ui) {
     }
     let list = app.session.run("formulas.watchWindow", json!({})).unwrap_or(Json::Null);
     egui::Grid::new("watch_grid").striped(true).num_columns(4).show(ui, |ui| {
-        ui.strong("Cell");
-        ui.strong("Value");
-        ui.strong("Formula");
+        ui.strong(crate::widgets::tr(ui, "Cell"));
+        ui.strong(crate::widgets::tr(ui, "Value"));
+        ui.strong(crate::widgets::tr(ui, "Formula"));
         ui.label("");
         ui.end_row();
         for w in list.as_array().cloned().unwrap_or_default() {
@@ -149,13 +149,13 @@ fn selection(app: &mut SheetApp, ui: &mut Ui) {
         .map(|sh| {
             sh.pivot_slicers
                 .iter()
-                .map(|s| (format!("Slicer {}", s.name), s.id))
-                .chain(sh.pivot_timelines.iter().map(|t| (format!("Timeline {}", t.name), t.id)))
+                .map(|s| (crate::widgets::tr(ui, "Slicer {}").replace("{}", &s.name), s.id))
+                .chain(sh.pivot_timelines.iter().map(|t| (crate::widgets::tr(ui, "Timeline {}").replace("{}", &t.name), t.id)))
                 .collect()
         })
         .unwrap_or_default();
     if items.is_empty() && widgets.is_empty() {
-        ui.label(egui::RichText::new("There are no shapes, pictures, charts or slicers on this sheet.").italics());
+        ui.label(egui::RichText::new(crate::widgets::tr(ui, "There are no shapes, pictures, charts or slicers on this sheet.")).italics());
     }
     for it in items.iter().rev() {
         let kind = it["kind"].as_str().unwrap_or("").to_string();
@@ -165,10 +165,10 @@ fn selection(app: &mut SheetApp, ui: &mut Ui) {
             if ui.selectable_label(sel, it["name"].as_str().unwrap_or("")).clicked() {
                 app.selected_chart = Some(id);
             }
-            if ui.small_button("▲").on_hover_text("Bring Forward").clicked() {
+            if ui.small_button("▲").on_hover_text(crate::widgets::tr(ui, "Bring Forward")).clicked() {
                 app.run_or_alert("arrange.bringForward", json!({"kind": kind, "id": id}));
             }
-            if ui.small_button("▼").on_hover_text("Send Backward").clicked() {
+            if ui.small_button("▼").on_hover_text(crate::widgets::tr(ui, "Send Backward")).clicked() {
                 app.run_or_alert("arrange.sendBackward", json!({"kind": kind, "id": id}));
             }
             if ui.small_button("✕").on_hover_text(crate::widgets::tr(ui, "Delete")).clicked() {
@@ -181,7 +181,7 @@ fn selection(app: &mut SheetApp, ui: &mut Ui) {
             if ui.selectable_label(app.selected_chart == Some(id), name).clicked() {
                 app.selected_chart = Some(id);
             }
-            if ui.small_button("✕").on_hover_text("Delete").clicked() {
+            if ui.small_button("✕").on_hover_text(crate::widgets::tr(ui, "Delete")).clicked() {
                 app.run_or_alert("slicer.delete", json!({"slicer": id}));
                 if app.selected_chart == Some(id) {
                     app.selected_chart = None;
