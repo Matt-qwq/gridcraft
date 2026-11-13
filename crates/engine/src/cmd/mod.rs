@@ -461,6 +461,14 @@ fn check_arrays(old: &Workbook, new: &Workbook) -> Result<()> {
         if std::sync::Arc::ptr_eq(sh, after) {
             continue;
         }
+        // A sheet holding no multi-cell legacy array has nothing this check can refuse an edit
+        // of, and both walks below cover the whole store: `diff` reads every band key, and
+        // `formulas` walks every row. The store answers "does any formula own one?" in constant
+        // time — it raises the flag whenever such a formula is written and only ever raises it —
+        // so an ordinary commit costs nothing here however large the sheet.
+        if !after.cells.has_array_anchors() {
+            continue;
+        }
         // What changed, before looking for arrays: most commits change one cell (or only
         // formatting), and `diff` shares every band it did not touch.
         let changed: Vec<CellRef> = sh

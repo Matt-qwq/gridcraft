@@ -2201,6 +2201,36 @@ fn part_of_a_legacy_array_cant_be_changed() {
 }
 
 #[test]
+fn part_of_a_legacy_array_cant_be_changed_on_a_sheet_with_many_cells() {
+    // The guard used to diff the whole cell store and walk its formulas on every commit, so a
+    // sheet holding no array at all paid for one. It now asks the store in constant time whether
+    // any formula owns a multi-cell array, so the refusal has to hold on a sheet whose cells sit
+    // in hundreds of bands, before and after a save/load (which fills the store a different way).
+    let mut s = s();
+    let rows: usize = 5_000;
+    let values: Vec<Vec<serde_json::Value>> = (0..rows).map(|i| vec![json!(i as f64)]).collect();
+    s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+    // A sheet with no multi-cell array says so, which is what lets the commit skip the walk.
+    assert!(!s.doc().unwrap().wb.sheet(0).unwrap().cells.has_array_anchors());
+    s.execute("range.setValues", json!({"range": "B2", "values": [[9]]})).unwrap();
+    assert_eq!(v(&s, "B2"), Value::Number(9.0), "an ordinary edit is not blocked");
+    s.execute("selection.set", json!({"range": "C5:D6"})).unwrap();
+    s.execute("cell.set", json!({"input": "=5", "array": true})).unwrap();
+    assert!(s.doc().unwrap().wb.sheet(0).unwrap().cells.has_array_anchors());
+    let e = s.execute("range.setValues", json!({"range": "D6", "values": [[13]]})).unwrap_err();
+    assert!(e.to_string().contains("part of an array"), "{e}");
+    assert_eq!(v(&s, "D6"), Value::Number(5.0));
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1]]})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(1.0), "outside the array is fine");
+    // The array and the flag come back through the file reader, which fills the store in batches.
+    reopen(&mut s);
+    assert!(s.doc().unwrap().wb.sheet(0).unwrap().cells.has_array_anchors());
+    let e = s.execute("range.setValues", json!({"range": "D6", "values": [[13]]})).unwrap_err();
+    assert!(e.to_string().contains("part of an array"), "{e}");
+    assert_eq!(v(&s, "D6"), Value::Number(5.0));
+}
+
+#[test]
 fn inserting_cells_across_a_merged_range_is_refused() {
     // A merge over whole rows extends past the E:H band the shift moves: moving the band and
     // leaving the rest would leave two overlapping merges (found by the command-sequence fuzzer).

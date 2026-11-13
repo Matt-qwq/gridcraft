@@ -586,6 +586,11 @@ impl Band {
             + self.number_slots.capacity() * size_of::<u16>()
     }
 
+    /// Whether any formula of this band owns a legacy array covering more than one cell.
+    fn has_array_anchor(&self) -> bool {
+        self.rows.iter().any(|row| row.formulas().iter().any(|(_, f)| f.array.is_some_and(|r| !r.is_single())))
+    }
+
     /// What one row's formulas and array values cost beyond the row header: the side table's run
     /// of entries, and the parsed tree each formula keeps.
     fn extras_bytes(row: &BandRow) -> usize {
@@ -1886,6 +1891,16 @@ pub struct CellStore {
     /// only. A mutator has `&mut self` and reaches it through `Mutex::get_mut`, so the write paths
     /// pay nothing for it; a reader pays one uncontended lock.
     used: Mutex<UsedBox>,
+    /// Whether any stored formula owns a legacy (Ctrl+Shift+Enter) array covering more than one
+    /// cell. A commit's array guard walks the store only when one does, so this is the difference
+    /// between an O(1) edit and an O(sheet) one.
+    ///
+    /// It is one-sided on purpose: every write of such a formula raises it, and nothing but a full
+    /// walk of the store (the guard's own, or `rebuild`) may lower it. Shearing it down costs a
+    /// walk nobody needs; shearing it up wrongly lets an edit overwrite part of an array, which the
+    /// guard exists to refuse. A store that once held an array and no longer does takes the slow
+    /// path.
+    array_anchors: bool,
 }
 
 impl Clone for CellStore {
@@ -1901,8 +1916,16 @@ impl Clone for CellStore {
             len: self.len,
             building: None,
             used: Mutex::new(self.used_box()),
+            array_anchors: self.array_anchors,
         }
     }
+}
+
+/// Whether a cell's formula owns a legacy array covering more than one cell, so that an edit of
+/// the other cells it covers has to be refused. The store index of that fact; keep the two in
+/// step (a store only ever raises it).
+fn cell_has_array(cell: &Cell) -> bool {
+    cell.formula.as_ref().and_then(|f| f.array).is_some_and(|r| !r.is_single())
 }
 
 impl PartialEq for CellStore {
@@ -2582,6 +2605,9 @@ impl CellStore {
             return;
         }
         let had = self.contains(c);
+        if !self.array_anchors {
+            self.array_anchors = cell_has_array(&cell);
+        }
         let band = Arc::make_mut(self.bands.entry(key).or_default());
         band.put(row, col, cell);
         match (had, self.contains(c)) {
@@ -2614,6 +2640,9 @@ impl CellStore {
         for (key, mut band) in batch.bands {
             // A batch is complete: give back what building it over-allocated.
             band.finish();
+            if !self.array_anchors {
+                self.array_anchors = band.has_array_anchor();
+            }
             // A chunk boundary can land in a band already spilled by the previous batch: bring it
             // back so the merge can see its rows, then spill the result again.
             if self.pages.contains_key(&key) && self.materialize(key).is_none() {
@@ -2659,6 +2688,14 @@ impl CellStore {
         if shrank {
             self.mark_used_stale();
         }
+    }
+
+    /// Whether any stored formula owns a legacy array covering more than one cell: the one thing
+    /// that makes an edit inside the cells it covers refusable. Answering costs nothing, so a
+    /// commit's array guard can ask before it walks the store. See the field for why the answer is
+    /// allowed to be stale in one direction only.
+    pub fn has_array_anchors(&self) -> bool {
+        self.array_anchors
     }
 
     /// Replaces the value of a cell that is already stored, keeping its formula and style. Returns
@@ -2990,6 +3027,9 @@ impl CellStore {
             {
                 band.finish();
             }
+        }
+        if !self.array_anchors {
+            self.array_anchors = cells.iter().any(|(_, cell)| cell_has_array(cell));
         }
         let band = Arc::make_mut(self.bands.entry(key).or_default());
         // A row that isn't there yet — every row while a file opens — is built in one go: the
@@ -7347,3 +7387,67 @@ mod tests {
         assert_eq!(store.used_range(), Some(RangeRef::new(c(0, 3), c(598, 3))));
     }
 }
+
+#[cfg(test)]
+mod array_anchor_tests {
+    use super::*;
+
+    fn anchored(text: &str, range: &str) -> Cell {
+        let mut f = Formula::new(text);
+        f.array = RangeRef::parse(range);
+        Cell::formula(f)
+    }
+
+    /// The flag answers "does any formula own a legacy array covering more than one cell?", which
+    /// is what lets the commit's array guard skip walking the store. It has to be raised by every
+    /// way a cell gets in, and kept by a clone: a missed one would let an edit overwrite part of
+    /// an array.
+    #[test]
+    fn the_array_flag_is_raised_however_a_formula_arrives() {
+        let mut s = CellStore::new();
+        assert!(!s.has_array_anchors(), "an empty store holds none");
+        s.set(CellRef::new(0, 0), anchored("=1", "A1"));
+        assert!(!s.has_array_anchors(), "a one-cell array owns no other cell");
+        s.set(CellRef::new(1, 0), Cell::value(Value::Number(1.0)));
+        assert!(!s.has_array_anchors(), "a value raises nothing");
+        s.set(CellRef::new(2, 0), anchored("=2", "A3:A4"));
+        assert!(s.has_array_anchors(), "set");
+        assert!(s.clone().has_array_anchors(), "a clone shares the cells, and the answer");
+
+        let mut s = CellStore::new();
+        s.set_row(5, &mut vec![(1, anchored("=3", "B6:B7"))]);
+        assert!(s.has_array_anchors(), "set_row");
+
+        let mut s = CellStore::new();
+        let mut batch = BandBatch::new();
+        batch.set_row(70, &mut vec![(2, anchored("=4", "C71:D72"))]);
+        s.insert_batch(batch);
+        assert!(s.has_array_anchors(), "a batch, the way a file reader fills the store");
+
+        let wire = serde_json::to_string(&s).expect("serialize");
+        let back: CellStore = serde_json::from_str(&wire).expect("deserialize");
+        assert!(back.has_array_anchors(), "a store read back from a file");
+        assert_eq!(back, s);
+    }
+
+    /// Removing cells or writing values over them never lowers the flag: it may answer "yes" for a
+    /// store whose array is gone (a sheet pays the guard's walk then), never "no" while one is
+    /// there. This is what makes the answer safe to skip the guard on.
+    #[test]
+    fn the_array_flag_is_only_lowered_by_a_walk_of_every_cell() {
+        let mut s = CellStore::new();
+        s.set(CellRef::new(2, 0), anchored("=2", "A3:A4"));
+        s.remove(CellRef::new(2, 0));
+        assert!(s.has_array_anchors(), "removing the array leaves the answer conservative");
+        s.set(CellRef::new(2, 0), Cell::value(Value::Number(7.0)));
+        s.set_value(CellRef::new(2, 0), &Value::Number(8.0));
+        assert!(s.has_array_anchors());
+        // Rebuilding walks every cell, so it settles the answer exactly again.
+        s.rebuild();
+        assert!(!s.has_array_anchors());
+        s.set(CellRef::new(4, 1), anchored("=2", "B5:B6"));
+        s.rebuild();
+        assert!(s.has_array_anchors(), "a rebuild that carries the array raises it");
+    }
+}
+
