@@ -10,7 +10,9 @@ fn visible_rows(op: &str) -> Vec<u32> {
     s.execute("data.filterBy", json!({"column":0, "custom":{"op":op, "value":"5"}})).unwrap();
     let doc = s.doc().unwrap();
     let sh = doc.wb.active().unwrap();
-    (1..6u32).filter(|r| !sh.rows.get(r).is_some_and(|i| i.hidden)).collect()
+    // `is_row_hidden`, not `rows[r].hidden`: a filter hides rows in the sheet's bitmap
+    // (`FilterHidden`), and only a hand-hidden row sets the line info's own flag.
+    (1..6u32).filter(|r| !sh.is_row_hidden(*r)).collect()
 }
 
 #[test]
