@@ -68,7 +68,7 @@ collaboration, mobile, AI).
 | Features (13 areas, table below) | ~64% (breadth ~78%) | 269–433 | [target-app-parity.md](docs/target-app-parity.md#feature-areas) |
 | UI/UX fidelity | ~58% | 45–72 | [ui-parity.md](docs/ui-parity.md) |
 | File formats | ~54% | 65–98 | [file-format-parity.md](docs/file-format-parity.md) |
-| Performance | ~35% (conservative; gate met) | 20–35 | large-workbook gate met (100M cells 16.7 MiB live, 100k edit 20–25 ms, 1M rows, bounded commands); M20/M19 base closed (page-file rewrite and streaming save deferred post-beta), zone maps and paging hardening remain; re-scored at beta exit. [target-app-parity.md](docs/target-app-parity.md#performance) |
+| Performance | ~35% (conservative; gate met) | 20–35 | large-workbook gate met (100M cells 16.7 MiB live, 100k edit 20–25 ms, 1M rows, bounded commands); the 11-13 round removed the per-frame work (`used_range` 6.5 ms → 10 ns at 1M rows, CF statistics, chart/sparkline layouts), made a static defined name a precedent (100k-cell recalc per keystroke → 1 cell) and a cached evaluation, made the array guard O(1), and stopped a save rebuilding each formula tree (12 % of a save); M20/M19 base closed (page-file rewrite and streaming save deferred post-beta), zone maps and paging hardening remain; re-scored at beta exit. [target-app-parity.md](docs/target-app-parity.md#performance) |
 | Stability | ~62% | 13–22 | [gaps.md](docs/gaps.md) |
 | Localization | ~15% (ribbon in 6 languages; shaping landed, RTL layout missing) | 100–165 | [localization-parity.md](docs/localization-parity.md) |
 | Hardware (multi-core calc, GPU, pen, multi-window) | ~40% | 25–40 | [hardware-parity.md](docs/hardware-parity.md) |

@@ -1,6 +1,6 @@
 # Target-app parity: GridCraft vs Microsoft Excel
 
-> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 18: the real-world corpus ran — 3,084 readable workbooks opened with no reader failure, 635 save/reopen with 0 mismatches, Excel 16-identical copies on 16 `.xlsx` files and all 37 readable `.xls` — so #1 is met and only #10 (field machines) plus the release run remain; remaining-to-beta ~8–12 h + 8–12 h. The corpus digest now covers formula text and merges/comments/links/CF/DV/tables/objects, and an `.xls` trailing-styled-column used-range bug is fixed. No score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-13 · **Last updated:** 2026-11-13 · **Change:** minor (2026-11-13: a **performance round**, every number measured on the owner's machine before and after: `used_range` 6.5 ms → 10 ns per call at 1M rows (it sized both scrollbars every frame), conditional-format statistics and chart/sparkline layouts kept across frames (grid paint 10.7 → 1.4 ms/frame on a 100k-row data bar), a defined name resolved to a static precedent instead of a dynamic reference (a keystroke on a name-formula column: 100,000 cells/158 ms → 1 cell/5 µs) and read from a cache when evaluated (31 ms per 100k names, at parity with an inline reference), the array guard asking the store instead of diffing it (1M-row keystroke 4.6 → 0.9 ms), and the parsed tree handed back to the cell so a save stops rebuilding it (12 % of a save). Round 18: the real-world corpus ran — 3,084 readable workbooks opened with no reader failure, 635 save/reopen with 0 mismatches, Excel 16-identical copies on 16 `.xlsx` files and all 37 readable `.xls` — so #1 is met and only #10 (field machines) plus the release run remain; remaining-to-beta ~8–12 h + 8–12 h. The corpus digest now covers formula text and merges/comments/links/CF/DV/tables/objects, and an `.xls` trailing-styled-column used-range bug is fixed. No score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 This is the authoritative parity assessment. [`ROADMAP.md`](../ROADMAP.md) summarizes it,
 [`gaps.md`](gaps.md) lists every shortfall, and the area checklists hold the detail:
@@ -210,18 +210,26 @@ Excel recalculates on every core (multi-threaded recalculation), streams large f
 |---|---|---|---|
 | Sheet size limits | 1,048,576 × 16,384 | same | measured (`crates/core/src/addr.rs`) |
 | Recalc threads | up to 8 for independent formulas (native; wasm single-threaded) | all cores | measured (`crates/calc`): leaves wave by wave; arrays, volatile formulas and cycles stay sequential |
+| Edit → recalc, with a defined name, 100k dependents | **1 cell, 5 µs** per keystroke (was 100,000 cells, 158 ms); a name that names a cell is a precedent, not a dynamic reference | 1–2 cells | measured 2026-11-13, release probe on 100k rows of `=Rate*A1`; 100k name evaluations 117 → 76 ms and now cost the same as the reference written inline (31 ms vs 35 ms per 100k-cell edit) |
 | Edit → recalc, 100k dependents | **20–25 ms** (2026-10-27); target < 100 ms met | tens of ms | measured on the owner's machine, `_gridcraft-bench/formula_bench`, release: 65–75 ms before threading, 245 ms before the round; 1M dependents are 208–277 ms in `calcbench`; a full recalc of the 100k sheet is 89–114 ms |
 | Grid scrolling | virtualised, O(log n) geometry with custom row heights | smooth | measured in code |
+| Grid paint, data bar over 100k rows | **1.4 ms/frame** (was 10.7): conditional-format statistics, chart layouts and sparkline paths are kept across frames and dropped on the document revision | smooth | measured 2026-11-13, 1200×800 kittest harness, `perf.grid_ms` median of 40 frames |
+| Scrollbar extent (`used_range`), 1M stored rows | **10 ns** per call (was 6.5 ms): the bounding box is grown on write and re-walked only when a mutation can shrink it | immediate | measured 2026-11-13, release probe; the UI asks twice per frame (both scrollbars) |
 | Open a large workbook | 100M-cell / 551 MB export: **16.7 MiB live, 183 MiB peak**, 729 MiB compressed pages; 31.7M-cell / 118 MB report: 49.7 MiB live, 1.47 s | opens | measured 2026-10-28, `session_breakdown` / `cell_digest` |
 | Row / column structural insert | 1M×20: row **3.7 ms** command / 35.8 ms commit; column **9.8 ms** / 42.5 ms; zero cells moved | immediate | measured 2026-10-28, `gridcraft-cli` |
 | Line metadata, 1M custom heights | `Sheet::clone` **0.13 ms**, insert/delete **0.013/0.007 ms**, 10k inherited lines 0.1 ms; `LineIndex` build 6.6 ms (cached per revision) | immediate | measured 2026-10-29, `_gridcraft-bench/linebench` |
 | Mapped value write-back | 1M values: identity 36–42 ms; after a row insert **35 ms** (was 131–135), after a column insert **33 ms** (was 116–142) | immediate | measured 2026-10-29, `_gridcraft-bench` release probe |
 | Packed walk / owned gate | Dense block **2.5–3.3 ns/cell** on identity or a mapped column (was 30.6); owned/formula gate over 1M paged rows **0.84 ms** (was 9.5) | fine | measured 2026-10-29, `_gridcraft-bench` release probe |
+| Save, 200k formula cells | **12 % faster** (514 → 460 ms of a 7.0 MB save): a formula whose file spelling is its own text is written without rebuilding its tree; bytes unchanged | flat | measured 2026-11-13, release, A/B on one binary, `sha256` identical |
 | Save a large workbook | 31.7M cells: **3.48 s, 1,283.9 MiB peak**; 100M-cell export: **28.42 s, 1,814.3 MiB peak** | should stay flat | measured 2026-10-29, `session_breakdown` release with counting allocator; per-sheet deflate, bytes identical |
 | Whole-sheet operations | Bounded: Remove Duplicates on 1M×10 falls from 91 s to 12 s, Sort 3.2 s, Fill Down of 1M rows 1.45 s; sort/remove duplicates/setValues cap at 12M cells (1M×20 refused in 1.3 s) | fine | measured on `max_1048576.xlsx` / `wide_1m_x20.xlsx`, `gridcraft-cli` |
 
 Work: the deferred page-file rewrite and post-beta streaming save, then M17 zone maps and the M21
-Parquet read half after beta. The
+Parquet read half after beta. The 2026-11-13 round removed the per-frame work (used range, CF
+statistics, chart/sparkline layouts), the per-evaluation name resolution, the per-commit store diff
+and the per-formula tree rebuild on save; the remaining cheap wins are `MODE`'s quadratic count,
+`VLOOKUP`/`MATCH` copying their key column, and `check_arrays` still walking the store on a sheet
+that holds a multi-cell array. The
 old streaming/threading/whole-column items are landed; keep the measured workbooks and
 `cargo xtask bench` as the regression net.
 
