@@ -28,7 +28,7 @@
 //! `NUMBER_WIDE`, which keeps the bits in the row's side table.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use gridcraft_core::{CellError, CellRef, RangeRef, Value};
 use serde::{Deserialize, Serialize};
@@ -1845,6 +1845,16 @@ pub struct SpillOptions<'a> {
     pub temp: Option<&'a std::path::Path>,
 }
 
+/// The cached used range of a [`CellStore`]: the box, and whether a walk has to rebuild it.
+#[derive(Clone, Copy, Debug, Default)]
+struct UsedBox {
+    /// The logical bounding box of the stored cells; `None` when the store holds none.
+    used: Option<RangeRef>,
+    /// `used` has to be walked again: a mutation removed cells, or moved them to another logical
+    /// position. A reader that finds this set walks and clears it.
+    stale: bool,
+}
+
 /// A `CellStore`'s packed bands, plus the count of stored cells.
 #[derive(Debug, Default)]
 pub struct CellStore {
@@ -1865,6 +1875,17 @@ pub struct CellStore {
     /// before it is complete and can stop carrying its number index. Not part of what a store is:
     /// two stores holding the same cells are equal whatever this says.
     building: Option<u32>,
+    /// The logical bounding box of the stored cells, as [`used_range`](Self::used_range) reports
+    /// it. Kept instead of recomputed: a write that stores a cell grows the box in O(1)
+    /// (`grow_used`), and a mutation that can shrink it or move a stored cell to another logical
+    /// position marks it stale (`mark_used_stale`), which the next reader repairs by walking it
+    /// once. Walking on every call cost 8 ms on a million stored rows and ran twice per repaint.
+    ///
+    /// A lock, not a plain field, because a reader repairs it: `used_range` takes `&self` (the UI
+    /// asks the sheet for its extent while drawing) and a repair is a mutation of derived state
+    /// only. A mutator has `&mut self` and reaches it through `Mutex::get_mut`, so the write paths
+    /// pay nothing for it; a reader pays one uncontended lock.
+    used: Mutex<UsedBox>,
 }
 
 impl Clone for CellStore {
@@ -1879,6 +1900,7 @@ impl Clone for CellStore {
             col_map: self.col_map.clone(),
             len: self.len,
             building: None,
+            used: Mutex::new(self.used_box()),
         }
     }
 }
@@ -2474,6 +2496,9 @@ impl CellStore {
         let Some(band) = self.bands.get(&key).cloned() else { return };
         let Some(bytes) = page::encode_band(&band) else { return };
         let Some(at) = file.write(&bytes) else { return };
+        // A page carries the band's bounds, so the cached used box is the same before and after:
+        // nothing has to be invalidated, and a store that opened a million rows through pages
+        // never walks them again for it.
         let bounds = page::band_bounds(&band);
         let formulas = band.rows.iter().any(|r| !r.formulas().is_empty());
         let owned = band.rows.iter().any(|r| !r.formulas().is_empty() || !r.arrays().is_empty());
@@ -2482,7 +2507,8 @@ impl CellStore {
     }
 
     /// Loads a paged band back into the live map, so a write can modify it. A corrupt page stays
-    /// paged and the write is refused rather than replacing data with an empty band.
+    /// paged and the write is refused rather than replacing data with an empty band. The band keeps
+    /// the page's bounds, so the cached used box is unchanged either way.
     fn materialize(&mut self, key: u32) -> Option<Arc<Band>> {
         if let Some(band) = self.bands.get(&key) {
             return Some(band.clone());
@@ -2559,8 +2585,16 @@ impl CellStore {
         let band = Arc::make_mut(self.bands.entry(key).or_default());
         band.put(row, col, cell);
         match (had, self.contains(c)) {
-            (false, true) => self.len += 1,
-            (true, false) => self.len -= 1,
+            (false, true) => {
+                self.len += 1;
+                // The only cell that can have entered the box: this one.
+                self.grow_used(c.row, c.col);
+            }
+            (true, false) => {
+                self.len -= 1;
+                // The box may have been sized by the cell that just went away.
+                self.mark_used_stale();
+            }
             _ => {}
         }
         if self.bands.get(&key).is_some_and(|b| b.rows.is_empty()) {
@@ -2573,6 +2607,10 @@ impl CellStore {
     /// there and hands them over here. A band the store already holds is replaced.
     pub fn insert_batch(&mut self, batch: BandBatch) {
         let count = |band: &Band| band.rows.iter().map(|row| row.cells as usize).sum::<usize>();
+        // A batch adds: each band it leaves behind grows the cached used box as it arrives. A
+        // batch that replaced a cell with a blank one can also shrink the box, and only then is
+        // the box walked again.
+        let mut shrank = false;
         for (key, mut band) in batch.bands {
             // A batch is complete: give back what building it over-allocated.
             band.finish();
@@ -2585,6 +2623,7 @@ impl CellStore {
                 self.len += count(&band);
                 self.bands.insert(key, Arc::new(band));
                 self.spill_band(key);
+                self.absorb_used_band(key);
                 continue;
             };
             // A band both sides hold: a chunk boundary fell inside it, since chunks are cut at row
@@ -2607,17 +2646,24 @@ impl CellStore {
                         target.put(row.key, col, cell);
                     }
                 }
-                self.len += target.row(row.key).map_or(0, |r| r.cells as usize) - before;
+                let after = target.row(row.key).map_or(0, |r| r.cells as usize);
+                self.len += after - before;
+                shrank |= after < before;
             }
             self.spill_band(key);
+            self.absorb_used_band(key);
         }
         if self.building.is_none() {
             self.building = self.bands.keys().next_back().copied();
         }
+        if shrank {
+            self.mark_used_stale();
+        }
     }
 
     /// Replaces the value of a cell that is already stored, keeping its formula and style. Returns
-    /// false when nothing is stored there.
+    /// false when nothing is stored there, so no cell enters or leaves the store and the cached
+    /// used box cannot change: no repair here.
     ///
     /// A recalculation only changes values, but [`set`](Self::set) rebuilds the whole `Cell` (and
     /// takes the store's bands apart) for each one; at 100k results that is most of the write-back.
@@ -2632,8 +2678,9 @@ impl CellStore {
         Arc::make_mut(band).set_value(physical % BAND, col, value)
     }
 
-    /// Replaces the values of cells that already exist. `values` must be sorted in row-major
-    /// order (the order a recalculation writes them in), so each band is looked up once.
+    /// Replaces the values of cells that already exist — like [`set_value`](Self::set_value), the
+    /// stored positions do not move, so the cached used box stays exact. `values` must be sorted in
+    /// row-major order (the order a recalculation writes them in), so each band is looked up once.
     ///
     /// A batch that is not in that order is written one value at a time instead: a mapped store's
     /// logical rows are not its physical rows, so a band-grouped walk would put a value on the
@@ -2947,11 +2994,13 @@ impl CellStore {
         let band = Arc::make_mut(self.bands.entry(key).or_default());
         // A row that isn't there yet — every row while a file opens — is built in one go: the
         // stripes are extended once from the cells instead of grown cell by cell.
+        let mut shrank = false;
         if band.row(band_row).is_none_or(BandRow::is_empty) {
             let before = band.row(band_row).map_or(0, |r| r.cells as usize);
             band.put_row(band_row, cells);
             let after = band.row(band_row).map_or(0, |r| r.cells as usize);
             self.len = self.len + after - before;
+            shrank = after < before;
         } else {
             for (col, cell) in cells.drain(..) {
                 let had = band.row(band_row).is_some_and(|r| r.index_of(band, col).is_some());
@@ -2959,13 +3008,25 @@ impl CellStore {
                 let has = band.row(band_row).is_some_and(|r| r.index_of(band, col).is_some());
                 match (had, has) {
                     (false, true) => self.len += 1,
-                    (true, false) => self.len -= 1,
+                    (true, false) => {
+                        self.len -= 1;
+                        shrank = true;
+                    }
                     _ => {}
                 }
             }
         }
+        // The row's stored columns, read from its own bitmap: this is the reader's per-row path,
+        // so the cached used box grows one row at a time instead of by a walk at the end.
+        let span = band.row(band_row).and_then(|r| r.column_span(band));
         if band.rows.is_empty() {
             self.bands.remove(&key);
+        }
+        if let Some((first, last)) = span {
+            self.absorb_used_stored(physical, physical, first, last);
+        }
+        if shrank {
+            self.mark_used_stale();
         }
     }
 
@@ -3016,6 +3077,8 @@ impl CellStore {
         let band = self.bands.get_mut(&key)?;
         let cell = Arc::make_mut(band).take(physical % BAND, col)?;
         self.len -= 1;
+        // The box may have been sized by the cell that just went away.
+        self.mark_used_stale();
         if self.bands.get(&key).is_some_and(|b| b.rows.is_empty()) {
             self.bands.remove(&key);
         }
@@ -3273,6 +3336,39 @@ impl CellStore {
     }
 
     pub fn used_range(&self) -> Option<RangeRef> {
+        let cached = *self.used_state();
+        if !cached.stale {
+            return cached.used;
+        }
+        // Stale: a mutation removed cells or moved them. Walking is a read-only pass over the
+        // bands, so the lock is not held while it runs; two readers that race here walk twice and
+        // write the same box, and a mutator cannot run meanwhile (it would need `&mut self`).
+        let walked = self.walk_used();
+        *self.used_state() = UsedBox { used: walked, stale: false };
+        walked
+    }
+
+    /// The cache, for a reader: repair and read both go through it.
+    fn used_state(&self) -> MutexGuard<'_, UsedBox> {
+        self.used.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cache, for a mutator: `&mut self` already excludes every other access, so this is the
+    /// plain field rather than a lock.
+    fn used_mut(&mut self) -> &mut UsedBox {
+        self.used.get_mut().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cache as it is, for a clone: a copy shares the bands it was derived from, so it shares
+    /// the box, stale flag and all.
+    fn used_box(&self) -> UsedBox {
+        *self.used_state()
+    }
+
+    /// The uncached walk over every band, every stored row of it and every bitmap word of that
+    /// row: the definition of [`used_range`](Self::used_range). Only a mutation that can shrink
+    /// the box marks the cache stale, and the next read repairs it with this.
+    fn walk_used(&self) -> Option<RangeRef> {
         let mut r0 = u32::MAX;
         let mut c0 = u32::MAX;
         let mut r1 = 0u32;
@@ -3305,6 +3401,87 @@ impl CellStore {
             return None;
         }
         Some(RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)))
+    }
+
+    /// Marks the cached box stale: a mutation removed cells, or moved stored ones to another
+    /// logical position. The next `used_range` walks it, once, however many cells the mutation
+    /// touched — which is what keeps a bulk clear linear instead of one walk per removed cell.
+    fn mark_used_stale(&mut self) {
+        self.used_mut().stale = true;
+    }
+
+    /// Grows the cached box to include one stored cell, given its logical position. Additions only
+    /// ever grow a bounding box, so this cannot disagree with `walk_used`, and it is the whole
+    /// cost of a write that only adds.
+    fn grow_used(&mut self, row: u32, col: u32) {
+        let cache = self.used_mut();
+        if cache.stale {
+            // The walk that clears the flag rebuilds the box from nothing; growing a stale one is
+            // wasted work, and only a mutation that removed something writes while stale.
+            return;
+        }
+        match &mut cache.used {
+            Some(used) => {
+                used.start.row = used.start.row.min(row);
+                used.start.col = used.start.col.min(col);
+                used.end.row = used.end.row.max(row);
+                used.end.col = used.end.col.max(col);
+            }
+            None => cache.used = Some(RangeRef::cell(CellRef::new(row, col))),
+        }
+    }
+
+    /// Grows the cached box to include the cells of one band the store now holds, live or paged.
+    /// The reader absorbs each band as it arrives, so opening a sheet grows the box band by band
+    /// instead of walking it once at the end.
+    fn absorb_used_band(&mut self, key: u32) {
+        if self.used_mut().stale {
+            return;
+        }
+        let bounds = match (self.bands.get(&key), self.pages.get(&key)) {
+            (Some(band), _) => page::band_bounds(band),
+            (None, Some(page)) => page.bounds(),
+            _ => None,
+        };
+        // A band's bounds are the row keys inside the band, not physical rows, so the band
+        // number lifts them the way the walk does.
+        if let Some((r0, r1, c0, c1)) = bounds {
+            let base = key.saturating_mul(BAND);
+            self.absorb_used_stored(base.saturating_add(r0), base.saturating_add(r1), c0, c1);
+        }
+    }
+
+    /// Grows the cached box to include the stored cells of the physical row span `r0..=r1` whose
+    /// columns span `c0..=c1`, mapped to logical positions. Rows and columns the maps do not cover
+    /// are skipped, exactly as `walk_used` skips them.
+    fn absorb_used_stored(&mut self, r0: u32, r1: u32, c0: u32, c1: u32) {
+        if self.used_mut().stale {
+            return;
+        }
+        // A band, and so a page, spans at most `BAND` physical rows. A wider span is not something
+        // a store can hold; walk instead of trusting that it is bounded.
+        if r1.saturating_sub(r0) >= BAND {
+            self.mark_used_stale();
+            return;
+        }
+        let (mut lo, mut hi) = (u32::MAX, 0u32);
+        let mut row = r0;
+        loop {
+            if let Some(logical) = self.row_map.inverse(row) {
+                lo = lo.min(logical);
+                hi = hi.max(logical);
+            }
+            if row >= r1 {
+                break;
+            }
+            row = row.saturating_add(1);
+        }
+        if lo == u32::MAX {
+            return;
+        }
+        let Some((first, last)) = self.logical_col_span(c0, c1) else { return };
+        self.grow_used(lo, first);
+        self.grow_used(hi, last);
     }
 
     /// Every formula in the store with the position it sits at and whether a cached value came
@@ -3563,6 +3740,9 @@ impl CellStore {
             return Compacted::default();
         }
         let shape = self.map_shape();
+        // Compaction drops cells no logical position covers and renumbers the maps, so the cached
+        // box is walked again by the next read.
+        self.mark_used_stale();
         let mut compacted = Compacted::default();
         let keys: Vec<u32> = self.bands.keys().copied().collect();
         for key in keys {
@@ -3760,11 +3940,14 @@ impl CellStore {
     /// moves.
     pub fn shift_rows(&mut self, from: u32, delta: i64) {
         self.row_map.shift(from, delta);
+        // Every cell at or after `from` has a new logical row.
+        self.mark_used_stale();
     }
 
     pub fn shift_cols(&mut self, from: u32, delta: i64) {
         self.ensure_col_map();
         self.col_map.shift(from, delta);
+        self.mark_used_stale();
     }
 
     /// Shifts cells within rows `r0..=r1` and columns `>= from` horizontally.
@@ -5172,6 +5355,10 @@ mod tests {
 
     fn c(r: u32, col: u32) -> CellRef {
         CellRef::new(r, col)
+    }
+
+    fn plain(n: u32) -> Cell {
+        Cell::value(Value::Number(f64::from(n)))
     }
 
     #[test]
@@ -7025,5 +7212,138 @@ mod tests {
         assert_eq!(back.iter().map(|(at, _)| at).collect::<Vec<_>>(), positions);
         assert_eq!(back.iter().map(|(_, cell)| cell.value).collect::<Vec<_>>(), values);
         assert_eq!(back, s, "the saved cells are the logical cells");
+    }
+
+    /// The cached used box has to be the box a walk finds, after every kind of mutation: writes,
+    /// blank writes, removals, taking a range, the reader's row-at-a-time path, band batches, row
+    /// and column shifts, compaction, paging and eviction. This is the proof that no mutator
+    /// forgets to grow or invalidate it: a stale box would show a wrong scrollbar extent and write
+    /// a wrong `<dimension>` on save.
+    #[test]
+    fn used_range_equals_a_walk_after_every_mutation() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n.max(1)
+        };
+        let number = |v: u64| Cell::value(Value::Number(v as f64));
+        let mut store = CellStore::new();
+        let mut paged = false;
+        for step in 0..1500u32 {
+            let op = next(15);
+            match op {
+                0..=3 => {
+                    let at = c(next(200) as u32, next(8) as u32);
+                    store.set(at, number(u64::from(step)));
+                }
+                // A blank write removes the cell instead of storing one.
+                4 => store.set(c(next(200) as u32, next(8) as u32), Cell::default()),
+                5 => {
+                    store.remove(c(next(200) as u32, next(8) as u32));
+                }
+                6 => {
+                    let r0 = next(200) as u32;
+                    let c0 = next(8) as u32;
+                    let r1 = r0.saturating_add(next(4) as u32).min(199);
+                    let c1 = c0.saturating_add(next(3) as u32).min(7);
+                    store.take_range(RangeRef::new(c(r0, c0), c(r1, c1)));
+                }
+                7 => {
+                    // The reader's path: one whole row at a time.
+                    let row = next(200) as u32;
+                    let mut cells: Vec<(u32, Cell)> = (0..next(6)).map(|i| (next(8) as u32, number((u64::from(row) << 8) | i as u64))).collect();
+                    cells.sort_unstable_by_key(|(col, _)| *col);
+                    store.set_row(row, &mut cells);
+                }
+                8 => {
+                    // The reader's other path: a whole band handed over at once.
+                    let mut batch = BandBatch::new();
+                    for _ in 0..1 + next(3) {
+                        let row = next(200) as u32;
+                        let mut cells: Vec<(u32, Cell)> = (0..1 + next(4)).map(|_| (next(8) as u32, number(u64::from(step)))).collect();
+                        cells.sort_unstable_by_key(|(col, _)| *col);
+                        batch.set_row(row, &mut cells);
+                    }
+                    store.insert_batch(batch);
+                }
+                9 => {
+                    let from = next(200) as u32;
+                    store.shift_rows(from, 1 + next(2) as i64);
+                }
+                10 => {
+                    let from = next(8) as u32;
+                    store.shift_cols(from, 1 + next(2) as i64);
+                }
+                11 => {
+                    store.compact();
+                }
+                12 => {
+                    let from = next(120) as u32;
+                    let delta = 1 + next(2) as i64;
+                    if next(2) == 0 {
+                        store.shift_rows_in_cols(0, 7, from, delta);
+                    } else {
+                        store.shift_cols_in_rows(0, 199, from, delta);
+                    }
+                }
+                13 => {
+                    if paged {
+                        // Eviction happens as the paged bands are read: the box is their bounds.
+                        for _ in 0..3 {
+                            let _ = store.get(c(next(200) as u32, next(8) as u32));
+                        }
+                    } else {
+                        paged = store.enable_paging_with_cache(64 * 1024);
+                    }
+                }
+                _ => {
+                    store.rebuild();
+                }
+            }
+            assert_eq!(store.used_range(), store.walk_used(), "step {step} op {op}");
+        }
+        assert!(!paged || store.paged_band_count() > 0 || store.used_range() == store.walk_used());
+    }
+
+    /// The box follows its edges and leaves the middle alone: a shrink only happens when the cell
+    /// that went away was the box's last row, column, or only cell.
+    #[test]
+    fn the_used_box_shrinks_when_its_edges_go_away() {
+        let mut store = CellStore::new();
+        store.set(c(2, 1), plain(1));
+        store.set(c(9, 4), plain(2));
+        store.set(c(5, 2), plain(3));
+        assert_eq!(store.used_range(), Some(RangeRef::new(c(2, 1), c(9, 4))));
+        store.remove(c(5, 2));
+        assert_eq!(store.used_range(), Some(RangeRef::new(c(2, 1), c(9, 4))), "the middle is not an edge");
+        store.remove(c(9, 4));
+        assert_eq!(store.used_range(), Some(RangeRef::new(c(2, 1), c(2, 1))));
+        store.set(c(2, 1), Cell::default());
+        assert_eq!(store.used_range(), None);
+        assert_eq!(store.used_range(), store.walk_used());
+    }
+
+    /// A band that moves to a page and back keeps its bounds, so the cached box is the same before
+    /// the spill, after it, and after a cache that holds one band evicts every band it reads.
+    #[test]
+    fn a_paged_store_reports_the_same_used_box_across_a_spill_and_an_eviction() {
+        let mut store = CellStore::new();
+        for row in 0..600u32 {
+            store.set(c(row, 3), plain(row));
+        }
+        let before = store.used_range();
+        assert_eq!(before, Some(RangeRef::new(c(0, 3), c(599, 3))));
+        assert!(store.enable_paging_with_cache(4096));
+        assert!(store.paged_band_count() > 0);
+        assert_eq!(store.used_range(), before, "a page carries the band's bounds");
+        for row in 0..600u32 {
+            let _ = store.get(c(row, 3));
+        }
+        assert_eq!(store.used_range(), before, "evicting decoded bands does not move the box");
+        assert_eq!(store.used_range(), store.walk_used());
+        store.remove(c(599, 3));
+        assert_eq!(store.used_range(), Some(RangeRef::new(c(0, 3), c(598, 3))));
     }
 }
