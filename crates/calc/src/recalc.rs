@@ -514,6 +514,10 @@ struct PassHost<'a> {
     /// The dependency graph as it stands at the start of the pass: an array's own references,
     /// for the self-overlap check.
     graph: &'a Graph,
+    /// Resolved defined-name definitions, shared with the pass so that a name a column of
+    /// formulas mentions is resolved and parsed once rather than once per cell (see
+    /// [`crate::eval::NameCache`]).
+    names: &'a mut crate::eval::NameCache,
     exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
     /// The anchors of legacy array formulas in this pass (usually none).
     legacy: &'a HashMap<Key, RangeRef>,
@@ -596,12 +600,14 @@ impl<'a> PassHost<'a> {
         graph: &'a Graph,
         exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
         legacy: &'a HashMap<Key, RangeRef>,
+        names: &'a mut crate::eval::NameCache,
         rng: &'a mut u64,
         now: f64,
     ) -> Self {
         PassHost {
             wb,
             graph,
+            names,
             exprs,
             legacy,
             results: HashMap::with_capacity_and_hasher(exprs.len(), Default::default()),
@@ -1004,6 +1010,9 @@ fn fit_to_range(v: Value, range: RangeRef) -> Value {
 impl Host for PassHost<'_> {
     fn workbook(&self) -> &Workbook {
         self.wb
+    }
+    fn name_target(&mut self, sheet: usize, name: &str) -> crate::eval::NameTarget {
+        self.names.target(self.wb, sheet, name)
     }
     fn spill_range(&mut self, sheet: usize, anchor: CellRef) -> Option<RangeRef> {
         let k = (sheet, anchor);
@@ -1561,7 +1570,10 @@ impl Calc {
                         }
                     }
                     let mut rng = seed ^ (ti as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    let mut host = PassHost::new(wb_ref, graph, &exprs, &legacy, &mut rng, now);
+                    // A shard keeps a cache of its own: the pass's is a `&mut` borrow, which the
+                    // threads can't share, and a shard resolves each name once at most anyway.
+                    let mut names = crate::eval::NameCache::default();
+                    let mut host = PassHost::new(wb_ref, graph, &exprs, &legacy, &mut names, &mut rng, now);
                     host.iterate = false;
                     for &k in &local {
                         host.calculate(k);
@@ -1965,7 +1977,7 @@ impl Calc {
             let mut rng = self.rng;
             let tp = prof_now();
             let (mut results, mut spills, cycles) = {
-                let mut host = PassHost::new(wb, &self.graph, &exprs, &legacy, &mut rng, now);
+                let mut host = PassHost::new(wb, &self.graph, &exprs, &legacy, &mut self.names, &mut rng, now);
                 host.iterate = wb.calc.iterative;
                 for k in &dirty {
                     host.calculate(*k);
@@ -2203,7 +2215,9 @@ pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> V
     let legacy = HashMap::default();
     let graph = Graph::default();
     let mut rng = 0x1234_5678_9ABC_DEF0u64;
-    let mut host = PassHost::new(wb, &graph, &exprs, &legacy, &mut rng, now_serial());
+    // One formula, so its own cache (and its names resolved once, however many of them it mentions).
+    let mut names = crate::eval::NameCache::default();
+    let mut host = PassHost::new(wb, &graph, &exprs, &legacy, &mut names, &mut rng, now_serial());
     let mut ev = Evaluator::new(&mut host, sheet, at);
     ev.value(expr)
 }
@@ -2451,6 +2465,182 @@ pub(crate) mod tests {
         (0..n).map(|r| wb.sheet(0).unwrap().value(CellRef::new(r, 9))).collect()
     }
 
+    /// A defined name, as a file spells its `refersTo` (no `=`): `scope` is the sheet it is
+    /// defined on, `None` for the workbook.
+    fn define_name(wb: &mut Workbook, name: &str, scope: Option<usize>, refers: &str) {
+        wb.names.push(DefinedName { name: name.into(), scope, formula: refers.into(), comment: String::new(), hidden: false });
+    }
+
+    fn put_formula(wb: &mut Workbook, sheet: usize, at: &str, text: &str) {
+        let c = CellRef::parse(at).unwrap();
+        wb.sheet_mut(sheet).unwrap().cells.set(c, Cell::formula(Formula::new(text)));
+    }
+
+    fn put_value(wb: &mut Workbook, sheet: usize, at: &str, v: f64) {
+        let c = CellRef::parse(at).unwrap();
+        wb.sheet_mut(sheet).unwrap().cells.set(c, Cell::value(Value::Number(v)));
+    }
+
+    fn cell_value(wb: &Workbook, sheet: usize, at: &str) -> Value {
+        wb.sheet(sheet).unwrap().value(CellRef::parse(at).unwrap())
+    }
+
+    /// A two-sheet workbook: Sheet1 and Sheet2.
+    fn two_sheets() -> Workbook {
+        let mut wb = Workbook::new();
+        wb.sheets.push(std::sync::Arc::new(gridcraft_model::Sheet::new("Sheet2")));
+        wb
+    }
+
+    /// A cached definition is only valid for the text and scope it was resolved from: a name
+    /// edited through the model is read with its new definition by the formulas already using
+    /// it, and a name moved to a sheet is no longer the workbook's.
+    #[test]
+    fn an_edited_name_is_read_with_its_new_definition() {
+        let mut wb = two_sheets();
+        put_value(&mut wb, 0, "B1", 2.0);
+        put_value(&mut wb, 0, "C1", 3.0);
+        put_formula(&mut wb, 0, "D1", "=Rate*10");
+        put_formula(&mut wb, 1, "A1", "=Rate*10");
+        define_name(&mut wb, "Rate", None, "Sheet1!$B$1");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 0, "D1").as_f64(), Some(20.0));
+        assert_eq!(cell_value(&wb, 1, "A1").as_f64(), Some(20.0));
+
+        // The definition text changes: the next pass reads the new one.
+        wb.names[0].formula = "Sheet1!$C$1".into();
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 0, "D1").as_f64(), Some(30.0));
+        assert_eq!(cell_value(&wb, 1, "A1").as_f64(), Some(30.0));
+
+        // Its scope too: now Sheet1's own name, so Sheet2 no longer sees it.
+        wb.names[0].formula = "Sheet1!$B$1".into();
+        wb.names[0].scope = Some(0);
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 0, "D1").as_f64(), Some(20.0));
+        assert_eq!(cell_value(&wb, 1, "A1"), Value::Error(CellError::Name));
+    }
+
+    /// One name, two sheets, two definitions: a sheet-level name shadows the workbook-level one
+    /// on its own sheet only, and both are resolved in the same pass.
+    #[test]
+    fn a_sheet_level_name_shadows_the_workbook_one_per_sheet() {
+        let mut wb = two_sheets();
+        put_value(&mut wb, 0, "B1", 2.0);
+        put_value(&mut wb, 0, "C1", 5.0);
+        define_name(&mut wb, "Rate", None, "Sheet1!$B$1");
+        define_name(&mut wb, "Rate", Some(1), "Sheet1!$C$1");
+        put_formula(&mut wb, 0, "A1", "=Rate*10");
+        put_formula(&mut wb, 1, "A1", "=Rate*10");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 0, "A1").as_f64(), Some(20.0));
+        assert_eq!(cell_value(&wb, 1, "A1").as_f64(), Some(50.0));
+
+        // Swap the two definitions: each sheet follows its own.
+        wb.names[0].formula = "Sheet1!$C$1".into();
+        wb.names[1].formula = "Sheet1!$B$1".into();
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 0, "A1").as_f64(), Some(50.0));
+        assert_eq!(cell_value(&wb, 1, "A1").as_f64(), Some(20.0));
+    }
+
+    /// A workbook-level name whose definition has no sheet qualifier means the sheet using it:
+    /// Sheet1 and Sheet2 each read their own B1, so one name has two answers in one pass.
+    #[test]
+    fn an_unqualified_workbook_name_means_the_using_sheet() {
+        let mut wb = two_sheets();
+        put_value(&mut wb, 0, "B1", 2.0);
+        put_value(&mut wb, 1, "B1", 7.0);
+        define_name(&mut wb, "Rate", None, "$B$1");
+        put_formula(&mut wb, 0, "A1", "=Rate*10");
+        put_formula(&mut wb, 1, "A1", "=Rate*10");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 0, "A1").as_f64(), Some(20.0));
+        assert_eq!(cell_value(&wb, 1, "A1").as_f64(), Some(70.0));
+        // And after an edit of either cell the same holds.
+        put_value(&mut wb, 1, "B1", 3.0);
+        calc.cells_changed(&mut wb, &[(1, CellRef::parse("B1").unwrap())]);
+        assert_eq!(cell_value(&wb, 0, "A1").as_f64(), Some(20.0));
+        assert_eq!(cell_value(&wb, 1, "A1").as_f64(), Some(30.0));
+    }
+
+    /// `Sheet1!Rate` reads the name as it is defined for Sheet1, whatever the using sheet's own
+    /// names say: the two spellings are cached apart.
+    #[test]
+    fn a_sheet_qualified_name_reads_the_other_sheet_s_definition() {
+        let mut wb = two_sheets();
+        put_value(&mut wb, 0, "B1", 2.0);
+        put_value(&mut wb, 0, "C1", 5.0);
+        define_name(&mut wb, "Rate", None, "Sheet1!$B$1");
+        define_name(&mut wb, "Rate", Some(1), "Sheet1!$C$1");
+        put_formula(&mut wb, 1, "A1", "=Rate*10");
+        put_formula(&mut wb, 1, "A2", "=Sheet1!Rate*10");
+        put_formula(&mut wb, 0, "A1", "=Rate*10");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 1, "A1").as_f64(), Some(50.0));
+        assert_eq!(cell_value(&wb, 1, "A2").as_f64(), Some(20.0));
+        assert_eq!(cell_value(&wb, 0, "A1").as_f64(), Some(20.0));
+    }
+
+    /// A name holding a relative reference is relative to A1, so each cell using it reads the
+    /// cell at its own offset: `Step` defined as `B1` reads one column right of the user, as
+    /// the same reference written inline does.
+    #[test]
+    fn a_relative_name_shifts_with_the_cell_that_uses_it() {
+        let mut wb = Workbook::new();
+        define_name(&mut wb, "Step", None, "B1");
+        for r in 10..=20 {
+            put_value(&mut wb, 0, &format!("B{r}"), r as f64);
+            put_formula(&mut wb, 0, &format!("A{r}"), "=Step");
+            put_formula(&mut wb, 0, &format!("C{r}"), &format!("=B{r}"));
+        }
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        for r in 10..=20 {
+            assert_eq!(cell_value(&wb, 0, &format!("A{r}")), cell_value(&wb, 0, &format!("C{r}")), "row {r}");
+            assert_eq!(cell_value(&wb, 0, &format!("A{r}")).as_f64(), Some(r as f64));
+        }
+    }
+
+    /// Names resolve to names: `Rate` defined as `Step`, `Step` as a cell. A ring is bounded and
+    /// shows an error rather than never ending.
+    #[test]
+    fn a_chained_name_evaluates_and_a_ring_ends() {
+        let mut wb = Workbook::new();
+        put_value(&mut wb, 0, "B1", 2.0);
+        define_name(&mut wb, "Rate", None, "Step");
+        define_name(&mut wb, "Step", None, "Sheet1!$B$1");
+        define_name(&mut wb, "Loop1", None, "Loop2");
+        define_name(&mut wb, "Loop2", None, "Loop1");
+        put_formula(&mut wb, 0, "A1", "=Rate*10");
+        put_formula(&mut wb, 0, "A2", "=Loop1");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        assert_eq!(cell_value(&wb, 0, "A1").as_f64(), Some(20.0));
+        assert_eq!(cell_value(&wb, 0, "A2"), Value::Error(CellError::Calc));
+    }
+
+    /// An unknown name, and one whose definition doesn't parse, are #NAME? — the same error the
+    /// evaluator gave when it parsed each definition itself.
+    #[test]
+    fn an_unknown_name_and_a_definition_that_does_not_parse_are_name_errors() {
+        let mut wb = Workbook::new();
+        define_name(&mut wb, "Bad", None, "1+");
+        put_formula(&mut wb, 0, "A1", "=Nope*2");
+        put_formula(&mut wb, 0, "A2", "=Bad*2");
+        put_formula(&mut wb, 0, "A3", "=Bad");
+        put_formula(&mut wb, 0, "A4", "=Sheet9!Nope");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        for at in ["A1", "A2", "A3", "A4"] {
+            assert_eq!(cell_value(&wb, 0, at), Value::Error(CellError::Name), "{at}");
+        }
+    }
+
     #[test]
     fn independent_leaves_recalc_on_threads() {
         let n = 17_000u32;
@@ -2614,7 +2804,8 @@ pub(crate) mod tests {
         let mut rng = 1u64;
         let graph = Graph::default();
         let legacy = HashMap::default();
-        let mut host = PassHost::new(&wb, &graph, &exprs, &legacy, &mut rng, 0.0);
+        let mut names = crate::eval::NameCache::default();
+        let mut host = PassHost::new(&wb, &graph, &exprs, &legacy, &mut names, &mut rng, 0.0);
         host.calculate((0, CellRef::parse("A1").unwrap()));
         let total = (WIDTH * (WIDTH + 1)) as f64;
         assert_eq!(host.results.get(&(0, CellRef::parse("A1").unwrap())).and_then(|s| s.value.as_ref()), Some(&Value::Number(total + 63.0)));
@@ -2638,7 +2829,8 @@ pub(crate) mod tests {
         let mut rng = 1u64;
         let graph = Graph::default();
         let legacy = HashMap::default();
-        let mut host = PassHost::new(wb, &graph, &exprs, &legacy, &mut rng, 0.0);
+        let mut names = crate::eval::NameCache::default();
+        let mut host = PassHost::new(wb, &graph, &exprs, &legacy, &mut names, &mut rng, 0.0);
 
         let mut seen = Vec::new();
         host.visit_range(0, range, &mut |v| {

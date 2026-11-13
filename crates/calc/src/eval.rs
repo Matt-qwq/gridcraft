@@ -75,6 +75,11 @@ pub trait Host {
     fn used_range(&mut self, sheet: usize) -> Option<RangeRef> {
         self.workbook().sheet(sheet).and_then(|s| s.used_range())
     }
+    /// The definition of the name `name` as used from `sheet`, resolved the way the evaluator
+    /// reads names (see [`NameCache`]): sheet-qualified, sheet scope before workbook scope, or a
+    /// table's name. Hosts keep a [`NameCache`] and answer from it, so a column of formulas
+    /// mentioning one name resolves and parses its definition once instead of once per cell.
+    fn name_target(&mut self, sheet: usize, name: &str) -> NameTarget;
     /// The position of a text needle in a block the host has indexed (see
     /// [`gridcraft_functions::Ctx::exact_text_position`]); `None` to scan instead.
     fn exact_text_position(&mut self, _hay: &Arc<Array>, _needle: &str, _reverse: bool) -> Option<Option<usize>> {
@@ -328,45 +333,34 @@ impl<'h> Evaluator<'h> {
         if let Some((_, v)) = self.env.iter().rev().find(|(k, _)| gridcraft_formula::same_name(k, n)) {
             return v.clone();
         }
-        let wb = self.host.workbook();
-        // Sheet-qualified `Sheet1!Name`.
-        let (scope_sheet, bare) = match n.split_once('!') {
-            Some((s, b)) => match wb.sheet_index(&gridcraft_core::unquote_sheet(s)) {
-                Some(i) => (i, b),
-                None => return err(CellError::Name),
+        // The host resolves the name (and parses its definition) once per sheet, not once per
+        // cell: a column of 100k `=Rate*A1` reads one cached tree 100k times. The answer is
+        // owned, so nothing of the cache is borrowed while the definition is evaluated — it may
+        // mention another name, which resolves the same way.
+        match self.host.name_target(self.sheet, n) {
+            NameTarget::Definition(expr, scope) => self.name_value(&expr, scope),
+            NameTarget::Relative(expr, scope) => {
+                // Relative references in a name are relative to A1: used here, they move by this
+                // cell's offset from it. The adjustment builds a tree, so the cached one stays.
+                let shifted = gridcraft_formula::adjust::shift_relative_wrapping((*expr).clone(), self.at.row as i64, self.at.col as i64);
+                self.name_value(&shifted, scope)
+            }
+            // A table name alone means its data body.
+            NameTarget::Table { area, body } => match body {
+                Some(range) => Ev::R(vec![Area { sheet: area.sheet, range }]),
+                None => err(CellError::Name),
             },
-            None => (self.sheet, n),
-        };
-        if let Some(def) = wb.name(bare, scope_sheet) {
-            let text = def.formula.clone();
-            let scope = def.scope.unwrap_or(self.sheet);
-            return match gridcraft_formula::parse_name(&text) {
-                Ok(expr) => {
-                    // Relative references in a name are relative to A1: used here, they move by
-                    // this cell's offset from it.
-                    let expr = if gridcraft_formula::adjust::has_relative_refs(&expr) {
-                        gridcraft_formula::adjust::shift_relative_wrapping(expr, self.at.row as i64, self.at.col as i64)
-                    } else {
-                        expr
-                    };
-                    let saved = self.sheet;
-                    // Unqualified references in a name refer to the scope sheet.
-                    self.sheet = scope;
-                    let r = self.eval(&expr);
-                    self.sheet = saved;
-                    r
-                }
-                Err(_) => err(CellError::Name),
-            };
+            NameTarget::Unresolved => err(CellError::Name),
         }
-        // A table name alone means its data body.
-        if let Some((si, ti)) = wb.table(bare)
-            && let Some(t) = wb.sheet(si).and_then(|s| s.tables.get(ti))
-            && let Some(d) = t.data_range()
-        {
-            return Ev::R(vec![Area { sheet: si, range: d }]);
-        }
-        err(CellError::Name)
+    }
+
+    /// Evaluates a name's definition, whose unqualified references mean the scope sheet.
+    fn name_value(&mut self, expr: &Expr, scope: usize) -> Ev {
+        let saved = self.sheet;
+        self.sheet = scope;
+        let r = self.eval(expr);
+        self.sheet = saved;
+        r
     }
 
     fn structured(&mut self, s: &StructRef) -> Ev {
@@ -2003,14 +1997,18 @@ const MAX_CACHED_NAMES: usize = 256;
 
 /// What a name in a formula reads, resolved the way the evaluator resolves it (`Evaluator::name`).
 #[derive(Clone, Debug)]
-pub(crate) enum NameTarget {
-    /// The name's definition and the sheet its unqualified references mean (its own scope
-    /// sheet, or the sheet using it for a workbook-level name).
+pub enum NameTarget {
+    /// The name's definition, parsed, and the sheet its unqualified references mean (its own
+    /// scope sheet, or the sheet using it for a workbook-level name). No reference in it is
+    /// relative, so the same tree serves every cell that uses the name.
     Definition(std::sync::Arc<Expr>, usize),
-    /// A table's whole range, for a name that is a table's name.
-    Table(Area),
-    /// Nothing static: an unknown name, a definition that doesn't parse, or one holding a
-    /// relative reference — which moves with the cell that uses the name.
+    /// The same, for a definition that holds a relative reference: it is relative to A1, so it
+    /// moves by the cell that uses the name and each of those needs the tree adjusted.
+    Relative(std::sync::Arc<Expr>, usize),
+    /// A name that is a table's name: the table's whole range (the dependency) and its data body,
+    /// which is what the name stands for as a value (`None`: the table has no body).
+    Table { area: Area, body: Option<RangeRef> },
+    /// An unknown name or a definition that doesn't parse.
     Unresolved,
 }
 
@@ -2056,8 +2054,8 @@ impl NameCache {
             // A table name alone means its data body. The table's whole range is the dependency:
             // it is a superset of the body (and of a header or totals row read through it), and
             // a table only moves or resizes through a structural edit, which rebuilds the graph.
-            return match wb.table(bare).and_then(|(si, ti)| wb.sheet(si).and_then(|s| s.tables.get(ti)).map(|t| (si, t.range))) {
-                Some((si, range)) => NameTarget::Table(Area { sheet: si, range }),
+            return match wb.table(bare).and_then(|(si, ti)| wb.sheet(si).and_then(|s| s.tables.get(ti)).map(|t| (si, t))) {
+                Some((si, t)) => NameTarget::Table { area: Area { sheet: si, range: t.range }, body: t.data_range() },
                 None => NameTarget::Unresolved,
             };
         };
@@ -2080,14 +2078,14 @@ impl NameCache {
     }
 }
 
-/// The definition of `formula` (a name's `refersTo` text) as a static target, its unqualified
+/// The definition of `formula` (a name's `refersTo` text) as a target, its unqualified
 /// references meaning `scope`.
 fn resolve_definition(formula: &str, scope: usize) -> NameTarget {
     let Ok(expr) = gridcraft_formula::parse_name(formula) else { return NameTarget::Unresolved };
     // A relative reference in a name is relative to A1, so it moves by the offset of the cell
-    // that uses the name: no fixed area describes it.
+    // that uses the name: usable per cell, but never one fixed area.
     if gridcraft_formula::adjust::has_relative_refs(&expr) {
-        return NameTarget::Unresolved;
+        return NameTarget::Relative(std::sync::Arc::new(expr), scope);
     }
     NameTarget::Definition(std::sync::Arc::new(expr), scope)
 }
@@ -2186,7 +2184,7 @@ fn precedents_at(names: &mut NameCache, wb: &Workbook, sheet: usize, e: &Expr, d
                 dynamic |= d;
                 trim |= t;
             }
-            NameTarget::Table(area) => out.push(area),
+            NameTarget::Table { area, .. } => out.push(area),
             _ => dynamic = true,
         },
         // A structured reference is a fixed area unless it depends on the cell it is written in
