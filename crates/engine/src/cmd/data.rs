@@ -679,7 +679,6 @@ pub(crate) fn apply_filter(wb: &mut Workbook, sheet: usize) {
     let Some(sh) = wb.sheet(sheet) else { return };
     let Some(af) = sh.autofilter.clone() else { return };
     let r = af.range;
-    let mut hide = Vec::new();
     // Precompute per-criterion top10 threshold and average once, not per row.
     let mut col_stats: std::collections::HashMap<usize, (Option<f64>, f64)> = std::collections::HashMap::new();
     for (i, (off, c)) in af.criteria.iter().enumerate() {
@@ -699,21 +698,124 @@ pub(crate) fn apply_filter(wb: &mut Workbook, sheet: usize) {
             col_stats.insert(i, (thr, avg));
         }
     }
-    for row in r.start.row + 1..=r.end.row {
+    let hide = evaluate(wb, sh, &af, &col_stats);
+    let Some(shm) = wb.sheet_mut(sheet) else { return };
+    // The previous filter gives back what it took off the rows it hid.
+    let mut previous = std::mem::take(&mut shm.filter_hidden);
+    for (row, info) in previous.take_saved() {
+        shm.rows.insert(row, info);
+    }
+    // The answer is a bitmap, not a line-info entry per row: a filtered id column hides a
+    // million rows, and an entry each made every scroll walk all of them (see FilterHidden).
+    let mut hidden = FilterHidden::build(hide.iter().filter(|(_, h)| *h).map(|(row, _)| *row), BTreeMap::new());
+    for (row, h) in hide {
+        if !h {
+            continue;
+        }
+        if let Some(info) = shm.rows.remove(&row) {
+            // A height, a whole-row style or a hand-hidden flag: kept for when the row returns.
+            hidden.save(row, info);
+        }
+    }
+    shm.filter_hidden = hidden;
+}
+
+/// Work hoisted out of the filter row loop: the value sets. The display text is formatted inside
+/// the criteria that read it, so a Top 10, an average or a colour filter formats nothing at all —
+/// formatting a million cells for nothing was most of a filter change.
+struct CriterionPlan {
+    /// A value filter compares against a set. Comparing one value at a time cost a comparison per
+    /// selected value per row: a 500-value selection over a million rows was half a billion.
+    sets: Vec<Option<std::collections::HashSet<String>>>,
+}
+
+impl CriterionPlan {
+    fn new(af: &AutoFilter) -> CriterionPlan {
+        CriterionPlan {
+            sets: af
+                .criteria
+                .iter()
+                .map(|(_, c)| match c {
+                    FilterCriterion::Values { values, .. } => Some(values.iter().map(|v| v.to_ascii_lowercase()).collect()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Whether a number format is Excel's General (what a value shows as itself).
+fn is_general(code: &str) -> bool {
+    code.trim().eq_ignore_ascii_case("general")
+}
+
+/// ASCII-lowercase `s` into `buf`: the comparison is `eq_ignore_ascii_case`, which folds ASCII only.
+fn lower_into<'a>(buf: &'a mut String, s: &str) -> &'a str {
+    buf.clear();
+    buf.extend(s.chars().map(|c| c.to_ascii_lowercase()));
+    buf.as_str()
+}
+
+/// The rows of the filter range the criteria hide, in order.
+fn evaluate(wb: &Workbook, sh: &Sheet, af: &AutoFilter, stats: &std::collections::HashMap<usize, (Option<f64>, f64)>) -> Vec<(u32, bool)> {
+    let from = af.range.start.row + 1;
+    let to = af.range.end.row;
+    if to < from {
+        return Vec::new();
+    }
+    let plan = CriterionPlan::new(af);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // A filter over a big range is a scan of read-only data: split it across threads.
+        const PAR_MIN_ROWS: u32 = 100_000;
+        const CHUNK: u32 = 16_384;
+        if to - from >= PAR_MIN_ROWS {
+            use rayon::prelude::*;
+            let chunks: Vec<(u32, u32)> = (from..=to).step_by(CHUNK as usize).map(|f| (f, to.min(f + CHUNK - 1))).collect();
+            let parts: Vec<Vec<(u32, bool)>> = chunks.par_iter().map(|(f, t)| evaluate_rows(wb, sh, af, stats, &plan, *f, *t)).collect();
+            return parts.into_iter().flatten().collect();
+        }
+    }
+    evaluate_rows(wb, sh, af, stats, &plan, from, to)
+}
+
+/// One pass over `from..=to`, deciding row by row.
+fn evaluate_rows(
+    wb: &Workbook,
+    sh: &Sheet,
+    af: &AutoFilter,
+    col_stats: &std::collections::HashMap<usize, (Option<f64>, f64)>,
+    plan: &CriterionPlan,
+    from: u32,
+    to: u32,
+) -> Vec<(u32, bool)> {
+    let mut hide = Vec::with_capacity(to.saturating_sub(from).saturating_add(1) as usize);
+    let mut lower = String::new();
+    let mut plain = String::new();
+    for row in from..=to {
         let mut visible = true;
         for (i, (off, crit)) in af.criteria.iter().enumerate() {
-            let c = CellRef::new(row, r.start.col + off);
+            let c = CellRef::new(row, af.range.start.col + off);
             let v = sh.value(c);
-            let text = crate::display::cell_text(wb, sh, c);
             let ok = match crit {
-                FilterCriterion::Values { values, blanks } => {
+                FilterCriterion::Values { blanks, .. } => {
                     if filter_blank(&v) {
                         *blanks
                     } else {
-                        values.iter().any(|x| x.eq_ignore_ascii_case(&text) || x.eq_ignore_ascii_case(&v.display()))
+                        let text = crate::display::cell_text(wb, sh, c);
+                        let hit = plan.sets.get(i).and_then(Option::as_ref).is_some_and(|set| set.contains(lower_into(&mut lower, &text)));
+                        // A criterion may give the value as typed rather than as displayed ("1000"
+                        // for a cell shown as "1,000"), so the value's own text counts too. A
+                        // General cell shows exactly that text, so only a formatted cell can
+                        // match here and the second formatting is not paid per row.
+                        hit || (!is_general(wb.styles.get(sh.style_id(c)).num_fmt.as_str()) && {
+                            let plain_text = v.display();
+                            plan.sets.get(i).and_then(Option::as_ref).is_some_and(|set| set.contains(lower_into(&mut plain, &plain_text)))
+                        })
                     }
                 }
                 FilterCriterion::Custom { a, b, and } => {
+                    let text = crate::display::cell_text(wb, sh, c);
                     let x = custom_ok(&v, &text, &a.0, &a.1);
                     match b {
                         Some(b) => {
@@ -752,25 +854,7 @@ pub(crate) fn apply_filter(wb: &mut Workbook, sheet: usize) {
         }
         hide.push((row, !visible));
     }
-    let Some(shm) = wb.sheet_mut(sheet) else { return };
-    // The previous filter gives back what it took off the rows it hid.
-    let mut previous = std::mem::take(&mut shm.filter_hidden);
-    for (row, info) in previous.take_saved() {
-        shm.rows.insert(row, info);
-    }
-    // The answer is a bitmap, not a line-info entry per row: a filtered id column hides a
-    // million rows, and an entry each made every scroll walk all of them (see FilterHidden).
-    let mut hidden = FilterHidden::build(hide.iter().filter(|(_, h)| *h).map(|(row, _)| *row), BTreeMap::new());
-    for (row, h) in hide {
-        if !h {
-            continue;
-        }
-        if let Some(info) = shm.rows.remove(&row) {
-            // A height, a whole-row style or a hand-hidden flag: kept for when the row returns.
-            hidden.save(row, info);
-        }
-    }
-    shm.filter_hidden = hidden;
+    hide
 }
 
 fn clear_filter(s: &mut Session, _: &Json) -> Result<Json> {

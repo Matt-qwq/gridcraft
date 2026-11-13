@@ -1656,6 +1656,7 @@ dependencies = [
  "gridcraft-xlsx",
  "image",
  "log",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
