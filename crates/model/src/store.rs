@@ -7293,7 +7293,7 @@ mod tests {
                 7 => {
                     // The reader's path: one whole row at a time.
                     let row = next(200) as u32;
-                    let mut cells: Vec<(u32, Cell)> = (0..next(6)).map(|i| (next(8) as u32, number((u64::from(row) << 8) | i as u64))).collect();
+                    let mut cells: Vec<(u32, Cell)> = (0..next(6)).map(|i| (next(8) as u32, number((u64::from(row) << 8) | i))).collect();
                     cells.sort_unstable_by_key(|(col, _)| *col);
                     store.set_row(row, &mut cells);
                 }
@@ -7450,4 +7450,3 @@ mod array_anchor_tests {
         assert!(s.has_array_anchors(), "a rebuild that carries the array raises it");
     }
 }
-

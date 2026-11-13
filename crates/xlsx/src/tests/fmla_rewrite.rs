@@ -67,11 +67,7 @@ fn the_rewrite_is_skipped_exactly_when_it_changes_nothing() {
         // A file spells a formula differently exactly when the rewrite's text differs from the
         // canonical text.
         let changes = fmla::expr_to_file_for_test((*e).clone()) != gridcraft_formula::print(&e);
-        assert_eq!(
-            fmla::needs_file_rewrite_for_test(&e),
-            changes,
-            "{text}: the scan and the rewrite disagree (the file text would be wrong)"
-        );
+        assert_eq!(fmla::needs_file_rewrite_for_test(&e), changes, "{text}: the scan and the rewrite disagree (the file text would be wrong)");
     }
 }
 
