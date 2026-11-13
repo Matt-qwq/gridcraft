@@ -46,6 +46,46 @@ impl T {
 }
 
 #[test]
+fn a_recalculation_hands_each_cell_the_tree_it_evaluated() {
+    // A formula read back from a serialized document carries its text alone (`Formula::expr` is
+    // skipped), so the writer, a sort, a fill and a paste each parsed that text again. The pass
+    // that evaluates the formula now shares its tree with the cell.
+    let mut t = T::new();
+    t.set("A1", "3");
+    t.set("B1", "=A1*2");
+    t.set("B2", "=SUM(B1,1)");
+    let at: Vec<CellRef> = t.wb.sheet(0).unwrap().cells.formulas().map(|(c, _, _)| c).collect();
+    for c in at {
+        let sh = t.wb.sheet_mut(0).unwrap();
+        let mut cell = sh.cells.get(c).unwrap();
+        let mut f = (*cell.formula.clone().unwrap()).clone();
+        f.expr = None;
+        f.expr_bytes = 0;
+        cell.formula = Some(std::sync::Arc::new(f));
+        sh.cells.set(c, cell);
+    }
+    assert!(t.wb.sheet(0).unwrap().cells.formulas().all(|(_, f, _)| f.expr.is_none()), "text only, as a file gives it");
+    t.calc.recalc_all(&mut t.wb);
+    let sh = t.wb.sheet(0).unwrap();
+    let formulas: Vec<_> = sh.cells.formulas().collect();
+    assert_eq!(formulas.len(), 2);
+    for (c, f, _) in &formulas {
+        assert!(f.expr.is_some(), "{c:?} got the tree the pass used");
+        assert!(f.expr_bytes > 0, "{c:?} counts what the tree costs");
+    }
+    assert_eq!(t.get("B1"), Value::Number(6.0));
+    assert_eq!(t.get("B2"), Value::Number(7.0));
+    // The cached tree says what the text says, and a copy of the cell keeps it: `expr()` serves
+    // the value without parsing again.
+    for (_, f, _) in &formulas {
+        let shared = f.clone();
+        let printed = shared.expr().map(|e| gridcraft_formula::print(&e));
+        assert_eq!(printed.as_deref(), Some(f.text.as_str()));
+        assert!(std::sync::Arc::ptr_eq(&shared.expr.clone().unwrap(), &f.expr.clone().unwrap()));
+    }
+}
+
+#[test]
 fn spill_range_operator() {
     let mut t = T::new();
     t.set("A1", "3");

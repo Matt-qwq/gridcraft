@@ -50,6 +50,18 @@ impl Formula {
     pub fn expr_arc(&self) -> Option<Arc<Expr>> {
         self.expr.clone().or_else(|| gridcraft_formula::parse(&self.text).ok().map(Arc::new))
     }
+    /// Keeps the tree something else parsed from this text, so the next consumer shares it instead
+    /// of parsing again: a formula deserialized into a document comes back as text alone
+    /// (`expr` is not written to a file). The tree already here is never replaced by a different
+    /// one — a cell that has one parsed its own text — and `text` is never regenerated from the
+    /// tree, so the two cannot drift apart.
+    pub fn share_expr(&mut self, e: &Arc<Expr>) {
+        if self.expr.is_some() {
+            return;
+        }
+        self.expr = Some(Arc::clone(e));
+        self.expr_bytes = expr_bytes(e);
+    }
 }
 
 /// Bytes an expression tree holds, node by node (the same figure [`Formula`] keeps).

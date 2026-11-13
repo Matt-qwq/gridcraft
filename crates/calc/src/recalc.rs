@@ -413,6 +413,12 @@ pub struct Calc {
     /// Definitions of the names formulas use, resolved once per sheet and name instead of once
     /// per formula that mentions it (see [`crate::eval::NameCache`]).
     names: crate::eval::NameCache,
+    /// The formulas the last rebuild had to parse from their text, with the tree it parsed. A
+    /// document read back from its own saved form keeps a formula's text alone (`Formula::expr` is
+    /// not written to a file), so after a rebuild these are handed back to their cells: the writer,
+    /// a sort, a fill and a paste then share the tree instead of parsing the text once each. Empty
+    /// for a workbook whose cells already carry theirs.
+    unshared: Vec<(Key, std::sync::Arc<Expr>)>,
     #[cfg(test)]
     parallel_runs: usize,
 }
@@ -427,6 +433,7 @@ impl Default for Calc {
             last_recalc_cells: 0,
             parallel_fallback: false,
             names: crate::eval::NameCache::default(),
+            unshared: vec![],
             #[cfg(test)]
             parallel_runs: 0,
         }
@@ -1482,6 +1489,27 @@ fn write_values_ordered(wb: &mut Workbook, values: &[(Key, Value)]) {
     }
 }
 
+/// Gives each formula the tree the rebuild parsed for it, when its cell has none: parsing it again
+/// on every later use (the writer, a sort, a fill, a paste) is what this avoids, and the tree is
+/// shared through the `Arc` rather than copied. A cell that already holds one is skipped, so the
+/// write costs nothing for a formula the user typed or a file reader parsed.
+pub(crate) fn share_exprs(wb: &mut Workbook, mut shared: Vec<(Key, std::sync::Arc<Expr>)>) {
+    shared.sort_unstable_by_key(|(k, _)| (k.0, k.1.row, k.1.col));
+    for ((si, at), e) in shared {
+        let Some(sheet) = wb.sheet_mut(si) else { continue };
+        let Some(mut cell) = sheet.cells.get(at) else { continue };
+        let Some(mut f) = cell.formula.clone() else { continue };
+        if f.expr.is_some() {
+            continue;
+        }
+        // The store still holds the `Arc`, so this copies the `Formula` (its text and the pointer
+        // to the tree), not the tree.
+        std::sync::Arc::make_mut(&mut f).share_expr(&e);
+        cell.formula = Some(f);
+        sheet.cells.set(at, cell);
+    }
+}
+
 /// Writes values back in row-major order. One sheet at a time, so the sheet's cells are borrowed
 /// once rather than looked up per value; the store rewrites the packed value slot in place.
 fn write_values(wb: &mut Workbook, mut values: Vec<(Key, Value)>) {
@@ -1668,12 +1696,18 @@ impl Calc {
     pub fn rebuild(&mut self, wb: &Workbook) {
         self.parallel_fallback = false;
         self.graph = Graph::default();
+        self.unshared.clear();
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, f, _) in sheet.cells.formulas() {
                 if let Some(e) = f.expr_arc() {
                     let (areas, dynamic, trim) = precedents(&mut self.names, wb, si, &e);
                     let may_spill = may_return_array(&mut self.names, wb, si, &e);
                     self.graph.insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill, trim });
+                    // The tree had to be parsed anyway; keeping it for the cell saves parsing it
+                    // again for every later use.
+                    if f.expr.is_none() {
+                        self.unshared.push(((si, c), e));
+                    }
                 }
             }
         }
@@ -1683,6 +1717,7 @@ impl Calc {
     /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
     pub fn recalc_all(&mut self, wb: &mut Workbook) {
         self.rebuild(wb);
+        share_exprs(wb, std::mem::take(&mut self.unshared));
         let prefer = spill_owners(wb);
         // Spills are laid out again from the formulas where they are now (a structural edit moves
         // or deletes the formulas, not the values they spilled).
@@ -1710,6 +1745,7 @@ impl Calc {
     pub fn recalc_on_open(&mut self, wb: &mut Workbook) {
         let tp = prof_now();
         self.rebuild(wb);
+        share_exprs(wb, std::mem::take(&mut self.unshared));
         let rebuild_ms = prof_now() - tp;
         let ts = prof_now();
         if wb.calc.full_calc_on_load {
@@ -1723,7 +1759,7 @@ impl Calc {
                 let derived = f.array.is_some()      // a legacy array fills its range
                     || f.dynamic                     // a dynamic array's spilled cells are derived
                     || !has_value; // the producer saved no value
-                if derived || f.expr().is_some_and(|e| is_volatile(&e)) {
+                if derived || f.expr_arc().is_some_and(|e| is_volatile(&e)) {
                     seeds.push((si, c));
                 }
             }

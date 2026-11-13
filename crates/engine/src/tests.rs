@@ -2231,6 +2231,25 @@ fn part_of_a_legacy_array_cant_be_changed_on_a_sheet_with_many_cells() {
 }
 
 #[test]
+fn a_recalculated_workbook_saves_byte_for_byte() {
+    // The tree the pass shares with each cell is not part of any file (`Formula::expr` is skipped
+    // when a workbook is serialized, and the writer puts the formula's text in the package), so a
+    // save after a full recalculation has to give exactly the bytes it gave before one.
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[1], [2], [3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=A1*2"})).unwrap();
+    s.execute("edit.autoFill", json!({"source": "B1", "target": "B1:B3"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C1", "input": "=SUMPRODUCT(A1:A3,B1:B3)"})).unwrap();
+    let save = |s: &mut Session| s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap()["base64"].as_str().unwrap_or_default().to_string();
+    let first = save(&mut s);
+    assert!(!first.is_empty(), "the package was written");
+    reopen(&mut s);
+    assert_eq!(save(&mut s), first, "opening and saving again gives the same package");
+    s.execute("formulas.calculateNow", json!({})).unwrap();
+    assert_eq!(save(&mut s), first, "a recalculation changes no byte of the package");
+}
+
+#[test]
 fn inserting_cells_across_a_merged_range_is_refused() {
     // A merge over whole rows extends past the E:H band the shift moves: moving the band and
     // leaving the rest would leave two overlapping merges (found by the command-sequence fuzzer).
