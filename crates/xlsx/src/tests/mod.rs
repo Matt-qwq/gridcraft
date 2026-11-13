@@ -11,6 +11,7 @@ mod chart_unmodelled_kinds;
 mod csv_tests;
 mod encrypted_tests;
 mod fixtures;
+mod fmla_rewrite;
 mod ink_roundtrip;
 mod literal_category_roundtrip;
 mod malformed;

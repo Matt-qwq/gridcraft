@@ -5,11 +5,48 @@ use gridcraft_formula::Expr;
 use gridcraft_model::Formula;
 
 /// Formula text for a file.
+///
+/// The rewrite below is only about what a file spells differently from the model's canonical
+/// text, and a formula that uses none of it — most of them — is written as its own text. That
+/// check is one allocation-free walk; the rewrite after it clones and rebuilds the tree twice,
+/// which on a million-row sheet is the difference between a save that is half tree-building and
+/// one that is not.
 pub fn to_file(f: &Formula) -> String {
-    match f.expr() {
-        Some(e) => expr_to_file(e),
+    match f.expr_arc() {
+        Some(e) if needs_file_rewrite(&e) => expr_to_file((*e).clone()),
+        Some(e) => gridcraft_formula::print(&e),
         None => f.text.clone(),
     }
+}
+
+/// The rewrite itself, for the test that holds the fast path to it.
+#[cfg(test)]
+pub(crate) fn expr_to_file_for_test(e: Expr) -> String {
+    expr_to_file(e)
+}
+
+/// The scan, for the test that holds it to the rewrite.
+#[cfg(test)]
+pub(crate) fn needs_file_rewrite_for_test(e: &Expr) -> bool {
+    needs_file_rewrite(e)
+}
+
+/// Whether a file writes `e` differently from the canonical text: a `_xlfn.` function name, a
+/// `LET`/`LAMBDA` parameter prefix, the `#`, `@` or trim-reference operator, or a structured
+/// reference (all spelled out in [`expr_to_file`]). Nothing else is rewritten, so a formula that
+/// holds none of them keeps its own text.
+fn needs_file_rewrite(e: &Expr) -> bool {
+    let mut need = false;
+    e.walk(&mut |x| match x {
+        // `LET`/`LAMBDA` declare parameters its calls reference, so the scope has to be built.
+        Expr::Call(name, _) if name == "LET" || name == "LAMBDA" || crate::tables::file_function_name(name).is_some() => need = true,
+        Expr::Unary(gridcraft_formula::UnOp::Spill | gridcraft_formula::UnOp::At | gridcraft_formula::UnOp::Trim(_), _) => need = true,
+        // Only the `[@Col]` shorthand prints differently: every other structured reference is
+        // already written the long way (see `printer::struct_ref_file`).
+        Expr::Struct(s) if s.specifiers.len() == 1 && s.specifiers.first() == Some(&gridcraft_formula::StructItem::ThisRow) => need = true,
+        _ => {}
+    });
+    need
 }
 
 /// Arbitrary formula text (names, CF, validation) for a file. Unparseable text is kept.
