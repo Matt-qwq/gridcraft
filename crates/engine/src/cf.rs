@@ -56,6 +56,8 @@ fn stats_need(rule: &CfRule) -> Option<StatsNeed> {
 
 impl RuleStats {
     fn build(sh: &Sheet, ranges: &[RangeRef], need: StatsNeed) -> RuleStats {
+        #[cfg(debug_assertions)]
+        BUILT.with(|n| n.set(n.get().saturating_add(1)));
         let (sorted, counts) = numbers_in(sh, ranges, need);
         let n = sorted.len().max(1) as f64;
         let avg = sorted.iter().sum::<f64>() / n;
@@ -68,6 +70,20 @@ impl RuleStats {
 thread_local! {
     /// Cells `numbers_in` visited on this thread (tests count the work a lookup does).
     static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Rule statistics built on this thread (tests count the work a cache saves across frames).
+    static BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many rule statistics this thread has built since the process started. A caller that keeps
+/// its [`CfCache`] across frames reads the same number twice; one that builds a new cache every
+/// frame sees it grow. Compiled out of a release binary, where nothing reads it.
+#[cfg(debug_assertions)]
+pub fn stats_built() -> usize {
+    BUILT.with(|n| n.get())
 }
 
 fn numbers_in(sh: &Sheet, ranges: &[RangeRef], need: StatsNeed) -> (Vec<f64>, HashMap<String, usize>) {

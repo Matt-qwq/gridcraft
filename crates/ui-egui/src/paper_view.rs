@@ -10,14 +10,13 @@
 use std::sync::Arc;
 
 use egui::{Align2, Color32, FontId, Key, Painter, Pos2, Rect, Stroke, StrokeKind, TextEdit, pos2, vec2};
-use gridcraft_engine::cf::CfCache;
 use gridcraft_engine::cmd::print::{self, HfContext};
 use gridcraft_engine::model::{HfPage, Sheet, SheetViewMode, Workbook};
 use gridcraft_engine::paper::{self, HfZone, PageGrid};
 use serde_json::json;
 
 use crate::SheetApp;
-use crate::grid::{self, DISPLAY_SCALE, Geo};
+use crate::grid::{self, DISPLAY_SCALE, Geo, PaintCache};
 use crate::icons::Icon;
 use crate::theme::{self, Tokens};
 
@@ -129,7 +128,7 @@ pub(crate) fn paint_pages(
     si: usize,
     sh: &Sheet,
     sel: &gridcraft_engine::Selection,
-    cf: &mut CfCache,
+    cache: &mut PaintCache,
     t: &Tokens,
 ) -> Vec<((u32, u32), (u32, u32), Rect)> {
     let mut quads = Vec::new();
@@ -160,7 +159,7 @@ pub(crate) fn paint_pages(
         }
         painted += 1;
         let pc = p.with_clip_rect(clip);
-        grid::paint_quadrant(&pc, geo, wb, si, sh, rows, cols, cf, t, &app.text);
+        grid::paint_quadrant(&pc, geo, wb, si, sh, rows, cols, cache, t, &app.text);
         if !pg.is_data_page(i, j) {
             // "Click to add data" pages: faded until something is typed there.
             pc.rect_filled(clip, 0.0, t.grid_bg.gamma_multiply(0.75));

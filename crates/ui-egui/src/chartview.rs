@@ -58,7 +58,10 @@ pub fn paint_chart(
 
 /// What a click at `at` (screen coordinates) inside a chart's on-screen `rect` lands on, in the
 /// Format pane's vocabulary. The chart is laid out at its anchor size and painted scaled, so the
-/// click maps back by the same scale; the regions come from the same layout that painted it.
+/// click maps back by the same scale; the regions come from the same layout that painted it
+/// (`hits`, kept across frames by [`crate::grid::PaintCache`]) or, for a chart that was not
+/// painted this frame, from a layout made here.
+#[allow(clippy::too_many_arguments)]
 pub fn element_at(
     p: &Painter,
     wb: &Workbook,
@@ -67,6 +70,7 @@ pub fn element_at(
     rect: Rect,
     at: Pos2,
     text: Option<&crate::text::GridText>,
+    hits: Option<&[gridcraft_chart::HitRegion]>,
 ) -> Option<gridcraft_chart::Hit> {
     if !rect.contains(at) {
         return None;
@@ -76,10 +80,14 @@ pub fn element_at(
     if !(w.is_finite() && h.is_finite() && z.is_finite() && z > 0.0) {
         return None;
     }
+    let (x, y) = ((at.x - rect.left()) / z, (at.y - rect.top()) / z);
+    if let Some(hits) = hits {
+        return gridcraft_chart::hit_at(hits, x, y);
+    }
     let data = gridcraft_chart::resolve(wb, sheet, chart);
     let m = EguiMeasure { painter: p, z, text };
-    let hits = gridcraft_chart::render_hits(chart, &data, w, h, &m);
-    gridcraft_chart::hit_at(&hits, (at.x - rect.left()) / z, (at.y - rect.top()) / z)
+    let laid_out = gridcraft_chart::render_hits(chart, &data, w, h, &m);
+    gridcraft_chart::hit_at(&laid_out, x, y)
 }
 
 /// Paints chart primitives at `origin`, scaled by `z`.
@@ -528,7 +536,15 @@ pub(crate) fn objects_hidden(wb: &Workbook) -> bool {
     wb.show_objects == gridcraft_engine::model::ShowObjects::None
 }
 
-pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workbook, si: usize, sh: &Sheet) -> Vec<PaintedObject> {
+pub(crate) fn paint_objects(
+    app: &SheetApp,
+    p: &Painter,
+    geo: &Geo,
+    wb: &Workbook,
+    si: usize,
+    sh: &Sheet,
+    cache: &mut crate::grid::PaintCache,
+) -> Vec<PaintedObject> {
     let mut painted = Vec::new();
     if objects_hidden(wb) {
         return painted;
@@ -617,7 +633,7 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
         }
         done(start, r);
     }
-    for ch in &sh.charts {
+    for (i, ch) in sh.charts.iter().enumerate() {
         let r = anchor_rect(geo, sh, &ch.anchor);
         if !r.intersects(p.clip_rect()) {
             continue;
@@ -626,10 +642,19 @@ pub(crate) fn paint_objects(app: &SheetApp, p: &Painter, geo: &Geo, wb: &Workboo
         // Soft shadow + white card.
         p.rect_filled(r.translate(vec2(0.0, 1.5)), 2.0, Color32::from_black_alpha(18));
         p.rect_filled(r, 0.0, Color32::WHITE);
-        let data = gridcraft_chart::resolve(wb, si, ch);
-        let m = EguiMeasure { painter: p, z: geo.z, text: Some(&app.text) };
-        let prims = gridcraft_chart::render(ch, &data, ch.anchor.width, ch.anchor.height, &m);
-        paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &prims, geo.z, Some(&app.text));
+        // Laying a chart out (axis ticks, measured labels) is far too slow for every frame: the
+        // drawing — primitives and click regions — is kept until the document or the anchor size
+        // changes.
+        let size = (ch.anchor.width.to_bits(), ch.anchor.height.to_bits());
+        if cache.chart_stale(i, size) {
+            let data = gridcraft_chart::resolve(wb, si, ch);
+            let m = EguiMeasure { painter: p, z: geo.z, text: Some(&app.text) };
+            let drawing = gridcraft_chart::draw(ch, &data, ch.anchor.width, ch.anchor.height, &m);
+            cache.put_chart(i, size, drawing);
+        }
+        if let Some(drawing) = cache.chart(i) {
+            paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &drawing.prims, geo.z, Some(&app.text));
+        }
         if app.selected_chart == Some(ch.id) {
             selection_frame(p, r);
         }

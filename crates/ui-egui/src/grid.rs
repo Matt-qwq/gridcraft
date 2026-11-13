@@ -200,6 +200,9 @@ pub struct GridState {
     /// `review.checkAccessibility`'s issue count for the status bar, cached per document revision:
     /// the check walks every sheet's cells and objects, far too slow to repeat every frame.
     pub a11y: Option<((u64, u64), usize)>,
+    /// Conditional-format statistics and the laid-out charts and sparklines of the sheet being
+    /// painted, kept across frames (see [`PaintCache`]).
+    pub paint: Option<PaintCache>,
 }
 
 /// The grid's line geometry: prefix sums over custom row heights and column widths, and the
@@ -245,6 +248,118 @@ impl GridState {
         let g = LineGeo { key, ..LineGeo::of(sh) };
         self.line_geo = Some(g.clone());
         g
+    }
+
+    /// The paint cache for `key` — (document uid, revision, sheet) — kept across frames and
+    /// rebuilt when the document changed. The caller owns it while the sheet is painted and puts
+    /// it back afterwards.
+    pub fn paint_cache(&mut self, key: (u64, u64, usize)) -> PaintCache {
+        match self.paint.take() {
+            Some(cache) if cache.key == key => cache,
+            _ => PaintCache::new(key),
+        }
+    }
+}
+
+/// What the sheet is painted from, kept for as long as the document and sheet stay the same:
+/// conditional-format statistics and the laid-out drawings of its charts and sparklines.
+///
+/// Every one of them is far too slow to rebuild each frame. A data bar, colour scale, icon set,
+/// top/bottom-N, above-average or duplicate rule scans — and sorts — its whole range for its
+/// statistics (up to 2,000,000 cells); a chart is laid out at its anchor size, axis ticks and
+/// label measurement included; a sparkline parses and evaluates its source formula. The key
+/// changes on every edit (undo and redo included), every sheet switch and every document switch,
+/// so a stale picture — the wrong colour scale after an edit — is never shown: the cache is
+/// dropped, never patched.
+#[derive(Default)]
+pub struct PaintCache {
+    /// (document uid, document revision, sheet index).
+    key: (u64, u64, usize),
+    /// Conditional-format statistics, one set per rule of the sheet.
+    pub(crate) cf: CfCache,
+    /// Charts' drawings by their index in the sheet's list, with the anchor size they were laid
+    /// out for (a resize changes the picture even before the document revision does).
+    charts: Vec<Option<((u32, u32), gridcraft_chart::Drawing)>>,
+    /// Sparklines' paths by their index in the sheet's list, with the cell size they were laid
+    /// out for (zoom and column width change the picture too). The index, not the cell, is the
+    /// identity: a hand-edited file can carry two sparklines on one cell.
+    sparks: Vec<Option<((u32, u32), Vec<gridcraft_chart::Prim>)>>,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Drawings laid out on this thread: a chart at its anchor size, a sparkline's path (tests
+    /// count them to see that a repaint without a change lays nothing out). Compiled out of a
+    /// release binary, where nothing reads it.
+    static LAYOUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Drawings (charts, sparklines) laid out on this thread since the process started. Tests read
+/// it; nothing else does.
+#[cfg(debug_assertions)]
+pub fn object_layouts() -> usize {
+    LAYOUTS.with(|n| n.get())
+}
+
+/// Counts one laid-out drawing (see [`object_layouts`]).
+fn layout_built() {
+    #[cfg(debug_assertions)]
+    LAYOUTS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
+impl PaintCache {
+    fn new(key: (u64, u64, usize)) -> PaintCache {
+        PaintCache { key, ..PaintCache::default() }
+    }
+
+    /// Whether chart `i` still needs laying out for an anchor of `size` (its width and height as
+    /// `f32` bits).
+    pub(crate) fn chart_stale(&self, i: usize, size: (u32, u32)) -> bool {
+        !matches!(self.charts.get(i), Some(Some((s, _))) if *s == size)
+    }
+
+    /// The drawing laid out for chart `i`, if it is up to date.
+    pub(crate) fn chart(&self, i: usize) -> Option<&gridcraft_chart::Drawing> {
+        self.charts.get(i).and_then(Option::as_ref).map(|(_, d)| d)
+    }
+
+    /// The click regions of chart `i` — the ones the layout that painted it produced, so a click
+    /// on a bar never lays the chart out again.
+    pub(crate) fn chart_hits(&self, i: usize) -> Option<&[gridcraft_chart::HitRegion]> {
+        self.chart(i).map(|d| d.hits.as_slice())
+    }
+
+    /// Keeps `drawing` as chart `i`'s layout for `size`.
+    pub(crate) fn put_chart(&mut self, i: usize, size: (u32, u32), drawing: gridcraft_chart::Drawing) {
+        if self.charts.len() <= i {
+            self.charts.resize_with(i.saturating_add(1), || None);
+        }
+        if let Some(slot) = self.charts.get_mut(i) {
+            *slot = Some((size, drawing));
+            layout_built();
+        }
+    }
+
+    /// Whether sparkline `i` still needs drawing for a cell of `size` (its width and height as
+    /// `f32` bits).
+    pub(crate) fn spark_stale(&self, i: usize, size: (u32, u32)) -> bool {
+        !matches!(self.sparks.get(i), Some(Some((s, _))) if *s == size)
+    }
+
+    /// The path drawn for sparkline `i`, if it is up to date.
+    pub(crate) fn spark(&self, i: usize) -> Option<&[gridcraft_chart::Prim]> {
+        self.sparks.get(i).and_then(Option::as_ref).map(|(_, p)| p.as_slice())
+    }
+
+    /// Keeps `prims` as sparkline `i`'s path for `size`.
+    pub(crate) fn put_spark(&mut self, i: usize, size: (u32, u32), prims: Vec<gridcraft_chart::Prim>) {
+        if self.sparks.len() <= i {
+            self.sparks.resize_with(i.saturating_add(1), || None);
+        }
+        if let Some(slot) = self.sparks.get_mut(i) {
+            *slot = Some((size, prims));
+            layout_built();
+        }
     }
 }
 
@@ -671,8 +786,9 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     let Some(sh) = wb.sheet(si) else { return };
     let sel = d.selection.clone();
     let place = (d.uid, si);
-    // The line geometry changes only with the document: the revision is part of its cache key.
-    let line_key = (d.uid, d.revision, si);
+    // The line geometry, the conditional-format statistics and the objects' layouts change only
+    // with the document (an edit, undo/redo, a sheet switch): the revision is part of each key.
+    let doc_key = (d.uid, d.revision, si);
     // The timeline axis is a source scan; the grid caches it per revision before painting.
     crate::slicer_view::ensure_timeline_axes(app, &wb, sh);
     let mut view = app.view();
@@ -686,7 +802,7 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
         Rect::from_min_max(pos2((rect.left() + ruler).min(rect.right()), (rect.top() + ruler).min(rect.bottom())), rect.max)
     };
     let make_geo = |app: &mut SheetApp, scroll: egui::Vec2| -> Geo {
-        let lines = app.grid.line_geo_for(line_key, sh);
+        let lines = app.grid.line_geo_for(doc_key, sh);
         if paper {
             let (ri, ci, row_outline, col_outline) = lines.clone().into_arcs();
             let probe = Geo::new_with_lines(sh, grid_rect, scroll, ri, ci, row_outline, col_outline);
@@ -824,18 +940,24 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     painter.rect_filled(rect, 0.0, t.grid_bg);
     // Everything up to the headers is painted in logical (left-to-right) coordinates.
     let mirror_from = painter.add(egui::Shape::Noop);
-    let mut cf = CfCache::new();
+    // Conditional-format statistics and the charts' and sparklines' layouts are far too slow to
+    // rebuild every frame, so they are kept across frames and dropped when the document changes
+    // (see [`PaintCache`]).
+    let mut paint = app.grid.paint_cache(doc_key);
     let quads = if geo.paper.is_some() {
-        crate::paper_view::paint_pages(app, &painter, &geo, &wb, si, sh, &sel, &mut cf, &t)
+        crate::paper_view::paint_pages(app, &painter, &geo, &wb, si, sh, &sel, &mut paint, &t)
     } else {
-        paint_panes(app, &painter, &geo, &wb, si, sh, &sel, &mut cf, &t)
+        paint_panes(app, &painter, &geo, &wb, si, sh, &sel, &mut paint, &t)
     };
     // Objects above cells. A hidden object can't stay selected: Delete or the Format pane would act
     // on something the user can't see.
     if crate::chartview::objects_hidden(&wb) {
         app.selected_chart = None;
     }
-    let objects = crate::chartview::paint_objects(app, &painter.with_clip_rect(geo.cells), &geo, &wb, si, sh);
+    let objects = crate::chartview::paint_objects(app, &painter.with_clip_rect(geo.cells), &geo, &wb, si, sh, &mut paint);
+    // Back in the grid state, so the click and drag code (`chartview::element_at`) reads the click
+    // regions of the layout that painted the chart instead of laying it out again.
+    app.grid.paint = Some(paint);
     paint_overlays(app, ui, &painter.with_clip_rect(geo.cells), &geo, &wb, si, sh, &sel);
     if sh.view == gridcraft_engine::model::SheetViewMode::PageBreakPreview {
         paint_pages(app, &painter.with_clip_rect(geo.cells), &geo, sh);
@@ -906,7 +1028,7 @@ fn paint_panes(
     si: usize,
     sh: &Sheet,
     sel: &gridcraft_engine::Selection,
-    cf: &mut CfCache,
+    cache: &mut PaintCache,
     t: &Tokens,
 ) -> Vec<((u32, u32), (u32, u32), Rect)> {
     // Quadrants: (rows, cols, clip).
@@ -930,7 +1052,7 @@ fn paint_panes(
             continue;
         }
         let p = painter.with_clip_rect(*clip);
-        paint_quadrant(&p, geo, wb, si, sh, *rows, *cols, cf, t, &app.text);
+        paint_quadrant(&p, geo, wb, si, sh, *rows, *cols, cache, t, &app.text);
         paint_selection(&p, geo, sh, sel, t, app, *rows, *cols);
     }
     // Freeze lines.
@@ -1156,7 +1278,7 @@ pub(crate) fn paint_quadrant(
     sh: &Sheet,
     rows: (u32, u32),
     cols: (u32, u32),
-    cf: &mut CfCache,
+    cache: &mut PaintCache,
     t: &Tokens,
     engine: &crate::text::GridText,
 ) {
@@ -1212,7 +1334,7 @@ pub(crate) fn paint_quadrant(
             Some(m) => (geo.range_rect(sh, m), m.start),
             None => (geo.cell_rect(sh, c), c),
         };
-        let (lk, cfl) = look(wb, si, sh, anchor, cf);
+        let (lk, cfl) = look(wb, si, sh, anchor, &mut cache.cf);
         if let Some(f) = lk.fill {
             p.rect_filled(rect.expand(0.0), 0.0, f);
         } else if in_merge(c).is_some() {
@@ -1232,7 +1354,7 @@ pub(crate) fn paint_quadrant(
         let right = (c1.saturating_add(1)..=c1.saturating_add(20).min(MAX_COLS - 1)).map(|col| CellRef::new(r, col)).find(|&n| !empty_ok(n));
         for n in [left, right].into_iter().flatten() {
             if same_pane(n.col) && sh.col_width(n.col) > 0.0 && in_merge(n).is_none() {
-                let (lk, cfl) = look(wb, si, sh, n, cf);
+                let (lk, cfl) = look(wb, si, sh, n, &mut cache.cf);
                 outside.push((n, geo.cell_rect(sh, n), lk, cfl));
             }
         }
@@ -1525,7 +1647,7 @@ pub(crate) fn paint_quadrant(
             // A merged area's outline lives on the cells along each of its edges (Excel writes the
             // right edge on the last column's cells and the bottom edge on the last row's), so each
             // edge is drawn cell by cell from the cell it belongs to.
-            Some(m) => merged_edges(wb, si, sh, geo, *m, *rect, (r0, r1), (c0, c1), cf),
+            Some(m) => merged_edges(wb, si, sh, geo, *m, *rect, (r0, r1), (c0, c1), &mut cache.cf),
             None => vec![
                 (b.top, [rect.left_top(), rect.right_top()]),
                 (b.bottom, [rect.left_bottom(), rect.right_bottom()]),
@@ -1566,19 +1688,26 @@ pub(crate) fn paint_quadrant(
             ));
         }
     }
-    // Sparklines.
-    for sp in &sh.sparklines {
+    // Sparklines. Parsing and evaluating the source formula once per frame is far too slow, so the
+    // drawn path is kept for as long as the document and the cell's size stay the same.
+    for (i, sp) in sh.sparklines.iter().enumerate() {
         if !range.contains(sp.cell) {
             continue;
         }
         let rect = geo.cell_rect(sh, sp.cell).shrink(3.0);
-        let vals: Vec<Option<f64>> = match gridcraft_engine::calc::evaluate(wb, si, sp.cell, &sp.source) {
-            Value::Array(a) => a.data.iter().map(Value::as_f64).collect(),
-            v => vec![v.as_f64()],
-        };
-        let col = sp.color.resolve(&wb.theme).unwrap_or([0x2B, 0x7C, 0xD3]);
-        let prims = gridcraft_chart::render_sparkline(sp.kind, &vals, [col[0], col[1], col[2], 255], sp.markers, rect.width(), rect.height());
-        crate::chartview::paint_prims(p, rect.min, &prims, 1.0, None);
+        let size = (rect.width().to_bits(), rect.height().to_bits());
+        if cache.spark_stale(i, size) {
+            let vals: Vec<Option<f64>> = match gridcraft_engine::calc::evaluate(wb, si, sp.cell, &sp.source) {
+                Value::Array(a) => a.data.iter().map(Value::as_f64).collect(),
+                v => vec![v.as_f64()],
+            };
+            let col = sp.color.resolve(&wb.theme).unwrap_or([0x2B, 0x7C, 0xD3]);
+            let prims = gridcraft_chart::render_sparkline(sp.kind, &vals, [col[0], col[1], col[2], 255], sp.markers, rect.width(), rect.height());
+            cache.put_spark(i, size, prims);
+        }
+        if let Some(prims) = cache.spark(i) {
+            crate::chartview::paint_prims(p, rect.min, prims, 1.0, None);
+        }
     }
     // Filter buttons.
     let mut buttons: Vec<(CellRef, bool)> = Vec::new();
@@ -2349,8 +2478,18 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
             if kind == "chart"
                 && primary_clicked
                 && already
-                && let Some(ch) = sh.charts.iter().find(|c| c.id == id)
-                && let Some(hit) = crate::chartview::element_at(ui.painter(), wb, wb.active_sheet, ch, rect, p, Some(&app.text))
+                && let Some((i, ch)) = sh.charts.iter().enumerate().find(|(_, c)| c.id == id)
+                // The click regions of the layout that painted the chart: a click never lays it out.
+                && let Some(hit) = crate::chartview::element_at(
+                    ui.painter(),
+                    wb,
+                    wb.active_sheet,
+                    ch,
+                    rect,
+                    p,
+                    Some(&app.text),
+                    app.grid.paint.as_ref().and_then(|cache| cache.chart_hits(i)),
+                )
             {
                 crate::chart_format::select_element(app, ui, id, hit);
             }
@@ -4544,6 +4683,60 @@ mod tests {
         assert_eq!(text(0, &mut cf), "1");
         assert_eq!(text(1, &mut cf), "3.00");
         assert_eq!(text(2, &mut cf), "4.00");
+    }
+
+    /// A rule's statistics scan and sort its whole range, so the frame-to-frame cache must build
+    /// them once — and must be dropped when an edit can have changed the numbers they came from.
+    #[test]
+    fn conditional_format_statistics_are_built_once_and_dropped_on_an_edit() {
+        use gridcraft_engine::cf::stats_built;
+        let mut session = gridcraft_engine::Session::new();
+        session.new_workbook();
+        session.execute("range.setValues", json!({"range": "A1", "values": [[1], [10]]})).unwrap();
+        session.execute("home.conditionalFormat", json!({"range": "A1:A2", "rule": {"type": "colorScale"}})).unwrap();
+        // A1 is the range's minimum, so the scale paints it at the low end.
+        let scale = |wb: &Workbook, cache: &mut CfCache| -> Option<[u8; 3]> {
+            let sh = wb.sheet(0)?;
+            look(wb, 0, sh, CellRef::new(0, 0), cache).1.and_then(|l| l.scale_fill)
+        };
+        let doc_key = {
+            let d = session.active().unwrap();
+            (d.uid, d.revision, d.wb.active_sheet)
+        };
+        let wb = session.active().unwrap().wb.clone();
+        let mut grid = GridState::default();
+        // Frame one, then frame two of the same document: the statistics are built once.
+        let mut paint = grid.paint_cache(doc_key);
+        let built = stats_built();
+        let low = scale(&wb, &mut paint.cf);
+        grid.paint = Some(paint);
+        let mut paint = grid.paint_cache(doc_key);
+        assert_eq!(scale(&wb, &mut paint.cf), low, "the same document paints the same scale");
+        assert_eq!(stats_built(), built.saturating_add(1), "one build for the rule, not one per frame");
+        grid.paint = Some(paint);
+
+        // A cache that outlives an edit keeps the old numbers (it is keyed by rule, not by value):
+        // that is the wrong colour scale the revision key exists to prevent.
+        session.execute("range.setValues", json!({"range": "A2", "values": [[0]]})).unwrap();
+        let d = session.active().unwrap();
+        let edited_key = (d.uid, d.revision, d.wb.active_sheet);
+        let wb2 = d.wb.clone();
+        assert_ne!(edited_key, doc_key, "an edit changes the key");
+        let mut stale = CfCache::new();
+        assert_eq!(scale(&wb, &mut stale), low);
+        assert_eq!(scale(&wb2, &mut stale), low, "a kept cache answers with the numbers it scanned");
+        // The grid drops it instead: the new revision builds afresh and shows the new scale.
+        let before = stats_built();
+        let mut paint = grid.paint_cache(edited_key);
+        let high = scale(&wb2, &mut paint.cf);
+        assert_ne!(high, low, "A1 is the range's maximum now, so the scale's other end paints it");
+        assert!(stats_built() > before, "the edited document's statistics are built again");
+        grid.paint = Some(paint);
+        // And they are kept again: another frame of the edited document builds nothing.
+        let settled = stats_built();
+        let mut paint = grid.paint_cache(edited_key);
+        assert_eq!(scale(&wb2, &mut paint.cf), high);
+        assert_eq!(stats_built(), settled);
     }
 
     #[test]
