@@ -410,6 +410,9 @@ pub struct Calc {
     /// A parallel pass produced a spill or a cycle and was rolled back: keep passes sequential
     /// until a formula changes, rather than paying for the same failed attempt every recalculation.
     parallel_fallback: bool,
+    /// Definitions of the names formulas use, resolved once per sheet and name instead of once
+    /// per formula that mentions it (see [`crate::eval::NameCache`]).
+    names: crate::eval::NameCache,
     #[cfg(test)]
     parallel_runs: usize,
 }
@@ -423,6 +426,7 @@ impl Default for Calc {
             circular: vec![],
             last_recalc_cells: 0,
             parallel_fallback: false,
+            names: crate::eval::NameCache::default(),
             #[cfg(test)]
             parallel_runs: 0,
         }
@@ -1261,8 +1265,15 @@ impl Host for PassHost<'_> {
 ///
 /// Functions that aggregate or look up a block and return one value are listed as scalar: their
 /// arguments are not walked, so `SUM(A1:A3)` stays parallel although its argument is a range.
-fn may_return_array(e: &Expr) -> bool {
-    let mut stack = vec![e];
+fn may_return_array(names: &mut crate::eval::NameCache, wb: &Workbook, sheet: usize, e: &Expr) -> bool {
+    may_return_array_at(names, wb, sheet, e, 0)
+}
+
+/// [`may_return_array`] at name depth `depth`. Only a name recurses (into its definition, at
+/// most `MAX_NAME_DEPTH` deep): the formula tree itself is walked with an explicit stack, as a
+/// long operator chain must not recurse once per operand.
+fn may_return_array_at(names: &mut crate::eval::NameCache, wb: &Workbook, sheet: usize, root: &Expr, depth: usize) -> bool {
+    let mut stack = vec![root];
     while let Some(e) = stack.pop() {
         match e {
             Expr::Array(_) => return true,
@@ -1287,7 +1298,17 @@ fn may_return_array(e: &Expr) -> bool {
             }
             Expr::Unary(_, a) | Expr::Paren(a) => stack.push(a),
             Expr::Invoke(..) => return true,
-            Expr::Name(_) | Expr::Struct(_) => return true,
+            // A name reads what its definition reads: `Rate` defined as `Sheet1!$B$1` returns
+            // one value. Anything that can't be resolved statically may return an array.
+            Expr::Name(n) => match names.target(wb, sheet, n) {
+                crate::eval::NameTarget::Definition(def, scope) if depth < crate::eval::MAX_NAME_DEPTH => {
+                    if may_return_array_at(names, wb, scope, &def, depth + 1) {
+                        return true;
+                    }
+                }
+                _ => return true,
+            },
+            Expr::Struct(_) => return true,
             Expr::Missing | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
         }
     }
@@ -1638,9 +1659,9 @@ impl Calc {
         for (si, sheet) in wb.sheets.iter().enumerate() {
             for (c, f, _) in sheet.cells.formulas() {
                 if let Some(e) = f.expr_arc() {
-                    let (areas, dynamic, trim) = precedents(wb, si, &e);
-                    self.graph
-                        .insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill: may_return_array(&e), trim });
+                    let (areas, dynamic, trim) = precedents(&mut self.names, wb, si, &e);
+                    let may_spill = may_return_array(&mut self.names, wb, si, &e);
+                    self.graph.insert((si, c), Node { areas, dynamic, expr: Some(e.clone()), legacy: f.array, may_spill, trim });
                 }
             }
         }
@@ -1731,8 +1752,8 @@ impl Calc {
             let parsed = formula.as_ref().and_then(|f| f.expr_arc().map(|e| (e, f.array)));
             match parsed {
                 Some((e, legacy)) => {
-                    let (areas, dynamic, trim) = precedents(wb, k.0, &e);
-                    let may_spill = may_return_array(&e);
+                    let (areas, dynamic, trim) = precedents(&mut self.names, wb, k.0, &e);
+                    let may_spill = may_return_array(&mut self.names, wb, k.0, &e);
                     self.graph.insert(k, Node { areas, dynamic, expr: Some(e), legacy, may_spill, trim });
                 }
                 None => {
@@ -2204,7 +2225,7 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     use gridcraft_core::{CellError, CellRef, RangeRef, Value};
-    use gridcraft_model::{Cell, Formula, Workbook};
+    use gridcraft_model::{Cell, DefinedName, Formula, Workbook};
 
     use super::{Calc, Graph, HashMap, Host, Intervals, Key, PassHost};
 
@@ -2446,6 +2467,35 @@ pub(crate) mod tests {
             assert!(calc.parallel_runs > 1, "the edit did not run the parallel path");
         }
         assert!(column_j(&wb, n).iter().all(|v| *v == Value::Number(20.0)));
+    }
+
+    /// A column of `=Rate*` formulas is as parallel as the same column written with the
+    /// reference the name stands for: a static name is a precedent like any other, not one of
+    /// the formulas that keep the whole pass sequential.
+    #[test]
+    fn a_static_name_does_not_keep_the_pass_sequential() {
+        let n = 17_000u32;
+        let mut named = leaf_book(n, "=Rate*2");
+        named.names.push(DefinedName { name: "Rate".into(), scope: None, formula: "Sheet1!$A$1".into(), comment: String::new(), hidden: false });
+        let mut plain = leaf_book(n, "=$A$1*2");
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut named);
+        if can_parallel() {
+            assert!(calc.parallel_runs > 0, "the parallel path did not run for a static name");
+        }
+        calc.recalc_all(&mut plain);
+        assert_eq!(column_j(&named, n), column_j(&plain, n));
+        // An edit of the cell the name names: the same formulas on threads, the same output.
+        named.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 0), Cell::value(Value::Number(10.0)));
+        plain.sheet_mut(0).unwrap().cells.set(CellRef::new(0, 0), Cell::value(Value::Number(10.0)));
+        calc.parallel_runs = 0;
+        calc.cells_changed(&mut named, &[(0, CellRef::new(0, 0))]);
+        if can_parallel() {
+            assert!(calc.parallel_runs > 0, "the edit did not run the parallel path for a static name");
+        }
+        calc.cells_changed(&mut plain, &[(0, CellRef::new(0, 0))]);
+        assert_eq!(column_j(&named, n), column_j(&plain, n));
+        assert!(column_j(&named, n).iter().all(|v| *v == Value::Number(20.0)));
     }
 
     #[test]

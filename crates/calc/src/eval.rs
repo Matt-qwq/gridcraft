@@ -1992,10 +1992,128 @@ pub fn trimmed(range: RangeRef) -> bool {
     !(cells <= FULL_SIZE_CELLS || (!to_edge && cells <= FULL_SIZE_BOUNDED_CELLS))
 }
 
+/// Most defined-name definitions [`precedents`] follows one into another (`Rate` defined as
+/// `Step`, `Step` defined as `Sheet1!$B$1`) before it treats the name as dynamic: a file can
+/// define names in a ring, and following them has to end.
+pub(crate) const MAX_NAME_DEPTH: usize = 8;
+
+/// Names one sheet's cache keeps before the least recently used is dropped (a formula can
+/// mention more names than any real sheet, so the cache has to be bounded).
+const MAX_CACHED_NAMES: usize = 256;
+
+/// What a name in a formula reads, resolved the way the evaluator resolves it (`Evaluator::name`).
+#[derive(Clone, Debug)]
+pub(crate) enum NameTarget {
+    /// The name's definition and the sheet its unqualified references mean (its own scope
+    /// sheet, or the sheet using it for a workbook-level name).
+    Definition(std::sync::Arc<Expr>, usize),
+    /// A table's whole range, for a name that is a table's name.
+    Table(Area),
+    /// Nothing static: an unknown name, a definition that doesn't parse, or one holding a
+    /// relative reference — which moves with the cell that uses the name.
+    Unresolved,
+}
+
+/// One resolved name.
+#[derive(Clone, Debug)]
+struct CachedName {
+    /// The name as written in the formula.
+    name: String,
+    /// The scope of the definition the answer came from, and its text: a cached answer is only
+    /// used for the same definition, so a name edited or re-scoped (a sheet-level name shadowing
+    /// a workbook-level one) is resolved again.
+    scope: Option<usize>,
+    formula: String,
+    target: NameTarget,
+}
+
+/// Resolved definitions of the names formulas use, keyed by the sheet the formula is on.
+///
+/// Walking a graph resolves `Rate` once for every formula that mentions it — a column of 100k
+/// `=Rate*A1` formulas mentions one name 100k times — and parsing a definition each time costs
+/// far more than the rest of the walk. Answers are keyed by (sheet, name) because that is what
+/// the resolution depends on besides the definitions themselves, and each is checked against the
+/// definition found now, so a name whose scope or text changed is resolved again. A table's range
+/// is not cached (tables are few, and a table only moves through a structural edit).
+#[derive(Clone, Debug, Default)]
+pub struct NameCache {
+    by_sheet: std::collections::HashMap<usize, Vec<CachedName>>,
+}
+
+impl NameCache {
+    /// Resolves the name `n` as used from `sheet`: `Sheet1!Name` is looked up on that sheet, a
+    /// bare name on `sheet` (sheet scope first, then workbook scope), and a name that is a
+    /// table's name stands for that table.
+    pub(crate) fn target(&mut self, wb: &Workbook, sheet: usize, n: &str) -> NameTarget {
+        let (scope_sheet, bare) = match n.split_once('!') {
+            Some((s, b)) => match wb.sheet_index(&gridcraft_core::unquote_sheet(s)) {
+                Some(i) => (i, b),
+                None => return NameTarget::Unresolved,
+            },
+            None => (sheet, n),
+        };
+        let Some(def) = wb.name(bare, scope_sheet) else {
+            // A table name alone means its data body. The table's whole range is the dependency:
+            // it is a superset of the body (and of a header or totals row read through it), and
+            // a table only moves or resizes through a structural edit, which rebuilds the graph.
+            return match wb.table(bare).and_then(|(si, ti)| wb.sheet(si).and_then(|s| s.tables.get(ti)).map(|t| (si, t.range))) {
+                Some((si, range)) => NameTarget::Table(Area { sheet: si, range }),
+                None => NameTarget::Unresolved,
+            };
+        };
+        let list = self.by_sheet.entry(sheet).or_default();
+        if let Some(i) = list.iter().position(|c| c.name.eq_ignore_ascii_case(n) && c.scope == def.scope && c.formula == def.formula) {
+            // Most recently used first: the same name is what the next formula reads.
+            let hit = list.remove(i);
+            let target = hit.target.clone();
+            list.insert(0, hit);
+            return target;
+        }
+        let target = resolve_definition(&def.formula, def.scope.unwrap_or(sheet));
+        let scope = def.scope;
+        let formula = def.formula.clone();
+        if list.len() >= MAX_CACHED_NAMES {
+            list.truncate(MAX_CACHED_NAMES - 1);
+        }
+        list.insert(0, CachedName { name: n.to_string(), scope, formula, target: target.clone() });
+        target
+    }
+}
+
+/// The definition of `formula` (a name's `refersTo` text) as a static target, its unqualified
+/// references meaning `scope`.
+fn resolve_definition(formula: &str, scope: usize) -> NameTarget {
+    let Ok(expr) = gridcraft_formula::parse_name(formula) else { return NameTarget::Unresolved };
+    // A relative reference in a name is relative to A1, so it moves by the offset of the cell
+    // that uses the name: no fixed area describes it.
+    if gridcraft_formula::adjust::has_relative_refs(&expr) {
+        return NameTarget::Unresolved;
+    }
+    NameTarget::Definition(std::sync::Arc::new(expr), scope)
+}
+
+/// Whether a definition is a LAMBDA (a name called like a function): what it reads is only
+/// known when it is called, so a formula using it cannot be tied to a fixed area.
+fn is_lambda_definition(e: &Expr) -> bool {
+    matches!(e, Expr::Call(n, _) if n.eq_ignore_ascii_case("LAMBDA"))
+}
+
 /// Collects the static references of an expression with their sheets resolved; `dynamic` is
-/// set when the formula uses INDIRECT/OFFSET/names/tables whose targets can change, and `trim`
-/// when one of its references is read through the used range (see [`trimmed`]).
-pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool, bool) {
+/// set when the formula uses INDIRECT/OFFSET, a volatile function, or a name or table whose
+/// target can move, and `trim` when one of its references is read through the used range (see
+/// [`trimmed`]).
+///
+/// A name that stands for cells is a precedent like a written reference: `Rate` defined as
+/// `Sheet1!$B$1` makes `=Rate*A1` read A1 and B1, so an edit elsewhere does not recalculate it
+/// and an edit of B1 does. `names` keeps the resolved definitions between calls.
+pub fn precedents(names: &mut NameCache, wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool, bool) {
+    precedents_at(names, wb, sheet, e, 0)
+}
+
+/// [`precedents`] at name depth `depth`: a name whose definition is static contributes that
+/// definition's references (`Rate` defined as `Sheet1!$B$1` reads one cell), and only a
+/// definition that can move stays dynamic.
+fn precedents_at(names: &mut NameCache, wb: &Workbook, sheet: usize, e: &Expr, depth: usize) -> (Vec<Area>, bool, bool) {
     let mut out = Vec::new();
     let mut dynamic = false;
     let mut trim = false;
@@ -2061,13 +2179,32 @@ pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool, bo
         {
             dynamic = true
         }
-        Expr::Name(_) | Expr::Struct(_) => dynamic = true,
+        Expr::Name(n) => match names.target(wb, sheet, n) {
+            NameTarget::Definition(def, scope) if depth < MAX_NAME_DEPTH && !is_lambda_definition(&def) => {
+                let (inner, d, t) = precedents_at(names, wb, scope, &def, depth + 1);
+                out.extend(inner);
+                dynamic |= d;
+                trim |= t;
+            }
+            NameTarget::Table(area) => out.push(area),
+            _ => dynamic = true,
+        },
+        // A structured reference is a fixed area unless it depends on the cell it is written in
+        // (a bare `[Column]` binds to the table around it, `[@Column]` to this row) or the
+        // table can't be found. The table's whole range covers every part of it.
+        Expr::Struct(s) if !s.table.is_empty() && !s.specifiers.contains(&StructItem::ThisRow) => {
+            match wb.table(&s.table).and_then(|(si, ti)| wb.sheet(si).and_then(|sh| sh.tables.get(ti)).map(|t| (si, t.range))) {
+                Some((si, range)) => out.push(Area { sheet: si, range }),
+                None => dynamic = true,
+            }
+        }
+        Expr::Struct(_) => dynamic = true,
         Expr::Call(n, _) if gridcraft_functions::lookup(n).is_none() && !is_special(n) => dynamic = true,
         // A range ending in a function's result (`A1:INDEX(B1:B9,n)`) covers the cells between
         // the references inside it, not only those references.
         Expr::Binary(BinOp::Range, a, b) if !matches!((&**a, &**b), (Expr::Ref(_), Expr::Ref(_))) => {
-            let mut inner = precedents(wb, sheet, a).0;
-            inner.extend(precedents(wb, sheet, b).0);
+            let mut inner = precedents_at(names, wb, sheet, a, depth).0;
+            inner.extend(precedents_at(names, wb, sheet, b, depth).0);
             let mut boxes: Vec<Area> = Vec::new();
             for area in inner {
                 match boxes.iter_mut().find(|x| x.sheet == area.sheet) {

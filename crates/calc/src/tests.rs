@@ -28,6 +28,18 @@ impl T {
     fn get(&self, at: &str) -> Value {
         self.wb.sheet(0).unwrap().value(c(at))
     }
+    /// Defines a workbook-scoped name and rebuilds the graph, which is what a name edit does in
+    /// the engine: committing one is a structural edit, so the workbook recalculates.
+    fn define(&mut self, name: &str, formula: &str) {
+        self.wb.names.push(gridcraft_model::DefinedName {
+            name: name.into(),
+            scope: None,
+            formula: formula.into(),
+            comment: String::new(),
+            hidden: false,
+        });
+        self.calc.rebuild(&self.wb);
+    }
     fn num(&self, at: &str) -> f64 {
         self.get(at).as_f64().unwrap_or_else(|| panic!("{at} = {:?}", self.get(at)))
     }
@@ -786,6 +798,119 @@ fn names_and_sheets() {
     t.wb.sheet_mut(1).unwrap().set_value(c("A1"), Value::Number(10.0));
     t.calc.cells_changed(&mut t.wb, &[(1, c("A1"))]);
     assert_eq!(t.num("A1"), 5.0);
+}
+
+#[test]
+fn a_name_that_names_a_cell_is_a_static_precedent() {
+    let mut t = T::new();
+    t.define("Rate", "Sheet1!$B$1");
+    t.set("B1", "2");
+    for row in 1..=50 {
+        t.set(&format!("A{row}"), "1");
+        t.set(&format!("C{row}"), &format!("=Rate*A{row}"));
+    }
+    assert_eq!(t.num("C1"), 2.0);
+    // An edit the name doesn't cover recalculates only what depends on that cell — with the name
+    // dynamic it recalculated all 50.
+    t.set("Z9", "5");
+    assert_eq!(t.calc.last_recalc_cells, 0, "an unrelated edit recalculated {} formulas", t.calc.last_recalc_cells);
+    t.set("A5", "3");
+    assert_eq!(t.calc.last_recalc_cells, 1, "editing A5 recalculated {} formulas", t.calc.last_recalc_cells);
+    assert_eq!(t.num("C5"), 6.0);
+    // The cell the name names recalculates every formula that uses the name.
+    t.set("B1", "4");
+    assert_eq!(t.calc.last_recalc_cells, 50, "editing the named cell recalculated {} formulas", t.calc.last_recalc_cells);
+    assert_eq!((t.num("C1"), t.num("C50")), (4.0, 4.0));
+}
+
+#[test]
+fn a_name_that_can_move_keeps_its_users_dynamic() {
+    // Definitions the graph cannot tie to a fixed area: INDIRECT and OFFSET work out their
+    // target while evaluating, a volatile function changes without any edit, a relative
+    // reference moves with the cell that uses the name, a LAMBDA body reads only when it is
+    // called, and an unresolvable name may come back as a table or a sheet-scoped name.
+    for def in ["INDIRECT(\"Sheet1!$B$1\")", "OFFSET(Sheet1!$B$1,0,0)", "TODAY()", "Sheet1!B1", "LAMBDA(x,x*2)", "NotDefinedAnywhere"] {
+        let mut t = T::new();
+        t.define("Rate", def);
+        t.set("B1", "2");
+        t.set("C1", "=Rate*1");
+        t.set("D1", "=1");
+        t.calc.last_recalc_cells = 0;
+        // An edit nobody named still recalculates a formula whose reference can move.
+        t.set("Z9", "5");
+        assert_eq!(t.calc.last_recalc_cells, 1, "a formula using \"{def}\" should stay dynamic");
+    }
+}
+
+#[test]
+fn names_that_ring_each_other_are_dynamic_and_the_walk_ends() {
+    // A file can define names in a ring; following definitions has a depth cap, so the walk ends
+    // (and the formula stays dynamic, because what it reads can't be resolved).
+    let mut t = T::new();
+    t.define("Loop1", "Loop2");
+    t.define("Loop2", "Loop1");
+    t.set("C1", "=Loop1");
+    t.set("Z9", "5");
+    assert_eq!(t.calc.last_recalc_cells, 1);
+}
+
+#[test]
+fn a_name_defined_as_another_name_reads_what_that_one_reads() {
+    let mut t = T::new();
+    t.define("Step", "Sheet1!$B$1");
+    t.define("Rate", "Step");
+    t.set("B1", "2");
+    t.set("A1", "10");
+    t.set("C1", "=Rate*A1");
+    assert_eq!(t.num("C1"), 20.0);
+    // The cell at the end of the chain recalculates the formula; an unrelated edit does not.
+    t.set("B1", "3");
+    assert_eq!(t.num("C1"), 30.0);
+    t.calc.last_recalc_cells = 0;
+    t.set("Z9", "5");
+    assert_eq!(t.calc.last_recalc_cells, 0);
+}
+
+#[test]
+fn a_structured_reference_is_a_static_precedent() {
+    let mut t = T::new();
+    for (at, v) in [("A1", "Amt"), ("B1", "Qty"), ("A2", "10"), ("B2", "2"), ("A3", "20"), ("B3", "3")] {
+        t.set(at, v);
+    }
+    let column = |name: &str| gridcraft_model::TableColumn {
+        name: name.into(),
+        totals: Default::default(),
+        totals_label: None,
+        formula: None,
+        unique_name: None,
+        xml: None,
+    };
+    t.wb.sheet_mut(0).unwrap().tables.push(gridcraft_model::Table {
+        id: 1,
+        name: "Sales".into(),
+        range: gridcraft_core::RangeRef::new(c("A1"), c("B3")),
+        header_row: true,
+        totals_row: false,
+        columns: vec![column("Amt"), column("Qty")],
+        style: String::new(),
+        banded_rows: false,
+        banded_cols: false,
+        first_col: false,
+        last_col: false,
+        filter_button: false,
+        filter: vec![],
+        table_type: None,
+        connection_id: None,
+    });
+    t.calc.rebuild(&t.wb);
+    t.set("D1", "=SUM(Sales[Amt])");
+    t.set("D2", "=SUM(Sales[Qty])");
+    assert_eq!((t.num("D1"), t.num("D2")), (30.0, 5.0));
+    t.set("A3", "200");
+    assert_eq!(t.num("D1"), 210.0);
+    t.calc.last_recalc_cells = 0;
+    t.set("Z9", "5");
+    assert_eq!(t.calc.last_recalc_cells, 0);
 }
 
 #[test]

@@ -749,6 +749,39 @@ mod tests {
         assert_eq!(r["refersTo"], "=Sheet1!$A$1");
     }
 
+    /// A formula that uses a name follows the name: the cell the definition names is a
+    /// precedent, and editing, renaming or deleting the name recalculates the workbook (a name
+    /// edit commits as a structural edit).
+    #[test]
+    fn formulas_follow_a_name_that_is_edited_renamed_or_deleted() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1:B2", "values": [[2, 10], [3, 20]]})).unwrap();
+        s.execute("formulas.defineName", json!({"name": "Rate", "refersTo": "=Sheet1!$B$1"})).unwrap();
+        s.execute("cell.set", json!({"cell": "C1", "input": "=Rate*2"})).unwrap();
+        let v = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap()["value"].clone();
+        assert_eq!(v(&mut s, "C1"), json!(20.0));
+        // The cell the definition names is a precedent: editing it updates the formula.
+        s.execute("cell.set", json!({"cell": "B1", "input": "5"})).unwrap();
+        assert_eq!(v(&mut s, "C1"), json!(10.0));
+        // Repointing the name (Name Manager › Edit) recalculates it too.
+        s.execute("formulas.defineName", json!({"name": "Rate", "refersTo": "=Sheet1!$B$2", "oldName": "Rate"})).unwrap();
+        assert_eq!(v(&mut s, "C1"), json!(40.0));
+        s.execute("cell.set", json!({"cell": "B2", "input": "7"})).unwrap();
+        assert_eq!(v(&mut s, "C1"), json!(14.0));
+        // Renaming it takes the formula with it, and the new definition is the precedent.
+        s.execute("formulas.defineName", json!({"name": "Rate2", "refersTo": "=Sheet1!$B$2", "oldName": "Rate"})).unwrap();
+        assert_eq!(v(&mut s, "C1"), json!(14.0));
+        s.execute("cell.set", json!({"cell": "B2", "input": "8"})).unwrap();
+        assert_eq!(v(&mut s, "C1"), json!(16.0));
+        // Deleting it leaves the formula without a definition.
+        s.execute("formulas.deleteName", json!({"name": "Rate2"})).unwrap();
+        assert_eq!(v(&mut s, "C1"), json!({"error": "#NAME?"}));
+        // ... and defining it again brings the value back.
+        s.execute("formulas.defineName", json!({"name": "Rate2", "refersTo": "=Sheet1!$B$2"})).unwrap();
+        assert_eq!(v(&mut s, "C1"), json!(16.0));
+    }
+
     #[test]
     fn arabic_defined_names_count_characters_not_bytes() {
         let mut s = Session::new();
