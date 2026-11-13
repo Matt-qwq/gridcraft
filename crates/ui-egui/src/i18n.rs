@@ -343,6 +343,31 @@ fn name_sort_key(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// What the filter menu and the save prompt say. An older installed build shipped these in
+    /// English; they are the first two places a Chinese user meets, so a missing key here is a
+    /// visible regression, not a polish item.
+    #[test]
+    fn the_filter_menu_and_the_save_prompt_speak_chinese() {
+        for english in [
+            "↑  Sort Ascending",
+            "↓  Sort Descending",
+            "Filter",
+            "Search",
+            "(Select All)",
+            "(Select All Search Results)",
+            "Only the first {n} values are listed.",
+            "Clear Filter",
+            "Apply",
+            "Do you want to save the changes you made to {title}?",
+            "Don't Save",
+            "Save",
+            "Cancel",
+        ] {
+            let text = zh::translate(english).unwrap_or_else(|| panic!("no Simplified Chinese for {english:?}"));
+            assert!(text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "{english:?} is not Chinese: {text:?}");
+        }
+    }
+
     /// Help tables are sorted, unique, and keyed by text the function catalog still has.
     #[test]
     fn function_help_is_sorted_and_keyed_by_current_catalog_text() {
