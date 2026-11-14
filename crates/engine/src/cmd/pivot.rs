@@ -207,6 +207,24 @@ pub fn specs() -> Vec<CommandSpec> {
             change_source
         ),
         cmd!(
+            "pivot.showDetails",
+            "Show Details",
+            ["PivotTable Analyze", "Active Field"],
+            None,
+            "{cell?: \"A5\" (a value cell of the report; default: the active cell when it is in the report, else the report's corner), pivot?} writes the source records behind that cell into a new sheet placed right after the PivotTable's, named from the cell's items (\"East\", \"East - Jan\", suffixed when taken), as one undo step → {sheet, name, title, rows, cells, skipped}; a leaf cell writes its records, a subtotal its group's and a grand total every record the filters pass, and the sheet holds at most 12,000,000 cells (a wide source writes fewer rows; `skipped` counts the records the cap left out)",
+            has_doc,
+            show_details
+        ),
+        cmd!(
+            "pivot.getPivotData",
+            "Generate GetPivotData",
+            ["PivotTable Analyze", "PivotTable"],
+            None,
+            "{pivot?, on?: bool, cell?: \"B5\"} Excel's Options ▸ Generate GetPivotData (on by default): with `on`, clicking a value of the report while a formula is being typed inserts =GETPIVOTDATA(\"Sum of Sales\", $A$3, \"Region\", \"East\", ...) — the field/item pairs the report draws — instead of a plain reference; without `on` it reports {pivot, on, cell, formula?} (the formula a click on `cell`, default the report's corner, inserts). Kept on the PivotTable in our own document format; a .xlsx save/reopen brings back the default",
+            has_doc,
+            generate_get_pivot_data
+        ),
+        cmd!(
             "pivot.delete",
             "Delete PivotTable",
             ["PivotTable Analyze", "Actions"],
@@ -1961,6 +1979,135 @@ fn recommended(s: &mut Session, p: &Json) -> Result<Json> {
     Ok(res)
 }
 
+// ---------------------------------------------------------------- Show Details / GetPivotData
+
+/// A fresh sheet name for a Show Details sheet: the item path under Excel's naming rules, with a
+/// numeric suffix when that name is taken (`East`, `East (2)`, ...).
+fn detail_sheet_name(wb: &Workbook, title: &str) -> String {
+    let clean = |s: &str| -> String {
+        // Excel's invalid sheet-name characters, plus the apostrophe rule.
+        let kept: String =
+            s.chars().take(31).map(|c| if matches!(c, ':' | '/' | '?' | '*' | '[' | ']') || c as u32 == 92 { '-' } else { c }).collect();
+        kept.trim().trim_matches('\'').to_string()
+    };
+    let base = clean(title);
+    let base = if base.is_empty() { "Details".to_string() } else { base };
+    // "History" is a reserved sheet name, so it counts as taken.
+    let taken = |n: &str| wb.sheet_index(n).is_some() || n.eq_ignore_ascii_case("History");
+    if !taken(&base) {
+        return base;
+    }
+    for k in 2..10_000u32 {
+        let suffix = format!(" ({k})");
+        let room = 31usize.saturating_sub(suffix.chars().count()).max(1);
+        let head: String = base.chars().take(room).collect();
+        let n = format!("{}{suffix}", head.trim_end());
+        if !taken(&n) {
+            return n;
+        }
+    }
+    wb.next_sheet_name()
+}
+
+/// Excel's Show Details: writes the source records behind one report cell into a new sheet right
+/// after the PivotTable's, as one undo step.
+fn show_details(s: &mut Session, p: &Json) -> Result<Json> {
+    if s.doc()?.wb.protected_structure {
+        return Err(other("The workbook is protected and cannot be changed."));
+    }
+    let (si, pi) = find_pivot(s, p)?;
+    let (detail, name) = {
+        let d = s.doc()?;
+        let wb = &d.wb;
+        let sh = wb.sheet(si).ok_or(EngineError::NoDocument)?;
+        let pt = sh.pivots.get(pi).ok_or_else(|| other("There's no such PivotTable."))?;
+        // The cell: `cell`, else the active cell when it is in the report, else its corner.
+        let active = d.selection.active;
+        let at = cell_param_on(s, p, "cell", si)?.unwrap_or_else(|| {
+            if pt.last_range.is_some_and(|r| r.contains(active)) { active } else { pt.last_range.map(|r| r.start).unwrap_or(pt.anchor) }
+        });
+        let detail = pv::details(wb, pt, si, at).map_err(other)?;
+        let name = detail_sheet_name(wb, &detail.title);
+        (detail, name)
+    };
+    let rows = detail.rows.len();
+    let cells = (rows as u64 + 1).saturating_mul(detail.headers.len() as u64);
+    let skipped = detail.skipped;
+    let title = detail.title.clone();
+    let idx = edit(s, |cx| {
+        if cx.wb.protected_structure {
+            return Err(other("The workbook is protected and cannot be changed."));
+        }
+        let at = si.saturating_add(1).min(cx.wb.sheets.len());
+        cx.wb.sheets.insert(at, Arc::new(Sheet::new(name.clone())));
+        // Names scoped to later sheets shift.
+        for n in cx.wb.names.iter_mut() {
+            if let Some(sc) = n.scope.as_mut()
+                && *sc >= at
+            {
+                *sc += 1;
+            }
+        }
+        // One style per source column, so dates and currency look like the source list.
+        let styles: Vec<StyleId> = detail
+            .formats
+            .iter()
+            .map(|f| if f == "General" { StyleId::default() } else { cx.wb.styles.intern(Style { num_fmt: NumFmt::new(f), ..Default::default() }) })
+            .collect();
+        let sh = cx.sheet_mut(at)?;
+        for (c, h) in detail.headers.iter().enumerate() {
+            let Ok(col) = u32::try_from(c) else { break };
+            sh.set_cell(CellRef::new(0, col), Cell { value: Value::text(h.as_str()), formula: None, style: StyleId::default() });
+        }
+        for (r, rec) in detail.rows.iter().enumerate() {
+            let Ok(row) = u32::try_from(r) else { break };
+            for (c, v) in rec.iter().enumerate() {
+                if v.is_empty() {
+                    continue;
+                }
+                let Ok(col) = u32::try_from(c) else { break };
+                let style = styles.get(c).copied().unwrap_or_default();
+                sh.set_cell(CellRef::new(row.saturating_add(1), col), Cell { value: v.clone(), formula: None, style });
+            }
+        }
+        cx.wb.active_sheet = at;
+        *cx.sel = crate::Selection::default();
+        cx.structural = true;
+        Ok(at)
+    })?;
+    {
+        let d = s.doc_mut()?;
+        d.sheet_selections.insert(idx.min(d.sheet_selections.len()), crate::Selection::default());
+    }
+    Ok(json!({"sheet": idx, "name": name, "title": title, "rows": rows, "cells": cells, "skipped": skipped}))
+}
+
+/// Excel's "Options > Generate GetPivotData": a toggle (`on`) and a getter, remembered on the
+/// PivotTable, so a click on a report value while a formula is being typed inserts a
+/// `GETPIVOTDATA` call instead of a plain reference.
+fn generate_get_pivot_data(s: &mut Session, p: &Json) -> Result<Json> {
+    if let Some(on) = p.get("on").and_then(Json::as_bool) {
+        let (si, pi) = find_pivot(s, p)?;
+        return edit(s, |cx| {
+            let pt = cx.sheet_mut(si)?.pivots.get_mut(pi).ok_or_else(|| other("There's no such PivotTable."))?;
+            pt.generate_get_pivot_data = on;
+            Ok(json!({"on": on, "pivot": pt.name.clone()}))
+        });
+    }
+    let (si, pi) = find_pivot(s, p)?;
+    let d = s.doc()?;
+    let wb = &d.wb;
+    let sh = wb.sheet(si).ok_or(EngineError::NoDocument)?;
+    let pt = sh.pivots.get(pi).ok_or_else(|| other("There's no such PivotTable."))?;
+    let at = cell_param_on(s, p, "cell", si)?.or_else(|| pt.last_range.map(|r| r.start)).unwrap_or(pt.anchor);
+    let mut out = json!({"pivot": pt.name, "on": pt.generate_get_pivot_data, "cell": at.a1()});
+    if pt.generate_get_pivot_data
+        && let Some(f) = pv::get_pivot_data(wb, si, at)
+    {
+        out["formula"] = json!(format!("={f}"));
+    }
+    Ok(out)
+}
 #[cfg(test)]
 mod tests {
     use gridcraft_core::{CellError, CellRef, Value};
@@ -2932,5 +3079,278 @@ mod tests {
         assert_eq!(l[0]["source"], "Sheet1!A3:E15");
         assert_eq!(l[0]["anchor"], "A3");
         s.execute("pivot.refresh", json!({"pivot": "PivotTable1"})).unwrap();
+    }
+
+    // ------------------------------------------------------ Show Details / GetPivotData
+
+    /// Region, Month, Product, Sales — 4 records, and a "Report" sheet to pivot onto.
+    fn drill_session() -> Session {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute(
+            "range.setValues",
+            json!({"range": "A1", "values": [
+                ["Region", "Month", "Product", "Sales"],
+                ["East", "Jan", "Apples", 100.0],
+                ["East", "Feb", "Pears", 150.0],
+                ["West", "Jan", "Apples", 200.0],
+                ["West", "Feb", "Pears", 250.0],
+            ]}),
+        )
+        .unwrap();
+        s.execute("selection.set", json!({"range": "A1"})).unwrap();
+        s.execute("home.insertSheet", json!({"name": "Report"})).unwrap();
+        s
+    }
+
+    /// The sheet names, in order.
+    fn names(s: &Session) -> Vec<String> {
+        s.doc().unwrap().wb.sheets.iter().map(|sh| sh.name.clone()).collect()
+    }
+
+    /// Every cell of a sheet's used range, as text.
+    fn sheet_text(s: &Session, name: &str) -> Vec<Vec<String>> {
+        let d = s.doc().unwrap();
+        let Some(sh) = d.wb.sheet_index(name).and_then(|i| d.wb.sheet(i)) else { return vec![] };
+        let Some(r) = sh.used_range() else { return vec![] };
+        (r.start.row..=r.end.row).map(|row| (r.start.col..=r.end.col).map(|col| sh.value(CellRef::new(row, col)).display()).collect()).collect()
+    }
+
+    /// A cell of the pivot's own sheet, whatever the active sheet is.
+    fn report_val(s: &Session, cell: &str) -> Value {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet_index("Report").and_then(|i| d.wb.sheet(i)).unwrap();
+        sh.value(CellRef::parse(cell).unwrap())
+    }
+
+    /// The report row whose first label cell reads `label`.
+    fn report_row(s: &Session, label: &str) -> u32 {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet_index("Report").and_then(|i| d.wb.sheet(i)).unwrap();
+        let r = sh.pivots.first().and_then(|p| p.last_range).unwrap();
+        let row = (r.start.row..=r.end.row).find(|row| sh.value(CellRef::new(*row, r.start.col)).display() == label);
+        row.unwrap()
+    }
+
+    #[test]
+    fn show_details_writes_the_source_rows_behind_a_value_cell() {
+        let mut s = drill_session();
+        s.execute(
+            "insert.pivotTable",
+            json!({"source": "Sheet1!A1:D5", "destination": "Report!A3", "name": "P1", "rows": ["Region"], "columns": ["Month"], "values": ["Sales"]}),
+        )
+        .unwrap();
+        // The items sort by their labels (our default is ascending), so Feb comes before Jan.
+        assert_eq!(report_val(&s, "A5"), Value::text("East"));
+        assert_eq!(report_val(&s, "B5"), Value::Number(150.0));
+        let r = s.execute("pivot.showDetails", json!({"cell": "B5"})).unwrap();
+        assert_eq!(r["name"], "East - Feb");
+        assert_eq!(r["rows"], 1);
+        assert_eq!(r["cells"], 8);
+        // The new sheet follows the pivot's, the source's header row first, then the record.
+        assert_eq!(names(&s), ["Sheet1", "Report", "East - Feb"]);
+        assert_eq!(
+            sheet_text(&s, "East - Feb"),
+            vec![
+                vec!["Region".to_string(), "Month".into(), "Product".into(), "Sales".into()],
+                vec!["East".into(), "Feb".into(), "Pears".into(), "150".into()],
+            ]
+        );
+        // The new sheet is active now, so a second call names its PivotTable.
+        // A label cell is not a value cell: the command says so instead of writing a guess.
+        let e = s.execute("pivot.showDetails", json!({"pivot": "P1", "cell": "A5"})).unwrap_err().to_string();
+        assert!(e.contains("value cell"), "{e}");
+        let e = s.execute("pivot.showDetails", json!({"pivot": "P1", "cell": "A1"})).unwrap_err().to_string();
+        assert!(e.contains("outside"), "{e}");
+    }
+
+    #[test]
+    fn show_details_emits_a_subtotal_group_and_the_records_a_filter_passes() {
+        let mut s = drill_session();
+        s.execute(
+            "insert.pivotTable",
+            json!({"source": "Sheet1!A1:D5", "destination": "Report!A3", "name": "P1", "rows": ["Region", "Month"], "values": ["Sales"]}),
+        )
+        .unwrap();
+        s.execute("pivot.subtotals", json!({"pivot": "P1", "mode": "bottom"})).unwrap();
+        let total = report_row(&s, "East Total");
+        let cell = CellRef::new(total, 1).a1();
+        assert_eq!(report_val(&s, &cell), Value::Number(250.0));
+        let r = s.execute("pivot.showDetails", json!({"cell": cell.clone()})).unwrap();
+        assert_eq!(r["name"], "East");
+        assert_eq!(r["rows"], 2, "the subtotal holds East's two records");
+        assert_eq!(
+            sheet_text(&s, "East")[1..],
+            [
+                vec!["East".to_string(), "Jan".into(), "Apples".into(), "100".into()],
+                vec!["East".to_string(), "Feb".into(), "Pears".into(), "150".into()]
+            ]
+        );
+        // A page filter narrows the grand total to the records it passes.
+        s.execute("pivot.filter", json!({"pivot": "P1", "field": "Product", "selected": ["Apples"]})).unwrap();
+        s.execute("pivot.refresh", json!({"pivot": "P1"})).unwrap();
+        let grand = report_row(&s, "Grand Total");
+        let cell = CellRef::new(grand, 1).a1();
+        assert_eq!(report_val(&s, &cell), Value::Number(300.0));
+        let r = s.execute("pivot.showDetails", json!({"pivot": "P1", "cell": cell})).unwrap();
+        assert_eq!(r["name"], "Details");
+        assert_eq!(r["rows"], 2);
+        assert_eq!(
+            sheet_text(&s, "Details")[1..],
+            [
+                vec!["East".to_string(), "Jan".into(), "Apples".into(), "100".into()],
+                vec!["West".to_string(), "Jan".into(), "Apples".into(), "200".into()]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_show_details_sheet_is_capped_by_cells() {
+        let mut s = drill_session();
+        s.execute(
+            "insert.pivotTable",
+            json!({"source": "Sheet1!A1:D5", "destination": "Report!A3", "name": "P1", "rows": ["Region"], "values": ["Sales"]}),
+        )
+        .unwrap();
+        let cell = CellRef::new(report_row(&s, "Grand Total"), 1);
+        let d = s.doc().unwrap();
+        let pt = d.wb.sheet_index("Report").and_then(|i| d.wb.sheet(i)).and_then(|sh| sh.pivots.first()).unwrap();
+        // The cap counts cells: an eight-cell sheet over four columns holds two records.
+        let detail = crate::pivot::details_with_cap(&d.wb, pt, d.wb.sheet_index("Report").unwrap(), cell, 8).unwrap();
+        assert_eq!(detail.rows.len(), 2);
+        assert_eq!(detail.skipped, 2);
+        // The command's own cap: 12,000,000 cells, and never more rows than a sheet has.
+        assert_eq!(crate::pivot::detail_row_cap(4, crate::pivot::MAX_DETAIL_CELLS), gridcraft_core::MAX_ROWS as u64 - 1);
+        assert_eq!(crate::pivot::detail_row_cap(160, crate::pivot::MAX_DETAIL_CELLS), 75_000);
+    }
+
+    #[test]
+    fn show_details_is_one_undo_step_and_does_not_reuse_a_name() {
+        let mut s = drill_session();
+        s.execute(
+            "insert.pivotTable",
+            json!({"source": "Sheet1!A1:D5", "destination": "Report!A3", "name": "P1", "rows": ["Region"], "columns": ["Month"], "values": ["Sales"]}),
+        )
+        .unwrap();
+        s.execute("pivot.showDetails", json!({"cell": "B5"})).unwrap();
+        assert_eq!(names(&s), ["Sheet1", "Report", "East - Feb"]);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(names(&s), ["Sheet1", "Report"]);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(names(&s), ["Sheet1", "Report", "East - Feb"]);
+        // The sheet name is taken now: the next one gets a suffix.
+        s.execute("pivot.showDetails", json!({"pivot": "P1", "cell": "B5"})).unwrap();
+        assert_eq!(names(&s), ["Sheet1", "Report", "East - Feb (2)", "East - Feb"]);
+    }
+
+    /// Sets `formula` on Sheet1!F1 and returns what it evaluated to.
+    fn gpd(s: &mut Session, formula: &str) -> Value {
+        s.execute("cell.set", json!({"sheet": "Sheet1", "cell": "F1", "input": format!("={formula}")})).unwrap();
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet_index("Sheet1").and_then(|i| d.wb.sheet(i)).unwrap();
+        sh.value(CellRef::parse("F1").unwrap())
+    }
+
+    #[test]
+    fn a_click_on_a_report_value_composes_a_getpivotdata_that_shows_the_same_number() {
+        let mut s = drill_session();
+        s.execute(
+            "insert.pivotTable",
+            json!({"source": "Sheet1!A1:D5", "destination": "Report!A3", "name": "P1", "rows": ["Region"], "columns": ["Month"], "values": ["Sales"]}),
+        )
+        .unwrap();
+        let formula = |s: &Session, cell: &str| -> String {
+            let d = s.doc().unwrap();
+            crate::pivot::get_pivot_data(&d.wb, d.wb.sheet_index("Report").unwrap(), CellRef::parse(cell).unwrap()).unwrap()
+        };
+        // The pairs are the labels the report draws.
+        assert_eq!(formula(&s, "B5"), "GETPIVOTDATA(\"Sum of Sales\", Report!$A$3, \"Region\", \"East\", \"Month\", \"Feb\")");
+        // A leaf, a grand-total column, a grand-total row and the corner: same number, through calc.
+        for cell in ["B5", "C6", "D5", "B7", "D7"] {
+            let f = formula(&s, &cell);
+            assert_eq!(gpd(&mut s, &f), report_val(&s, cell), "{cell}: {f}");
+        }
+        // With the option off the click writes a plain reference instead.
+        s.execute("pivot.getPivotData", json!({"pivot": "P1", "on": false})).unwrap();
+        // The option is remembered in our own document format (the XLSX writer has no slot for
+        // it, so that format brings back Excel's default, on).
+        {
+            let wb = (*s.doc().unwrap().wb).clone();
+            let bytes = crate::io::save_bytes(&wb, "book.json").unwrap();
+            let (back, _) = crate::io::open_bytes("book.json", &bytes).unwrap();
+            assert!(!back.sheet(1).unwrap().pivots[0].generate_get_pivot_data);
+        }
+        {
+            let d = s.doc().unwrap();
+            let pt = d.wb.sheet_index("Report").and_then(|i| d.wb.sheet(i)).and_then(|sh| sh.pivots.first()).unwrap();
+            assert!(!pt.generate_get_pivot_data);
+            let si = d.wb.sheet_index("Report").unwrap();
+            assert!(crate::pivot::click_reference(&d.wb, si, CellRef::parse("B5").unwrap()).is_none());
+        }
+        let r = s.execute("pivot.getPivotData", json!({"pivot": "P1", "on": true})).unwrap();
+        assert_eq!(r["on"], true);
+        // The getter answers what a click would insert (the plain reference is the UI's fallback).
+        let r = s.execute("pivot.getPivotData", json!({"pivot": "P1", "cell": "B5"})).unwrap();
+        assert_eq!(r["on"], true);
+        assert_eq!(r["formula"], format!("={}", formula(&s, "B5")));
+        {
+            let d = s.doc().unwrap();
+            let si = d.wb.sheet_index("Report").unwrap();
+            // A label cell of the report is not a value cell.
+            assert!(crate::pivot::click_reference(&d.wb, si, CellRef::parse("A5").unwrap()).is_none());
+        }
+        // A nested report: every value cell — a leaf, a subtotal, a grand total — composes a call
+        // that evaluates to the number it shows.
+        s.execute(
+            "insert.pivotTable",
+            json!({"source": "Sheet1!A1:D5", "destination": "Report!K3", "name": "P2", "rows": ["Region", "Month"], "columns": ["Product"], "values": ["Sales"]}),
+        )
+        .unwrap();
+        s.execute("pivot.subtotals", json!({"pivot": "P2", "mode": "bottom"})).unwrap();
+        let sweep = {
+            let d = s.doc().unwrap();
+            let si = d.wb.sheet_index("Report").unwrap();
+            let sh = d.wb.sheet(si).unwrap();
+            let pt = sh.pivots.iter().find(|p| p.name == "P2").unwrap();
+            let area = pt.last_range.unwrap();
+            let mut v = Vec::new();
+            for row in area.start.row..=area.end.row {
+                for col in area.start.col..=area.end.col {
+                    let at = CellRef::new(row, col);
+                    if let Some(f) = crate::pivot::get_pivot_data(&d.wb, si, at) {
+                        v.push((at.a1(), f, sh.value(at)));
+                    }
+                }
+            }
+            v
+        };
+        let live: Vec<(String, String, Value)> = sweep.into_iter().filter(|(_, _, v)| !v.is_empty()).collect();
+        assert!(live.len() >= 8, "a report with subtotals and totals has values: {live:?}");
+        for (cell, f, shown) in &live {
+            assert_eq!(&gpd(&mut s, f), shown, "{cell}: {f}");
+        }
+    }
+
+    #[test]
+    fn a_show_details_sheet_survives_a_save_and_reopen() {
+        let mut s = drill_session();
+        s.execute(
+            "insert.pivotTable",
+            json!({"source": "Sheet1!A1:D5", "destination": "Report!A3", "name": "P1", "rows": ["Region"], "columns": ["Month"], "values": ["Sales"]}),
+        )
+        .unwrap();
+        s.execute("pivot.showDetails", json!({"cell": "B5"})).unwrap();
+        let before = sheet_text(&s, "East - Feb");
+        let wb = (*s.doc().unwrap().wb).clone();
+        let bytes = crate::io::save_bytes(&wb, "book.xlsx").unwrap();
+        let (back, _) = crate::io::open_bytes("book.xlsx", &bytes).unwrap();
+        let i = back.sheet_index("East - Feb").unwrap();
+        assert_eq!(i, 2, "the sheet stays right after the pivot's");
+        let sh = back.sheet(i).unwrap();
+        assert_eq!(sh.value(CellRef::new(0, 0)), Value::text("Region"));
+        assert_eq!(sh.value(CellRef::new(1, 0)), Value::text("East"));
+        assert_eq!(sh.value(CellRef::new(1, 3)), Value::Number(150.0));
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[1][2], "Pears");
     }
 }

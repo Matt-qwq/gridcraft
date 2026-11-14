@@ -2731,11 +2731,18 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 c
             };
             let range = RangeRef::new(anchor, c);
-            let text = if range.is_single() { c.a1() } else { range.a1() };
-            let sheet_name = (ed.sheet != wb.active_sheet).then(|| sh.name.clone());
-            let r = match sheet_name {
-                Some(n) => format!("{}!{text}", gridcraft_engine::formula::quote_sheet(&n)),
-                None => text,
+            // Excel's "Generate GetPivotData": a click on a value of a PivotTable report inserts a
+            // GETPIVOTDATA call naming the cell's items instead of a plain reference.
+            let pivot_ref = range.is_single().then(|| gridcraft_engine::pivot::click_reference(wb, wb.active_sheet, c)).flatten();
+            let r = match pivot_ref {
+                Some(f) => f,
+                None => {
+                    let text = if range.is_single() { c.a1() } else { range.a1() };
+                    match (ed.sheet != wb.active_sheet).then(|| sh.name.clone()) {
+                        Some(n) => format!("{}!{text}", gridcraft_engine::formula::quote_sheet(&n)),
+                        None => text,
+                    }
+                }
             };
             if mods.command && !mods.shift {
                 ed.append_ref(&r);

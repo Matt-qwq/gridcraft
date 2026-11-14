@@ -321,6 +321,8 @@ pub const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("pivot.sort", "PivotTable Analyze", "Sort", "Sort"),
     ("pivot.group", "PivotTable Analyze", "Group", "Group Field"),
     ("pivot.collapse", "PivotTable Analyze", "Active Field", "Collapse Field"),
+    ("pivot.showDetails", "PivotTable Analyze", "Active Field", "Show Details"),
+    ("pivot.getPivotData", "PivotTable Analyze", "PivotTable", "Options"),
     ("pivot.delete", "PivotTable Analyze", "Actions", "Clear All"),
 ];
 

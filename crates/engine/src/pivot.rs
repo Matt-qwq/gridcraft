@@ -666,7 +666,7 @@ impl OutCell {
 }
 
 /// A computed report: a dense grid relative to its top-left, with row kinds.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Output {
     pub grid: Vec<Vec<OutCell>>,
     pub row_kinds: Vec<RowKind>,
@@ -679,6 +679,26 @@ pub struct Output {
     pub chart_cols: Vec<(u32, String)>,
     /// Grid column holding the innermost row labels (`None` without row fields).
     pub label_col: Option<u32>,
+    /// Columns of row labels before the data columns.
+    pub label_cols: u32,
+    /// Source column of each row field and column field the report kept from the source.
+    pub row_fields: Vec<String>,
+    pub col_fields: Vec<String>,
+    /// Captions of each field's items; a report path holds these indexes.
+    pub row_items: Vec<Vec<String>>,
+    pub col_items: Vec<Vec<String>>,
+    /// Per grid row: the row-field items the line stands for (empty on a total line).
+    pub row_paths: Vec<Vec<u32>>,
+    /// Per grid row: the value field the line holds when Σ Values sits in Rows.
+    pub row_values: Vec<Option<usize>>,
+    /// Per data column (the columns right of `label_cols`): the column-field items it stands for.
+    pub col_paths: Vec<Vec<u32>>,
+    /// Per data column: the value field it holds (Σ Values in Rows names it on the line instead).
+    pub col_values: Vec<Option<usize>>,
+    /// Per data column: it is the grand-total column, not an item of the column fields.
+    pub col_grand: Vec<bool>,
+    /// Caption of each value field, in data-column order.
+    pub value_names: Vec<String>,
 }
 
 impl Output {
@@ -688,6 +708,14 @@ impl Output {
     /// Value at (row, col) relative to the top-left.
     pub fn value(&self, r: usize, c: usize) -> Value {
         self.grid.get(r).and_then(|row| row.get(c)).map(|x| x.value.clone()).unwrap_or_default()
+    }
+    /// (grid row, grid column, data column) of a cell of the report written at `origin` (its
+    /// top-left). `None` left of the data columns or outside the grid.
+    fn grid_pos(&self, origin: CellRef, at: CellRef) -> Option<(usize, usize, usize)> {
+        let r = at.row.checked_sub(origin.row)? as usize;
+        let c = at.col.checked_sub(origin.col)? as usize;
+        let j = c.checked_sub(self.label_cols as usize)?;
+        Some((r, c, j))
     }
 }
 
@@ -1057,6 +1085,12 @@ impl Lookup<'_> {
 
 /// Computes a PivotTable report from the workbook.
 pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Output, String> {
+    compute_with_source(wb, pt, pivot_sheet).map(|(out, _)| out)
+}
+
+/// `compute`, also handing back the source list it read: Show Details writes the records the
+/// source holds, so it needs them and not a second read of the sheet.
+pub fn compute_with_source(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<(Output, Source), String> {
     let src = read_source(wb, &pt.source, pivot_sheet)?;
     let fmt_of = |c: usize| src.formats.get(c).cloned().unwrap_or_else(|| "General".into());
     let rows: Vec<(usize, &PivotField)> = pt.rows.iter().filter_map(|f| src.col(&f.source_col).map(|c| (c, f))).collect();
@@ -1289,15 +1323,7 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     if empty {
         let r = g.push_row(RowKind::Placeholder)?;
         g.set(r, 0, Value::text(format!("{} — choose fields", pt.name)), CellKind::Placeholder, 0, None);
-        return Ok(Output {
-            width: g.width as u32,
-            grid: g.rows,
-            row_kinds: g.kinds,
-            body_offset,
-            chart_rows: vec![],
-            chart_cols: vec![],
-            label_col: None,
-        });
+        return Ok((Output { width: g.width as u32, grid: g.rows, row_kinds: g.kinds, body_offset, ..Output::default() }, src));
     }
 
     let val_name = |vi: usize| vals.get(vi).map(|(_, v)| v.name.clone()).unwrap_or_default();
@@ -1454,6 +1480,7 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     } else {
         Some(row_levels.saturating_sub(1) as u32)
     };
+    let first_line = g.rows.len();
     for line in &lines {
         let rk = match line.kind {
             LineKind::Item(b) => RowKind::Item(b),
@@ -1524,7 +1551,50 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
             g.set(r, l + j, shown, ck.1, 0, data_fmt.get(*vi).cloned().flatten());
         }
     }
-    Ok(Output { width: g.width as u32, grid: g.rows, row_kinds: g.kinds, body_offset, chart_rows, chart_cols, label_col })
+    // ---- what each written cell stands for (Show Details, Generate GetPivotData)
+    // One entry per grid row: a body line's path, and the value field it names when Σ Values sits
+    // in Rows (the rows above the body hold none).
+    let mut row_paths: Vec<Vec<u32>> = vec![Vec::new(); g.rows.len()];
+    let mut row_values: Vec<Option<usize>> = vec![None; g.rows.len()];
+    for (i, line) in lines.iter().enumerate() {
+        let at = first_line.saturating_add(i);
+        if let (Some(p), Some(v)) = (row_paths.get_mut(at), row_values.get_mut(at)) {
+            *p = line.path.clone();
+            *v = line.vi;
+        }
+    }
+    let col_paths: Vec<Vec<u32>> = data_cols.iter().map(|(si, _)| specs.get(*si).map(|s| s.path.clone()).unwrap_or_default()).collect();
+    let col_values: Vec<Option<usize>> = data_cols.iter().map(|(_, vi)| *vi).collect();
+    let col_grand: Vec<bool> = data_cols.iter().map(|(si, _)| specs.get(*si).is_some_and(|s| s.kind == ColKind::Grand)).collect();
+    // The item captions, moved out of the renderer (calculated items are already appended).
+    let Ctx { row_items: row_item_list, .. } = ctx;
+    let captions =
+        |items: Vec<FieldItems>| -> Vec<Vec<String>> { items.into_iter().map(|fi| fi.items.into_iter().map(|it| it.label).collect()).collect() };
+    let row_items = captions(row_item_list);
+    let col_items = captions(col_items);
+    Ok((
+        Output {
+            width: g.width as u32,
+            grid: g.rows,
+            row_kinds: g.kinds,
+            body_offset,
+            chart_rows,
+            chart_cols,
+            label_col,
+            label_cols: l as u32,
+            row_fields: row_fields.iter().map(|f| f.source_col.clone()).collect(),
+            col_fields: col_fields.iter().map(|f| f.source_col.clone()).collect(),
+            row_items,
+            col_items,
+            row_paths,
+            row_values,
+            col_paths,
+            col_values,
+            col_grand,
+            value_names: val_names,
+        },
+        src,
+    ))
 }
 
 // ---------------------------------------------------------------- styling and writing
@@ -1824,6 +1894,200 @@ pub fn clear_output(wb: &mut Workbook, sheet: usize, idx: usize) {
     if let Some(p) = shm.pivots.get_mut(idx) {
         p.last_range = None;
     }
+}
+
+// ---------------------------------------------------------------- Show Details / GetPivotData
+
+/// Most cells a Show Details sheet may hold: the bulk-edit cap, so a wide source writes fewer
+/// rows (12,000,000 cells is a million rows of twelve columns).
+pub const MAX_DETAIL_CELLS: u64 = 12_000_000;
+
+/// Why a click on the cell is not the value cell it has to be.
+const NOT_A_VALUE_CELL: &str =
+    "That isn't a value cell of the PivotTable report: show details and generate GetPivotData work on its numbers, not on its labels.";
+
+/// What Show Details writes into its new sheet: the source's header row and the records behind
+/// one report cell.
+#[derive(Clone, Debug, Default)]
+pub struct Detail {
+    /// Sheet name made from the cell's item path (`East`, `East - Jan`); it may still collide.
+    pub title: String,
+    /// The source's header row.
+    pub headers: Vec<String>,
+    /// The source's column number formats, so dates and currency look like the source.
+    pub formats: Vec<String>,
+    /// The records, in source order.
+    pub rows: Vec<Vec<Value>>,
+    /// Records the cell cap left out.
+    pub skipped: u64,
+}
+
+/// The PivotTable whose last written report covers `at`.
+pub fn pivot_at(wb: &Workbook, sheet: usize, at: CellRef) -> Option<&PivotTable> {
+    wb.sheet(sheet)?.pivots.iter().find(|p| p.last_range.is_some_and(|r| r.contains(at)))
+}
+
+/// The records behind one report cell (Excel's Show Details): every record the report's filters
+/// pass whose own item path starts with the cell's, in source order. A leaf cell gets its records,
+/// a subtotal its group's and a grand total all of them. `Err` when the cell is not a value cell
+/// of the report, or when the path cannot be derived (a calculated item holds no records).
+pub fn details(wb: &Workbook, pt: &PivotTable, sheet: usize, cell: CellRef) -> Result<Detail, String> {
+    details_with_cap(wb, pt, sheet, cell, MAX_DETAIL_CELLS)
+}
+
+/// Rows a Show Details sheet may hold over a source `width` columns wide: `max_cells` cells, and
+/// never more than a sheet's rows (one of them is the header row).
+pub fn detail_row_cap(width: usize, max_cells: u64) -> u64 {
+    (max_cells / width.max(1) as u64).max(1).min(MAX_ROWS as u64 - 1)
+}
+
+/// [`details`] with the cell cap given (the command uses [`MAX_DETAIL_CELLS`]).
+pub fn details_with_cap(wb: &Workbook, pt: &PivotTable, sheet: usize, cell: CellRef, max_cells: u64) -> Result<Detail, String> {
+    let area = pt.last_range.ok_or("Refresh the PivotTable before showing details.")?;
+    if !area.contains(cell) {
+        return Err(format!("{} is outside the PivotTable report {}.", cell.a1(), area.a1()));
+    }
+    let (out, src) = compute_with_source(wb, pt, sheet)?;
+    let (r, c, j) = out.grid_pos(area.start, cell).ok_or(NOT_A_VALUE_CELL)?;
+    let kind = out.grid.get(r).and_then(|row| row.get(c)).map(|x| x.kind);
+    if !matches!(kind, Some(CellKind::Data | CellKind::Subtotal | CellKind::GrandTotal)) {
+        return Err(NOT_A_VALUE_CELL.into());
+    }
+    let row_path = out.row_paths.get(r).cloned().unwrap_or_default();
+    let col_path = out.col_paths.get(j).cloned().ok_or(NOT_A_VALUE_CELL)?;
+    // The sheet's name: the items the line and the column stand for.
+    let title = {
+        let mut parts: Vec<String> = Vec::new();
+        for (d, id) in row_path.iter().enumerate() {
+            if let Some(l) = out.row_items.get(d).and_then(|items| items.get(*id as usize)) {
+                parts.push(l.clone());
+            }
+        }
+        for (d, id) in col_path.iter().enumerate() {
+            if let Some(l) = out.col_items.get(d).and_then(|items| items.get(*id as usize)) {
+                parts.push(l.clone());
+            }
+        }
+        if parts.is_empty() { "Details".to_string() } else { parts.join(" - ") }
+    };
+    // The items of each field, interned in source order exactly as `compute` does: a report path
+    // holds the position of a value in that order, so walking the records the same way gives the
+    // ids the report used. The fields kept are the ones the report kept.
+    let rows_f: Vec<(usize, &PivotField)> = pt.rows.iter().filter_map(|f| src.col(&f.source_col).map(|c| (c, f))).collect();
+    let cols_f: Vec<(usize, &PivotField)> = pt.columns.iter().filter_map(|f| src.col(&f.source_col).map(|c| (c, f))).collect();
+    let fmt_of = |c: usize| src.formats.get(c).cloned().unwrap_or_else(|| "General".into());
+    let row_fmts: Vec<String> = rows_f.iter().map(|(c, _)| fmt_of(*c)).collect();
+    let col_fmts: Vec<String> = cols_f.iter().map(|(c, _)| fmt_of(*c)).collect();
+    let mut row_items: Vec<FieldItems> = rows_f.iter().map(|_| FieldItems::default()).collect();
+    let mut col_items: Vec<FieldItems> = cols_f.iter().map(|_| FieldItems::default()).collect();
+    let cap = detail_row_cap(src.headers.len(), max_cells);
+    let mut kept: Vec<Vec<Value>> = Vec::new();
+    let mut skipped = 0u64;
+    for (ri, rec) in src.rows.iter().enumerate() {
+        if !record_passes(wb, &src, pt, rec) {
+            continue;
+        }
+        let rp: Vec<u32> = rows_f
+            .iter()
+            .zip(row_items.iter_mut())
+            .zip(row_fmts.iter())
+            .map(|(((c, f), fi), fmt)| fi.intern(wb, rec.get(*c).unwrap_or(&Value::Empty), Grouping::of(f), fmt, ri))
+            .collect();
+        let cp: Vec<u32> = cols_f
+            .iter()
+            .zip(col_items.iter_mut())
+            .zip(col_fmts.iter())
+            .map(|(((c, f), fi), fmt)| fi.intern(wb, rec.get(*c).unwrap_or(&Value::Empty), Grouping::of(f), fmt, ri))
+            .collect();
+        if !rp.starts_with(&row_path) || !cp.starts_with(&col_path) {
+            continue;
+        }
+        if kept.len() as u64 >= cap {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
+        kept.push(rec.clone());
+    }
+    // An item past the field's real items is a calculated item: it has no records of its own.
+    let calc =
+        |items: &[FieldItems], path: &[u32]| path.iter().enumerate().any(|(d, id)| items.get(d).is_none_or(|fi| *id as usize >= fi.items.len()));
+    if kept.is_empty() && (calc(&row_items, &row_path) || calc(&col_items, &col_path)) {
+        return Err("Show Details isn't available for a calculated item.".into());
+    }
+    Ok(Detail { title, headers: src.headers.clone(), formats: src.formats.clone(), rows: kept, skipped })
+}
+
+/// A text argument of a formula.
+fn quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// The `GETPIVOTDATA(...)` text for one report cell (without the leading `=`): the value field's
+/// caption, an absolute reference to the report, then the field/item pairs the report draws, so
+/// that it evaluates to the number the cell shows. `None` for a cell that is not a value of a
+/// PivotTable report.
+pub fn get_pivot_data(wb: &Workbook, sheet: usize, at: CellRef) -> Option<String> {
+    let pt = pivot_at(wb, sheet, at)?;
+    let out = compute(wb, pt, sheet).ok()?;
+    formula_for(wb, sheet, pt, &out, at).ok()
+}
+
+/// What a click on `at` inserts into a formula being typed: the `GETPIVOTDATA` call when the
+/// PivotTable's "Generate GetPivotData" is on (Excel's default), nothing otherwise — the caller
+/// then inserts a plain reference.
+pub fn click_reference(wb: &Workbook, sheet: usize, at: CellRef) -> Option<String> {
+    let pt = pivot_at(wb, sheet, at)?;
+    if !pt.generate_get_pivot_data {
+        return None;
+    }
+    get_pivot_data(wb, sheet, at)
+}
+
+fn formula_for(wb: &Workbook, sheet: usize, pt: &PivotTable, out: &Output, at: CellRef) -> Result<String, String> {
+    let area = pt.last_range.ok_or("Refresh the PivotTable first: the cell isn't part of a written report.")?;
+    let (r, c, j) = out.grid_pos(area.start, at).ok_or(NOT_A_VALUE_CELL)?;
+    if !matches!(out.grid.get(r).and_then(|row| row.get(c)).map(|x| x.kind), Some(CellKind::Data | CellKind::Subtotal | CellKind::GrandTotal)) {
+        return Err(NOT_A_VALUE_CELL.into());
+    }
+    let vi = out.col_values.get(j).copied().flatten().or_else(|| out.row_values.get(r).copied().flatten()).ok_or(NOT_A_VALUE_CELL)?;
+    let value = out.value_names.get(vi).filter(|n| !n.is_empty()).ok_or(NOT_A_VALUE_CELL)?;
+    let name = wb.sheet(sheet).map(|s| s.name.clone()).ok_or("There's no such sheet.")?;
+    let abs = |c: CellRef| format!("\u{24}{}\u{24}{}", gridcraft_core::col_to_letters(c.col), c.row as u64 + 1);
+    let corner = format!("{}!{}", quote_sheet(&name), abs(area.start));
+    let mut args: Vec<String> = vec![quoted(value), corner];
+    // The pairs of one axis: its items, or "Grand Total" for a total line (which stands for every
+    // item of the axis's first field).
+    let pairs = |fields: &[String], items: &[Vec<String>], path: &[u32]| -> Result<Vec<(String, String)>, String> {
+        path.iter()
+            .enumerate()
+            .map(|(d, id)| {
+                let f = fields.get(d).ok_or(NOT_A_VALUE_CELL)?;
+                let l = items.get(d).and_then(|l| l.get(*id as usize)).ok_or(NOT_A_VALUE_CELL)?;
+                Ok((f.clone(), l.clone()))
+            })
+            .collect()
+    };
+    let rp = out.row_paths.get(r).map(Vec::as_slice).unwrap_or(&[]);
+    let mut want: Vec<(String, String)> = if rp.is_empty() {
+        out.row_fields.first().map(|f| vec![(f.clone(), "Grand Total".to_string())]).unwrap_or_default()
+    } else {
+        pairs(&out.row_fields, &out.row_items, rp)?
+    };
+    let cp = out.col_paths.get(j).map(Vec::as_slice).unwrap_or(&[]);
+    if cp.is_empty() {
+        if out.col_grand.get(j).copied().unwrap_or(false)
+            && let Some(f) = out.col_fields.first()
+        {
+            want.push((f.clone(), "Grand Total".to_string()));
+        }
+    } else {
+        want.extend(pairs(&out.col_fields, &out.col_items, cp)?);
+    }
+    for (field, item) in &want {
+        args.push(quoted(field));
+        args.push(quoted(item));
+    }
+    Ok(format!("GETPIVOTDATA({})", args.join(", ")))
 }
 
 #[cfg(test)]
