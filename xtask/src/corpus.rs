@@ -289,7 +289,7 @@ fn round_trip(
     let after = digest(&back);
     let file = temp.join(saved_name(index, name));
     if let Err(e) = std::fs::write(&file, &bytes) {
-        if let Some(py) = python {
+        if python.is_some() {
             *foreign = Some(Err(format!("write: {e}")));
         }
     } else {
@@ -467,7 +467,7 @@ fn is_cloud_placeholder(path: &Path) -> bool {
         use std::os::windows::fs::MetadataExt;
         const OFFLINE: u32 = 0x1000;
         const RECALL_ON_DATA_ACCESS: u32 = 0x400000;
-        return std::fs::metadata(path).is_ok_and(|m| m.file_attributes() & (OFFLINE | RECALL_ON_DATA_ACCESS) != 0);
+        std::fs::metadata(path).is_ok_and(|m| m.file_attributes() & (OFFLINE | RECALL_ON_DATA_ACCESS) != 0)
     }
     #[cfg(not(windows))]
     {
