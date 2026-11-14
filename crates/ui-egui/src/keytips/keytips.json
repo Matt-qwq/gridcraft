@@ -1162,9 +1162,7 @@
    "seq": "NE",
    "kind": "command",
    "target": "insert.equation",
-   "pending": true,
-   "excel": "Equations",
-   "note": "Equations; reserved until the command lands"
+   "excel": "Equations"
   },
   {
    "seq": "NF",

@@ -31,7 +31,7 @@ edit into a kept part), the option matrix below, merged PRs #62, #116,
 | Waterfall, Funnel | 2 | 2 of 2 | written as chartex parts (PR #161); kind survives a round-trip |
 | Chart sheets | any chart on a sheet of its own | yes | `chart.moveToSheet` / `chart.moveToObject` (11-14): the tab is present with its glyph, the chart fills the viewport keeping its proportions, clicks still pick elements, and the whole round trip keeps page setup, margins, header/footer and printer settings |
 | Filled map | 1 | 0 | needs geographic boundary data (licensing decision) |
-| Combo | custom combinations, secondary axis | yes (line on secondary axis) | |
+| Combo | custom combinations, secondary axis | yes: any series on a secondary axis (`chart.setSeriesAxis`, the Format pane's checkbox, `y2_axis` with its own bounds/unit/log/reverse/crossing/display units/number format), series read back in `c:order`, the two groups sharing one category slot edge to edge and centred (pinned by tests), and **a bar chart's secondary axis keeps the chart horizontal** (`barDir="bar"`, the second value axis along the top as `axPos="t"`). Still open: a stacked group of a combo is written `clustered`, a combo mixing directions (columns + bars) is drawn along the primary group's direction, per-group `gapWidth`/`overlap` are not modelled, and a click on the secondary axis reports the primary one | |
 | **Total** | ~60 subtypes | **25 (~42%)** | usage-weighted breadth higher (~65%): column, bar, line, pie and scatter dominate |
 
 ## Chart elements and formatting

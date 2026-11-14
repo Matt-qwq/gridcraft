@@ -1228,6 +1228,8 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         // The Format pane's own labels and reasons, and the chart-sheet tab: they are translated
         // through `tr` and only need their entry (the checker's "wrapped but no entry" rule).
         "Chart sheet" => "图表工作表",
+        "Equation" => "公式",
+        "Edit Equation" => "编辑公式",
         "Axis" => "坐标轴",
         "Value axis" => "数值轴",
         "Category axis" => "分类轴",

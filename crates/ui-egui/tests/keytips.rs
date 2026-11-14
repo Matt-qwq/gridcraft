@@ -514,21 +514,25 @@ fn pending_sequences_are_silent_no_ops() {
 
 #[test]
 fn pending_sequences_go_live_when_the_command_lands() {
-    // The command lands in the catalog (here: a test-registered stand-in).
-    // The sequence must run it with no table edit.
-    gridcraft_engine::register_test_command("insert.equation", |s, _| {
-        s.execute("cell.set", json!({"cell": "Z9", "input": "live"}))?;
-        Ok(json!({}))
-    });
+    // `insert.equation` really did land (11-14): the NE sequence was reserved while the command was
+    // missing, and it runs the live command with no table edit — that is the contract this test
+    // has held since the table was generated.
     let mut h = harness(blank());
+    let before = h.state().session.journal.len();
     sequence(&mut h, &[Key::N, Key::E], false); // NE -> insert.equation
-    assert_eq!(value(&h, "Z9"), Value::from("live"), "the pending sequence ran the landed command");
+    let sh = h.state().session.active().expect("a document").wb.active().expect("a sheet");
+    assert_eq!(sh.equations.len(), 1, "NE inserts an equation now that the command exists");
     assert_eq!(
         h.state().session.journal.iter().filter(|(id, _)| id == "insert.equation").count(),
         1,
         "the landed command is journaled like any live command"
     );
+    assert!(h.state().session.journal.len() > before);
     assert_eq!(h.state().keytips.prefix(), None);
+    // And a sequence that is still reserved stays a silent no-op (NW -> insert.wordArt).
+    let mut h = harness(blank());
+    sequence(&mut h, &[Key::N, Key::W], false);
+    assert!(h.state().session.active().expect("a document").wb.active().expect("a sheet").equations.is_empty());
 }
 
 #[test]
