@@ -61,7 +61,9 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
                 }
                 ui.allocate_space(vec2(avail, h - 6.0));
                 let chevron = if expanded { Icon::ChevronUp } else { Icon::Chevron };
-                if crate::widgets::icon_button(ui, chevron, t.text_dim, "Expand formula bar", vec2(20.0, 22.0)).clicked() {
+                // The button folds the bar away once it is open, so its tip names what it does.
+                let tip = if expanded { "Collapse formula bar" } else { "Expand formula bar" };
+                if crate::widgets::icon_button(ui, chevron, t.text_dim, tip, vec2(20.0, 22.0)).clicked() {
                     app.ui.formula_bar_expanded = !app.ui.formula_bar_expanded;
                 }
             });

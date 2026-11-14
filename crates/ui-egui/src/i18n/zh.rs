@@ -548,6 +548,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Current region" => "当前区域",
         "Custom (%):" => "自定义（%）：",
         // zh-file - entries the File view, the formula bar and the print dialogs need (wave 4).
+        "Collapse formula bar" => "折叠编辑栏",
         "Custom Sort" => "自定义排序",
         "Damping factor:" => "阻尼系数：",
         "dashed" => "虚线",
