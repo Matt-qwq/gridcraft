@@ -165,6 +165,40 @@ fn chains_out_of_order() {
     assert_eq!(t.num("A5"), 5.0);
 }
 
+/// An exact text search over a block the host indexes answers what the scan answers: the first
+/// occurrence wins, the comparison is case-insensitive, a 2-D lookup array is still `#N/A` (the
+/// index only answers for a 1-D block), and `XMATCH` finds the same position as `MATCH`.
+///
+/// The index shortcut only applies to a formula whose lookup array is a block the host indexed
+/// (`A1:A4`), so this pins the behaviour of the path a plain scan cannot reach from here.
+#[test]
+fn an_indexed_text_lookup_answers_what_a_scan_answers() {
+    let mut t = T::new();
+    for (i, k) in ["alpha", "beta", "beta", "gamma"].iter().enumerate() {
+        t.set(&format!("A{}", i + 1), k);
+        t.set(&format!("B{}", i + 1), &(i + 1).to_string());
+    }
+    // A duplicate key resolves to the first occurrence, in either case.
+    t.set("D1", "=XLOOKUP(\"beta\",A1:A4,B1:B4)");
+    assert_eq!(t.num("D1"), 2.0);
+    t.set("D2", "=XLOOKUP(\"GAMMA\",A1:A4,B1:B4)");
+    assert_eq!(t.num("D2"), 4.0);
+    t.set("D3", "=XLOOKUP(\"delta\",A1:A4,B1:B4,\"miss\")");
+    assert_eq!(t.get("D3"), Value::from("miss"));
+    t.set("D4", "=XMATCH(\"beta\",A1:A4)");
+    assert_eq!(t.num("D4"), 2.0);
+    t.set("D5", "=MATCH(\"beta\",A1:A4,0)");
+    assert_eq!(t.num("D5"), 2.0);
+    // A 2-D lookup array is not a vector: each function keeps its own error (the index only
+    // answers for a 1-D block, and it must not turn these into a position).
+    t.set("E1", "=XLOOKUP(\"beta\",A1:B4,B1:B4)");
+    assert_eq!(t.get("E1"), Value::Error(CellError::Value));
+    t.set("E2", "=XMATCH(\"beta\",A1:B4)");
+    assert_eq!(t.get("E2"), Value::Error(CellError::Value));
+    t.set("E3", "=MATCH(\"beta\",A1:B4,0)");
+    assert_eq!(t.get("E3"), Value::Error(CellError::NA));
+}
+
 #[test]
 fn xlookup_returns_a_reference() {
     let mut t = T::new();
