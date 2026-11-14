@@ -715,9 +715,15 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
         }
     }
 
-    // Drawing: pictures, charts, shapes, and the frames that place slicers and timelines.
+    // Drawing: pictures, charts, shapes, equations, and the frames that place slicers and timelines.
     let frames = slicers.frames(si);
-    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.kept_charts.is_empty() || !sheet.shapes.is_empty() || !frames.is_empty() {
+    if !sheet.images.is_empty()
+        || !sheet.charts.is_empty()
+        || !sheet.kept_charts.is_empty()
+        || !sheet.shapes.is_empty()
+        || !sheet.equations.is_empty()
+        || !frames.is_empty()
+    {
         out.drawings += 1;
         let dn = out.drawings;
         let mut drels = Rels::default();
@@ -758,6 +764,9 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
         }
         for sh in &sheet.shapes {
             objs.push(Obj::Shape(sh));
+        }
+        for eq in &sheet.equations {
+            objs.push(Obj::Equation(eq));
         }
         for f in &frames {
             objs.push(Obj::Widget { name: f.name, anchor: f.anchor, timeline: f.timeline });

@@ -139,8 +139,16 @@ pub fn specs() -> Vec<CommandSpec> {
             &with(p, "kind", json!("textBox"))
         )),
         cmd!("shape.setText", "Edit Text Box", [], None, "{id: textBox id, text: string}", has_doc, shape_set_text),
-        cmd!("object.delete", "Delete Object", [], None, "{kind: chart|image|shape, id}", has_doc, delete_object),
-        cmd!("object.move", "Move Object", [], None, "{kind: chart|image|shape, id, at?: \"C3\", dx?, dy?, width?, height?}", has_doc, move_object),
+        cmd!("object.delete", "Delete Object", [], None, "{kind: chart|image|shape|equation, id}", has_doc, delete_object),
+        cmd!(
+            "object.move",
+            "Move Object",
+            [],
+            None,
+            "{kind: chart|image|shape|equation, id, at?: \"C3\", dx?, dy?, width?, height?}",
+            has_doc,
+            move_object
+        ),
         cmd!(
             "object.setAnchorMode",
             "Object Properties",
@@ -155,7 +163,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Alt Text",
             ["Review", "Accessibility"],
             None,
-            "{kind: chart|image|shape, id, text?: string (empty clears it)}",
+            "{kind: chart|image|shape|equation, id, text?: string (empty clears it)}",
             has_doc,
             set_alt_text
         ),
@@ -194,6 +202,16 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("review.resolveComment", "Resolve Thread", [], None, "{cell?, resolved?: true}", has_doc, resolve_comment),
         cmd!("review.deleteComment", "Delete Comment", ["Review", "Comments"], None, "{cell?}", has_doc, delete_comment),
         cmd!("review.showNote", "Show/Hide Note", ["Review", "Notes"], None, "{cell?}", has_doc, show_note),
+        cmd!(
+            "insert.equation",
+            "Equation",
+            ["Insert", "Symbols"],
+            None,
+            "{at?: \"C3\", text?: string, fill?, line?, width?, height?} (the markup written is the plain runs the text is)",
+            has_doc,
+            insert_equation
+        ),
+        cmd!("equation.setText", "Edit Equation", [], None, "{id: equation id, text: string}", has_doc, equation_set_text),
         cmd!(
             "insert.symbol",
             "Symbol",
@@ -1242,6 +1260,78 @@ fn shape_set_text(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
+/// Excel's Insert ▸ Equation: a floating equation object whose linear text is `text` (empty by
+/// default, which is an empty equation waiting to be typed into). The markup written with it is the
+/// plain runs that text is — anything richer is what a file brings, and is kept from the file.
+fn insert_equation(s: &mut Session, p: &Json) -> Result<Json> {
+    let text = str_param(p, "text").unwrap_or("").to_string();
+    if text.chars().nth(SHAPE_TEXT_MAX_CHARS).is_some() {
+        return Err(bad("insert.equation", "`text` is longer than 32,767 characters"));
+    }
+    let d = s.doc()?;
+    let id = d.wb.next_object_id();
+    let at = cell_param(s, p, "at")?.unwrap_or(d.selection.active);
+    // An equation has neither fill nor outline unless a caller asks for them, as in Excel.
+    let fill = super::format::color_param(p.get("fill")).unwrap_or(Color::Auto);
+    let line = super::format::color_param(p.get("line")).unwrap_or(Color::Auto);
+    let equation = Equation {
+        id,
+        alt: None,
+        anchor: Anchor {
+            cell: at,
+            dx: 0.0,
+            dy: 0.0,
+            width: f64_param(p, "width").unwrap_or(160.0) as f32,
+            height: f64_param(p, "height").unwrap_or(48.0) as f32,
+            mode: anchor_mode_param(p).unwrap_or_default(),
+        },
+        fill,
+        line,
+        source: text,
+        // Generated from the text on save: there is no richer markup to keep yet.
+        omml: None,
+    };
+    let sheet = d.wb.active_sheet;
+    edit(s, |cx| {
+        cx.sheet_mut(sheet)?.equations.push(equation);
+        Ok(json!({"equation": id}))
+    })
+}
+
+/// Replaces an equation's text: what is painted in its box, and what its markup is rewritten from.
+/// A file's rich math (fractions, radicals, sums, matrices) is *not* re-created from the new text —
+/// the runs become exactly what was typed. Saying so is the honest half of the trade: the
+/// alternative was refusing to let anyone correct a hand-typed equation.
+fn equation_set_text(s: &mut Session, p: &Json) -> Result<Json> {
+    let id = p
+        .get("id")
+        .and_then(Json::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or_else(|| bad("equation.setText", "`id` must be an equation id"))?;
+    let text = str_param(p, "text").ok_or_else(|| bad("equation.setText", "`text` must be a string"))?;
+    if text.chars().nth(SHAPE_TEXT_MAX_CHARS).is_some() {
+        return Err(bad("equation.setText", "`text` is longer than 32,767 characters"));
+    }
+    let d = s.doc()?;
+    let sheet = d.wb.active_sheet;
+    let sh = d.wb.active().ok_or_else(|| bad("equation.setText", "no such equation"))?;
+    let equation = sh.equations.iter().find(|eq| eq.id == id).ok_or_else(|| bad("equation.setText", "no such equation"))?;
+    // Sheet protection locks drawing objects (there is no "edit objects" allowance yet).
+    if sh.is_protected() {
+        return Err(EngineError::Other(PROTECTED.into()));
+    }
+    if equation.source == text {
+        return ok();
+    }
+    edit(s, |cx| {
+        let equation = cx.sheet_mut(sheet)?.equations.iter_mut().find(|eq| eq.id == id).ok_or_else(|| bad("equation.setText", "no such equation"))?;
+        equation.source = text.into();
+        // The markup no longer describes the text: it is regenerated as plain runs on save.
+        equation.omml = None;
+        Ok(json!({"id": id, "text": text}))
+    })
+}
+
 fn delete_object(s: &mut Session, p: &Json) -> Result<Json> {
     let id = u32_param(p, "id").ok_or_else(|| bad("object.delete", "missing `id`"))?;
     let kind = str_param(p, "kind").unwrap_or("").to_string();
@@ -1252,6 +1342,7 @@ fn delete_object(s: &mut Session, p: &Json) -> Result<Json> {
             "chart" => sh.charts.retain(|c| c.id != id),
             "image" => sh.images.retain(|c| c.id != id),
             "slicer" => sh.slicers.retain(|c| c.id != id),
+            "equation" => sh.equations.retain(|c| c.id != id),
             _ => sh.shapes.retain(|c| c.id != id),
         }
         Ok(Json::Null)
@@ -1270,6 +1361,7 @@ fn move_object(s: &mut Session, p: &Json) -> Result<Json> {
             "image" => sh.images.iter_mut().find(|c| c.id == id).map(|c| &mut c.anchor),
             "slicer" => sh.slicers.iter_mut().find(|c| c.id == id).map(|c| &mut c.anchor),
             "shape" => sh.shapes.iter_mut().find(|c| c.id == id).map(|c| &mut c.anchor),
+            "equation" => sh.equations.iter_mut().find(|c| c.id == id).map(|c| &mut c.anchor),
             _ => None,
         };
         let Some(a) = anchor else { return Err(bad("object.move", "no such object")) };
@@ -1321,8 +1413,8 @@ fn set_anchor_mode(s: &mut Session, p: &Json) -> Result<Json> {
 fn set_alt_text(s: &mut Session, p: &Json) -> Result<Json> {
     let id = u32_param(p, "id").ok_or_else(|| bad("object.setAltText", "missing `id`"))?;
     let kind = str_param(p, "kind").unwrap_or("").to_string();
-    if !matches!(kind.as_str(), "chart" | "image" | "shape") {
-        return Err(bad("object.setAltText", "kind must be chart, image or shape"));
+    if !matches!(kind.as_str(), "chart" | "image" | "shape" | "equation") {
+        return Err(bad("object.setAltText", "kind must be chart, image, shape or equation"));
     }
     // 1,024 characters is what a screen reader's description field holds in Excel's Alt Text pane.
     let text: Option<String> = str_param(p, "text").map(str::trim).filter(|t| !t.is_empty()).map(|t| t.chars().take(1024).collect());
@@ -1339,6 +1431,11 @@ fn set_alt_text(s: &mut Session, p: &Json) -> Result<Json> {
                 let im = sh.images.iter_mut().find(|c| c.id == id).ok_or_else(|| bad("object.setAltText", "no such picture"))?;
                 im.alt = text.clone().unwrap_or_default();
                 im.alt.clone()
+            }
+            "equation" => {
+                let eq = sh.equations.iter_mut().find(|c| c.id == id).ok_or_else(|| bad("object.setAltText", "no such equation"))?;
+                eq.alt = text.clone();
+                eq.alt.clone().unwrap_or_default()
             }
             _ => {
                 let sp = sh.shapes.iter_mut().find(|c| c.id == id).ok_or_else(|| bad("object.setAltText", "no such shape"))?;
@@ -2546,5 +2643,122 @@ mod tests {
         }
         s.execute("table.rename", json!({"table": "Table1", "name": "Table1"})).unwrap();
         s.execute("table.rename", json!({"table": "Table1", "name": "Rates"})).unwrap();
+    }
+
+    /// The equation `id` on the active sheet.
+    fn equation_of(s: &Session, id: u32) -> gridcraft_model::Equation {
+        s.doc().unwrap().wb.active().unwrap().equations.iter().find(|e| e.id == id).cloned().expect("the equation")
+    }
+
+    #[test]
+    fn an_inserted_equation_is_plain_runs_and_survives_a_text_edit() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id =
+            u32::try_from(s.execute("insert.equation", json!({"at": "C3", "text": "a+b"})).unwrap()["equation"].as_u64().unwrap_or(0)).unwrap_or(0);
+        let eq = equation_of(&s, id);
+        assert_eq!(eq.anchor.cell, CellRef::parse("C3").unwrap());
+        assert_eq!(eq.source, "a+b");
+        assert_eq!(eq.omml, None, "a new equation has no markup of its own: it is generated from the text");
+        assert_eq!((eq.fill, eq.line), (Color::Auto, Color::Auto), "an equation has no fill or outline unless asked");
+        assert!(s.doc().unwrap().wb.active().unwrap().shapes.is_empty(), "an equation is not a shape");
+
+        // Editing the text is what rewrites the markup: the file then holds plain runs of it.
+        s.execute("equation.setText", json!({"id": id, "text": "x^2 < y"})).unwrap();
+        assert_eq!(equation_of(&s, id).source, "x^2 < y");
+        let bytes = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
+        gridcraft_xlsx::testing::check_package(&bytes).expect("the package validates");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+        let mut part = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("xl/drawings/drawing1.xml").unwrap(), &mut part).unwrap();
+        assert!(part.contains("<a14:m>"), "the math is the a14 extension: {part}");
+        assert!(part.contains("xmlns:a14=") && part.contains("xmlns:m="), "the math's namespaces are declared: {part}");
+        assert!(part.contains("x^2 &lt; y"), "the text is escaped into the math: {part}");
+        // The part parses and the equation reads back: the same text, held as its own markup now.
+        let back = gridcraft_xlsx::read_xlsx(&bytes).unwrap().0;
+        let sheet = back.sheet(0).unwrap();
+        assert!(sheet.shapes.is_empty(), "an equation is not read back as a shape");
+        let eq = &sheet.equations[0];
+        assert_eq!(eq.source, "x^2 < y");
+        assert!(eq.omml.as_deref().is_some_and(|m| m.contains("x^2 &lt; y")), "{:?}", eq.omml);
+    }
+
+    #[test]
+    fn editing_a_files_rich_math_replaces_it_with_the_typed_runs() {
+        // What a text edit costs on a file that had a fraction: the math becomes the text, and that
+        // is the documented trade (the alternative is refusing the edit).
+        const FRACTION: &str =
+            "<m:oMathPara><m:oMath><m:f><m:num><m:r><m:t>1</m:t></m:r></m:num><m:den><m:r><m:t>2</m:t></m:r></m:den></m:f></m:oMath></m:oMathPara>";
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = s.execute("insert.equation", json!({"text": "12"})).unwrap()["equation"].as_u64().unwrap_or(0);
+        {
+            let wb = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb);
+            if let Some(eq) = wb.sheet_mut(0).and_then(|sh| sh.equations.first_mut()) {
+                eq.omml = Some(FRACTION.into());
+            }
+        }
+        // Untouched, the file's markup goes back byte for byte.
+        let kept = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(kept)).unwrap();
+        let mut part = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("xl/drawings/drawing1.xml").unwrap(), &mut part).unwrap();
+        assert!(part.contains(FRACTION), "a file's math is never rewritten just because it was opened");
+        // Edited, it is regenerated from the text.
+        let id = u32::try_from(id).unwrap_or(0);
+        s.execute("equation.setText", json!({"id": id, "text": "a half"})).unwrap();
+        let bytes = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut part = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("xl/drawings/drawing1.xml").unwrap(), &mut part).unwrap();
+        assert!(!part.contains("<m:f>"), "the fraction is gone: {part}");
+        assert!(part.contains("a half"), "{part}");
+    }
+
+    #[test]
+    fn an_equation_is_an_object_that_moves_deletes_and_takes_alt_text() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = u32::try_from(s.execute("insert.equation", json!({"at": "B2", "text": "e=mc^2"})).unwrap()["equation"].as_u64().unwrap_or(0))
+            .unwrap_or(0);
+        let r = s.execute("object.setAltText", json!({"kind": "equation", "id": id, "text": "  Mass–energy  "})).unwrap();
+        assert_eq!(r["text"], json!("Mass–energy"), "trimmed, like every object's alt text");
+        assert_eq!(equation_of(&s, id).alt.as_deref(), Some("Mass–energy"));
+        s.execute("object.move", json!({"kind": "equation", "id": id, "at": "D4", "width": 200})).unwrap();
+        let eq = equation_of(&s, id);
+        assert_eq!((eq.anchor.cell, eq.anchor.width), (CellRef::parse("D4").unwrap(), 200.0));
+        // The ids a new object gets never collide with an equation's.
+        let next = s.execute("insert.equation", json!({"text": "2"})).unwrap()["equation"].as_u64().unwrap_or(0);
+        assert_ne!(next, u64::from(id));
+        s.execute("object.delete", json!({"kind": "equation", "id": id})).unwrap();
+        assert!(s.doc().unwrap().wb.active().unwrap().equations.iter().all(|e| e.id != id));
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().equations.len(), 1, "the other equation stays");
+        // A text edit of an equation that is gone is an error, not a panic.
+        assert!(s.execute("equation.setText", json!({"id": id, "text": "x"})).is_err());
+        // Deleting the last one takes the drawing's math with it: no orphan equation in the file.
+        s.execute("object.delete", json!({"kind": "equation", "id": next})).unwrap();
+        let bytes = gridcraft_xlsx::write_xlsx(&s.doc().unwrap().wb).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut math = false;
+        for i in 0..zip.len() {
+            let mut f = zip.by_index(i).unwrap();
+            if !f.name().ends_with(".xml") {
+                continue;
+            }
+            let mut data = String::new();
+            let _ = std::io::Read::read_to_string(&mut f, &mut data);
+            math |= data.contains("<a14:m>");
+        }
+        assert!(!math, "a deleted equation leaves no math behind");
+    }
+
+    #[test]
+    fn an_equation_text_edit_is_one_undo_step() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = u32::try_from(s.execute("insert.equation", json!({"text": "a"})).unwrap()["equation"].as_u64().unwrap_or(0)).unwrap_or(0);
+        s.execute("equation.setText", json!({"id": id, "text": "b"})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(equation_of(&s, id).source, "a");
     }
 }

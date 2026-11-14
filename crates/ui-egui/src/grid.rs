@@ -3375,6 +3375,7 @@ fn object_anchor(sh: &Sheet, kind: &str, id: u32) -> Option<gridcraft_engine::mo
         "slicer" => sh.slicers.iter().find(|c| c.id == id).map(|c| c.anchor),
         "pivotSlicer" => sh.pivot_slicers.iter().find(|c| c.id == id).map(|c| c.anchor),
         "timeline" => sh.pivot_timelines.iter().find(|c| c.id == id).map(|c| c.anchor),
+        "equation" => sh.equations.iter().find(|c| c.id == id).map(|c| c.anchor),
         _ => sh.shapes.iter().find(|c| c.id == id).map(|c| c.anchor),
     }
 }
@@ -3400,6 +3401,8 @@ fn object_kind(sh: &Sheet, id: u32) -> Option<&'static str> {
         Some("pivotSlicer")
     } else if sh.pivot_timelines.iter().any(|o| o.id == id) {
         Some("timeline")
+    } else if sh.equations.iter().any(|o| o.id == id) {
+        Some("equation")
     } else if sh.shapes.iter().any(|o| o.id == id) {
         Some("shape")
     } else {

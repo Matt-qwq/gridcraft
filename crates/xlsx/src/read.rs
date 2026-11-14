@@ -528,10 +528,11 @@ fn read_chart_sheet(cx: &mut Ctx<'_>, part: &str, name: &str, sheet: &mut Sheet)
     };
     let drawing = rel.target.clone();
     crate::drawing::read_drawing(cx, &drawing, sheet)?;
-    // A chart sheet is one chart and nothing else: pictures and shapes a drawing carries there are
-    // not part of the sheet, and only the first chart fits.
+    // A chart sheet is one chart and nothing else: pictures, shapes and equations a drawing carries
+    // there are not part of the sheet, and only the first chart fits.
     sheet.images.clear();
     sheet.shapes.clear();
+    sheet.equations.clear();
     if !sheet.kept_charts.is_empty() {
         sheet.kept_charts.clear();
         sheet.charts.clear();

@@ -394,6 +394,9 @@ impl Workbook {
             for c in &s.shapes {
                 m = m.max(c.id);
             }
+            for e in &s.equations {
+                m = m.max(e.id);
+            }
             for c in &s.tables {
                 m = m.max(c.id);
             }

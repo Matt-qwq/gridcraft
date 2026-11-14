@@ -7,6 +7,7 @@ use gridcraft_core::{CellRef, RangeRef, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::cell::{Cell, CellPicture};
+use crate::equation::Equation;
 use crate::features::*;
 use crate::line::{FilterHidden, LineMap};
 use crate::store::CellStore;
@@ -145,6 +146,10 @@ pub struct Sheet {
     pub kept_charts: Vec<KeptChart>,
     pub images: Vec<Image>,
     pub shapes: Vec<Shape>,
+    /// Excel's equation objects: floating shapes whose text body is an OMML math paragraph. Painted
+    /// as their linear text; the file's own markup is kept verbatim (see `crate::equation`).
+    #[serde(default)]
+    pub equations: Vec<Equation>,
     pub sparklines: Vec<Sparkline>,
     /// On-sheet slicer widgets (filter a table column by clicking value tiles).
     #[serde(default)]
@@ -226,6 +231,7 @@ impl Sheet {
             kept_charts: vec![],
             images: vec![],
             shapes: vec![],
+            equations: vec![],
             sparklines: vec![],
             slicers: vec![],
             pivot_slicers: vec![],

@@ -7,6 +7,7 @@
 mod b64;
 pub mod cell;
 mod cellmap;
+pub mod equation;
 pub mod features;
 pub mod line;
 pub mod password;
@@ -19,6 +20,7 @@ pub mod style;
 pub mod workbook;
 
 pub use cell::{Cell, CellPicture, Formula};
+pub use equation::Equation;
 pub use features::*;
 pub use line::{FilterHidden, LineAxis, LineMap};
 pub use password::PasswordHash;

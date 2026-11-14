@@ -253,9 +253,22 @@ fn area_mesh(v: &[Pos2], col: Color32) -> egui::Mesh {
 /// alignment and vertical anchor. Shapes other than text boxes default to white text centred in
 /// the shape; text boxes to black text at the top left.
 fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Shape, r: Rect, z: f32, text: Option<&crate::text::GridText>) {
+    paint_box_text(p, wb, &sp.text, sp.kind == ShapeKind::TextBox, &sp.format, r, z, text);
+}
+
+/// The text of a box — a shape's or an equation's — as [`paint_shape_text`] draws it.
+#[allow(clippy::too_many_arguments)]
+fn paint_box_text(
+    p: &Painter,
+    wb: &Workbook,
+    body: &str,
+    text_box: bool,
+    f: &gridcraft_engine::model::ShapeFormat,
+    r: Rect,
+    z: f32,
+    text: Option<&crate::text::GridText>,
+) {
     use gridcraft_engine::model::{ShapeTextAlign, ShapeTextAnchor};
-    let f = &sp.format;
-    let text_box = sp.kind == ShapeKind::TextBox;
     let align = f.align.unwrap_or(if text_box { ShapeTextAlign::Left } else { ShapeTextAlign::Center });
     let anchor = f.anchor.unwrap_or(if text_box { ShapeTextAnchor::Top } else { ShapeTextAnchor::Middle });
     let default_color = if text_box { Color32::BLACK } else { Color32::WHITE };
@@ -282,8 +295,8 @@ fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Sh
     // Wrapped shape text is shaped the way a wrapped cell is (its bidi runs, joining and marks
     // resolved per line); printable ASCII keeps the unshaped layout below, bit for bit.
     if let Some(engine) = text {
-        let direction = crate::text::base_direction(&sp.text, false);
-        if let Some(lines) = engine.wrap(p.ctx(), &font, &sp.text, direction, color, width) {
+        let direction = crate::text::base_direction(body, false);
+        if let Some(lines) = engine.wrap(p.ctx(), &font, body, direction, color, width) {
             let total: f32 = lines.iter().map(|l| l.height()).sum();
             let mut y = match anchor {
                 ShapeTextAnchor::Top => r.top() + inset,
@@ -303,7 +316,7 @@ fn paint_shape_text(p: &Painter, wb: &Workbook, sp: &gridcraft_engine::model::Sh
             return;
         }
     }
-    let mut job = egui::text::LayoutJob::simple(sp.text.clone(), font, color, width);
+    let mut job = egui::text::LayoutJob::simple(body.to_string(), font, color, width);
     job.halign = match align {
         ShapeTextAlign::Left => egui::Align::LEFT,
         ShapeTextAlign::Center => egui::Align::Center,
@@ -620,6 +633,34 @@ pub(crate) fn paint_objects(
         }
         done(start, r);
     }
+    // Equations: a box painted like a text box, holding the equation's linear text. The 2-D math
+    // layout belongs to whoever reads the file (the markup is kept verbatim); here it reads aloud.
+    for eq in &sh.equations {
+        let r = anchor_rect(geo, sh, &eq.anchor);
+        if !r.intersects(p.clip_rect()) {
+            continue;
+        }
+        let start = p.add(egui::Shape::Noop);
+        if let Some(fill) = eq.fill.resolve(&wb.theme).map(theme::color32) {
+            p.rect_filled(r, 0.0, fill);
+        }
+        if let Some(line) = eq.line.resolve(&wb.theme).map(theme::color32) {
+            p.rect_stroke(r, 0.0, Stroke::new(1.0, line), StrokeKind::Inside);
+        }
+        if !eq.source.is_empty() {
+            // Centred in its box, as Excel lays an equation out.
+            let format = gridcraft_engine::model::ShapeFormat {
+                align: Some(gridcraft_engine::model::ShapeTextAlign::Center),
+                anchor: Some(gridcraft_engine::model::ShapeTextAnchor::Middle),
+                ..Default::default()
+            };
+            paint_box_text(p, wb, &eq.source, true, &format, r, geo.z, Some(&app.text));
+        }
+        if app.selected_chart == Some(eq.id) {
+            selection_frame(p, r);
+        }
+        done(start, r);
+    }
     for im in &sh.images {
         let r = anchor_rect(geo, sh, &im.anchor);
         if !r.intersects(p.clip_rect()) {
@@ -862,6 +903,12 @@ pub fn hit(app: &SheetApp, geo: &Geo, sh: &Sheet, p: Pos2) -> Option<(&'static s
         let r = anchor_rect(geo, sh, &im.anchor);
         if r.contains(p) && geo.cells.contains(p) {
             return Some(("image", im.id, r));
+        }
+    }
+    for eq in sh.equations.iter().rev() {
+        let r = anchor_rect(geo, sh, &eq.anchor);
+        if r.contains(p) && geo.cells.contains(p) {
+            return Some(("equation", eq.id, r));
         }
     }
     for s in sh.shapes.iter().rev() {
