@@ -1,0 +1,14 @@
+# Untranslated interface literals: the ratchet for cargo xtask i18n.
+#
+# One entry per line, path:line, a tab, then the text: a string in crates/ui-egui/src that reaches
+# the user through a UI call (ui.label, on_hover_text, RichText::new, ...) without going through the
+# translation lookup tr(...). The two shipped languages are English and Simplified Chinese, so every
+# entry here is text that still reads English in the Chinese build.
+#
+# cargo xtask i18n lists them, --write refreshes this file, --check (a cargo xtask ci step) fails
+# when a literal outside it appears. Deleting a row is the ratchet clicking down; adding one is a
+# deliberate "this stays English" and belongs in the commit message with the reason. Rows are
+# matched by path and text, so the line number is only a hint for the reviewer: an edit that shifts
+# lines does not report the whole file as new.
+crates/ui-egui/src/backstage.rs:1029	GridCraft
+crates/ui-egui/src/dialogs.rs:1750	GridCraft

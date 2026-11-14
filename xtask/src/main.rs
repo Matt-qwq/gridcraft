@@ -9,6 +9,7 @@ mod assets;
 #[cfg(feature = "engine")]
 mod corpus;
 mod eol;
+mod i18n;
 mod ico;
 mod keytips;
 mod layers;
@@ -26,8 +27,9 @@ const USAGE: &str = "\
 usage: cargo xtask <command>
 
 commands:
-  ci              fmt --check, clippy -D warnings, test, assets, layers, wasm, parity --check
-                  (stops at the first failure; the parity check runs only if docs/parity-checklist.md exists)
+  ci              fmt --check, clippy -D warnings, test, assets, layers, wasm, parity --check,
+                  keytips --check, i18n --check (stops at the first failure; the parity check runs
+                  only if docs/parity-checklist.md exists)
   assets          check that every icon/image/font/sample file is attributed in ATTRIBUTION.md
   layers          enforce the crate dependency layering (AGENTS.md \"Layering\")
   wasm            cargo check --target wasm32-unknown-unknown for the L0-L5 crates (+ gridcraft-web)
@@ -41,6 +43,10 @@ commands:
                   read it back with openpyxl — never writes into <dir> (see docs/oracle.md)
   keytips [--check]
                   regenerate crates/ui-egui/src/keytips/generated.rs from keytips.json (--check: fail if stale)
+  i18n [--check] [--write]
+                  list the user-visible literals in crates/ui-egui/src that skip the translation
+                  lookup, with a ratchet baseline in xtask/i18n-baseline.txt (--write: refresh it,
+                  --check: fail on a new literal)
   version [set X.Y.Z[-pre]]
                   print or set the workspace version ([workspace.package] in Cargo.toml)
   stats [--exact] count tests and lines per crate (--exact: ask the test harness via `-- --list`)
@@ -67,6 +73,7 @@ fn main() -> ExitCode {
         #[cfg(not(feature = "engine"))]
         Some("oracle") => Err("`oracle` needs the engine feature (on by default)".to_string()),
         Some("keytips") => keytips::run(&root(), &rest),
+        Some("i18n") => i18n::run(&root(), &rest),
         Some("ico") => ico::run(&rest),
         Some("version") => version::run(&root(), &rest),
         Some("-h" | "--help" | "help") | None => {
@@ -218,6 +225,7 @@ fn cmd_ci() -> Result<(), String> {
             }),
         ),
         ("keytips", Box::new(|| keytips::run(&root(), &["--check"]))),
+        ("i18n", Box::new(|| i18n::run(&root(), &["--check"]))),
     ];
     let mut done = Vec::new();
     for (name, f) in &steps {
