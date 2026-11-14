@@ -1,46 +1,44 @@
 # Localization parity
 
-> **Last reviewed:** 2026-10-30 · **Last updated:** 2026-10-30 · **Change:** major (text is shaped in **both** paths now: cell text on the grid and in the in-cell editor — Arabic joining, Devanagari reordering, Thai marks, mixed bidi runs and a visual caret, with a Devanagari fallback face — and PDF export, where `ToUnicode` follows each glyph's whole cluster so extraction returns the logical text and bidi runs are laid out in visual order) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-14 · **Last updated:** 2026-11-14 · **Change:** **the product ships English and Simplified Chinese only (decision 11-14).** The 18 other UI catalogs (12,290 lines of contributed translations) are removed, the language enum is `En | Zh`, and a `ui.json` saved with a removed code loads as English with every other preference intact. Chinese is the only translated catalog: 1,489 entries of a ~2,200 estimate, 214 of 362 engine command labels, with a **ratchet test** so a new command cannot land without its label and the count may only fall; and `cargo xtask i18n` now gates the other half of the problem in CI (a literal that skips `tr()`). **Formula syntax stays en-US** — which is what Excel's own Simplified Chinese build uses, so no localized function names or separators are needed and that work is dropped. What remains is 20–35 h of catalog completion. Previously: major (text is shaped in **both** paths now: cell text on the grid and in the in-cell editor — Arabic joining, Devanagari reordering, Thai marks, mixed bidi runs and a visual caret, with a Devanagari fallback face — and PDF export, where `ToUnicode` follows each glyph's whole cluster so extraction returns the logical text and bidi runs are laid out in visual order) · **Target:** Microsoft Excel (Microsoft 365)
 
 Per-language status against Excel, which ships its UI in dozens of languages (Windows language
 packs cover 100+), with localized function names, argument separators, number and date formats,
 right-to-left sheets and full complex-script support. Part of
-[target-app-parity.md](target-app-parity.md). **Localization: ~10% ready, 100–165 h** (estimated).
+[target-app-parity.md](target-app-parity.md). **Localization: en + zh-CN shipped, 20–35 h to finish**
+(estimated; the 100–165 h figure predates the two-language decision).
 
 ## Where we are (measured from source on `main`, after the 2026-10-10 merges)
 
-- **A first catalog exists, for the ribbon only.** `crates/ui-egui/src/i18n.rs` (merged 10-10 in
-  #31, #104, #82; German added 10-11) adds an interface-language preference that defaults to the
-  system language (closes #20) and a View-tab switcher, with English-keyed lookup tables:
-  Japanese 268 labels, Simplified Chinese, Korean, Russian, Brazilian Portuguese, German and Czech 266
-  each. The tables are used by
-  the ribbon, sheet tabs and widgets (`ribbon.rs`, `tabs.rs`, `widgets.rs`), the Format Cells
-  dialog, every dialog title and the shared OK/Cancel buttons; the other dialogs, menus,
-  context menus, task panes, status messages and command labels are still English literals.
-  Untranslated labels fall back to English.
+- **One catalog, two languages.** `crates/ui-egui/src/i18n.rs` holds an interface-language
+  preference (defaulting to the system language, #20) and a View-tab switcher over `Language::En |
+  Zh`; the Chinese table is `i18n/zh.rs` (1,489 English-keyed entries) plus `zh_functions.rs` for
+  function help. It covers the ribbon and its command labels, the sheet tabs, widgets, the Format
+  Cells dialog, dialog titles and the shared OK/Cancel buttons, the File view and the pivot pane;
+  what it does not cover yet is the rest of the dialogs, the menus and context menus, the status
+  messages and some task panes. An untranslated label renders as its English text, never as a key.
+  Eleven other catalogs shipped between 10-10 and 11-13 and were **removed on 11-14**: the product
+  claims one market, so a catalog nobody verifies is a liability, not a feature.
 - **Function help** (the argument hint, autocomplete, Insert Function and the Formulas-tab
-  menus) follows the interface language through per-language tables keyed by the catalog's
-  English text (`i18n/<lang>_functions.rs`): descriptions, and argument names from which the
-  hint is assembled with the formula syntax's function name and separator. Spanish translates
-  the 10 common functions it had help for (SUM, AVERAGE, IF…); other languages show the English
-  help.
-- **A first catalog exists.** `crates/ui-egui/src/i18n.rs` (merged 10-10 in #31, #104, #82; German
-  added 10-11) adds an interface-language preference that defaults to the system language (closes
-  #20) and a View-tab switcher, with English-keyed lookup tables: Simplified Chinese, Korean,
-  Russian, German and Czech 266–518 labels each, Brazilian Portuguese and Japanese 943 each. The
-  tables are used by the ribbon, sheet tabs and widgets (`ribbon.rs`, `tabs.rs`, `widgets.rs`), the
-  Format Cells dialog, every dialog title and the shared OK/Cancel buttons; Japanese and Portuguese
-  also cover the other dialog labels, message boxes, Backstage/File-view items, template names and
-  native menus (Japanese, 10-17: `i18n/ja.rs` keeps the shared 398-label core and adds 545 of those
-  strings). The remaining menus, context menus, task panes, status messages, command labels and
-  function descriptions are still English literals. Untranslated labels fall back to English.
-- **About 2,200 user-visible strings** in all (heuristic source scan: ~1,700 UI and command
-  strings plus ~500 function descriptions), so the ribbon-only languages cover **~12%** and
-  Japanese and Portuguese **~43%** (measured count / estimated total).
-- **en-US only formulas and formats.** Function names, `,` argument separator, `.` decimal
-  separator, en-US number and date formats (`crates/numfmt` says "en-US only"). Users ask for
-  localized function names and `;` separators (#45). German with localized numbers and formulas
-  is in PR #163 (open).
+  menus) follows the interface language through `i18n/zh_functions.rs`, keyed by the catalog's
+  English text: descriptions and argument names, from which the hint is assembled with the formula
+  syntax's (English) function name and separator.
+- **About 2,200 user-visible strings** in all (heuristic scan: ~1,700 UI and command strings plus
+  ~500 function descriptions). Chinese covers **1,489 of them**; of the 362 registered engine
+  command labels, **214** are translated. Two guards keep that honest: a test that enumerates the
+  engine's command specs and fails when a new label arrives untranslated or a translation is lost
+  (a ratchet — the number may only fall), and `cargo xtask i18n` in CI, which lists every
+  user-visible string that skips `tr()` against a committed baseline.
+  The checker found that the leakage is **not** unwrapped literals — there are two, both the
+  `GridCraft` brand — but catalog coverage: strings handed to helpers as keys and translated one
+  frame down. So the remaining work is entries, not plumbing.
+- **en-US formulas and formats, by decision.** Function names, the `,` argument separator, the `.`
+  decimal separator and en-US number/date formats (`crates/numfmt`) stay canonical, and files keep
+  that form whatever the interface language — which is exactly what Excel's Simplified Chinese build
+  does (English function names, English separators, no localized formula syntax). Localized function
+  names and `;` separators would only be needed for a language we no longer ship, so #45 as filed
+  is closed by scope rather than by implementation. `FormulaLocale` parsing (a Spanish `;`/`,`
+  dialect) stays engine-side and tested; the interface no longer reaches it.
 - **Script support.** System-font fallback for CJK, Thai and Hebrew landed in #38 (closes #32;
   #142 is still open pending confirmation). Native CJK fallback also probes Flatpak's read-only
   `/run/host/fonts`, `/run/host/local-fonts` and `/run/host/user-fonts` layouts, so installed
@@ -87,31 +85,28 @@ right-to-left sheets and full complex-script support. Part of
 
 ## Languages
 
-UI strings translated are measured counts against the ~2,200 estimate. Estimates to `full`
-include the rest of the catalog work below (10–20 h, counted once), localized function names,
-separators, number/date formats, machine translation with agent review, and script work.
+**Two ship: English and Simplified Chinese** (decision 11-14). The other 18 catalogs that had
+accumulated between 10-10 and 11-13 — 12,290 lines of contributed translations, verified by
+nobody — were removed with their `Language` variants, their `app.language.*` commands and their
+picker entries. A `ui.json` that still says `"ja"` or `"de"` loads as English with every other
+preference intact, and `app.language.set` refuses a removed code by name.
 
-| Language | Code | UI strings translated | Dialogs / tooltips / help | Script support | Native review | Status | Estimate to full |
-|---|---|---|---|---|---|---|---|
-| English | en | ~2,200 / ~2,200 (100%, source) | yes | Latin: yes | yes | full | — |
-| Simplified Chinese (Mandarin) | zh-Hans | 266 (~12%) | no | CJK system-font fallback (#38); IME unverified; PDF embeds a subset (M14) | no | menus only | 8–13 h |
-| Spanish | es | 0 (0%) | no | Latin: yes | no | none | 6–10 h |
-| Hindi | hi | 0 (0%) | no | Devanagari: shaped and reordered on screen (M14, `sys-devanagari` fallback face) and in PDF (M14, `cluster-exact ToUnicode`) | no | none | 12–18 h |
-| Arabic | ar | 0 (0%) | no | Arabic joins and bidirectional runs draw in visual order on screen and in PDF (M14); **no RTL interface**; Sheet Right-to-Left mirrors the grid (#146) | no | none | 25–35 h |
-| French | fr | 0 (0%) | no | Latin: yes | no | none | 6–10 h |
-| Portuguese | pt-BR | 943 (~43%) | dialogs and tooltips (dialogs take effect with #669) | Latin: yes | no | menus, File view, dialogs | 2–4 h |
-| Indonesian | id | 0 (0%) | no | Latin: yes | no | none | 5–8 h |
-| Japanese | ja | 943 (~43%) | dialogs and messages | CJK system-font fallback; IME unverified; PDF embeds a subset (M14); no furigana display | no | menus, File view, dialogs, messages | 3–5 h |
-| German | de | 266 (~12%) | no | Latin: yes | no | menus only | 4–8 h |
-| Italian | it | 971 (~44%) | dialogs, tooltips, pivot pane | Latin: yes | no | menus, File view, dialogs, pivot pane | 3–5 h |
-| Korean | ko | 266 (~12%) | no | Hangul via the CJK fallback; IME unverified; PDF embeds a subset (M14) | no | menus only | 6–10 h |
-| Turkish | tr | 382 (~17%) | no | Latin: yes | yes | menus only | 4–8 h |
-| Vietnamese | vi | 398 (~18%) | no | Latin with stacked diacritics: unverified | no | menus, File view | 5–9 h |
+| Language | Code | UI strings | Command labels | What is left |
+|---|---|---|---|---|
+| English | `en` | the source (~2,200) | 362 of 362 | — |
+| Simplified Chinese | `zh` | 1,489 (~68%) | 214 of 362 | the rest of the dialogs, menus and context menus, status messages, some task panes; function help beyond `zh_functions.rs` |
 
-Other shipped languages, measured from the catalogs on 10-30 (entries, against a ~1,000-entry reference set): Romanian 991, Italian and Greek 965, Ukrainian and Polish 964, Japanese 963, Portuguese 959 — menus, File view, dialogs and messages; Czech 532, Dutch 513, Spanish 456, German 439, French 427, Serbian and Russian 426, Korean 425, Chinese 421, Vietnamese 400, Turkish 400 — menus and part of the dialogs.
+Guards, both in CI:
+- a test that enumerates `gridcraft_engine::cmd::command_specs()` and fails when a label arrives
+  without its Chinese entry or a translation is lost — a **ratchet**, the untranslated count may
+  only fall (148 at 11-14);
+- `cargo xtask i18n`, which lists every user-visible string that skips `tr()` against a committed
+  baseline (`xtask/i18n-baseline.txt`: 2 rows, both the `GridCraft` brand).
 
-**Total:** catalog work 10–20 h + languages 92–144 h ≈ **100–165 h**. Parallelizes almost fully
-once the catalog covers dialogs and commands.
+**Remaining: 20–35 h**, and it is translation, not engineering: the plumbing exists and is gated.
+Localized function names, `;` separators and per-locale number/date formats are **out of scope by
+decision** — see the formulas bullet above; Excel's own Simplified Chinese build uses the English
+formula syntax, so a Chinese workbook is read and written byte-identically to an English one.
 
 ## PDF text (M14)
 
