@@ -3267,7 +3267,7 @@ mod tests {
         assert_eq!(formula(&s, "B5"), "GETPIVOTDATA(\"Sum of Sales\", Report!$A$3, \"Region\", \"East\", \"Month\", \"Feb\")");
         // A leaf, a grand-total column, a grand-total row and the corner: same number, through calc.
         for cell in ["B5", "C6", "D5", "B7", "D7"] {
-            let f = formula(&s, &cell);
+            let f = formula(&s, cell);
             assert_eq!(gpd(&mut s, &f), report_val(&s, cell), "{cell}: {f}");
         }
         // With the option off the click writes a plain reference instead.

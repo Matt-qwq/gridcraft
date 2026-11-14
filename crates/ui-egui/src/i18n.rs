@@ -380,7 +380,7 @@ mod tests {
             assert_eq!(language.tr(""), "");
             assert_eq!(language.tr("Not a label any catalog has"), "Not a label any catalog has");
             assert_eq!(language.tr("Sheet1!A1"), "Sheet1!A1");
-            assert_eq!(language.tr("Page Layout|Orientation").is_empty(), false);
+            assert!(!language.tr("Page Layout|Orientation").is_empty());
         }
         assert_eq!(Language::En.tr("Data"), "Data");
         assert_eq!(Language::En.tr("Page Layout|Orientation"), "Orientation");
