@@ -1786,6 +1786,79 @@ mod tests {
         assert!(!sh.is_row_hidden(2));
         assert_eq!(sh.row_height(2), 44.0, "the height came back with the row");
     }
+    /// Saves and reloads, then asserts the two agree on the hidden rows and the line map: the
+    /// fuzz invariant that catches a filtered row written where the model does not have one.
+    fn round_trips(s: &Session) {
+        let wb = s.doc().unwrap().wb.clone();
+        let bytes = crate::io::save_bytes(&wb, "filter.xlsx").unwrap();
+        let (back, _) = crate::io::open_bytes("filter.xlsx", &bytes).unwrap();
+        for (x, y) in wb.sheets.iter().zip(&back.sheets) {
+            let hidden = |sh: &gridcraft_model::Sheet| sh.filter_hidden.rows().collect::<Vec<u32>>();
+            assert_eq!(hidden(x), hidden(y), "{}: filter-hidden rows differ after reload", x.name);
+            let lines = |sh: &gridcraft_model::Sheet| sh.rows.iter().map(|(r, i)| (r, *i)).collect::<Vec<_>>();
+            assert_eq!(lines(x), lines(y), "{}: rows differ after reload", x.name);
+        }
+    }
+
+    /// The filter's hidden rows are a bitmap over logical rows, not entries of the line map, so a
+    /// row insert or delete has to move them with the data. Left behind, the rows below an insert
+    /// stay hidden one row early and the file saves them at indices the model disagrees with.
+    #[test]
+    fn a_row_delete_moves_the_filters_hidden_rows() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let values: Vec<Json> = (0..9).map(|i| json!([i])).collect();
+        s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+        s.execute("data.filter", json!({"range": "A1:A9"})).unwrap();
+        s.execute("data.filterBy", json!({"column": "A", "values": ["7"]})).unwrap();
+        let hidden = |s: &Session| s.doc().unwrap().wb.sheet(0).unwrap().filter_hidden.rows().collect::<Vec<u32>>();
+        assert_eq!(hidden(&s), vec![1, 2, 3, 4, 5, 6, 8], "row 7 is the value the filter keeps");
+        // Delete row 3 (index 2), above every hidden row but the first two.
+        s.execute("home.deleteRows", json!({"rows": "3:3"})).unwrap();
+        assert_eq!(hidden(&s), vec![1, 2, 3, 4, 5, 7], "every hidden row above the delete moved up one");
+        round_trips(&s);
+    }
+
+    /// AutoFit leaves a row the filter is hiding alone: an entry for it would put the row in the
+    /// line map and the bitmap at once, and the save then writes `hidden` with a height that the
+    /// reader cannot turn back into a filtered row.
+    #[test]
+    fn autofit_leaves_a_filtered_row_alone() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["N"], [1], [2], [3]]})).unwrap();
+        s.execute("data.filter", json!({"range": "A1:A4"})).unwrap();
+        s.execute("data.filterBy", json!({"column": "A", "values": ["1"]})).unwrap();
+        // A font big enough to autofit row 3 taller, if autofit looked at a row nobody can see.
+        s.execute("home.fontSize", json!({"range": "A3", "size": 28})).unwrap();
+        {
+            let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+            assert!(sh.is_row_filtered(2));
+            assert!(sh.rows.get(&2).is_none(), "a filtered row keeps no line info of its own");
+        }
+        round_trips(&s);
+    }
+
+    /// A filter stops at a table's totals row: the sheet AutoFilter a table's filter installs spans
+    /// the whole table, and deleting rows can land a filtered row on the totals row. Keeping it
+    /// writes a row as filtered that no filter covers.
+    #[test]
+    fn a_filter_never_covers_a_tables_totals_row() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let values: Vec<Json> = (0..12).map(|i| json!([[i, i + 1]])).collect();
+        s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+        s.execute("insert.table", json!({"range": "A1:B10", "header": true})).unwrap();
+        s.execute("table.totalRow", json!({"table": "Table1", "on": true})).unwrap();
+        s.execute("data.filterBy", json!({"column": "A", "values": ["1"]})).unwrap();
+        s.execute("home.deleteRows", json!({"rows": "8:9"})).unwrap();
+        if let Some(sh) = s.doc().unwrap().wb.sheet(0) {
+            let totals = sh.tables.first().map(|t| t.range.end.row).unwrap_or(u32::MAX);
+            assert!(!sh.filter_hidden.contains(totals), "the totals row is never filter-hidden");
+        }
+        round_trips(&s);
+    }
+
     /// An id column has a value per row. The dropdown lists the first 1,000 (as Excel does) and
     /// says there are more, instead of formatting a million values on every frame the menu opens.
     #[test]

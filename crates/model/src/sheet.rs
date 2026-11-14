@@ -50,6 +50,24 @@ impl SheetViewMode {
     }
 }
 
+/// Drops one row from a list of inclusive row spans, splitting the span that holds it.
+fn drop_row(spans: &mut Vec<(u32, u32)>, row: u32) {
+    let mut out = Vec::with_capacity(spans.len().saturating_add(1));
+    for (a, b) in spans.drain(..) {
+        if row < a || row > b {
+            out.push((a, b));
+            continue;
+        }
+        if a < row {
+            out.push((a, row.saturating_sub(1)));
+        }
+        if row < b {
+            out.push((row.saturating_add(1), b));
+        }
+    }
+    *spans = out;
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sheet {
     pub name: String,
@@ -325,6 +343,39 @@ impl Sheet {
     pub fn is_row_hidden(&self, row: u32) -> bool {
         self.filter_hidden.contains(row) || self.rows.get(&row).is_some_and(|r| r.hidden)
     }
+    /// The rows an applied filter covers: a sheet AutoFilter's body (its header row excluded) and
+    /// each filtered table's data rows (its header and totals rows excluded). A row a filter hides
+    /// lies inside one of these, so a hidden row outside all of them is left over from a structural
+    /// edit — deleting rows can move a filtered row onto a table's totals row — and must not be
+    /// written as a filtered row: the reader would keep it as a hand-hidden row and the file would
+    /// not reopen identical (the command-sequence fuzzer's "rows differ after reload").
+    pub fn filter_row_ranges(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        if let Some(af) = &self.autofilter
+            && !af.criteria.is_empty()
+        {
+            let first = af.range.start.row.saturating_add(1);
+            if first <= af.range.end.row {
+                out.push((first, af.range.end.row));
+            }
+        }
+        for t in &self.tables {
+            if !t.filter.is_empty()
+                && let Some(d) = t.data_range()
+                && d.start.row <= d.end.row
+            {
+                out.push((d.start.row, d.end.row));
+            }
+            // A table's totals row is never filtered, whatever the sheet AutoFilter's range says:
+            // when a table's filter is the sheet's, the two ranges overlap and the AutoFilter's
+            // covers the totals row.
+            if t.totals_row && t.range.end.row > t.range.start.row {
+                drop_row(&mut out, t.range.end.row);
+            }
+        }
+        out
+    }
+
     /// Whether `row` is hidden by an applied filter: a hidden row below the header of the
     /// sheet AutoFilter while it has criteria, or a hidden data row of a filtered table.
     /// Other hidden rows were hidden by hand.

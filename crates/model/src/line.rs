@@ -803,6 +803,55 @@ impl FilterHidden {
     pub fn save(&mut self, row: u32, info: LineInfo) {
         self.saved.insert(row, info);
     }
+
+    /// Moves the hidden rows down by `count` for an insert of `count` rows at `at`, the way the
+    /// line map moves behind it. The bitmap is logical rows, not entries of that map, so a
+    /// structural edit that shifts the map has to shift this too: otherwise the rows below an
+    /// insert are hidden one row early, the parked line info comes back on the wrong row when the
+    /// filter lets go, and the file saves rows hidden at indices the model does not agree with
+    /// (found by the command-sequence fuzzer: `data.filterBy` then `home.deleteRows` produced an
+    /// XLSX whose rows differed after reload).
+    ///
+    /// Rows that the shift would put outside the grid are dropped, like the line map's own limit.
+    pub fn insert_rows(&mut self, at: u32, count: u32) {
+        if count == 0 || (self.count == 0 && self.saved.is_empty()) {
+            return;
+        }
+        let move_row = |row: u32| if row >= at { row.saturating_add(count) } else { row };
+        self.shift_rows(move_row, |row| row < gridcraft_core::MAX_ROWS);
+    }
+
+    /// Keeps the hidden rows `keep` accepts, dropping the rest (and their parked line info).
+    /// Used when a filter stops covering rows a structural edit left outside it: a row no filter
+    /// covers must not be written as a filtered row, or the file reopens with a hand-hidden row
+    /// where the model has a filtered one.
+    pub fn retain(&mut self, keep: impl Fn(u32) -> bool) {
+        if self.count == 0 && self.saved.is_empty() {
+            return;
+        }
+        self.shift_rows(|row| row, keep);
+    }
+
+    /// The delete half: the rows `[at, at + count)` lose their bit and their parked line info,
+    /// and the rows below move up by `count`.
+    pub fn delete_rows(&mut self, at: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let end = at.saturating_add(count);
+        let move_row = |row: u32| if row >= end { row - count } else { row };
+        self.shift_rows(move_row, |row| row < at || row >= end);
+    }
+
+    /// Rebuilds the bitmap and the parked line info through `move_row`, keeping the rows
+    /// `keep` accepts. Rebuilding rather than moving words keeps one implementation for both
+    /// directions; the cost is the hidden rows, which a structural edit touches anyway.
+    fn shift_rows(&mut self, move_row: impl Fn(u32) -> u32 + Copy, keep: impl Fn(u32) -> bool) {
+        let rows: Vec<u32> = self.rows().filter(|row| keep(*row)).map(move_row).collect();
+        let saved: BTreeMap<u32, LineInfo> =
+            std::mem::take(&mut self.saved).into_iter().filter(|(row, _)| keep(*row)).map(|(row, info)| (move_row(row), info)).collect();
+        *self = FilterHidden::build(rows, saved);
+    }
 }
 
 #[cfg(test)]

@@ -561,6 +561,14 @@ fn wrapped_line_count(line: &str, width: f32, size: f32, bold: bool) -> f32 {
 /// a multi-line value shows on one line and AutoFit gives a one-line row.
 pub fn auto_row_height(wb: &mut Workbook, si: usize, row: u32) {
     let Some(sh) = wb.sheet(si) else { return };
+    // A row the filter is hiding isn't laid out, and the filter already took its line info off
+    // the row: an entry here would put the row in the line map and the bitmap at once. The save
+    // then writes `hidden="1"` with a height, which the reader cannot turn back into a
+    // filter-hidden row, so the file reopens with a hand-hidden row where the model has a filtered
+    // one (the command-sequence fuzzer's "rows differ after reload").
+    if sh.filter_hidden.contains(row) {
+        return;
+    }
     if sh.rows.get(&row).is_some_and(|i| i.custom) {
         return;
     }

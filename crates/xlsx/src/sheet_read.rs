@@ -333,10 +333,8 @@ pub(crate) fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, plan: &R
 /// filter becomes a million line infos, which every scroll and every frame then walks; the sheet
 /// keeps them in its filter bitmap instead and gives them back when the filter is cleared.
 fn heal_filter_hidden(sheet: &mut Sheet) {
-    let by_a_filter = |row: u32| {
-        let sheet_filter = sheet.autofilter.as_ref().is_some_and(|af| !af.criteria.is_empty() && row > af.range.start.row && row <= af.range.end.row);
-        sheet_filter || sheet.tables.iter().any(|t| !t.filter.is_empty() && t.data_range().is_some_and(|r| row >= r.start.row && row <= r.end.row))
-    };
+    let ranges = sheet.filter_row_ranges();
+    let by_a_filter = |row: u32| ranges.iter().any(|(a, b)| row >= *a && row <= *b);
     let only_hidden = LineInfo { hidden: true, ..Default::default() };
     let moved: Vec<u32> = sheet.rows.iter().filter(|(r, i)| **i == only_hidden && by_a_filter(*r)).map(|(r, _)| r).collect();
     if moved.is_empty() {

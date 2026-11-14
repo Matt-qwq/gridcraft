@@ -144,11 +144,24 @@ fn shift_sheet_features(sh: &mut Sheet, axis: Axis, at: u32, count: u32, insert:
         .collect();
     // Line info. The entries live under physical ids now, so a structural edit only moves the
     // logical→physical runs; the deleted lines' entries are dropped by `delete_lines`.
-    let lines = if axis == Axis::Rows { &mut sh.rows } else { &mut sh.cols };
-    if insert {
-        lines.insert_lines(at, count);
-    } else {
-        lines.delete_lines(at, count);
+    {
+        let lines = if axis == Axis::Rows { &mut sh.rows } else { &mut sh.cols };
+        if insert {
+            lines.insert_lines(at, count);
+        } else {
+            lines.delete_lines(at, count);
+        }
+    }
+    // A filter's hidden rows are a bitmap over logical rows, not entries of that map, so they move
+    // with it. Without this the rows below an insert stay hidden one row early, the line info the
+    // filter parked comes back on the wrong row, and the file saves rows hidden at indices the
+    // model disagrees with (the command-sequence fuzzer's "rows differ after reload").
+    if axis == Axis::Rows {
+        if insert {
+            sh.filter_hidden.insert_rows(at, count);
+        } else {
+            sh.filter_hidden.delete_rows(at, count);
+        }
     }
     sh.merges = sh.merges.iter().filter_map(|m| map_range(*m)).filter(|m| !m.is_single()).collect();
     for cf in sh.cond_formats.iter_mut() {
@@ -218,6 +231,12 @@ fn shift_sheet_features(sh: &mut Sheet, axis: Axis, at: u32, count: u32, insert:
         });
         pt.last_range = pt.last_range.and_then(map_range);
     }
+    // Last, because the filter ranges just moved: a delete shrinks what a filter covers, and the
+    // rows below moving up can land a filtered row on a table's totals row (or past its last data
+    // row). Such a row is not filtered by anything any more, and keeping it would write it as a
+    // hand-hidden row — not what the model holds, so the file would not reopen identical.
+    let ranges = sh.filter_row_ranges();
+    sh.filter_hidden.retain(|row| ranges.iter().any(|(a, b)| row >= *a && row <= *b));
 }
 
 /// Rewrites every formula reference (and chart series) for a structural edit on `target`.
