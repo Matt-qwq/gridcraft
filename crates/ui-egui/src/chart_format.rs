@@ -13,7 +13,8 @@ use std::ops::RangeInclusive;
 use egui::{RichText, Ui, vec2};
 use gridcraft_chart::ChartKind;
 use gridcraft_engine::model::{
-    AxisCrossing, AxisOptions, Chart, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, LabelFont, LabelOptions, LabelPosition,
+    Anchor, AnchorMode, AxisCrossing, AxisOptions, Chart, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, Image, LabelFont, LabelOptions,
+    LabelPosition, Shape, ShapeTextAlign, ShapeTextAnchor,
 };
 use serde_json::{Map, Value as Json, json};
 
@@ -300,11 +301,17 @@ pub fn clear_axis_params(chart: &Chart, value_axis: bool, axis_name: &str, drop:
 pub fn show(app: &mut SheetApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(id) = app.selected_chart else {
-        ui.label(RichText::new(crate::widgets::tr(ui, "Select a chart to format it.")).italics().color(t.text_dim));
+        ui.label(RichText::new(crate::widgets::tr(ui, "Select a chart, shape or picture to format it.")).italics().color(t.text_dim));
         return;
     };
+    // A shape or a picture has its own sections; a chart keeps the ones below.
+    match picked(app, id) {
+        Some(Picked::Shape(sh)) => return shape(app, ui, &sh),
+        Some(Picked::Image(im)) => return picture(app, ui, &im),
+        None => {}
+    }
     let Some(chart) = app.session.active().and_then(|d| d.wb.active().and_then(|s| s.charts.iter().find(|c| c.id == id).cloned())) else {
-        ui.label(RichText::new(crate::widgets::tr(ui, "The chart no longer exists.")).italics().color(t.text_dim));
+        ui.label(RichText::new(crate::widgets::tr(ui, "The object no longer exists.")).italics().color(t.text_dim));
         return;
     };
     // A series selection can go stale (Select Data removed one).
@@ -1047,11 +1054,10 @@ fn colour_of(pt: &gridcraft_engine::model::PointFormat, key: &str) -> Option<Col
     }
 }
 
-/// One point colour row: the current swatch (or "Automatic") and a palette menu. The palette has no
-/// "No Fill" entry: `chart.formatPoint` can clear the whole point, not one colour.
-#[allow(clippy::too_many_arguments)]
 /// A colour row: the current colour (or Automatic) and a palette menu that runs `cmd` with
-/// `params` plus the chosen colour under `key`.
+/// `params` plus the chosen colour under `key`. `none` is the palette's no-colour entry, if it has
+/// one; a point has none, since `chart.formatPoint` can clear the whole point, not one colour.
+#[allow(clippy::too_many_arguments)]
 fn colour_row(
     app: &mut SheetApp,
     ui: &mut Ui,
@@ -1061,30 +1067,41 @@ fn colour_row(
     cmd: &str,
     params: &Map<String, Json>,
     key: &str,
+    none: &str,
 ) {
-    let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
         ui.label(tr(ui, label));
-        match current.and_then(|c| c.resolve(wb_theme)).map(theme::color32) {
-            Some(c) => {
-                let (r, _) = ui.allocate_exact_size(vec2(16.0, 14.0), egui::Sense::hover());
-                ui.painter().rect_filled(r, 1.0, c);
-                ui.painter().rect_stroke(r, 1.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
-            }
-            None => {
-                // Not "Automatic": that word is the position combo's own value in this pane.
-                ui.label(RichText::new(crate::widgets::tr(ui, "Automatic colour")).small().color(t.text_dim));
-            }
+        if let Some(c) = colour_choice(ui, wb_theme, current, none) {
+            let mut m = params.clone();
+            m.insert(key.into(), json!(c));
+            app.run_or_alert(cmd, Json::Object(m));
         }
-        ui.menu_button(tr(ui, "Colour…"), |ui| {
-            if let Some(c) = crate::widgets::color_palette_fixed(ui, &wb_theme.colors, "") {
-                ui.close();
-                let mut m = params.clone();
-                m.insert(key.into(), json!(c));
-                app.run_or_alert(cmd, Json::Object(m));
-            }
-        });
     });
+}
+
+/// The swatch of the current colour (or a dim word when there is none) and the palette menu beside
+/// it: returns the colour that was picked, `"none"` for the palette's no-colour entry.
+fn colour_choice(ui: &mut Ui, wb_theme: &gridcraft_engine::model::Theme, current: Option<Color>, none: &str) -> Option<String> {
+    let t = Tokens::get(ui.ctx());
+    let mut picked = None;
+    match current.and_then(|c| c.resolve(wb_theme)).map(theme::color32) {
+        Some(c) => {
+            let (r, _) = ui.allocate_exact_size(vec2(16.0, 14.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 1.0, c);
+            ui.painter().rect_stroke(r, 1.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Inside);
+        }
+        None => {
+            // Not "Automatic": that word is the position combo's own value in this pane.
+            ui.label(RichText::new(crate::widgets::tr(ui, "Automatic colour")).small().color(t.text_dim));
+        }
+    }
+    ui.menu_button(tr(ui, "Colour…"), |ui| {
+        if let Some(c) = crate::widgets::color_palette_fixed(ui, &wb_theme.colors, none) {
+            ui.close();
+            picked = Some(c);
+        }
+    });
+    picked
 }
 
 /// A point's fill, line or marker colour through `chart.formatPoint`.
@@ -1105,7 +1122,7 @@ fn point_colour(
     m.insert("series".into(), json!(series));
     m.insert("point".into(), json!(point));
     // `chart.formatPoint` keys its colour by the option's own name (fill, line, marker).
-    colour_row(app, ui, wb_theme, label, current, "chart.formatPoint", &m, key);
+    colour_row(app, ui, wb_theme, label, current, "chart.formatPoint", &m, key, "");
 }
 
 /// A label's own font — size, weight and colour — for the chart's, a series' or one point's
@@ -1137,7 +1154,7 @@ fn label_font_controls(app: &mut SheetApp, ui: &mut Ui, id: u32, series: Option<
         app.run_or_alert("chart.setDataLabels", Json::Object(m));
     }
     let theme = app.session.active().map(|d| d.wb.theme.clone()).unwrap_or_default();
-    colour_row(app, ui, &theme, "Label colour", f.color, "chart.setDataLabels", &params, "color");
+    colour_row(app, ui, &theme, "Label colour", f.color, "chart.setDataLabels", &params, "color", "");
 }
 
 /// The series a chart-level section works on, remembered per chart.
@@ -1157,6 +1174,219 @@ fn chart_scope(ui: &mut Ui, chart: &Chart, id: u32) -> usize {
         }
     });
     scope.min(n.saturating_sub(1))
+}
+
+// ---------------------------------------------------------------- shapes & pictures
+
+/// What the pane formats when the selected object is not a chart: a shape or a picture, copied out
+/// of the workbook so the pane never holds a borrow of it.
+enum Picked {
+    Shape(Shape),
+    Image(Image),
+}
+
+/// The shape or picture the selected object id names on the active sheet, if it is one.
+fn picked(app: &SheetApp, id: u32) -> Option<Picked> {
+    let sh = app.session.active()?.wb.active()?;
+    if let Some(shape) = sh.shapes.iter().find(|s| s.id == id) {
+        return Some(Picked::Shape(shape.clone()));
+    }
+    sh.images.iter().find(|i| i.id == id).map(|i| Picked::Image(i.clone()))
+}
+
+/// The `object.format` params for one object; a section adds the field it changes.
+fn object_params(kind: &str, id: u32) -> Map<String, Json> {
+    let mut m = Map::new();
+    m.insert("kind".into(), json!(kind));
+    m.insert("id".into(), json!(id));
+    m
+}
+
+/// Runs `object.format` with the object's params and the fields one control sets.
+fn run_object(app: &mut SheetApp, base: &Map<String, Json>, fields: Json) {
+    let mut m = base.clone();
+    if let Json::Object(f) = fields {
+        m.extend(f);
+    }
+    app.run_or_alert("object.format", Json::Object(m));
+}
+
+/// A shape: its fill, its outline, its text and its box — exactly what the model stores for one and
+/// `object.format` writes, so no control here offers a value the command would refuse.
+fn shape(app: &mut SheetApp, ui: &mut Ui, sh: &Shape) {
+    let wb_theme = app.session.active().map(|d| d.wb.theme.clone()).unwrap_or_default();
+    let t = Tokens::get(ui.ctx());
+    let params = object_params("shape", sh.id);
+    ui.collapsing(tr(ui, "Fill"), |ui| {
+        colour_row(app, ui, &wb_theme, "Fill", Some(sh.fill), "object.format", &params, "fill", tr(ui, "No Fill"));
+    });
+    ui.collapsing(tr(ui, "Line"), |ui| {
+        let mut drawn = !sh.format.no_line;
+        if ui.checkbox(&mut drawn, crate::widgets::tr(ui, "No line")).changed() {
+            run_object(app, &params, json!({"noLine": !drawn}));
+        }
+        ui.add_enabled_ui(drawn, |ui| {
+            colour_row(app, ui, &wb_theme, "Line colour", Some(sh.line), "object.format", &params, "line", tr(ui, "Automatic"));
+        });
+    });
+    // A shape's text formatting is stored with its text, so it is offered where there is text.
+    if !sh.text.is_empty() {
+        let f = &sh.format;
+        ui.collapsing(tr(ui, "Text"), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(tr(ui, "Text size"));
+                let field = egui::Id::new(("gridcraft.object_font_size", sh.id));
+                if let Some(v) = number(ui, field, f64::from(f.font_size.unwrap_or(SHAPE_TEXT_PT)), 1.0..=400.0, "") {
+                    run_object(app, &params, json!({"fontSize": v}));
+                }
+                ui.label(RichText::new(tr(ui, "pt")).small().color(t.text_dim));
+            });
+            let mut bold = f.bold;
+            if ui.checkbox(&mut bold, crate::widgets::tr(ui, "Bold")).changed() {
+                run_object(app, &params, json!({"bold": bold}));
+            }
+            let mut italic = f.italic;
+            if ui.checkbox(&mut italic, crate::widgets::tr(ui, "Italic")).changed() {
+                run_object(app, &params, json!({"italic": italic}));
+            }
+            ui.horizontal(|ui| {
+                ui.label(tr(ui, "Typeface"));
+                let field = egui::Id::new(("gridcraft.object_font", sh.id));
+                if let Some(name) = crate::widgets::committed_text(ui, field, f.font.as_deref().unwrap_or(""), Some(120.0)) {
+                    run_object(app, &params, json!({"font": name}));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(tr(ui, "Text colour"));
+                if let Some(c) = colour_choice(ui, &wb_theme, f.text_color, tr(ui, "Automatic")) {
+                    run_object(app, &params, json!({"textColor": c}));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(tr(ui, "Text outline"));
+                if let Some(c) = colour_choice(ui, &wb_theme, f.text_outline.map(|(c, _)| c), tr(ui, "No outline")) {
+                    // A picked colour keeps the width it already had; 0.75 pt is Excel's hairline.
+                    let width = f.text_outline.map_or(0.75, |(_, w)| w);
+                    let fields = if c == "none" { json!({"textOutline": Json::Null}) } else { json!({"textOutline": {"color": c, "width": width}}) };
+                    run_object(app, &params, fields);
+                }
+                if let Some((colour, width)) = f.text_outline
+                    && let Some(hex) = colour.hex(&wb_theme)
+                    && let Some(v) = number(ui, egui::Id::new(("gridcraft.object_text_outline", sh.id)), f64::from(width), 0.0..=100.0, "")
+                {
+                    run_object(app, &params, json!({"textOutline": {"color": hex, "width": v}}));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(tr(ui, "Alignment"));
+                let current = match f.align {
+                    Some(ShapeTextAlign::Left) => "Left",
+                    Some(ShapeTextAlign::Center) => "Center",
+                    Some(ShapeTextAlign::Right) => "Right",
+                    None => "Default",
+                };
+                egui::ComboBox::from_id_salt(("gridcraft.object_align", sh.id)).selected_text(tr(ui, current)).show_ui(ui, |ui| {
+                    for (label, value) in [("Default", Json::Null), ("Left", json!("left")), ("Center", json!("center")), ("Right", json!("right"))] {
+                        if ui.selectable_label(current == label, tr(ui, label)).clicked() {
+                            run_object(app, &params, json!({"align": value}));
+                        }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label(tr(ui, "Vertical anchor"));
+                let current = match f.anchor {
+                    Some(ShapeTextAnchor::Top) => "Top",
+                    Some(ShapeTextAnchor::Middle) => "Middle",
+                    Some(ShapeTextAnchor::Bottom) => "Bottom",
+                    None => "Default",
+                };
+                egui::ComboBox::from_id_salt(("gridcraft.object_anchor", sh.id)).selected_text(tr(ui, current)).show_ui(ui, |ui| {
+                    for (label, value) in [("Default", Json::Null), ("Top", json!("top")), ("Middle", json!("middle")), ("Bottom", json!("bottom"))] {
+                        if ui.selectable_label(current == label, tr(ui, label)).clicked() {
+                            run_object(app, &params, json!({"anchor": value}));
+                        }
+                    }
+                });
+            });
+        });
+    }
+    object_box(app, ui, "shape", sh.id, &sh.anchor);
+    object_alt(app, ui, "shape", sh.id, sh.alt.as_deref().unwrap_or(""));
+}
+
+/// A picture: the box it sits in and its alt text, the two things the model stores for one. Its
+/// pixels are its own fill and outline, so there is nothing here to paint.
+fn picture(app: &mut SheetApp, ui: &mut Ui, im: &Image) {
+    object_box(app, ui, "image", im.id, &im.anchor);
+    object_alt(app, ui, "image", im.id, &im.alt);
+}
+
+/// Excel's 18 pt default for a shape's text: what the size field shows before a size is stored.
+const SHAPE_TEXT_PT: f32 = 18.0;
+
+/// Where the object sits and how big it is (`object.format`), and how it follows the cells it covers
+/// (`object.setAnchorMode`, the same choices a chart has).
+fn object_box(app: &mut SheetApp, ui: &mut Ui, kind: &str, id: u32, anchor: &Anchor) {
+    let params = object_params(kind, id);
+    ui.collapsing(tr(ui, "Position & Size"), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(tr(ui, "From"));
+            if let Some(at) = crate::widgets::committed_text(ui, egui::Id::new(("gridcraft.object_at", id)), &anchor.cell.a1(), Some(70.0)) {
+                run_object(app, &params, json!({"at": at}));
+            }
+        });
+        // Keep the value being typed or dragged between frames; reloading it from the object every
+        // frame threw the edit away.
+        let draft = egui::Id::new(("gridcraft.object_size", id));
+        let min = crate::chartview::OBJECT_MIN_SIZE;
+        let (mut w, mut h) = ui.data_mut(|d| d.get_temp::<(f32, f32)>(draft)).unwrap_or((anchor.width, anchor.height));
+        let a = ui.add(egui::DragValue::new(&mut w).prefix(tr(ui, "Width ")).range(min..=4000.0));
+        let b = ui.add(egui::DragValue::new(&mut h).prefix(tr(ui, "Height ")).range(0.0..=4000.0));
+        if a.drag_stopped() || a.lost_focus() || b.drag_stopped() || b.lost_focus() {
+            ui.data_mut(|d| d.remove::<(f32, f32)>(draft));
+            if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                run_object(app, &params, json!({"width": w, "height": h}));
+            }
+        } else if a.dragged() || a.has_focus() || b.dragged() || b.has_focus() {
+            ui.data_mut(|d| d.insert_temp(draft, (w, h)));
+        } else {
+            ui.data_mut(|d| d.remove::<(f32, f32)>(draft));
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (label, mode) in [
+                ("Move and size with cells", AnchorMode::MoveAndSize),
+                ("Move but don't size with cells", AnchorMode::MoveOnly),
+                ("Don't move or size with cells", AnchorMode::Absolute),
+            ] {
+                if ui.selectable_label(anchor.mode == mode, tr(ui, label)).clicked() {
+                    app.run_or_alert("object.setAnchorMode", json!({"kind": kind, "id": id, "mode": anchor_mode_name(mode)}));
+                }
+            }
+        });
+    });
+}
+
+/// The wire name of an anchor mode, as `object.setAnchorMode` takes it.
+fn anchor_mode_name(mode: AnchorMode) -> &'static str {
+    match mode {
+        AnchorMode::MoveAndSize => "moveAndSize",
+        AnchorMode::MoveOnly => "moveOnly",
+        AnchorMode::Absolute => "absolute",
+    }
+}
+
+/// What a screen reader reads for the object, through the command that has always set it.
+fn object_alt(app: &mut SheetApp, ui: &mut Ui, kind: &str, id: u32, alt: &str) {
+    ui.collapsing(tr(ui, "Alt Text"), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(tr(ui, "Description"));
+            if let Some(text) = crate::widgets::committed_text(ui, egui::Id::new(("gridcraft.object_alt", id)), alt, None) {
+                app.run_or_alert("object.setAltText", json!({"kind": kind, "id": id, "text": text}));
+            }
+        });
+        ui.label(RichText::new(tr(ui, "Read out by a screen reader in place of the object.")).small().color(Tokens::get(ui.ctx()).text_dim));
+    });
 }
 
 /// How many points a series plots (its value count, at least one).

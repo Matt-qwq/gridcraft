@@ -4073,6 +4073,10 @@ fn object_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
             if kind == "chart" {
                 items.extend([("-", ""), ("Select Data…", "ui:selectData"), ("Format Chart Area…", "ui:formatChart")]);
             }
+            // A shape or a picture opens the same Format pane, with its own sections.
+            if matches!(kind, "image" | "shape") {
+                items.extend([("-", ""), ("Format Object…", "ui:formatChart")]);
+            }
             if kind == "pivotSlicer" {
                 items.extend([("-", ""), ("Select All", "slicer.selectAll"), ("Clear Filter", "slicer.clear")]);
             }

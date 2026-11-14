@@ -160,6 +160,15 @@ pub fn specs() -> Vec<CommandSpec> {
             set_alt_text
         ),
         cmd!(
+            "object.format",
+            "Format Object",
+            ["Format", "Current Selection"],
+            None,
+            "{kind: shape|image, id, fill?: #RRGGBB|{theme, tint}|none, line?, no_line?: bool, width?, height?: points, at?: \"C3\", font_size?: 1..400, bold?, italic?, font?: typeface, text_color?, text_outline?: {color, width?: points}, align?: left|center|right, anchor?: top|middle|bottom, alt?: string} — one undo step; a picture takes at, width, height and alt, a shape every field (camelCase spellings are accepted too)",
+            has_doc,
+            object_format
+        ),
+        cmd!(
             "insert.link",
             "Link",
             ["Insert", "Links"],
@@ -1324,6 +1333,400 @@ fn set_alt_text(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
+// ---------------------------------------------------------------- object formatting
+
+/// The object fields `object.format` was given: `None` is a field the params left alone, and a
+/// `Some(None)` is a field the caller cleared (a shape can hold no typeface, colour or outline).
+#[derive(Default)]
+struct ObjectFormat {
+    at: Option<CellRef>,
+    width: Option<f32>,
+    height: Option<f32>,
+    alt: Option<Option<String>>,
+    fill: Option<Color>,
+    line: Option<Color>,
+    no_line: Option<bool>,
+    font_size: Option<Option<f32>>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    font: Option<Option<String>>,
+    text_color: Option<Option<Color>>,
+    text_outline: Option<Option<(Color, f32)>>,
+    align: Option<Option<ShapeTextAlign>>,
+    anchor: Option<Option<ShapeTextAnchor>>,
+}
+
+impl ObjectFormat {
+    fn is_empty(&self) -> bool {
+        self.at.is_none()
+            && self.width.is_none()
+            && self.height.is_none()
+            && self.alt.is_none()
+            && self.fill.is_none()
+            && self.line.is_none()
+            && self.no_line.is_none()
+            && self.font_size.is_none()
+            && self.bold.is_none()
+            && self.italic.is_none()
+            && self.font.is_none()
+            && self.text_color.is_none()
+            && self.text_outline.is_none()
+            && self.align.is_none()
+            && self.anchor.is_none()
+    }
+
+    /// Puts the fields the caller gave onto a shape; the ones it did not give stay as they were.
+    fn apply_shape(&self, sh: &mut Shape) {
+        if let Some(at) = self.at {
+            sh.anchor.cell = at;
+        }
+        if let Some(w) = self.width {
+            sh.anchor.width = w;
+        }
+        if let Some(h) = self.height {
+            sh.anchor.height = h;
+        }
+        if let Some(alt) = &self.alt {
+            sh.alt = alt.clone();
+        }
+        if let Some(c) = self.fill {
+            sh.fill = c;
+        }
+        if let Some(c) = self.line {
+            sh.line = c;
+        }
+        let f = &mut sh.format;
+        if let Some(v) = self.no_line {
+            f.no_line = v;
+        }
+        if let Some(v) = self.font_size {
+            f.font_size = v;
+        }
+        if let Some(v) = self.bold {
+            f.bold = v;
+        }
+        if let Some(v) = self.italic {
+            f.italic = v;
+        }
+        if let Some(v) = &self.font {
+            f.font = v.clone();
+        }
+        if let Some(v) = self.text_color {
+            f.text_color = v;
+        }
+        if let Some(v) = self.text_outline {
+            f.text_outline = v;
+        }
+        if let Some(v) = self.align {
+            f.align = v;
+        }
+        if let Some(v) = self.anchor {
+            f.anchor = v;
+        }
+    }
+
+    /// A picture stores its box and its alt text; its pixels are its own fill, so there is nothing
+    /// else to apply.
+    fn apply_image(&self, im: &mut Image) {
+        if let Some(at) = self.at {
+            im.anchor.cell = at;
+        }
+        if let Some(w) = self.width {
+            im.anchor.width = w;
+        }
+        if let Some(h) = self.height {
+            im.anchor.height = h;
+        }
+        if let Some(alt) = &self.alt {
+            im.alt = alt.clone().unwrap_or_default();
+        }
+    }
+}
+
+/// What a shape now looks like, so a caller (and the Format pane's own tests) can see that the
+/// formatting reached the model.
+fn shape_format_json(sh: &Shape) -> Json {
+    let f = &sh.format;
+    json!({
+        "kind": "shape",
+        "id": sh.id,
+        "fill": object_colour_json(&sh.fill),
+        "line": object_colour_json(&sh.line),
+        "noLine": f.no_line,
+        "at": sh.anchor.cell.a1(),
+        "width": sh.anchor.width,
+        "height": sh.anchor.height,
+        "fontSize": f.font_size.map_or(Json::Null, |v| json!(v)),
+        "bold": f.bold,
+        "italic": f.italic,
+        "font": f.font.clone().map_or(Json::Null, Json::String),
+        "textColor": f.text_color.map_or(Json::Null, |c| object_colour_json(&c)),
+        "textOutline": f.text_outline.map_or(Json::Null, |(c, w)| json!({"color": object_colour_json(&c), "width": w})),
+        "align": f.align.map_or(Json::Null, |a| json!(object_align_name(a))),
+        "anchor": f.anchor.map_or(Json::Null, |a| json!(object_anchor_name(a))),
+        "alt": sh.alt.clone().map_or(Json::Null, Json::String),
+    })
+}
+
+/// A picture's box and alt text, reported the same way.
+fn image_format_json(im: &Image) -> Json {
+    json!({
+        "kind": "image",
+        "id": im.id,
+        "at": im.anchor.cell.a1(),
+        "width": im.anchor.width,
+        "height": im.anchor.height,
+        "alt": im.alt,
+    })
+}
+
+/// A colour as the params take it: `#RRGGBB`, a theme colour `{theme, tint}`, or `"none"`.
+fn object_colour_json(c: &Color) -> Json {
+    match *c {
+        Color::Auto => json!("none"),
+        Color::Rgb(v) => json!(format!("#{v:06X}")),
+        Color::Theme(i, tint) => json!({"theme": i, "tint": f64::from(tint) / 1000.0}),
+    }
+}
+
+fn object_align_name(a: ShapeTextAlign) -> &'static str {
+    match a {
+        ShapeTextAlign::Left => "left",
+        ShapeTextAlign::Center => "center",
+        ShapeTextAlign::Right => "right",
+    }
+}
+
+fn object_anchor_name(a: ShapeTextAnchor) -> &'static str {
+    match a {
+        ShapeTextAnchor::Top => "top",
+        ShapeTextAnchor::Middle => "middle",
+        ShapeTextAnchor::Bottom => "bottom",
+    }
+}
+
+/// A field's params spelling and its camelCase alias: the pane and the rest of the command table
+/// write `fontSize`, a hand-written call may write `font_size`; both mean the same field.
+fn object_field<'a>(p: &'a Json, key: &str) -> Option<&'a Json> {
+    const ALIAS: [(&str, &str); 4] = [("no_line", "noLine"), ("font_size", "fontSize"), ("text_color", "textColor"), ("text_outline", "textOutline")];
+    p.get(key).or_else(|| ALIAS.iter().find(|(snake, _)| *snake == key).and_then(|(_, camel)| p.get(*camel)))
+}
+
+/// A colour param: `#RRGGBB`, a theme colour `{theme, tint}`, or `"none"`/`null` to clear it.
+fn object_colour_param(cmd: &str, v: &Json, key: &str) -> Result<Option<Color>> {
+    match v {
+        Json::Null => Ok(None),
+        Json::String(s) => {
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("automatic") {
+                return Ok(None);
+            }
+            Color::from_hex(s)
+                .map(Some)
+                .ok_or_else(|| bad(cmd, format!("`{key}` is not a colour: give #RRGGBB, a theme colour {{theme, tint}} or none, not `{s}`")))
+        }
+        Json::Object(o) => {
+            let theme = o.get("theme").and_then(Json::as_u64).ok_or_else(|| bad(cmd, format!("`{key}` needs a theme index 0-11")))?;
+            let tint = o.get("tint").and_then(Json::as_f64).unwrap_or(0.0);
+            if !tint.is_finite() || !(-1.0..=1.0).contains(&tint) {
+                return Err(bad(cmd, format!("`{key}`'s tint must be between -1 and 1")));
+            }
+            Ok(Some(Color::Theme(u8::try_from(theme.min(11)).unwrap_or(0), (tint * 1000.0) as i16)))
+        }
+        _ => Err(bad(cmd, format!("`{key}` must be a colour: #RRGGBB, a theme colour {{theme, tint}} or none"))),
+    }
+}
+
+/// A size param in points: a shape's `width` is 1-10,000 and its `height` 0-10,000, as
+/// `object.move` takes them.
+fn object_size_param(cmd: &str, p: &Json, key: &str, lo: f64, hi: f64) -> Result<Option<f32>> {
+    let Some(v) = object_field(p, key).filter(|v| !v.is_null()) else { return Ok(None) };
+    let v = v.as_f64().ok_or_else(|| bad(cmd, format!("`{key}` must be a number of points")))?;
+    if !v.is_finite() || !(lo..=hi).contains(&v) {
+        return Err(bad(cmd, format!("`{key}` must be between {lo} and {hi} points")));
+    }
+    Ok(Some(v as f32))
+}
+
+/// The `align`/`anchor` param: a name, or `null`/`"default"` to go back to the shape's own default.
+fn object_choice_param<T>(cmd: &str, v: &Json, key: &str, f: impl Fn(&str) -> Option<T>) -> Result<Option<T>> {
+    match v {
+        Json::Null => Ok(None),
+        Json::String(s) if s.trim().is_empty() || s.eq_ignore_ascii_case("default") || s.eq_ignore_ascii_case("auto") => Ok(None),
+        Json::String(s) => f(&s.trim().to_ascii_lowercase()).map(Some).ok_or_else(|| bad(cmd, format!("`{key}` does not take `{s}`"))),
+        _ => Err(bad(cmd, format!("`{key}` must be a name"))),
+    }
+}
+
+/// Reads every field `object.format` can set, before anything is touched, so a bad value leaves the
+/// workbook exactly as it was.
+fn parse_object_format(s: &Session, p: &Json, shape: bool) -> Result<ObjectFormat> {
+    const CMD: &str = "object.format";
+    let at = cell_param(s, p, "at")?;
+    let width = object_size_param(CMD, p, "width", 1.0, 10_000.0)?;
+    let height = object_size_param(CMD, p, "height", 0.0, 10_000.0)?;
+    let alt = match object_field(p, "alt") {
+        None => None,
+        Some(Json::Null) => Some(None),
+        Some(Json::String(t)) => {
+            let t = t.trim();
+            if t.chars().count() > 1024 {
+                return Err(bad(CMD, "`alt` is longer than the 1,024 characters a screen reader reads"));
+            }
+            Some((!t.is_empty()).then(|| t.to_string()))
+        }
+        Some(_) => return Err(bad(CMD, "`alt` must be a string")),
+    };
+    if !shape {
+        // A picture's own pixels are its fill: the file has no place for a picture's outline or text.
+        let shape_only = ["fill", "line", "no_line", "font_size", "bold", "italic", "font", "text_color", "text_outline", "align", "anchor"];
+        if let Some(key) = shape_only.into_iter().find(|key| object_field(p, key).is_some()) {
+            return Err(bad(CMD, format!("`{key}` is a shape's own field: a picture takes at, width, height and alt")));
+        }
+        return Ok(ObjectFormat { at, width, height, alt, ..Default::default() });
+    }
+    let fill = match object_field(p, "fill") {
+        None => None,
+        Some(v) => Some(object_colour_param(CMD, v, "fill")?.unwrap_or(Color::Auto)),
+    };
+    let line = match object_field(p, "line") {
+        None => None,
+        Some(v) => Some(object_colour_param(CMD, v, "line")?.unwrap_or(Color::Auto)),
+    };
+    let no_line = match object_field(p, "no_line") {
+        None => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| bad(CMD, "`no_line` must be true or false"))?),
+    };
+    let font_size = match object_field(p, "font_size") {
+        None => None,
+        Some(Json::Null) => Some(None),
+        Some(v) => {
+            let v = v.as_f64().ok_or_else(|| bad(CMD, "`font_size` must be a number of points"))?;
+            if !v.is_finite() || !(1.0..=400.0).contains(&v) {
+                return Err(bad(CMD, "`font_size` must be between 1 and 400 points"));
+            }
+            // Excel's font size box holds halves of a point.
+            Some(Some(((v * 2.0).round() / 2.0) as f32))
+        }
+    };
+    let bold = match object_field(p, "bold") {
+        None => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| bad(CMD, "`bold` must be true or false"))?),
+    };
+    let italic = match object_field(p, "italic") {
+        None => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| bad(CMD, "`italic` must be true or false"))?),
+    };
+    let font = match object_field(p, "font") {
+        None => None,
+        Some(Json::Null) => Some(None),
+        Some(Json::String(t)) => {
+            let t = t.trim();
+            if t.chars().count() > 31 {
+                return Err(bad(CMD, "`font` is longer than the 31 characters a typeface name holds"));
+            }
+            Some((!t.is_empty()).then(|| t.to_string()))
+        }
+        Some(_) => return Err(bad(CMD, "`font` must be a typeface name")),
+    };
+    let text_color = match object_field(p, "text_color") {
+        None => None,
+        Some(v) => Some(object_colour_param(CMD, v, "text_color")?),
+    };
+    let text_outline = match object_field(p, "text_outline") {
+        None => None,
+        Some(v @ Json::Object(_)) => {
+            let colour = object_colour_param(CMD, v.get("color").unwrap_or(&Json::Null), "text_outline.color")?
+                .ok_or_else(|| bad(CMD, "`text_outline` needs a colour"))?;
+            let width = match v.get("width").filter(|w| !w.is_null()) {
+                None => 0.75,
+                Some(w) => {
+                    let w = w.as_f64().ok_or_else(|| bad(CMD, "`text_outline.width` must be a number of points"))?;
+                    if !w.is_finite() || !(0.0..=100.0).contains(&w) {
+                        return Err(bad(CMD, "`text_outline.width` must be between 0 and 100 points"));
+                    }
+                    w as f32
+                }
+            };
+            Some(Some((colour, width)))
+        }
+        Some(v) => Some(object_colour_param(CMD, v, "text_outline")?.map(|colour| (colour, 0.75))),
+    };
+    let align = match object_field(p, "align") {
+        None => None,
+        Some(v) => Some(object_choice_param(CMD, v, "align", |s| match s {
+            "left" | "l" => Some(ShapeTextAlign::Left),
+            "center" | "centre" | "ctr" => Some(ShapeTextAlign::Center),
+            "right" | "r" => Some(ShapeTextAlign::Right),
+            _ => None,
+        })?),
+    };
+    let anchor = match object_field(p, "anchor") {
+        None => None,
+        Some(v) => Some(object_choice_param(CMD, v, "anchor", |s| match s {
+            "top" | "t" => Some(ShapeTextAnchor::Top),
+            "middle" | "center" | "centre" | "ctr" | "m" => Some(ShapeTextAnchor::Middle),
+            "bottom" | "b" => Some(ShapeTextAnchor::Bottom),
+            _ => None,
+        })?),
+    };
+    Ok(ObjectFormat { at, width, height, alt, fill, line, no_line, font_size, bold, italic, font, text_color, text_outline, align, anchor })
+}
+
+/// Formats a shape or a picture: its fill, its outline, its text and its box, in one undo step.
+/// Every value is checked before the workbook changes, and setting what the object already holds is
+/// not an edit at all.
+fn object_format(s: &mut Session, p: &Json) -> Result<Json> {
+    const CMD: &str = "object.format";
+    let kind = str_param(p, "kind").ok_or_else(|| bad(CMD, "`kind` must be shape or image"))?;
+    if !matches!(kind, "shape" | "image") {
+        return Err(bad(CMD, format!("`kind` must be shape or image, not `{kind}`")));
+    }
+    let shape = kind == "shape";
+    let id = u32_param(p, "id").ok_or_else(|| bad(CMD, "missing `id`"))?;
+    let o = parse_object_format(s, p, shape)?;
+    if o.is_empty() {
+        return Err(bad(
+            CMD,
+            "give at least one field to set: at, width, height, alt, or a shape's fill, line, no_line, font_size, bold, italic, font, text_color, text_outline, align, anchor",
+        ));
+    }
+    let missing = || bad(CMD, if shape { "no such shape" } else { "no such picture" });
+    let sheet = s.doc()?.wb.active_sheet;
+    // An edit that changes nothing would still be an undo step (a commit always swaps the workbook),
+    // so the object is patched and compared first, the way `shape.setText` does it.
+    {
+        let sh = s.doc()?.wb.sheet(sheet).ok_or_else(|| bad(CMD, "no such sheet"))?;
+        if shape {
+            let Some(before) = sh.shapes.iter().find(|x| x.id == id) else { return Err(missing()) };
+            let mut after = before.clone();
+            o.apply_shape(&mut after);
+            if after == *before {
+                return Ok(shape_format_json(&after));
+            }
+        } else {
+            let Some(before) = sh.images.iter().find(|x| x.id == id) else { return Err(missing()) };
+            let mut after = before.clone();
+            o.apply_image(&mut after);
+            if after == *before {
+                return Ok(image_format_json(&after));
+            }
+        }
+    }
+    edit(s, |cx| {
+        let sh = cx.sheet_mut(sheet)?;
+        if shape {
+            let sp = sh.shapes.iter_mut().find(|x| x.id == id).ok_or_else(missing)?;
+            o.apply_shape(sp);
+            Ok(shape_format_json(sp))
+        } else {
+            let im = sh.images.iter_mut().find(|x| x.id == id).ok_or_else(missing)?;
+            o.apply_image(im);
+            Ok(image_format_json(im))
+        }
+    })
+}
+
 // ---------------------------------------------------------------- links & comments
 
 fn insert_link(s: &mut Session, p: &Json) -> Result<Json> {
@@ -1819,6 +2222,236 @@ fn insert_icon(s: &mut Session, p: &Json) -> Result<Json> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 1×1 PNG, so a picture can be inserted from code (no binary fixture in the repo).
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    /// A text box, the shape that carries text and so every field `object.format` can set.
+    fn text_box(s: &mut Session) -> u32 {
+        let id = s.execute("insert.textBox", json!({"at": "C3", "width": 144, "height": 96, "text": "Summary"})).unwrap()["shape"].clone();
+        u32::try_from(id.as_u64().unwrap_or(0)).unwrap_or(0)
+    }
+
+    fn shape_of(s: &Session, id: u32) -> Shape {
+        s.doc().unwrap().wb.active().unwrap().shapes.iter().find(|sh| sh.id == id).cloned().expect("the shape")
+    }
+
+    #[test]
+    fn object_format_sets_every_field_of_a_shape_in_one_undo_step() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = text_box(&mut s);
+        let original = shape_of(&s, id);
+        let undo_len = s.doc().unwrap().undo.len();
+        let r = s
+            .execute(
+                "object.format",
+                json!({
+                    "kind": "shape",
+                    "id": id,
+                    "fill": "#FF0000",
+                    "line": "#0000FF",
+                    "no_line": false,
+                    "at": "D4",
+                    "width": 200,
+                    "height": 80,
+                    "font_size": 14.4,
+                    "bold": true,
+                    "italic": true,
+                    "font": "Verdana",
+                    "text_color": "#112233",
+                    "text_outline": {"color": "#445566", "width": 1.5},
+                    "align": "right",
+                    "anchor": "bottom",
+                    "alt": "  Region summary  ",
+                }),
+            )
+            .unwrap();
+        // The command reports what it stored, so a caller can see the formatting took.
+        assert_eq!(r["fill"], json!("#FF0000"));
+        assert_eq!(r["line"], json!("#0000FF"));
+        assert_eq!(r["at"], json!("D4"));
+        assert_eq!(r["fontSize"], json!(14.5), "Excel's font box holds halves of a point");
+        assert_eq!(r["align"], json!("right"));
+        assert_eq!(r["anchor"], json!("bottom"));
+        assert_eq!(r["textOutline"], json!({"color": "#445566", "width": 1.5}));
+        assert_eq!(r["alt"], json!("Region summary"), "trimmed like object.setAltText");
+
+        let sh = shape_of(&s, id);
+        assert_eq!(sh.fill, Color::rgb(0xFF, 0, 0));
+        assert_eq!(sh.line, Color::rgb(0, 0, 0xFF));
+        assert_eq!((sh.anchor.cell, sh.anchor.width, sh.anchor.height), (CellRef::parse("D4").unwrap(), 200.0, 80.0));
+        assert_eq!(sh.alt.as_deref(), Some("Region summary"));
+        let f = &sh.format;
+        assert_eq!(f.font_size, Some(14.5));
+        assert!(f.bold && f.italic && !f.no_line);
+        assert_eq!(f.font.as_deref(), Some("Verdana"));
+        assert_eq!(f.text_color, Some(Color::rgb(0x11, 0x22, 0x33)));
+        assert_eq!(f.text_outline, Some((Color::rgb(0x44, 0x55, 0x66), 1.5)));
+        assert_eq!((f.align, f.anchor), (Some(ShapeTextAlign::Right), Some(ShapeTextAnchor::Bottom)));
+        assert_eq!(sh.text, "Summary", "formatting leaves the text alone");
+
+        // One step, whatever it set, and one undo puts the shape back as it was.
+        assert_eq!(s.doc().unwrap().undo.len(), undo_len + 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(shape_of(&s, id), original);
+    }
+
+    #[test]
+    fn object_format_clears_what_it_is_asked_to_clear() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = text_box(&mut s);
+        s.execute(
+            "object.format",
+            json!({"kind": "shape", "id": id, "fill": "#FF0000", "line": "#00FF00", "no_line": true, "font": "Verdana", "text_color": "#112233", "text_outline": {"color": "#445566"}, "align": "center", "anchor": "middle", "alt": "x"}),
+        )
+        .unwrap();
+        // "none" and null clear a colour; the shape keeps a line colour it is not drawing.
+        s.execute(
+            "object.format",
+            json!({"kind": "shape", "id": id, "fill": "none", "no_line": false, "font": null, "text_color": "none", "text_outline": null, "align": "default", "anchor": null, "alt": ""}),
+        )
+        .unwrap();
+        let sh = shape_of(&s, id);
+        assert_eq!(sh.fill, Color::Auto, "no fill");
+        assert_eq!(sh.format.font, None);
+        assert_eq!(sh.format.text_color, None);
+        assert_eq!(sh.format.text_outline, None);
+        assert_eq!((sh.format.align, sh.format.anchor), (None, None), "back to the shape's own default");
+        assert_eq!(sh.alt, None);
+        assert_eq!((sh.line, sh.format.no_line), (Color::rgb(0, 0xFF, 0), false), "the outline is drawn again in its own colour");
+    }
+
+    #[test]
+    fn object_format_is_not_an_undo_step_when_nothing_changes() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = text_box(&mut s);
+        let wb = s.doc().unwrap().wb.clone();
+        let undo_len = s.doc().unwrap().undo.len();
+        for params in [
+            json!({"kind": "shape", "id": id, "at": "C3", "width": 144, "height": 96}),
+            json!({"kind": "shape", "id": id, "fill": "#FFFFFF", "at": "C3"}),
+            json!({"kind": "shape", "id": id, "bold": false, "align": "default"}),
+        ] {
+            s.execute("object.format", params).unwrap();
+        }
+        assert!(std::sync::Arc::ptr_eq(&s.doc().unwrap().wb, &wb), "no revision for an edit that changes nothing");
+        assert_eq!(s.doc().unwrap().undo.len(), undo_len);
+    }
+
+    #[test]
+    fn object_format_rejects_what_it_cannot_store() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = text_box(&mut s);
+        let picture = s.execute("insert.picture", json!({"base64": PNG, "mime": "image/png", "at": "A10"})).unwrap()["image"].as_u64().unwrap_or(0);
+        let picture = u32::try_from(picture).unwrap_or(0);
+        let before = s.doc().unwrap().wb.clone();
+        let undo_len = s.doc().unwrap().undo.len();
+        for params in [
+            // Empty and half-empty params never open a dialog: they say what is missing.
+            json!({}),
+            json!({"kind": "shape"}),
+            json!({"id": id, "fill": "#FF0000"}),
+            json!({"kind": "chart", "id": id, "fill": "#FF0000"}),
+            // A kind with nothing to set is not an edit.
+            json!({"kind": "shape", "id": id}),
+            // Unknown, misspelled and out-of-range values.
+            json!({"kind": "shape", "id": id, "fill": "red"}),
+            json!({"kind": "shape", "id": id, "fill": "#FF00"}),
+            json!({"kind": "shape", "id": id, "fill": {"theme": 99, "tint": 5}}),
+            json!({"kind": "shape", "id": id, "width": 0}),
+            json!({"kind": "shape", "id": id, "height": 10_001}),
+            json!({"kind": "shape", "id": id, "width": "wide"}),
+            json!({"kind": "shape", "id": id, "font_size": 0}),
+            json!({"kind": "shape", "id": id, "font_size": 401}),
+            json!({"kind": "shape", "id": id, "font": 12}),
+            json!({"kind": "shape", "id": id, "bold": "yes"}),
+            json!({"kind": "shape", "id": id, "text_outline": {"color": "#445566", "width": 101}}),
+            json!({"kind": "shape", "id": id, "text_outline": {"width": 1}}),
+            json!({"kind": "shape", "id": id, "align": "justify"}),
+            json!({"kind": "shape", "id": id, "anchor": "sideways"}),
+            json!({"kind": "shape", "id": id, "alt": "x".repeat(1025)}),
+            json!({"kind": "shape", "id": id, "at": "not a cell"}),
+            // A picture has no fill, outline or text of its own.
+            json!({"kind": "image", "id": picture, "fill": "#FF0000"}),
+            json!({"kind": "image", "id": picture, "font_size": 12}),
+            // And an id that names nothing.
+            json!({"kind": "shape", "id": 999, "fill": "#FF0000"}),
+            json!({"kind": "image", "id": id, "alt": "x"}),
+        ] {
+            assert!(matches!(s.execute("object.format", params.clone()), Err(crate::EngineError::BadParams { .. })), "{params}");
+            assert!(std::sync::Arc::ptr_eq(&s.doc().unwrap().wb, &before), "{params} must change nothing");
+            assert_eq!(s.doc().unwrap().undo.len(), undo_len, "{params}");
+        }
+    }
+
+    #[test]
+    fn object_format_survives_a_save_and_reopen() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = text_box(&mut s);
+        s.execute(
+            "object.format",
+            json!({
+                "kind": "shape",
+                "id": id,
+                "fill": "#FF0000",
+                "line": "#0000FF",
+                "width": 200,
+                "height": 80,
+                "at": "D4",
+                "font_size": 14,
+                "bold": true,
+                "italic": true,
+                "font": "Verdana",
+                "text_color": "#112233",
+                "text_outline": {"color": "#445566", "width": 1.5},
+                "align": "right",
+                "anchor": "bottom",
+                "alt": "Region summary",
+            }),
+        )
+        .unwrap();
+        let picture = s.execute("insert.picture", json!({"base64": PNG, "mime": "image/png", "at": "A10"})).unwrap()["image"].as_u64().unwrap_or(0);
+        let picture = u32::try_from(picture).unwrap_or(0);
+        s.execute("object.format", json!({"kind": "image", "id": picture, "at": "B12", "width": 90, "height": 60, "alt": "Logo"})).unwrap();
+
+        let bytes = crate::io::save_bytes(&s.doc().unwrap().wb, "format.xlsx").unwrap();
+        let (wb, warnings) = crate::io::open_bytes("format.xlsx", &bytes).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let sh = wb.active().unwrap();
+        let shape = sh.shapes.iter().find(|x| x.text == "Summary").unwrap();
+        assert_eq!(shape.fill, Color::rgb(0xFF, 0, 0));
+        assert_eq!(shape.line, Color::rgb(0, 0, 0xFF));
+        assert_eq!((shape.anchor.cell.a1(), shape.anchor.width, shape.anchor.height), ("D4".to_string(), 200.0, 80.0));
+        assert_eq!(shape.alt.as_deref(), Some("Region summary"));
+        let f = &shape.format;
+        assert_eq!(f.font_size, Some(14.0));
+        assert!(f.bold && f.italic);
+        assert_eq!(f.font.as_deref(), Some("Verdana"));
+        assert_eq!(f.text_color, Some(Color::rgb(0x11, 0x22, 0x33)));
+        assert_eq!(f.text_outline, Some((Color::rgb(0x44, 0x55, 0x66), 1.5)));
+        assert_eq!((f.align, f.anchor), (Some(ShapeTextAlign::Right), Some(ShapeTextAnchor::Bottom)));
+
+        let image = sh.images.first().unwrap();
+        assert_eq!((image.anchor.cell.a1(), image.anchor.width, image.anchor.height), ("B12".to_string(), 90.0, 60.0));
+        assert_eq!(image.alt, "Logo");
+    }
+
+    #[test]
+    fn a_shape_with_no_outline_keeps_that_in_the_file() {
+        let mut s = Session::new();
+        s.new_workbook();
+        let id = text_box(&mut s);
+        s.execute("object.format", json!({"kind": "shape", "id": id, "no_line": true})).unwrap();
+        let bytes = crate::io::save_bytes(&s.doc().unwrap().wb, "noline.xlsx").unwrap();
+        let (wb, _) = crate::io::open_bytes("noline.xlsx", &bytes).unwrap();
+        let shape = wb.active().unwrap().shapes.iter().find(|x| x.text == "Summary").unwrap();
+        assert!(shape.format.no_line, "a:ln/a:noFill is read back as no_line");
+    }
 
     #[test]
     fn manage_rules_delete_then_move() {
