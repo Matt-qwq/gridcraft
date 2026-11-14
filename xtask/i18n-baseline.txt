@@ -11,10 +11,4 @@
 # matched by path and text, so the line number is only a hint for the reviewer: an edit that shifts
 # lines does not report the whole file as new.
 crates/ui-egui/src/backstage.rs:1029	GridCraft
-crates/ui-egui/src/border_preview.rs:59	Border preview
 crates/ui-egui/src/dialogs.rs:1750	GridCraft
-crates/ui-egui/src/ribbon.rs:617	Paste
-crates/ui-egui/src/ribbon.rs:680	Format Painter
-crates/ui-egui/src/ribbon.rs:745	Border presets
-crates/ui-egui/src/ribbon.rs:1245	Font Size
-crates/ui-egui/src/ribbon.rs:1525	Pictures

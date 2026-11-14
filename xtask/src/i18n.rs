@@ -1,5 +1,7 @@
 //! cargo xtask i18n [--check] [--write]: the user-visible string literals in the UI crate that do
-//! not go through the translation lookup (tr(...)), grouped by file, with a committed baseline that
+//! not go through the translation lookup (tr(...)) — and, the other half of the same problem, every
+//! label that *does* go through it but has no Chinese entry, so it still renders English — grouped
+//! by file, with a committed baseline that
 //! ratchets the count down.
 //!
 //! - a bare command lists them, per file, with line numbers and a total
@@ -16,7 +18,7 @@
 //! Known limit: a literal bound to a let first and passed along later (let tip = "Save"; then
 //! ui.label(tip)) is not seen. The catalog grows in one direction, so those are translated by hand.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The committed baseline, relative to the workspace root.
@@ -24,6 +26,8 @@ pub const BASELINE: &str = "xtask/i18n-baseline.txt";
 
 /// The crate the scan reads, relative to the workspace root.
 const UI_SRC: &str = "crates/ui-egui/src";
+/// The catalogue the Chinese build reads: every `"english" => "中文"` arm.
+const ZH: &str = "crates/ui-egui/src/i18n/zh.rs";
 
 /// How deep the tree walk may go. The UI source is a handful of directories deep; the cap keeps a
 /// hostile layout from recursing forever.
@@ -154,13 +158,61 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// --check: every literal the scan finds is either translated or accepted in the baseline.
+/// --check: every literal the scan finds is either translated or accepted in the baseline, and
+/// every `tr("…")` key has a Chinese entry (a wrapped label without one still shows English).
 fn check(root: &Path, hits: &[Hit]) -> Result<(), String> {
     let path = root.join(BASELINE);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e} (run cargo xtask i18n --write)", path.display()))?;
     let rows = parse_baseline(&text)?;
     println!("{}", verify(&rows, hits)?);
+    let keys = scan_key_tree(root)?;
+    let known = zh_keys(root)?;
+    println!("{}", verify_keys(&keys, &known)?);
     Ok(())
+}
+
+/// One `tr("…")` call site: the key it looks up.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Key {
+    pub file: String,
+    pub line: usize,
+    pub text: String,
+}
+
+/// Whether `zh.rs` answers `key`: the whole key, or the label half of a `context|label` key (which
+/// is what `Language::tr` falls back to).
+pub fn key_is_known(key: &str, known: &BTreeSet<String>) -> bool {
+    known.contains(key) || key.rsplit_once('|').is_some_and(|(_, label)| known.contains(label))
+}
+
+/// The comparison behind --check for keys: every wrapped label has an entry, or the failure names it.
+pub fn verify_keys(keys: &[Key], known: &BTreeSet<String>) -> Result<String, String> {
+    let missing: Vec<&Key> = keys.iter().filter(|k| !key_is_known(&k.text, known)).collect();
+    if !missing.is_empty() {
+        let mut unique: BTreeMap<&str, &Key> = BTreeMap::new();
+        for k in &missing {
+            unique.entry(k.text.as_str()).or_insert(k);
+        }
+        let mut msg = format!(
+            "{} translated label(s) have no Chinese entry in {}:
+",
+            unique.len(),
+            ZH
+        );
+        for (text, k) in &unique {
+            msg.push_str(&format!(
+                "  {}:{}  {text}
+",
+                k.file, k.line
+            ));
+        }
+        msg.push_str(
+            "
+Add the entry to zh.rs: a label that goes through tr() still shows English without one.",
+        );
+        return Err(msg);
+    }
+    Ok(format!("i18n: {} translated label(s), all with a Chinese entry", keys.len()))
 }
 
 /// The comparison behind --check, without the file: the summary line, or the list of new literals.
@@ -292,13 +344,63 @@ pub fn reconcile(baseline: &[Row], found: &[Hit]) -> Diff {
 /// keytip table, sorted so the report and the baseline are stable run to run.
 fn scan_tree(root: &Path) -> Result<Vec<Hit>, String> {
     let mut hits = Vec::new();
-    walk(&root.join(UI_SRC), "", 0, &mut hits)?;
+    let mut keys = Vec::new();
+    walk(&root.join(UI_SRC), "", 0, &mut hits, &mut keys)?;
     hits.sort_by(|a, b| (&a.file, a.line, &a.text).cmp(&(&b.file, b.line, &b.text)));
     hits.dedup();
     Ok(hits)
 }
 
-fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Hit>) -> Result<(), String> {
+/// Every `tr("…")` call site in the UI crate, sorted and de-duplicated by (file, line, key).
+fn scan_key_tree(root: &Path) -> Result<Vec<Key>, String> {
+    let mut hits = Vec::new();
+    let mut keys = Vec::new();
+    walk(&root.join(UI_SRC), "", 0, &mut hits, &mut keys)?;
+    keys.sort_by(|a, b| (&a.file, a.line, &a.text).cmp(&(&b.file, b.line, &b.text)));
+    keys.dedup();
+    Ok(keys)
+}
+
+/// The English keys `zh.rs` answers, from its `"…" =>` arms.
+fn zh_keys(root: &Path) -> Result<BTreeSet<String>, String> {
+    let path = root.join(ZH);
+    let source = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(zh_keys_of(&source))
+}
+
+/// The keys of a catalogue source: a string literal whose next token is `=>`.
+pub fn zh_keys_of(source: &str) -> BTreeSet<String> {
+    let src = source.as_bytes();
+    let mut out = BTreeSet::new();
+    let mut i = 0usize;
+    while let Some(&b) = src.get(i) {
+        if b == b'/' && src.get(i + 1) == Some(&b'/') {
+            i = skip_line_comment(src, i);
+            continue;
+        }
+        if b == b'/' && src.get(i + 1) == Some(&b'*') {
+            i = skip_block_comment(src, i);
+            continue;
+        }
+        if b == b'"'
+            && let Some((from, to, after)) = string_end(src, i)
+        {
+            let mut next = skip_space(src, after);
+            if src.get(next) == Some(&b'=') && src.get(next + 1) == Some(&b'>') {
+                next += 2;
+                if let Some(text) = src.get(from..to).and_then(|s| std::str::from_utf8(s).ok()) {
+                    out.insert(text.to_string());
+                }
+            }
+            i = after.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Hit>, keys: &mut Vec<Key>) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Ok(());
     }
@@ -323,14 +425,16 @@ fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Hit>) -> Result<(), S
             continue;
         }
         if kind.is_dir() {
-            walk(&full, &rel_path, depth + 1, out)?;
+            walk(&full, &rel_path, depth + 1, out, keys)?;
             continue;
         }
         if !name.ends_with(".rs") {
             continue;
         }
         let source = std::fs::read_to_string(&full).map_err(|e| format!("read {}: {e}", full.display()))?;
-        out.extend(scan_source(&format!("{UI_SRC}/{rel_path}"), &source));
+        let file = format!("{UI_SRC}/{rel_path}");
+        out.extend(scan_source(&file, &source));
+        keys.extend(scan_keys_source(&file, &source));
     }
     Ok(())
 }
@@ -339,6 +443,71 @@ fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Hit>) -> Result<(), S
 /// table are not interface text.
 fn skip_path(rel: &str) -> bool {
     matches!(rel, "i18n.rs" | "icons.rs") || rel.starts_with("i18n/") || rel.starts_with("keytips/keytip_table/")
+}
+
+/// Every `tr("…")` call site in one file's source: the key it looks up, or nothing when the
+/// argument is not a lone literal (a variable, a `format!`, a `match` arm).
+pub fn scan_keys_source(file: &str, source: &str) -> Vec<Key> {
+    let src = source.as_bytes();
+    let lines = newline_offsets(src);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while let Some(&b) = src.get(i) {
+        if b == b'/' && src.get(i + 1) == Some(&b'/') {
+            i = skip_line_comment(src, i);
+            continue;
+        }
+        if b == b'/' && src.get(i + 1) == Some(&b'*') {
+            i = skip_block_comment(src, i);
+            continue;
+        }
+        // A literal is not a call, and a literal may spell "tr(" itself.
+        if b == b'"' {
+            match string_end(src, i) {
+                Some((_, _, after)) => i = after.max(i + 1),
+                None => break,
+            }
+            continue;
+        }
+        if b == b'\'' {
+            i = char_end(src, i).unwrap_or(i + 1);
+            continue;
+        }
+        if let Some((_, _, after)) = raw_string(src, i) {
+            i = after.max(i + 1);
+            continue;
+        }
+        if is_ident_start(b) {
+            let (segments, after_path) = read_path(src, i);
+            if segments.last() == Some(&"tr") {
+                let mut open = skip_space(src, after_path);
+                if src.get(open) == Some(&b'!') {
+                    open = skip_space(src, open + 1);
+                }
+                if src.get(open) == Some(&b'(') {
+                    // The label is the call's last argument: tr("x") and tr(ui, "x") both hold it
+                    // there, and a template built by a match is not a literal at all.
+                    let args = split_args(src, open);
+                    if let Some(&(start, end)) = args.last() {
+                        let start = skip_space(src, start);
+                        if src.get(start) == Some(&b'"')
+                            && let Some((from, to, after)) = string_end(src, start)
+                            && after <= end
+                            && let Some(text) = src.get(from..to).and_then(|s| std::str::from_utf8(s).ok())
+                        {
+                            out.push(Key { file: file.to_string(), line: line_at(&lines, from), text: text.to_string() });
+                        }
+                    }
+                    i = skip_balanced(src, open, b'(', b')').max(i + 1);
+                    continue;
+                }
+            }
+            i = after_path.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Scan one file's source. The file name only labels the hits.
@@ -969,6 +1138,53 @@ mod tests {
 
     fn found(source: &str) -> Vec<(usize, String)> {
         scan_source(FILE, source).into_iter().map(|h| (h.line, h.text)).collect()
+    }
+
+    fn keys(source: &str) -> Vec<(usize, String)> {
+        scan_keys_source(FILE, source).into_iter().map(|k| (k.line, k.text)).collect()
+    }
+
+    /// The other half of the check: a label that goes through `tr` still reads English when the
+    /// catalogue has no entry for it, which is how three waves shipped English by accident.
+    #[test]
+    fn finds_the_key_of_every_tr_call_and_only_a_lone_literal() {
+        let source = concat!(
+            "fn f(ui: &Ui, language: Language, name: &str) {\n",
+            "    ui.label(tr(ui, \"Paste\"));\n",
+            "    ui.label(tr(\"Bold\"));\n",
+            "    ui.label(language.tr(\"Italic\"));\n",
+            "    ui.label(widgets::tr(ui, \"Height: {:.2} ({} pixels)\"));\n",
+            "    ui.label(tr(ui, name));\n",
+            "    ui.label(tr(ui, format!(\"Total: {n}\")));\n",
+            "    let s = \"tr(\\\"Not a call\\\")\";\n",
+            "    // tr(\"A comment is not a call\")\n",
+            "}\n",
+        );
+        assert_eq!(
+            keys(source),
+            vec![(2, "Paste".to_string()), (3, "Bold".to_string()), (4, "Italic".to_string()), (5, "Height: {:.2} ({} pixels)".to_string()),]
+        );
+    }
+
+    #[test]
+    fn a_key_without_an_entry_fails_and_a_context_key_may_use_its_label() {
+        let known: std::collections::BTreeSet<String> = zh_keys_of(concat!(
+            "    match text {\n",
+            "        \"Paste\" => \"粘贴\",\n",
+            "        \"General\" => \"常规\",\n",
+            "        _ => return None,\n",
+            "    }\n"
+        ));
+        assert!(known.contains("Paste") && known.contains("General"), "{known:?}");
+        let ok = vec![
+            Key { file: "a.rs".into(), line: 1, text: "Paste".into() },
+            // tr() strips a context prefix when the full key is missing.
+            Key { file: "a.rs".into(), line: 2, text: "Options|General".into() },
+        ];
+        assert!(verify_keys(&ok, &known).is_ok());
+        let missing = vec![Key { file: "grid.rs".into(), line: 42, text: "Minor gridlines".into() }];
+        let err = verify_keys(&missing, &known).unwrap_err();
+        assert!(err.contains("grid.rs:42") && err.contains("Minor gridlines"), "{err}");
     }
 
     #[test]

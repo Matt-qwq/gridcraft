@@ -678,7 +678,10 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
         }
         let fp_on = app.session.format_painter.is_some();
         let fp = toggle_button(ui, Icon::Brush, fp_on, "Format Painter (double-click to keep it on)");
-        fp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), fp_on, "Format Painter"));
+        // Translated before the closure: `widget_info` runs while egui holds the context lock, so
+        // reading the frame language inside it deadlocks.
+        let fp_name = crate::widgets::tr(ui, "Format Painter");
+        fp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), fp_on, fp_name));
         control_keytip(app, ui, &fp, "edit.formatPainter");
         if fp.double_clicked() {
             act(app, "edit.formatPainter", json!({"sticky": true}));
