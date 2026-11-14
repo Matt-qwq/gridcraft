@@ -4,8 +4,8 @@
 //! saves it, so an option that survives a save is the same one the UI draws.
 
 use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont, LabelOptions,
-    LabelPosition, PointFormat, PointLabel, Series,
+    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, Gridlines, LabelFont, LabelOptions,
+    LabelPosition, LegendPos, PointFormat, PointLabel, Series,
 };
 use serde_json::{Value as Json, json};
 
@@ -41,6 +41,24 @@ pub fn specs() -> Vec<CommandSpec> {
             set_error_bars
         ),
         cmd!(
+            "chart.setGridlines",
+            "Gridlines",
+            ["Chart Design", "Chart Layouts"],
+            None,
+            "{chart?, axis?: x|y (default y: the value axis; x is the category axis, or a scatter chart's numeric X), major?: bool, minor?: bool, on?: bool (both sets at once)}",
+            has_doc,
+            set_gridlines
+        ),
+        cmd!(
+            "chart.setLegend",
+            "Legend",
+            ["Chart Design", "Chart Layouts"],
+            None,
+            "{chart?, position?: none|bottom|top|left|right, overlay?: bool (draw the legend over the plot area instead of in a band of its own), deleteEntry?: series index, showEntry?: series index} (a legend entry is a series' entry; a pie-like chart's entries are its points and a waterfall's its totals, which GridCraft does not model)",
+            has_doc,
+            set_legend
+        ),
+        cmd!(
             "chart.formatPoint",
             "Format Data Point",
             ["Format", "Current Selection"],
@@ -61,7 +79,136 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
-/// The chart a command names on the active sheet (the last one when `chart` is absent).
+/// Gridlines on one axis, major and/or minor set (Add Chart Element ▸ Gridlines). The value axis's
+/// major set is the chart-level gridlines flag that chart.set has always written, so the two
+/// spellings name the same thing.
+fn set_gridlines(s: &mut Session, p: &Json) -> Result<Json> {
+    const CMD: &str = "chart.setGridlines";
+    let axis_sel = axis_param(p, CMD)?;
+    if axis_sel == AxisSel::Y2 {
+        return Err(bad(CMD, "gridlines are modelled on the category axis and the primary value axis, not on the secondary one"));
+    }
+    let on = bool_param(p, "on");
+    let major = bool_param(p, "major");
+    let minor = bool_param(p, "minor");
+    if on.is_none() && major.is_none() && minor.is_none() {
+        return Err(bad(CMD, "give major, minor or on (both sets at once)"));
+    }
+    with_chart(s, p, |c| {
+        if c.kind.is_chartex() {
+            // A chartex part has one value axis with a major-gridline element and nothing else: the
+            // minor set and the category gridlines have no element to be stored in.
+            if !chartex_value_axis(c) {
+                return Err(bad(CMD, "this chart type has no axis frame to draw gridlines on"));
+            }
+            if axis_sel != AxisSel::Y || minor.is_some() || on.is_some() {
+                return Err(bad(
+                    CMD,
+                    "a chartex part stores only the value axis's major gridlines: give major (chart.set gridlines is the same flag)",
+                ));
+            }
+            c.gridlines = major.unwrap_or(c.gridlines);
+            c.gridlines_minor = false;
+            c.x_gridlines = Gridlines::default();
+            return Ok(());
+        }
+        if !has_axis_frame(c.kind) {
+            return Err(bad(CMD, "this chart type has no axis frame to draw gridlines on"));
+        }
+        if axis_sel == AxisSel::X && c.kind == ChartKind::Radar {
+            return Err(bad(CMD, "a radar chart's category axis is its ring of spokes: it has no category gridlines"));
+        }
+        let apply = |g: &mut Gridlines| {
+            if let Some(v) = on {
+                g.major = v;
+                g.minor = v;
+            }
+            if let Some(v) = major {
+                g.major = v;
+            }
+            if let Some(v) = minor {
+                g.minor = v;
+            }
+        };
+        if axis_sel == AxisSel::X {
+            apply(&mut c.x_gridlines);
+        } else {
+            let mut g = c.y_gridlines();
+            apply(&mut g);
+            c.set_y_gridlines(g);
+        }
+        Ok(())
+    })
+}
+
+/// Whether a chart kind draws an axis frame (a pie-like chart draws no axes, so a gridline on it
+/// would never be seen).
+fn has_axis_frame(kind: ChartKind) -> bool {
+    matches!(
+        kind,
+        ChartKind::ColumnClustered
+            | ChartKind::ColumnStacked
+            | ChartKind::ColumnStacked100
+            | ChartKind::BarClustered
+            | ChartKind::BarStacked
+            | ChartKind::BarStacked100
+            | ChartKind::Line
+            | ChartKind::LineMarkers
+            | ChartKind::LineStacked
+            | ChartKind::Area
+            | ChartKind::AreaStacked
+            | ChartKind::Combo
+            | ChartKind::Scatter
+            | ChartKind::ScatterLines
+            | ChartKind::Bubble
+            | ChartKind::Radar
+            | ChartKind::Stock
+    )
+}
+
+/// The legend: where it sits, whether it lies over the plot area, and which series' entries are
+/// deleted (c:legend/c:overlay, c:legendEntry/c:delete).
+fn set_legend(s: &mut Session, p: &Json) -> Result<Json> {
+    const CMD: &str = "chart.setLegend";
+    let position = match str_param(p, "position") {
+        None => None,
+        Some("none") => Some(LegendPos::None),
+        Some("bottom") => Some(LegendPos::Bottom),
+        Some("top") => Some(LegendPos::Top),
+        Some("left") => Some(LegendPos::Left),
+        Some("right") => Some(LegendPos::Right),
+        Some(other) => return Err(bad(CMD, format!("unknown legend position {other}: expected none, bottom, top, left or right"))),
+    };
+    let overlay = bool_param(p, "overlay");
+    let delete = u32_param(p, "deleteEntry");
+    let show = u32_param(p, "showEntry");
+    if position.is_none() && overlay.is_none() && delete.is_none() && show.is_none() {
+        return Err(bad(CMD, "give a position, overlay, deleteEntry or showEntry"));
+    }
+    if delete.is_some() && show.is_some() {
+        return Err(bad(CMD, "give either deleteEntry or showEntry"));
+    }
+    with_chart(s, p, |c| {
+        if let Some(pos) = position {
+            c.legend = pos;
+        }
+        if let Some(v) = overlay {
+            c.legend_overlay = v;
+        }
+        let entry = delete.map(|i| (i, true)).or(show.map(|i| (i, false)));
+        if let Some((i, deleted)) = entry {
+            if !c.kind.legend_entries_are_series() {
+                return Err(bad(CMD, "this chart's legend entries are not series' entries, the only kind GridCraft can delete"));
+            }
+            let count = c.series.len();
+            let se = c.series.get_mut(i as usize).ok_or_else(|| bad(CMD, format!("no series {i}: the chart has {count}")))?;
+            se.legend_deleted = deleted;
+        }
+        Ok(())
+    })
+}
+
+/// The chart a command names on the active sheet (the last one when chart is absent).
 fn find_chart(s: &Session, p: &Json) -> Result<(usize, usize)> {
     let d = s.doc()?;
     let si = d.wb.active_sheet;

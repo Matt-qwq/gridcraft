@@ -302,6 +302,8 @@ pub const CATALOG: &[(&str, &str, &str, &str)] = &[
     ("chart.formatPoint", "Format", "Current Selection", "Format Data Point"),
     ("chart.setDataLabels", "Chart Design", "Chart Layouts", "Data Labels"),
     ("chart.setErrorBars", "Chart Design", "Chart Layouts", "Error Bars"),
+    ("chart.setGridlines", "Chart Design", "Chart Layouts", "Gridlines"),
+    ("chart.setLegend", "Chart Design", "Chart Layouts", "Legend"),
     ("chart.shapeFill", "Format", "Shape Styles", "Shape Fill"),
     ("chart.shapeOutline", "Format", "Shape Styles", "Shape Outline"),
     // PivotTable Analyze / Design

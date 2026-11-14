@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use gridcraft_core::{RangeRef, Value, category_levels};
 use gridcraft_formula::{Expr, SheetSel};
 use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DefinedName, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont,
+    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DefinedName, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, Gridlines, LabelFont,
     LabelOptions, LabelPosition, LegendPos, LineDash, PointFormat, PointLabel, Series, Trendline, TrendlineKind, Workbook,
 };
 
@@ -179,6 +179,8 @@ fn read_series(s: &El) -> Series {
         error_bars: s.child("errBars").and_then(read_error_bars),
         points,
         point_labels,
+        // Read from the legend's own entries, once the series order is known.
+        legend_deleted: false,
     }
 }
 
@@ -556,6 +558,30 @@ pub fn read_chart(root: &El) -> Option<Chart> {
             _ => LegendPos::Right,
         },
     };
+    let legend_overlay = chart.child("legend").is_some_and(|l| l.child("overlay").is_some_and(|o| o.flag("val", true)));
+    // A legend entry deletion names the series whose entry it hides. On a chart whose entries are
+    // its points (pie, doughnut, treemap, sunburst) or fixed (waterfall) the index is not a series
+    // index, so those deletions stay with the kept part rather than being read as something else.
+    if kind.legend_entries_are_series() {
+        for e in chart.child("legend").map(|l| l.kids("legendEntry").collect::<Vec<_>>()).unwrap_or_default() {
+            if !bool_val(e, "delete") {
+                continue;
+            }
+            let idx = e.child("idx").and_then(|i| i.attr_u32("val")).map(|i| i as usize);
+            if let Some(se) = idx.and_then(|i| series.get_mut(i)) {
+                se.legend_deleted = true;
+            }
+        }
+    }
+    // Gridlines belong to one axis each; the legacy chart-level flag is the value axis's major set.
+    let y_gridlines = Gridlines {
+        major: y_ax.map(|a| a.child("majorGridlines").is_some()).unwrap_or_else(|| plot.kids("valAx").any(|a| a.child("majorGridlines").is_some())),
+        minor: y_ax.is_some_and(|a| a.child("minorGridlines").is_some()),
+    };
+    let x_gridlines = Gridlines {
+        major: x_ax.is_some_and(|a| a.child("majorGridlines").is_some()),
+        minor: x_ax.is_some_and(|a| a.child("minorGridlines").is_some()),
+    };
     Some(Chart {
         id: 0,
         kind,
@@ -564,7 +590,10 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         series,
         legend,
         data_labels,
-        gridlines: plot.kids("valAx").any(|a| a.child("majorGridlines").is_some()),
+        gridlines: y_gridlines.major,
+        gridlines_minor: y_gridlines.minor,
+        x_gridlines,
+        legend_overlay,
         style: root.child_val("style").and_then(|v| v.parse().ok()).unwrap_or(2),
         x_title: x_ax.and_then(|a| a.child("title")).and_then(rich_title),
         y_title: y_ax.and_then(|a| a.child("title")).and_then(rich_title),
@@ -1192,7 +1221,7 @@ struct Ax<'a> {
     cross: u32,
     pos: &'a str,
     delete: bool,
-    grid: bool,
+    grid: Gridlines,
     title: Option<&'a str>,
     options: &'a AxisOptions,
     /// A category axis that plots numbers (a scatter chart's X axis) is written `valAx`.
@@ -1208,6 +1237,22 @@ pub(crate) fn legend_pos_file(p: LegendPos) -> Option<&'static str> {
         LegendPos::Left => Some("l"),
         LegendPos::Right => Some("r"),
     }
+}
+
+/// The `<c:legend>` element in CT_Legend order: its position, one `c:legendEntry` per series whose
+/// entry the model has deleted, then the overlay flag. The patcher writes a missing legend through
+/// this too, so a legend created by an edit says the same thing as a regenerated part.
+pub(crate) fn legend_xml(ch: &Chart) -> String {
+    let mut s = String::from("<c:legend>");
+    if let Some(p) = legend_pos_file(ch.legend) {
+        let _ = write!(s, "<c:legendPos val=\"{p}\"/>");
+    }
+    for (i, _) in ch.series.iter().enumerate().filter(|(_, se)| se.legend_deleted) {
+        let _ = write!(s, "<c:legendEntry><c:idx val=\"{i}\"/><c:delete val=\"1\"/></c:legendEntry>");
+    }
+    let _ = write!(s, "<c:overlay val=\"{}\"/>", ch.legend_overlay as u8);
+    s.push_str("</c:legend>");
+    s
 }
 
 /// A group's `<c:dLbls>` children in CT_DLbls order: the delete flag, number format, position, the
@@ -1260,8 +1305,12 @@ fn axis_xml(a: &Ax<'_>) -> String {
     let o = a.options;
     let tag = if a.cat && !a.numeric_cat { "catAx" } else { "valAx" };
     let mut s = format!("<c:{tag}><c:axId val=\"{}\"/>{}<c:delete val=\"{}\"/><c:axPos val=\"{}\"/>", a.id, scaling_xml(o), a.delete as u8, a.pos);
-    if a.grid {
+    // CT_*Ax order: majorGridlines, then minorGridlines.
+    if a.grid.major {
         s.push_str("<c:majorGridlines/>");
+    }
+    if a.grid.minor {
+        s.push_str("<c:minorGridlines/>");
     }
     if let Some(t) = a.title {
         s.push_str(&title_xml(t));
@@ -1423,6 +1472,11 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
     if secondary_y.crosses == AxisCrossing::AutoZero {
         secondary_y.crosses = AxisCrossing::Max;
     }
+    // A gridline set belongs to one axis: the category axis carries the model's x gridlines, the
+    // primary value axis its y pair (no gridlines on a hidden or a secondary axis, as Excel's own
+    // gallery writes them).
+    let y_grid = ch.y_gridlines();
+    let no_grid = Gridlines::default();
     match primary_g {
         G::Pie | G::Doughnut => {}
         G::Scatter { .. } | G::Bubble => {
@@ -1432,7 +1486,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
                 cross: 2,
                 pos: "b",
                 delete: false,
-                grid: false,
+                grid: ch.x_gridlines,
                 title: ch.x_title.as_deref(),
                 options: &ch.x_axis,
                 numeric_cat: true,
@@ -1443,7 +1497,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
                 cross: 1,
                 pos: "l",
                 delete: false,
-                grid: ch.gridlines,
+                grid: y_grid,
                 title: ch.y_title.as_deref(),
                 options: &ch.y_axis,
                 numeric_cat: true,
@@ -1456,7 +1510,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
                 cross: 2,
                 pos: "l",
                 delete: false,
-                grid: false,
+                grid: ch.x_gridlines,
                 title: ch.x_title.as_deref(),
                 options: &ch.x_axis,
                 numeric_cat: false,
@@ -1467,7 +1521,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
                 cross: 1,
                 pos: "b",
                 delete: false,
-                grid: ch.gridlines,
+                grid: y_grid,
                 title: ch.y_title.as_deref(),
                 options: &ch.y_axis,
                 numeric_cat: true,
@@ -1480,7 +1534,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
                 cross: 2,
                 pos: "b",
                 delete: false,
-                grid: false,
+                grid: ch.x_gridlines,
                 title: ch.x_title.as_deref(),
                 options: &ch.x_axis,
                 numeric_cat: false,
@@ -1491,7 +1545,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
                 cross: 1,
                 pos: "l",
                 delete: false,
-                grid: ch.gridlines,
+                grid: y_grid,
                 title: ch.y_title.as_deref(),
                 options: &ch.y_axis,
                 numeric_cat: true,
@@ -1505,7 +1559,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
             cross: 4,
             pos: "b",
             delete: true,
-            grid: false,
+            grid: no_grid,
             title: None,
             options: &no_options,
             numeric_cat: false,
@@ -1516,16 +1570,15 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
             cross: 3,
             pos: "r",
             delete: false,
-            grid: false,
+            grid: no_grid,
             title: None,
             options: &secondary_y,
             numeric_cat: true,
         }));
     }
     s.push_str("</c:plotArea>");
-    let pos = legend_pos_file(ch.legend);
-    if let Some(p) = pos {
-        let _ = write!(s, "<c:legend><c:legendPos val=\"{p}\"/><c:overlay val=\"0\"/></c:legend>");
+    if legend_pos_file(ch.legend).is_some() {
+        s.push_str(&legend_xml(ch));
     }
     s.push_str("<c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>");
     // A part regenerated from the model gets no kept style: the file's style and colour parts

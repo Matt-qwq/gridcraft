@@ -139,7 +139,7 @@ pub fn patch_chartex(xml: &str, then: &Chart, now: &Chart, wb: &Workbook, _si: u
             None => plan.set(chart, CHART_ORDER, "title", text),
         }
     }
-    if then.legend != now.legend {
+    if then.legend != now.legend || then.legend_overlay != now.legend_overlay {
         let pos = match now.legend {
             gridcraft_model::LegendPos::None => None,
             gridcraft_model::LegendPos::Bottom => Some("b"),
@@ -148,9 +148,23 @@ pub fn patch_chartex(xml: &str, then: &Chart, now: &Chart, wb: &Workbook, _si: u
             gridcraft_model::LegendPos::Right => Some("r"),
         };
         match (child(chart, "legend"), pos) {
-            (Some(l), Some(p)) => plan.set_attr(l, "pos", Some(p.to_string())),
+            // A chartex legend's position and overlay are both attributes, so patching either
+            // keeps the element's alignment and whatever else the file put on it.
+            (Some(l), Some(p)) => {
+                if then.legend != now.legend {
+                    plan.set_attr(l, "pos", Some(p.to_string()));
+                }
+                if then.legend_overlay != now.legend_overlay {
+                    plan.set_attr(l, "overlay", Some((now.legend_overlay as u8).to_string()));
+                }
+            }
             (Some(_), None) => plan.set(chart, CHART_ORDER, "legend", None),
-            (None, Some(p)) => plan.set(chart, CHART_ORDER, "legend", Some(format!("<cx:legend pos=\"{p}\" align=\"ctr\" overlay=\"0\"/>"))),
+            (None, Some(p)) => plan.set(
+                chart,
+                CHART_ORDER,
+                "legend",
+                Some(format!("<cx:legend pos=\"{p}\" align=\"ctr\" overlay=\"{}\"/>", now.legend_overlay as u8)),
+            ),
             (None, None) => {}
         }
     }

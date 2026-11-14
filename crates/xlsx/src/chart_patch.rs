@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use gridcraft_model::{AxisCrossing, AxisOptions, Chart, DisplayUnits, LabelOptions, PointFormat, PointLabel, Series, Workbook};
+use gridcraft_model::{AxisCrossing, AxisOptions, Chart, DisplayUnits, Gridlines, LabelOptions, PointFormat, PointLabel, Series, Workbook};
 
 use crate::chart::{
     MAX_POINTS, cat_data, dlbls_xml, err_bars_children, label_children, num_data, point_xml, scaling_xml, series_sp_pr, series_tx_xml, title_xml,
@@ -210,6 +210,7 @@ const CHART_ORDER: &[&str] = &[
     "extLst",
 ];
 const LEGEND_ORDER: &[&str] = &["legendPos", "legendEntry", "layout", "overlay", "spPr", "txPr", "extLst"];
+const LEGEND_ENTRY_ORDER: &[&str] = &["idx", "delete", "txPr", "extLst"];
 const VALAX_ORDER: &[&str] = &[
     "axId",
     "scaling",
@@ -649,6 +650,65 @@ fn display_unit_name(u: DisplayUnits) -> &'static str {
         HundredMillions => "hundredMillions",
         Billions => "billions",
         Trillions => "trillions",
+    }
+}
+
+/// Patches one axis's gridlines: an absent element is off, as the schema spells it, and a new one
+/// is inserted at its schema position. Line formatting GridCraft does not model is written by the
+/// writer as a plain element, so switching a set off and on again drops the file's own styling.
+fn patch_gridlines(plan: &mut Plan, a: Option<&Node>, then: Gridlines, now: Gridlines) {
+    let Some(a) = a else { return };
+    if then == now {
+        return;
+    }
+    let order = match a.name.as_str() {
+        "catAx" | "dateAx" => CATAX_ORDER,
+        _ => VALAX_ORDER,
+    };
+    if then.major != now.major {
+        plan.set(a, order, "majorGridlines", now.major.then(|| "<c:majorGridlines/>".to_string()));
+    }
+    if then.minor != now.minor {
+        plan.set(a, order, "minorGridlines", now.minor.then(|| "<c:minorGridlines/>".to_string()));
+    }
+}
+
+/// The legend entry index a `c:legendEntry` names, if it has one.
+fn legend_entry_index(xml: &str, n: &Node) -> Option<u32> {
+    child(n, "idx").and_then(|i| attr(xml, i, "val")).and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+/// Whether a `c:legendEntry` holds only what the model owns (so dropping the whole element loses
+/// nothing): the index and the deletion flag.
+fn is_own_legend_entry(n: &Node) -> bool {
+    n.children.iter().all(|c| matches!(c.name.as_str(), "idx" | "delete"))
+}
+
+/// Patches one `c:legendEntry` per series whose legend deletion changed: added, deleted in place
+/// (keeping any formatting the entry carried) or dropped when nothing else is in it.
+fn patch_legend_entries(plan: &mut Plan, xml: &str, legend: &Node, then: &Chart, now: &Chart) {
+    for (i, (a, b)) in then.series.iter().zip(now.series.iter()).enumerate() {
+        if a.legend_deleted == b.legend_deleted {
+            continue;
+        }
+        let Ok(idx) = u32::try_from(i) else { continue };
+        let node = legend.children.iter().find(|n| n.name == "legendEntry" && legend_entry_index(xml, n) == Some(idx));
+        match (node, b.legend_deleted) {
+            (Some(n), true) => plan.set(n, LEGEND_ENTRY_ORDER, "delete", Some("<c:delete val=\"1\"/>".to_string())),
+            (Some(n), false) => {
+                if is_own_legend_entry(n) {
+                    if let Some(k) = legend.children.iter().position(|c| c.start == n.start) {
+                        plan.edits(legend, LEGEND_ORDER).remove.push(k);
+                    }
+                } else {
+                    plan.set(n, LEGEND_ENTRY_ORDER, "delete", None);
+                }
+            }
+            (None, true) => {
+                plan.add(legend, LEGEND_ORDER, "legendEntry", format!("<c:legendEntry><c:idx val=\"{idx}\"/><c:delete val=\"1\"/></c:legendEntry>"))
+            }
+            (None, false) => {}
+        }
     }
 }
 
@@ -1181,16 +1241,28 @@ pub fn patch_chart(xml: &str, then: &Chart, now: &Chart, wb: &Workbook, si: usiz
         plan.set(chart, CHART_ORDER, "title", text);
         plan.set(chart, CHART_ORDER, "autoTitleDeleted", Some(format!("<c:autoTitleDeleted val=\"{}\"/>", deleted as u8)));
     }
-    if then.legend != now.legend {
+    if then.legend != now.legend || then.legend_overlay != now.legend_overlay {
         let pos = crate::chart::legend_pos_file(now.legend);
         match (child(chart, "legend"), pos) {
-            (Some(l), Some(p)) => plan.set(l, LEGEND_ORDER, "legendPos", Some(format!("<c:legendPos val=\"{p}\"/>"))),
-            (Some(_), None) => plan.set(chart, CHART_ORDER, "legend", None),
-            (None, Some(p)) => {
-                plan.set(chart, CHART_ORDER, "legend", Some(format!("<c:legend><c:legendPos val=\"{p}\"/><c:overlay val=\"0\"/></c:legend>")))
+            (Some(l), Some(p)) => {
+                if then.legend != now.legend {
+                    plan.set(l, LEGEND_ORDER, "legendPos", Some(format!("<c:legendPos val=\"{p}\"/>")));
+                }
+                // An overlaid legend is the legend element's own flag, so the layout, the
+                // formatting and the entries around it stay as the file had them.
+                if then.legend_overlay != now.legend_overlay {
+                    plan.set(l, LEGEND_ORDER, "overlay", Some(format!("<c:overlay val=\"{}\"/>", now.legend_overlay as u8)));
+                }
             }
+            (Some(_), None) => plan.set(chart, CHART_ORDER, "legend", None),
+            (None, Some(_)) => plan.set(chart, CHART_ORDER, "legend", Some(crate::chart::legend_xml(now))),
             (None, None) => {}
         }
+    }
+    if then.series.iter().map(|s| s.legend_deleted).ne(now.series.iter().map(|s| s.legend_deleted))
+        && let Some(l) = child(chart, "legend")
+    {
+        patch_legend_entries(&mut plan, xml, l, then, now);
     }
 
     // Series, group by group, in the order the reader flattened them.
@@ -1271,9 +1343,11 @@ pub fn patch_chart(xml: &str, then: &Chart, now: &Chart, wb: &Workbook, si: usiz
         let a = y2_ax?;
         patch_axis(&mut plan, a, &then.y2_axis, &now.y2_axis, VALAX_ORDER, false, None, None);
     }
-    if then.gridlines != now.gridlines {
-        let a = y_ax?;
-        plan.set(a, VALAX_ORDER, "majorGridlines", now.gridlines.then(|| "<c:majorGridlines/>".to_string()));
+    if then.y_gridlines() != now.y_gridlines() {
+        patch_gridlines(&mut plan, y_ax, then.y_gridlines(), now.y_gridlines());
+    }
+    if then.x_gridlines != now.x_gridlines {
+        patch_gridlines(&mut plan, x_ax, then.x_gridlines, now.x_gridlines);
     }
 
     let mut out = String::with_capacity(xml.len() + 256);

@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use gridcraft_core::CellRef;
 use gridcraft_model::{
-    Anchor, AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont, LabelOptions,
-    LabelPosition, LegendPos, PointFormat, PointLabel, Series, Sheet, Workbook,
+    Anchor, AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, Gridlines, LabelFont,
+    LabelOptions, LabelPosition, LegendPos, PointFormat, PointLabel, Series, Sheet, Workbook,
 };
 
 use crate::{read_xlsx, write_xlsx};
@@ -666,6 +666,145 @@ fn adding_and_removing_trendlines_and_point_formats_patches_the_repeated_element
     }
 }
 
+// ---------------------------------------------------------------- gridlines and the legend
+
+#[test]
+fn gridlines_on_both_axes_and_the_legend_options_round_trip() {
+    let mut wb = bar_workbook();
+    let mut sheet = (*wb.sheets[0]).clone();
+    {
+        let c = &mut sheet.charts[0];
+        // The value axis keeps the legacy flag as its major set; the category axis has its own pair.
+        c.gridlines = true;
+        c.gridlines_minor = true;
+        c.x_gridlines = Gridlines { major: true, minor: true };
+        c.legend_overlay = true;
+        c.series[1].legend_deleted = true;
+        c.series[3].legend_deleted = true;
+    }
+    wb.sheets = vec![Arc::new(sheet)];
+    let bytes = write_xlsx(&wb).unwrap();
+    let part = chart_part(&bytes, "xl/charts/chart1.xml");
+    // CT_*Ax order: major, then minor, on the value axis (left) and the category axis (bottom).
+    assert!(part.contains(r#"<c:axPos val="l"/><c:majorGridlines/><c:minorGridlines/><c:numFmt"#), "the value axis: {part}");
+    assert!(part.contains(r#"<c:axPos val="b"/><c:majorGridlines/><c:minorGridlines/><c:numFmt"#), "the category axis: {part}");
+    // CT_Legend order: position, one entry per deleted series, then the overlay flag.
+    assert!(
+        part.contains(
+            r#"<c:legend><c:legendPos val="b"/><c:legendEntry><c:idx val="1"/><c:delete val="1"/></c:legendEntry><c:legendEntry><c:idx val="3"/><c:delete val="1"/></c:legendEntry><c:overlay val="1"/></c:legend>"#
+        ),
+        "the legend: {part}"
+    );
+    let (back, _rep) = read_xlsx(&bytes).unwrap();
+    let c = &back.sheets[0].charts[0];
+    assert!(c.gridlines, "the legacy flag is the value axis's major set");
+    assert_eq!(c.y_gridlines(), Gridlines { major: true, minor: true });
+    assert_eq!(c.x_gridlines, Gridlines { major: true, minor: true });
+    assert!(c.legend_overlay);
+    assert_eq!(c.series.iter().map(|s| s.legend_deleted).collect::<Vec<_>>(), vec![false, true, false, true]);
+    // A second save writes the same part: nothing drifts on the way round.
+    assert_eq!(chart_part(&write_xlsx(&back).unwrap(), "xl/charts/chart1.xml"), part);
+}
+
+#[test]
+fn gridlines_and_a_deleted_legend_entry_are_read_from_excel_shaped_xml() {
+    let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numRef><c:f>Data!$B$2:$B$5</c:f></c:numRef></c:val></c:ser><c:ser><c:idx val="1"/><c:order val="1"/><c:val><c:numRef><c:f>Data!$C$2:$C$5</c:f></c:numRef></c:val></c:ser><c:axId val="1"/><c:axId val="2"/></c:barChart><c:catAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:majorGridlines/><c:minorGridlines/><c:crossAx val="2"/></c:catAx><c:valAx><c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines><c:spPr><a:ln w="6350"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln></c:spPr></c:majorGridlines><c:crossAx val="1"/></c:valAx></c:plotArea><c:legend><c:legendPos val="r"/><c:legendEntry><c:idx val="1"/><c:delete val="1"/></c:legendEntry><c:legendEntry><c:idx val="7"/><c:delete val="1"/></c:legendEntry><c:overlay val="1"/></c:legend></c:chart></c:chartSpace>"#;
+    let root = crate::xml::parse(xml.as_bytes()).unwrap();
+    let c = crate::chart::read_chart(&root).unwrap();
+    assert!(c.gridlines, "the value axis's major gridlines are the legacy flag");
+    assert!(!c.gridlines_minor, "the value axis has no minor element here");
+    assert_eq!(c.x_gridlines, Gridlines { major: true, minor: true });
+    assert!(c.legend_overlay);
+    // The deletion names series 1. An index past the series (7) belongs to a trendline or to a
+    // chart whose entries are not series at all: the model leaves it to the kept part.
+    assert_eq!(c.series.iter().map(|s| s.legend_deleted).collect::<Vec<_>>(), vec![false, true]);
+}
+
+#[test]
+fn a_pie_legends_entries_are_its_points_not_its_series() {
+    // A pie chart's legend entry index is a slice, so reading it as a series index would hide the
+    // whole series' entry: the deletion is left to the part instead.
+    let xml = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart><c:plotArea><c:pieChart><c:varyColors val="1"/><c:ser><c:idx val="0"/><c:order val="0"/><c:val><c:numRef><c:f>Data!$B$2:$B$5</c:f></c:numRef></c:val></c:ser></c:pieChart></c:plotArea><c:legend><c:legendPos val="r"/><c:legendEntry><c:idx val="0"/><c:delete val="1"/></c:legendEntry></c:legend></c:chart></c:chartSpace>"#;
+    let root = crate::xml::parse(xml.as_bytes()).unwrap();
+    let c = crate::chart::read_chart(&root).unwrap();
+    assert_eq!(c.kind, ChartKind::Pie);
+    assert!(c.series.iter().all(|s| !s.legend_deleted));
+    assert!(!c.kind.legend_entries_are_series());
+}
+
+#[test]
+fn gridline_and_legend_edits_keep_the_kept_parts_unknown_xml() {
+    let (mut wb, _rep) = read_xlsx(&rich_fixture()).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        let c = &mut sheet.charts[0];
+        // As the file has it: the value axis has a formatted major gridline, the legend is overlaid
+        // and series 1's entry is deleted.
+        assert!(c.gridlines);
+        assert!(!c.gridlines_minor, "the secondary axis's minor gridlines are not the primary one's");
+        assert_eq!(c.x_gridlines, Gridlines::default());
+        assert!(c.legend_overlay);
+        assert!(c.series[1].legend_deleted);
+        // The edit: gridlines on both axes and both sets, the legend back in its own band, the
+        // deleted entry moved from series 1 to series 0.
+        c.gridlines_minor = true;
+        c.x_gridlines = Gridlines { major: true, minor: true };
+        c.legend_overlay = false;
+        c.series[1].legend_deleted = false;
+        c.series[0].legend_deleted = true;
+    }
+    let back = write_xlsx(&wb).unwrap();
+    let part = part_of(&back);
+    for needle in SURVIVORS {
+        assert!(
+            part.contains(needle),
+            "the edit dropped {needle}:
+{part}"
+        );
+    }
+    // The category axis here is a date axis: its gridlines go where the schema wants them, after
+    // axPos and before the title, and its date units are untouched.
+    let start = part.find("<c:dateAx>").unwrap_or_default();
+    let end = part.find("</c:dateAx>").unwrap_or(start);
+    let date_axis = part.get(start..end).unwrap_or_default();
+    assert!(date_axis.contains("<c:majorGridlines/><c:minorGridlines/><c:title>"), "the date axis gets both sets: {date_axis}");
+    assert!(date_axis.contains("<c:baseTimeUnit val=\"days\"/>"), "the date axis keeps its units: {date_axis}");
+    // The primary value axis gains a minor element after its own formatted major one, which it keeps.
+    assert!(part.contains("</a:ln></c:spPr></c:majorGridlines>"), "{part}");
+    assert!(part.contains("<c:minorGridlines/><c:title>"), "{part}");
+    assert_eq!(part.matches("<c:majorGridlines").count(), 2, "the value axis and the category axis: {part}");
+    assert_eq!(part.matches("<c:minorGridlines").count(), 3, "both axes and the secondary axis's own: {part}");
+    assert!(part.contains(r#"<a:srgbClr val="EEEEEE"/>"#), "the secondary axis keeps its formatted minor gridlines");
+    // The legend: the layout stays, the overlay flag flips, the entries move.
+    assert!(part.contains(r#"<c:legendEntry><c:idx val="0"/><c:delete val="1"/></c:legendEntry><c:layout/><c:overlay val="0"/>"#), "{part}");
+    assert!(!part.contains(r#"<c:legendEntry><c:idx val="1"/><c:delete val="1"/></c:legendEntry>"#), "series 1's entry is back: {part}");
+    // And back through the reader: the model says what the edit said.
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    let c = &again.sheets[0].charts[0];
+    assert_eq!(c.y_gridlines(), Gridlines { major: true, minor: true });
+    assert_eq!(c.x_gridlines, Gridlines { major: true, minor: true });
+    assert!(!c.legend_overlay);
+    assert_eq!(c.series.iter().map(|s| s.legend_deleted).collect::<Vec<_>>(), vec![true, false]);
+    // A second save of the reopened workbook changes nothing, nor does saving the edit twice.
+    assert_eq!(part_of(&write_xlsx(&again).unwrap()), part);
+    assert_eq!(part_of(&write_xlsx(&wb).unwrap()), part);
+}
+
+#[test]
+fn a_deleted_legend_entry_of_a_regenerated_part_is_written_from_the_model() {
+    let mut wb = bar_workbook();
+    let mut sheet = (*wb.sheets[0]).clone();
+    sheet.charts[0].series[2].legend_deleted = true;
+    sheet.charts[0].legend_overlay = true;
+    wb.sheets = vec![Arc::new(sheet)];
+    let part = chart_part(&write_xlsx(&wb).unwrap(), "xl/charts/chart1.xml");
+    assert!(
+        part.contains(r#"<c:legendPos val="b"/><c:legendEntry><c:idx val="2"/><c:delete val="1"/></c:legendEntry><c:overlay val="1"/>"#),
+        "{part}"
+    );
+    assert_eq!(part.matches("<c:legendEntry>").count(), 1);
+}
+
 // ---------------------------------------------------------------- chartex parts
 
 /// A modelled chartex part (a histogram) carrying options GridCraft has no field for: a title fill,
@@ -742,6 +881,32 @@ fn chartex_part_of(bytes: &[u8]) -> String {
     chart_part(bytes, "xl/charts/chartEx1.xml")
 }
 
+#[test]
+fn a_chartex_legend_overlay_is_read_and_patched_in_place() {
+    let (mut wb, _rep) = read_xlsx(&chartex_package(CHARTEX_HISTOGRAM)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        let c = &mut sheet.charts[0];
+        assert_eq!(c.legend, LegendPos::Bottom);
+        assert!(!c.legend_overlay, "the file's legend says overlay=0");
+        // The edit: the legend goes over the plot area.
+        c.legend_overlay = true;
+    }
+    let back = write_xlsx(&wb).unwrap();
+    let part = chartex_part_of(&back);
+    assert!(part.contains(r#"<cx:legend pos="b" align="ctr" overlay="1"/>"#), "{part}");
+    // Only the overlay attribute changed: the alignment and everything else is the file's.
+    assert_eq!(
+        part.replace("overlay=\"1\"", "overlay=\"0\""),
+        CHARTEX_HISTOGRAM,
+        "the patch touched more than the flag:
+{part}"
+    );
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    assert!(again.sheets[0].charts[0].legend_overlay);
+    // A second save is stable.
+    assert_eq!(chartex_part_of(&write_xlsx(&again).unwrap()), part);
+}
 #[test]
 fn a_chartex_chart_read_from_a_file_keeps_its_options_through_an_edit() {
     let bytes = chartex_package(CHARTEX_HISTOGRAM);

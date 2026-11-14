@@ -1040,6 +1040,136 @@ fn box_and_stock_charts_honour_the_gridlines_flag() {
 }
 
 #[test]
+fn minor_gridlines_are_dashed_and_lighter_than_the_major_ones() {
+    let d = sample(ChartKind::ColumnClustered);
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    let major_only = render(&c, &d, 640.0, 400.0, &m);
+    assert!(major_only.iter().any(|p| matches!(p, Prim::Line { dash: false, color, .. } if *color == [0xD9, 0xD9, 0xD9, 0xFF])));
+    assert!(!major_only.iter().any(|p| matches!(p, Prim::Line { dash: true, .. })), "no minor gridlines with them off");
+    // The value axis's minor set: dashes halfway between the labelled ticks.
+    c.gridlines_minor = true;
+    let with_minor = render(&c, &d, 640.0, 400.0, &m);
+    let dashed = with_minor.iter().filter(|p| matches!(p, Prim::Line { dash: true, color, .. } if *color == [0xE9, 0xE9, 0xE9, 0xFF])).count();
+    let majors = with_minor.iter().filter(|p| matches!(p, Prim::Line { dash: false, color, .. } if *color == [0xD9, 0xD9, 0xD9, 0xFF])).count();
+    assert!(dashed > 0, "minor gridlines on must draw dashed lines");
+    assert_eq!(dashed, majors.saturating_sub(1).max(1), "one minor line per gap between two major ones: {dashed} minors, {majors} majors");
+    // Halfway between the major lines, and never where a major one is.
+    let ys = |prims: &[Prim], dash: bool| -> Vec<f32> {
+        prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { pts, dash: d, color, .. }
+                    if *d == dash && (*color == [0xD9, 0xD9, 0xD9, 0xFF] || *color == [0xE9, 0xE9, 0xE9, 0xFF]) && pts[0][1] == pts[1][1] =>
+                {
+                    Some(pts[0][1])
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let (major, minor) = (ys(&with_minor, false), ys(&with_minor, true));
+    for m in &minor {
+        assert!(major.iter().all(|y| (y - m).abs() > 0.5), "a minor line sits on a major one");
+    }
+    for w in major.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        assert!(minor.iter().any(|m| (m - (a + b) / 2.0).abs() < 0.5), "no minor line between {a} and {b}");
+    }
+    // Off again: back to the major set alone.
+    c.gridlines_minor = false;
+    assert!(!render(&c, &d, 640.0, 400.0, &m).iter().any(|p| matches!(p, Prim::Line { dash: true, .. })));
+    // A radar chart's value-axis gridlines are its rings, so its minor set is the rings between them.
+    let mut r = chart(ChartKind::Radar);
+    let rings = |prims: &[Prim], dash: bool| prims.iter().filter(|p| matches!(p, Prim::Line { dash: d, .. } if *d == dash)).count();
+    let major_only = render(&r, &sample(ChartKind::Radar), 640.0, 400.0, &m);
+    assert!(rings(&major_only, false) > 0 && rings(&major_only, true) == 0, "radar rings are solid");
+    r.gridlines_minor = true;
+    assert!(rings(&render(&r, &sample(ChartKind::Radar), 640.0, 400.0, &m), true) > 0, "radar minor rings");
+}
+
+#[test]
+fn category_gridlines_are_vertical_lines_at_the_boundaries() {
+    let d = sample(ChartKind::ColumnClustered);
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    let verticals = |prims: &[Prim], color: Rgba| -> Vec<(f32, f32, f32)> {
+        prims
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Line { pts, color: col, .. } if *col == color && pts.len() == 2 && pts[0][0] == pts[1][0] && pts[1][1] - pts[0][1] > 50.0 => {
+                    Some((pts[0][0], pts[0][1], pts[1][1]))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(verticals(&render(&c, &d, 640.0, 400.0, &m), [0xD9, 0xD9, 0xD9, 0xFF]).is_empty(), "off by default");
+    c.x_gridlines = Gridlines::MAJOR;
+    let prims = render(&c, &d, 640.0, 400.0, &m);
+    let lines = verticals(&prims, [0xD9, 0xD9, 0xD9, 0xFF]);
+    // One line per category boundary: six categories, seven boundaries.
+    assert_eq!(lines.len(), 7, "one major line per boundary");
+    // They run down the whole plot and are evenly spaced.
+    let mut xs: Vec<f32> = lines.iter().map(|l| l.0).collect();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let step = xs[1] - xs[0];
+    assert!(step > 10.0, "categories are {step} apart");
+    for w in xs.windows(2) {
+        assert!((w[1] - w[0] - step).abs() < 0.5, "uneven category lines");
+    }
+    // A bar chart turns the axes: its category gridlines are horizontal.
+    let mut h = chart(ChartKind::BarClustered);
+    h.x_gridlines = Gridlines::MAJOR;
+    let prims = render(&h, &sample(ChartKind::BarClustered), 640.0, 400.0, &m);
+    let horizontals = prims
+        .iter()
+        .filter(|p| matches!(p, Prim::Line { color, pts, dash: false, .. } if *color == [0xD9, 0xD9, 0xD9, 0xFF] && pts[0][1] == pts[1][1] && pts[1][0] - pts[0][0] > 100.0))
+        .count();
+    assert!(horizontals > 0, "a bar chart draws its category gridlines horizontally");
+}
+
+#[test]
+fn an_overlaid_legend_sits_inside_the_plot_area() {
+    let d = sample(ChartKind::ColumnClustered);
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::ColumnClustered);
+    c.legend = LegendPos::Bottom;
+    // The "East" entry's text anchor: the legend is laid out before the plot is drawn.
+    let entry_at = |prims: &[Prim]| -> Option<[f32; 2]> {
+        prims.iter().find_map(|p| match p {
+            Prim::Text { text, x, y, .. } if text == "East" => Some([*x, *y]),
+            _ => None,
+        })
+    };
+    // "Q1" is the first category label, drawn just under the plot area: its y is the plot's
+    // bottom edge plus the label gap, so it says where the plot ends and the labels begin.
+    let cat_label_y = |prims: &[Prim]| -> Option<f32> {
+        prims.iter().find_map(|p| match p {
+            Prim::Text { text, y, .. } if text == "Q1" => Some(*y),
+            _ => None,
+        })
+    };
+    let beside = render(&c, &d, 640.0, 400.0, &m);
+    let apart = cat_label_y(&beside).expect("the category labels are drawn");
+    let ly = entry_at(&beside).expect("the legend entry is drawn")[1];
+    assert!(ly > apart, "a legend in its own band sits below the plot area ({ly} vs {apart})");
+    c.legend_overlay = true;
+    let over = render(&c, &d, 640.0, 400.0, &m);
+    let inside = cat_label_y(&over).expect("the category labels are still drawn");
+    let [ex, ey] = entry_at(&over).expect("the overlaid legend entry is drawn");
+    assert!(ey < inside, "an overlaid legend sits inside the plot area ({ey} vs {inside})");
+    // The plot keeps the room the legend would have taken, so its bottom edge is lower than before.
+    assert!(inside > apart, "the overlaid legend frees the plot area ({inside} vs {apart})");
+    // The entries are still there, and a click on one still selects its series.
+    let hits = render_hits(&c, &d, 640.0, 400.0, &m);
+    assert!(
+        hits.iter().any(|r| matches!(r.hit, Hit::Series { index: 1, point: None }) && r.shape.contains(ex, ey)),
+        "the overlaid entry keeps its click target"
+    );
+}
+
+#[test]
 fn funnel_value_labels_follow_the_data_labels_flag() {
     let data = ChartData {
         label_font: None,

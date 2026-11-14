@@ -5712,6 +5712,106 @@ fn chart_formatting_commands_set_every_modelled_option() {
 }
 
 #[test]
+fn gridlines_and_legend_commands_set_every_modelled_option() {
+    use gridcraft_model::{Gridlines, LegendPos};
+    let mut s = s();
+    chart_data(&mut s);
+    s.execute("insert.chart", json!({"type": "column", "range": "A1:E7"})).unwrap();
+    // Every command names its chart: the last one on the sheet is not the one under test once the
+    // other charts are inserted.
+    let column = s.doc().unwrap().wb.active().unwrap().charts[0].id;
+    let col = |p: serde_json::Value| {
+        let mut p = p;
+        if let Some(o) = p.as_object_mut() {
+            o.insert("chart".into(), json!(column));
+        }
+        p
+    };
+    let chart = |s: &Session| s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    // As inserted: the value axis's major gridlines only, the legend in its own band.
+    assert!(chart(&s).gridlines);
+    assert_eq!(chart(&s).y_gridlines(), Gridlines::MAJOR);
+    assert_eq!(chart(&s).x_gridlines, Gridlines::default());
+    assert!(!chart(&s).legend_overlay);
+
+    // One set at a time, per axis.
+    s.execute("chart.setGridlines", col(json!({"axis": "y", "minor": true}))).unwrap();
+    assert_eq!(chart(&s).y_gridlines(), Gridlines { major: true, minor: true });
+    s.execute("chart.setGridlines", col(json!({"axis": "x", "major": true}))).unwrap();
+    assert_eq!(chart(&s).x_gridlines, Gridlines { major: true, minor: false });
+    // Both at once, as the ribbon's one switch does it.
+    s.execute("chart.setGridlines", col(json!({"on": true}))).unwrap();
+    assert_eq!(chart(&s).y_gridlines(), Gridlines { major: true, minor: true });
+    s.execute("chart.setGridlines", col(json!({"axis": "x", "on": false}))).unwrap();
+    assert_eq!(chart(&s).x_gridlines, Gridlines::default());
+    // The chart-level flag chart.set has always written is the value axis's major set.
+    s.execute("chart.set", col(json!({"gridlines": false}))).unwrap();
+    assert_eq!(chart(&s).y_gridlines(), Gridlines { major: false, minor: true });
+    s.execute("chart.setGridlines", col(json!({"major": true}))).unwrap();
+    assert!(chart(&s).gridlines);
+
+    // Refusals: nothing to change, the secondary axis, a name that is not an axis.
+    assert!(s.execute("chart.setGridlines", col(json!({}))).is_err(), "a set is required");
+    assert!(s.execute("chart.setGridlines", col(json!({"axis": "y2", "major": true}))).is_err());
+    assert!(s.execute("chart.setGridlines", col(json!({"axis": "z", "major": true}))).is_err());
+    // A chart with no axis frame, and a radar's ring of spokes, have none to draw.
+    s.execute("insert.chart", json!({"type": "pie", "range": "A1:E7"})).unwrap();
+    let pie = s.doc().unwrap().wb.active().unwrap().charts[1].id;
+    assert!(s.execute("chart.setGridlines", json!({"chart": pie, "major": true})).is_err(), "a pie has no axes");
+    s.execute("insert.chart", json!({"type": "radar", "range": "A1:E7"})).unwrap();
+    let radar = s.doc().unwrap().wb.active().unwrap().charts[2].id;
+    assert!(!s.execute("chart.setGridlines", json!({"chart": radar, "axis": "x", "major": true})).is_ok(), "a radar has no category axis");
+    s.execute("chart.setGridlines", json!({"chart": radar, "minor": true})).unwrap();
+    assert!(s.doc().unwrap().wb.active().unwrap().charts[2].gridlines_minor, "the radar's minor rings");
+
+    // The legend: position, overlay and one entry deleted by series index.
+    s.execute("chart.setLegend", col(json!({"position": "right", "overlay": true}))).unwrap();
+    assert_eq!(chart(&s).legend, LegendPos::Right);
+    assert!(chart(&s).legend_overlay);
+    s.execute("chart.setLegend", col(json!({"deleteEntry": 1}))).unwrap();
+    assert!(chart(&s).series[1].legend_deleted);
+    assert!(!chart(&s).series[0].legend_deleted);
+    s.execute("chart.setLegend", col(json!({"showEntry": 1}))).unwrap();
+    assert!(!chart(&s).series[1].legend_deleted);
+    s.execute("chart.setLegend", col(json!({"deleteEntry": 3}))).unwrap();
+    s.execute("chart.setLegend", col(json!({"deleteEntry": 0}))).unwrap();
+    assert_eq!(chart(&s).series.iter().map(|se| se.legend_deleted).collect::<Vec<_>>(), vec![true, false, false, true]);
+    assert!(s.execute("chart.setLegend", col(json!({}))).is_err(), "an option is required");
+    assert!(s.execute("chart.setLegend", col(json!({"deleteEntry": 9}))).is_err(), "no such series");
+    assert!(s.execute("chart.setLegend", col(json!({"deleteEntry": 0, "showEntry": 0}))).is_err());
+    assert!(s.execute("chart.setLegend", col(json!({"position": "middle"}))).is_err());
+    assert!(s.execute("chart.setLegend", json!({"chart": pie, "deleteEntry": 0})).is_err(), "a pie's entries are its points");
+    // A chartex legend keeps its entries in a part with no entry elements at all, but its overlay is
+    // an attribute the part does have.
+    s.execute("insert.chart", json!({"type": "treemap", "range": "A1:E7"})).unwrap();
+    let treemap = s.doc().unwrap().wb.active().unwrap().charts[3].id;
+    assert!(s.execute("chart.setLegend", json!({"chart": treemap, "deleteEntry": 0})).is_err());
+    s.execute("chart.setLegend", json!({"chart": treemap, "overlay": true})).unwrap();
+    // A chartex gridline is the value axis's major set and nothing else; a treemap has no axis at all.
+    assert!(s.execute("chart.setGridlines", json!({"chart": treemap, "major": true})).is_err(), "a treemap has no axis");
+    s.execute("insert.chart", json!({"type": "histogram", "range": "A1:E7"})).unwrap();
+    let histogram = s.doc().unwrap().wb.active().unwrap().charts[4].id;
+    s.execute("chart.setGridlines", json!({"chart": histogram, "major": true})).unwrap();
+    assert!(s.doc().unwrap().wb.active().unwrap().charts[4].gridlines);
+    assert!(s.execute("chart.setGridlines", json!({"chart": histogram, "minor": true})).is_err(), "chartex has no minor set");
+    assert!(s.execute("chart.setGridlines", json!({"chart": histogram, "axis": "x", "major": true})).is_err());
+
+    // Everything above survives a save and reopen.
+    let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    s.execute("file.open", json!({"name": "gridlines.xlsx", "base64": b64})).unwrap();
+    let charts = s.doc().unwrap().wb.active().unwrap().charts.clone();
+    let c = &charts[0];
+    assert_eq!(c.y_gridlines(), Gridlines { major: true, minor: true });
+    assert_eq!(c.x_gridlines, Gridlines::default());
+    assert_eq!(c.legend, LegendPos::Right);
+    assert!(c.legend_overlay);
+    assert_eq!(c.series.iter().map(|se| se.legend_deleted).collect::<Vec<_>>(), vec![true, false, false, true]);
+    assert!(charts[2].gridlines_minor, "the radar's minor rings");
+    assert!(charts[3].legend_overlay, "a chartex legend keeps its overlay flag");
+}
+
+#[test]
 fn a_label_font_is_set_at_each_level_and_survives_a_save() {
     use gridcraft_model::{Color, LabelFont};
     let mut s = s();

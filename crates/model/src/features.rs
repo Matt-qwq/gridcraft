@@ -436,6 +436,13 @@ impl ChartKind {
     pub fn is_chartex(self) -> bool {
         matches!(self, Self::Histogram | Self::BoxWhisker | Self::Waterfall | Self::Funnel | Self::Treemap | Self::Sunburst)
     }
+
+    /// Whether this kind's legend has one entry per series, so an entry can be deleted through
+    /// [`Series::legend_deleted`]. A pie-like chart's entries are its points and a waterfall's are
+    /// its three totals (Increase, Decrease, Total), which a series flag cannot name.
+    pub fn legend_entries_are_series(self) -> bool {
+        !matches!(self, Self::Pie | Self::Doughnut | Self::Treemap | Self::Sunburst | Self::Waterfall)
+    }
 }
 
 /// Where the other axis crosses this one (Format Axis ▸ Axis value).
@@ -522,6 +529,23 @@ pub struct AxisOptions {
     pub display_units: Option<DisplayUnits>,
     /// Number format code of the axis labels; `None` follows the plotted values.
     pub number_format: Option<String>,
+}
+
+/// Gridlines on one axis (Add Chart Element ▸ Gridlines): Excel has a major and a minor set on
+/// each axis, and each set has its own line formatting (`c:spPr`) — the formatting is not
+/// modelled, so it stays with the chart part as kept from the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Gridlines {
+    /// A line at every major tick: the labelled values, or the boundaries between the categories.
+    pub major: bool,
+    /// A line halfway between the major ticks.
+    pub minor: bool,
+}
+
+impl Gridlines {
+    /// The major set alone (what switching gridlines on means).
+    pub const MAJOR: Gridlines = Gridlines { major: true, minor: false };
 }
 
 /// Where a data label sits relative to its point (`c:dLblPos`).
@@ -798,6 +822,11 @@ pub struct Series {
     /// Data labels for this series only (Excel's Format Data Labels on a selected series).
     #[serde(default)]
     pub labels: Option<LabelOptions>,
+    /// This series' legend entry is deleted (`c:legendEntry/c:delete`). Stored on the series rather
+    /// than as an entry index, so the deletion stays with its own series when one is added, removed
+    /// or reordered before it.
+    #[serde(default)]
+    pub legend_deleted: bool,
     /// Error bars drawn on this series.
     #[serde(default)]
     pub error_bars: Option<ErrorBars>,
@@ -925,7 +954,19 @@ pub struct Chart {
     pub series: Vec<Series>,
     pub legend: LegendPos,
     pub data_labels: bool,
+    /// The value axis's major gridlines. This flag is older than [`Gridlines`], so it keeps its
+    /// meaning (and a file written before minor and category-axis gridlines existed still reads the
+    /// same); [`Chart::y_gridlines`] is the value axis's whole set.
     pub gridlines: bool,
+    /// The value axis's minor gridlines (`c:valAx/c:minorGridlines`).
+    #[serde(default)]
+    pub gridlines_minor: bool,
+    /// The category axis's gridlines (`c:catAx/c:majorGridlines` and `c:minorGridlines`).
+    #[serde(default)]
+    pub x_gridlines: Gridlines,
+    /// Draw the legend over the plot area rather than in a band of its own (`c:legend/c:overlay`).
+    #[serde(default)]
+    pub legend_overlay: bool,
     pub style: u32,
     pub x_title: Option<String>,
     pub y_title: Option<String>,
@@ -958,6 +999,17 @@ pub struct Chart {
 }
 
 impl Chart {
+    /// The value axis's gridlines: the legacy [`Chart::gridlines`] flag is its major set.
+    pub fn y_gridlines(&self) -> Gridlines {
+        Gridlines { major: self.gridlines, minor: self.gridlines_minor }
+    }
+
+    /// Sets the value axis's gridlines (the major set is written to the legacy flag).
+    pub fn set_y_gridlines(&mut self, g: Gridlines) {
+        self.gridlines = g.major;
+        self.gridlines_minor = g.minor;
+    }
+
     /// Keeps the chart part `xml`, read into `self`, for a later save.
     pub fn keep_part(&mut self, xml: std::sync::Arc<str>) {
         let mut as_read = self.clone();

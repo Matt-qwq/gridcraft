@@ -199,6 +199,8 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
             _ => LegendPos::Right,
         },
     };
+    // A chartex legend carries its overlay as an attribute of the legend element.
+    let legend_overlay = chart.child("legend").is_some_and(|l| l.flag("overlay", false));
     let axis_title = |id: &str| plot.kids("axis").find(|a| a.attr("id") == Some(id)).and_then(|a| a.path(&["title", "tx"])).and_then(text);
     Some(Chart {
         id: 0,
@@ -208,7 +210,10 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
         series,
         legend,
         data_labels,
+        // A chartex part has one axis with a major gridline element; the model's one flag is what
+        // that element means.
         gridlines: plot.kids("axis").any(|a| a.child("majorGridlines").is_some()),
+        legend_overlay,
         style: 2,
         x_title: axis_title("0"),
         y_title: axis_title("1"),
@@ -471,7 +476,7 @@ pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<Strin
         LegendPos::Right => Some("r"),
     };
     if let Some(p) = pos {
-        let _ = write!(s, "<cx:legend pos=\"{p}\" align=\"ctr\" overlay=\"0\"/>");
+        let _ = write!(s, "<cx:legend pos=\"{p}\" align=\"ctr\" overlay=\"{}\"/>", ch.legend_overlay as u8);
     }
     // A white chart area with a light border, like other charts.
     let _ = write!(

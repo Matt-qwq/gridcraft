@@ -21,8 +21,8 @@ mod trend;
 mod tests;
 
 pub use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, LabelFont, LabelOptions, LabelPosition,
-    LegendPos, PointFormat, SparklineKind, Trendline, TrendlineKind,
+    AxisCrossing, AxisOptions, Chart, ChartKind, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, Gridlines, LabelFont, LabelOptions,
+    LabelPosition, LegendPos, PointFormat, SparklineKind, Trendline, TrendlineKind,
 };
 use serde::{Deserialize, Serialize};
 

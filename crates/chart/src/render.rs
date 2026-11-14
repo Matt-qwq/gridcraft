@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::f32::consts::{PI, TAU};
 
 use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, DisplayUnits, ErrorBarDirection, ErrorBarKind, LabelOptions, LabelPosition, LegendPos, LineDash,
-    QuartileMethod, Theme, TrendlineKind,
+    AxisCrossing, AxisOptions, Chart, ChartKind, DisplayUnits, ErrorBarDirection, ErrorBarKind, Gridlines, LabelOptions, LabelPosition, LegendPos,
+    LineDash, QuartileMethod, Theme, TrendlineKind,
 };
 
 use crate::axis::{Fmt, Scale, axis_scale, clean, fixed_scale, format_number};
@@ -19,6 +19,8 @@ use crate::{
 pub(crate) const TEXT: Rgba = [0x59, 0x59, 0x59, 0xFF];
 const DARK_TEXT: Rgba = [0x26, 0x26, 0x26, 0xFF];
 const GRID: Rgba = [0xD9, 0xD9, 0xD9, 0xFF];
+/// Minor gridlines: lighter than the major ones, and dashed.
+const GRID_MINOR: Rgba = [0xE9, 0xE9, 0xE9, 0xFF];
 const AXIS: Rgba = [0xBF, 0xBF, 0xBF, 0xFF];
 const WHITE: Rgba = [0xFF, 0xFF, 0xFF, 0xFF];
 const STOCK: Rgba = [0x40, 0x40, 0x40, 0xFF];
@@ -36,6 +38,9 @@ const MAX_LINE_PTS: usize = 2000;
 const MAX_MARKERS: usize = 5000;
 /// Data labels are skipped when a series has more points than this.
 const MAX_LABELS: usize = 200;
+/// Most gridlines a category axis draws: a denser axis (tens of thousands of categories) is drawn
+/// every n-th slot, so the primitive list stays bounded.
+const MAX_AXIS_LINES: usize = 400;
 
 #[derive(Clone, Copy, Debug)]
 struct Bx {
@@ -133,6 +138,39 @@ impl Ctx<'_> {
     fn vline(&mut self, x: f32, y0: f32, y1: f32, color: Rgba, width: f32) {
         self.line(vec![[x, y0], [x, y1]], color, width);
     }
+    /// A dashed line, as a minor gridline is drawn.
+    fn dashed(&mut self, from: [f32; 2], to: [f32; 2], color: Rgba, width: f32) {
+        self.out.push(Prim::Line { pts: vec![from, to], color, width, dash: true });
+    }
+}
+
+/// The gridlines a chart draws, one set (major and minor) per axis: the value axis and the
+/// category axis, which is also a scatter chart's numeric X axis.
+#[derive(Clone, Copy, Default)]
+struct GridSpans {
+    x: Gridlines,
+    y: Gridlines,
+}
+
+impl GridSpans {
+    fn of(chart: &Chart) -> Self {
+        Self { x: chart.x_gridlines, y: chart.y_gridlines() }
+    }
+}
+
+/// Minor gridline values: halfway between two major ticks (the geometric mean between two powers
+/// of the base on a log axis, where Excel puts the sub-powers).
+fn minor_ticks(s: &Scale) -> Vec<f64> {
+    let ticks = s.ticks();
+    let mut out = Vec::with_capacity(ticks.len());
+    for w in ticks.windows(2) {
+        let (Some(a), Some(b)) = (w.first().copied(), w.last().copied()) else { continue };
+        let m = if s.log.is_some() && a > 0.0 && b > a { (a * b).sqrt() } else { a + (b - a) / 2.0 };
+        if m.is_finite() && m > s.min && m < s.max {
+            out.push(m);
+        }
+    }
+    out
 }
 
 /// Text colour readable on `fill`.
@@ -522,12 +560,18 @@ pub fn draw(chart: &Chart, data: &ChartData, w: f32, h: f32, m: &dyn Measure) ->
         area.h -= used;
     }
     let entries = legend_entries(chart, &data);
-    if !entries.is_empty() && area.ok() {
-        let targets = legend_hits(chart, &data, entries.len());
+    let targets = legend_hits(chart, &data, entries.len());
+    // An overlaid legend is drawn after the plot, over it, and takes no band of its own: the plot
+    // area keeps the room the legend would have used.
+    let overlay = chart.legend_overlay && !entries.is_empty();
+    if !entries.is_empty() && !overlay && area.ok() {
         area = draw_legend(&mut ctx, &entries, &targets, chart.legend, area);
     }
     if area.ok() && !data.series.is_empty() {
         draw_kind(&mut ctx, chart, &data, area);
+    }
+    if overlay && area.ok() {
+        draw_legend(&mut ctx, &entries, &targets, chart.legend, overlay_box(area, chart.legend, data.category_levels.len()));
     }
     Drawing { prims: finalize(ctx.out, w, h), hits: ctx.hits }
 }
@@ -612,6 +656,19 @@ fn draw_swatch(ctx: &mut Ctx, sw: Swatch, x: f32, yc: f32, s: f32, color: Rgba) 
         }
         Swatch::Marker => ctx.out.push(Prim::Circle { cx: x + s, cy: yc, r: s * 0.4, fill: Some(color), stroke: None }),
     }
+}
+
+/// The box an overlaid legend is laid out in: inside the plot region rather than the whole chart
+/// area, so it covers the data and not the axis labels. GridCraft's frame keeps a label band below
+/// and beside the plot (one label line per row of axis labels); the legend is inset by that much
+/// on every side, plus a row per outer category level along the bottom.
+fn overlay_box(area: Bx, pos: LegendPos, levels: usize) -> Bx {
+    // An axis label row, an axis title and the label column beside the plot.
+    let label = LABEL_SIZE * 1.4;
+    let side = LABEL_SIZE * 2.0 + 4.0;
+    // A bottom legend clears the category label rows too (one per outer level).
+    let bottom = if pos == LegendPos::Bottom { side + label * (1.0 + levels.min(3) as f32) + 4.0 } else { side };
+    Bx { x: area.x + side, y: area.y + side, w: (area.w - 2.0 * side).max(1.0), h: (area.h - bottom - side).max(1.0) }
 }
 
 fn draw_legend(ctx: &mut Ctx, entries: &[(String, Rgba, Swatch)], targets: &[Hit], pos: LegendPos, area: Bx) -> Bx {
@@ -801,7 +858,7 @@ impl ValAxis<'_> {
 }
 
 /// Draws gridlines, axis labels and the category axis line; returns the plot rectangle.
-fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis>, horizontal: bool, grid: bool) -> Bx {
+fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis>, horizontal: bool, grid: GridSpans) -> Bx {
     let ls = LABEL_SIZE;
     let lh = ls * 1.4;
     let ylabels = y.labels();
@@ -831,10 +888,16 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         ctx.hit_rect(Hit::AxisX, plot.x, plot.bottom(), plot.w, area.bottom() - plot.bottom());
         for (v, t) in &ylabels {
             let yy = plot.bottom() - y.scale.frac(*v) * plot.h;
-            if grid {
+            if grid.y.major {
                 ctx.hline(plot.x, plot.right(), yy, GRID, 0.75);
             }
             ctx.text(plot.x - 4.0, yy, t, ls, TEXT, HAlign::Right, VAlign::Middle);
+        }
+        if grid.y.minor {
+            for v in minor_ticks(&y.scale) {
+                let yy = plot.bottom() - y.scale.frac(v) * plot.h;
+                ctx.dashed([plot.x, yy], [plot.right(), yy], GRID_MINOR, 0.75);
+            }
         }
         if let (Some(a), Some(l)) = (y2, &y2labels) {
             for (v, t) in l {
@@ -856,6 +919,7 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
             CatAxis::Labels(l, outer, crosses) => {
                 let n = l.len().max(1);
                 let cw = plot.w / n as f32;
+                draw_cat_grid(ctx, plot, n, grid);
                 let lw = l.iter().take(2000).map(|t| ctx.tw(t, ls)).fold(0.0f32, f32::max);
                 let k = (((lw + 6.0) / cw.max(1e-3)).ceil() as usize).clamp(1, n);
                 for (j, t) in l.iter().enumerate().step_by(k) {
@@ -888,6 +952,21 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
             }
             CatAxis::Numeric(s, f, crosses, units) => {
                 let ticks = s.ticks();
+                // A numeric category axis is a scatter chart's X: its gridlines are vertical lines
+                // at its own ticks, where a label axis's fall between the categories.
+                for (c, dashed) in [(grid.x.major, false), (grid.x.minor, true)] {
+                    if !c {
+                        continue;
+                    }
+                    for v in if dashed { minor_ticks(&s) } else { ticks.clone() } {
+                        let xx = plot.x + s.frac(v) * plot.w;
+                        if dashed {
+                            ctx.dashed([xx, plot.y], [xx, plot.bottom()], GRID_MINOR, 0.75);
+                        } else {
+                            ctx.vline(xx, plot.y, plot.bottom(), GRID, 0.75);
+                        }
+                    }
+                }
                 let divisor = units.map(DisplayUnits::factor).unwrap_or(1.0);
                 let labels: Vec<String> = ticks.iter().map(|v| f.format(v / divisor, Some(s.step))).collect();
                 let lw = labels.iter().map(|t| ctx.tw(t, ls)).fold(0.0f32, f32::max);
@@ -937,11 +1016,17 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         let k = (((vw + 6.0) / slot.max(1e-3)).ceil() as usize).max(1);
         for (i, (v, t)) in ylabels.iter().enumerate() {
             let xx = plot.x + y.scale.frac(*v) * plot.w;
-            if grid {
+            if grid.y.major {
                 ctx.vline(xx, plot.y, plot.bottom(), GRID, 0.75);
             }
             if i % k == 0 {
                 ctx.text(xx, plot.bottom() + 3.0, t, ls, TEXT, HAlign::Center, VAlign::Top);
+            }
+        }
+        if grid.y.minor {
+            for v in minor_ticks(&y.scale) {
+                let xx = plot.x + y.scale.frac(v) * plot.w;
+                ctx.dashed([xx, plot.y], [xx, plot.bottom()], GRID_MINOR, 0.75);
             }
         }
         let x0 = plot.x + y.scale.frac(y.crossing()) * plot.w;
@@ -953,6 +1038,22 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         let n = labels.len().max(1);
         let ch = plot.h / n as f32;
         let k = ((lh / ch.max(1e-3)).ceil() as usize).clamp(1, n);
+        // The category axis of a bar chart runs down the plot: its gridlines are horizontal, one
+        // at each category boundary for the major set and one at each category's centre for the
+        // minor set.
+        let gstep = n.div_ceil(MAX_AXIS_LINES).max(1);
+        if grid.x.major {
+            for j in (0..=n).step_by(gstep) {
+                let yy = plot.bottom() - j as f32 * ch;
+                ctx.hline(plot.x, plot.right(), yy, GRID, 0.75);
+            }
+        }
+        if grid.x.minor {
+            for j in (0..n).step_by(gstep) {
+                let yy = plot.bottom() - (j as f32 + 0.5) * ch;
+                ctx.dashed([plot.x, yy], [plot.right(), yy], GRID_MINOR, 0.75);
+            }
+        }
         for (j, t) in labels.iter().enumerate().step_by(k) {
             let t = ctx.fit(t, ls, lw - 6.0);
             ctx.text(plot.x - 4.0, plot.bottom() - (j as f32 + 0.5) * ch, &t, ls, TEXT, HAlign::Right, VAlign::Middle);
@@ -981,6 +1082,26 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
             x1 = x0;
         }
         plot
+    }
+}
+
+/// Gridlines of a label category axis: a line at each category boundary for the major set (where
+/// Excel's category tick marks sit) and one at each category's centre for the minor set. A dense
+/// axis (tens of thousands of categories) is drawn every n-th slot so the drawing stays bounded.
+fn draw_cat_grid(ctx: &mut Ctx, plot: Bx, n: usize, grid: GridSpans) {
+    let step = n.div_ceil(MAX_AXIS_LINES).max(1);
+    let cw = plot.w / n as f32;
+    if grid.x.major {
+        for j in (0..=n).step_by(step) {
+            let xx = plot.x + j as f32 * cw;
+            ctx.vline(xx, plot.y, plot.bottom(), GRID, 0.75);
+        }
+    }
+    if grid.x.minor {
+        for j in (0..n).step_by(step) {
+            let xx = plot.x + (j as f32 + 0.5) * cw;
+            ctx.dashed([xx, plot.y], [xx, plot.bottom()], GRID_MINOR, 0.75);
+        }
     }
 }
 
@@ -1462,7 +1583,7 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
         .iter()
         .map(|l| (0..ncat_slots).map(|p| cat_at(p).and_then(|c| l.get(c).cloned()).unwrap_or_default()).collect())
         .collect();
-    let plot = frame(ctx, area, CatAxis::Labels(&labels, &outer, chart.x_axis.crosses), &y1, y2.as_ref(), horizontal, chart.gridlines);
+    let plot = frame(ctx, area, CatAxis::Labels(&labels, &outer, chart.x_axis.crosses), &y1, y2.as_ref(), horizontal, GridSpans::of(chart));
     if !plot.ok() {
         return;
     }
@@ -1748,7 +1869,8 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let fx = Fmt::new(chart.x_axis.number_format.as_deref().unwrap_or("General"));
     let fy = Fmt::new(chart.y_axis.number_format.as_deref().or_else(|| data.series.first().map(|s| s.number_format.as_str())).unwrap_or("General"));
     let y_axis = ValAxis { scale: ys, fmt: &fy, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses };
-    let plot = frame(ctx, area, CatAxis::Numeric(xs, &fx, chart.x_axis.crosses, chart.x_axis.display_units), &y_axis, None, false, chart.gridlines);
+    let plot =
+        frame(ctx, area, CatAxis::Numeric(xs, &fx, chart.x_axis.crosses, chart.x_axis.display_units), &y_axis, None, false, GridSpans::of(chart));
     if !plot.ok() {
         return;
     }
@@ -1876,7 +1998,7 @@ fn histogram(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         &ValAxis { scale: ys, fmt: &fc, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,
-        chart.gridlines,
+        GridSpans::of(chart),
     );
     if !plot.ok() {
         return;
@@ -1937,7 +2059,7 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,
-        chart.gridlines,
+        GridSpans::of(chart),
     );
     if !plot.ok() {
         return;
@@ -2202,16 +2324,28 @@ fn radar(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let divisor = chart.y_axis.display_units.map(DisplayUnits::factor).unwrap_or(1.0);
     let spacing = r / ticks.len().saturating_sub(1).max(1) as f32;
     let every = ((LABEL_SIZE * 1.3 / spacing.max(1e-3)).ceil() as usize).max(1);
+    // A ring at each radius: the value axis's gridlines, closed back to the first spoke.
+    let ring = |rr: f32| -> Vec<[f32; 2]> {
+        let mut pts: Vec<[f32; 2]> = (0..ncat).map(|j| pt(ang(j), rr)).collect();
+        if ncat < 3 {
+            pts = (0..=48).map(|k| pt(k as f32 / 48.0 * TAU, rr)).collect();
+        } else if let Some(p) = pts.first().copied() {
+            pts.push(p);
+        }
+        pts
+    };
+    if chart.gridlines_minor {
+        for v in minor_ticks(&sc) {
+            let rr = sc.frac(v) * r;
+            if rr > 0.5 {
+                ctx.out.push(Prim::Line { pts: ring(rr), color: GRID_MINOR, width: 0.75, dash: true });
+            }
+        }
+    }
     for (ti, t) in ticks.into_iter().enumerate() {
         let rr = sc.frac(t) * r;
         if rr > 0.5 && chart.gridlines {
-            let mut ring: Vec<[f32; 2]> = (0..ncat).map(|j| pt(ang(j), rr)).collect();
-            if ncat < 3 {
-                ring = (0..=48).map(|k| pt(k as f32 / 48.0 * TAU, rr)).collect();
-            } else if let Some(p) = ring.first().copied() {
-                ring.push(p);
-            }
-            ctx.line(ring, GRID, 0.75);
+            ctx.line(ring(rr), GRID, 0.75);
         }
         if ti % every == 0 {
             ctx.text(cx - 3.0, cy - rr, &f.format(t / divisor, Some(sc.step)), LABEL_SIZE * 0.9, TEXT, HAlign::Right, VAlign::Middle);
@@ -2286,7 +2420,7 @@ fn box_whisker(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,
-        chart.gridlines,
+        GridSpans::of(chart),
     );
     if !plot.ok() {
         return;
@@ -2344,7 +2478,7 @@ fn stock(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         &ValAxis { scale: ys, fmt: &f, units: chart.y_axis.display_units, crosses: chart.y_axis.crosses },
         None,
         false,
-        chart.gridlines,
+        GridSpans::of(chart),
     );
     if !plot.ok() {
         return;
