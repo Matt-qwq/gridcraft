@@ -568,6 +568,11 @@ impl SheetApp {
         if id == "insert.recommendedCharts" && params.get("type").is_none() {
             return self.open_dialog("recommendedCharts", json!({}));
         }
+        // Move Chart with no sheet named (ribbon path, command search) asks where the chart goes;
+        // programmatic callers of `run` still move it straight onto the sheet they named.
+        if id == "chart.move" && params.get("sheet").and_then(Json::as_str).is_none_or(str::is_empty) {
+            return self.open_dialog("moveChart", json!({}));
+        }
         if let Err(e) = self.run(id, params) {
             self.alert(e);
         }

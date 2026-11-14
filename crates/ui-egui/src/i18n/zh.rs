@@ -1242,6 +1242,12 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "This chart type has no axis frame to draw gridlines on." => "此图表类型没有可绘制网格线的坐标轴。",
         "Move Chart to a New Sheet" => "将图表移至新工作表",
         "Move Chart to a Sheet" => "将图表移至工作表",
+        // Chart Design ▸ Move Chart: the dialog, its two choices and the ribbon button. Excel's
+        // Chinese wording, so the radio buttons read as they do there.
+        "Move Chart" => "移动图表",
+        "Move\nChart" => "移动\n图表",
+        "New sheet" => "新的工作表",
+        "Object in" => "对象位于",
         " — Edited" => " — 已修改",
         "check" => "对勾",
         "close" => "关闭",

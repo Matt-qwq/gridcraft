@@ -74,6 +74,11 @@ impl Dialog {
                 _ => {}
             }
         }
+        // Move Chart's two choices run two commands: "New sheet" makes a chart sheet of the
+        // chart, "Object in" puts a chart sheet's chart back on a worksheet.
+        if self.name == "moveChart" && key == "where" {
+            self.command = Some(if value.as_str() == Some("object") { "chart.moveToObject" } else { "chart.moveToSheet" });
+        }
         self.values.insert(key.into(), value);
     }
 
@@ -842,6 +847,46 @@ impl Dialog {
                 ],
                 json!({"chart": p("chart")}),
             ),
+            "moveChart" => {
+                // Chart Design ▸ Move Chart: the chart onto a chart sheet of its own ("New sheet"),
+                // or a chart sheet's chart back onto a worksheet as a floating object ("Object in").
+                // The chart's state decides which choice is proposed, as in Excel.
+                let doc = app.session.active()?;
+                let active = doc.wb.active_sheet;
+                let chart_sheet = doc.wb.active().is_some_and(|s| s.is_chart_sheet());
+                let wanted = p("chart").as_u64().and_then(|id| u32::try_from(id).ok()).or(app.selected_chart);
+                let chart = doc.wb.active().and_then(|sh| {
+                    if chart_sheet { sh.chart_sheet_chart().map(|c| c.id) } else { wanted.filter(|id| sh.charts.iter().any(|c| c.id == *id)) }
+                });
+                // Objects land on a worksheet: a chart sheet holds its own chart and no objects, so
+                // it is never offered. The proposed one is the command's own default — the nearest
+                // worksheet before the chart sheet.
+                let sheets: Vec<String> = doc.wb.sheets.iter().filter(|s| !s.is_chart_sheet()).map(|s| s.name.clone()).collect();
+                let sheet = if chart_sheet {
+                    (0..active).rev().find_map(|i| doc.wb.sheet(i).filter(|s| !s.is_chart_sheet()).map(|s| s.name.clone()))
+                } else {
+                    doc.wb.sheet(active).filter(|s| !s.is_chart_sheet()).map(|s| s.name.clone())
+                }
+                .or_else(|| sheets.first().cloned())
+                .unwrap_or_default();
+                let name = doc.wb.next_chart_sheet_name();
+                let Some(chart) = chart else {
+                    app.message = Some(("Move Chart".into(), "Select a chart first.".into()));
+                    return None;
+                };
+                let mut d = Dialog::custom(
+                    "moveChart",
+                    "Move Chart",
+                    json!({
+                        "where": if chart_sheet { "object" } else { "newSheet" },
+                        "name": name,
+                        "sheet": sheet,
+                        "chart": chart,
+                    }),
+                );
+                d.command = Some(if chart_sheet { "chart.moveToObject" } else { "chart.moveToSheet" });
+                d
+            }
             "insertPicture" => {
                 let placement = params.get("placement").and_then(Json::as_str).unwrap_or("overCells");
                 let mut dialog = Dialog::form(
@@ -1128,6 +1173,26 @@ pub(crate) fn build_params(d: &Dialog) -> Json {
                 m.remove("stop");
             }
         }
+        "moveChart" => {
+            // Each choice runs its own command and takes only that command's parameters; a blank
+            // name means the workbook's next ChartN, which the command picks itself.
+            if let Some(m) = v.as_object_mut() {
+                m.remove("where");
+                m.remove("sheets");
+                if d.command == Some("chart.moveToObject") {
+                    m.remove("chart");
+                    m.remove("name");
+                } else {
+                    m.remove("sheet");
+                    let name = m.get("name").and_then(Json::as_str).map(str::trim).unwrap_or("").to_string();
+                    if name.is_empty() {
+                        m.remove("name");
+                    } else {
+                        m.insert("name".into(), json!(name));
+                    }
+                }
+            }
+        }
         "defineName" => {
             if let Some(m) = v.as_object_mut() {
                 for key in ["scope", "oldScope"] {
@@ -1190,6 +1255,7 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                 "manageRules" => manage_rules(app, ui),
                 "recommendedCharts" => recommended_charts(app, ui, &mut d, &mut confirm, &mut open),
                 "selectData" => select_data(app, ui, &mut d, &mut confirm, &mut open),
+                "moveChart" => move_chart(app, ui, &mut d, &mut confirm, &mut open),
                 "commandSearch" => command_search(app, ui, &mut d, &mut confirm),
                 "goalSeek" => goal_seek(app, ui, &mut d, &mut confirm),
                 "pasteSpecial" => paste_special(app, ui, &mut d, &mut confirm, &mut open),
@@ -2673,6 +2739,81 @@ fn select_data(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &
             Err(e) => app.message = Some((d.title.clone(), crate::clean_error(&e))),
         }
     }
+}
+
+/// Chart Design ▸ Move Chart (Excel's Move Chart dialog): the chart onto a chart sheet of its own,
+/// or a chart sheet's chart back onto a worksheet as a floating object. Both choices are always
+/// drawn, as in Excel; the chart's own state only decides which one is proposed.
+fn move_chart(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: &mut bool, open: &mut bool) {
+    let lang = app.ui.language;
+    let t = theme::Tokens::get(ui.ctx());
+    let object = |d: &Dialog| d.values.get("where").and_then(Json::as_str) == Some("object");
+    ui.add_space(4.0);
+    if ui.radio(!object(d), lang.tr("New sheet")).clicked() {
+        d.set_value("where", json!("newSheet"));
+    }
+    // A taken name is refused here, before OK runs the command (Excel's rule); a blank one falls
+    // back to the workbook's next ChartN, which the command itself picks.
+    let mut refusal = None;
+    if !object(d) {
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            ui.label(lang.tr("Name:"));
+            let mut name = d.values.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+            if ui.add(egui::TextEdit::singleline(&mut name).desired_width(220.0)).changed() {
+                d.values.insert("name".into(), json!(name));
+            }
+        });
+        refusal = app.session.active().and_then(|doc| {
+            let name = d.values.get("name").and_then(Json::as_str).unwrap_or("").trim().to_string();
+            if name.is_empty() { None } else { doc.wb.check_sheet_name(&name, None).err() }
+        });
+        if let Some(why) = &refusal {
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                ui.label(egui::RichText::new(lang.tr(why)).color(t.danger));
+            });
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui.radio(object(d), lang.tr("Object in")).clicked() {
+            d.set_value("where", json!("object"));
+        }
+        // A chart sheet holds its own chart and no objects: only worksheets are offered. The list
+        // is refreshed every frame (a sheet can be added behind the dialog) and kept in the values
+        // so the control channel can read what the dropdown holds.
+        if object(d) {
+            let sheets: Vec<String> = app
+                .session
+                .active()
+                .map(|doc| doc.wb.sheets.iter().filter(|s| !s.is_chart_sheet()).map(|s| s.name.clone()).collect())
+                .unwrap_or_default();
+            d.values.insert("sheets".into(), json!(sheets));
+            let cur = d.values.get("sheet").and_then(Json::as_str).unwrap_or("").to_string();
+            egui::ComboBox::from_id_salt(("moveChart", "sheet")).selected_text(cur.as_str()).width(220.0).show_ui(ui, |ui| {
+                for name in &sheets {
+                    if ui.selectable_label(*name == cur, name).clicked() {
+                        d.values.insert("sheet".into(), json!(name));
+                    }
+                }
+            });
+        }
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let ok = ui.add_enabled(
+                refusal.is_none(),
+                egui::Button::new(egui::RichText::new(format!("   {}   ", lang.tr("OK"))).color(Color32::WHITE)).fill(t.accent),
+            );
+            if ok.clicked() || (refusal.is_none() && ui.input(|i| i.key_pressed(Key::Enter))) {
+                *confirm = true;
+            }
+            if ui.button(format!(" {} ", lang.tr("Cancel"))).clicked() {
+                *open = false;
+            }
+        });
+    });
 }
 
 fn manage_rules(app: &mut SheetApp, ui: &mut egui::Ui) {

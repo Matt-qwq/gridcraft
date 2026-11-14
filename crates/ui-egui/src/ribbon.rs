@@ -2632,6 +2632,15 @@ fn chart_design(app: &mut SheetApp, ui: &mut Ui) {
     if __k.clicked() || invoke(app, "chartTitle") {
         app.open_dialog("chartTitle", json!({"chart": id}));
     }
+    let mc = big_button(ui, Icon::Sheet, "Move\nChart", "Move the chart to a chart sheet of its own, or back onto a worksheet", false);
+    control_keytip(app, ui, &mc, "dialog:moveChart");
+    // A painted label needs its accessibility name: readers, the control channel and the tests
+    // find the button by it. Translated outside the closure, which runs under the context lock.
+    let mc_label = tr(ui, "Move Chart");
+    mc.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), mc_label));
+    if mc.clicked() {
+        app.open_dialog("moveChart", json!({"chart": id}));
+    }
     let __k = big_button(ui, Icon::Delete, "Delete\nChart", "Delete chart", false);
     control_keytip(app, ui, &__k, "chart.delete");
     if __k.clicked() {
