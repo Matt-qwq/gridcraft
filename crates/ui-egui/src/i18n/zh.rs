@@ -1225,6 +1225,8 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Grab bag" => "杂项",
         "Height: {:.2} ({} pixels)" => "行高：{:.2}（{} 像素）",
         "Width: {:.2} ({} pixels)" => "列宽：{:.2}（{} 像素）",
+        "Move Chart to a New Sheet" => "将图表移至新工作表",
+        "Move Chart to a Sheet" => "将图表移至工作表",
         " — Edited" => " — 已修改",
         "check" => "对勾",
         "close" => "关闭",

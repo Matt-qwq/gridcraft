@@ -44,14 +44,21 @@ pub(crate) fn expose_grid(ui: &mut egui::Ui, wb: &Workbook, si: usize, sh: &Shee
     let used = sh.used_range();
     let active_value = sh.value(active);
     let value = if active_value.is_empty() { String::new() } else { format!(", {}", active_value.display()) };
-    let description = format!(
-        "Worksheet {}{}, active cell {}{value}, {} cell{} selected",
-        sh.name,
-        if wb.active_sheet == si { "" } else { " (not shown)" },
-        active.a1(),
-        range.count(),
-        if range.count() == 1 { "" } else { "s" }
-    );
+    // A chart sheet holds one chart and no cells: walking cell nodes there would describe an
+    // editable grid that does not exist, so the node names the sheet and says what it holds.
+    let not_shown = if wb.active_sheet == si { "" } else { " (not shown)" };
+    let description = if sh.is_chart_sheet() {
+        let charts = sh.charts.len();
+        format!("Chart sheet {}{not_shown}, {charts} chart{}", sh.name, if charts == 1 { "" } else { "s" })
+    } else {
+        format!(
+            "Worksheet {}{not_shown}, active cell {}{value}, {} cell{} selected",
+            sh.name,
+            active.a1(),
+            range.count(),
+            if range.count() == 1 { "" } else { "s" }
+        )
+    };
     // Physical pixels for the node's bounds. (Anything that reads the context must happen before
     // `accesskit_node_builder`: it holds the context lock while its closure runs.)
     let ppp = ctx.pixels_per_point();
