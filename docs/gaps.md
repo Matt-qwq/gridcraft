@@ -767,12 +767,20 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 12–16 h for this soak and its fixes; done.
 ## After beta
 
-### 11. No localization at all (L)
-- Catalog: ribbon-only in five languages (#31, #104, #82; ~12% of strings each), and 943 strings
-  (~43%) in Japanese (10-17) and Brazilian Portuguese, including the dialog labels, messages, File
-  view and menus. The remaining dialogs, menus and messages are English; en-US function names and
-  separators (#45); German in PR #163. **Estimate:**
-  100–165 h including #5. [localization-parity.md](localization-parity.md)
+### 11. Localization: two languages, deliberately (L)
+- **Rescoped 11-14 to English + Simplified Chinese.** The 18 catalogs that had accumulated
+  (12,290 lines, verified by nobody) are gone; the enum is `Language::En | Zh`, an old `ui.json`
+  saying `"ja"` loads as English with every other preference intact. Chinese covers **1,739 of
+  ~2,200 strings** and **all 362 engine command labels**; every `tr()` key has an entry (437 of
+  them) and the only accepted English literals in the UI are the `GridCraft` brand. Formula syntax,
+  separators and number/date formats stay **en-US by decision** — Excel's own Simplified Chinese
+  build does the same, so #45 as filed is closed by scope. Two CI guards hold it: a strict test over
+  the engine's command specs, and `cargo xtask i18n` (unwrapped literals **and** wrapped keys with
+  no entry).
+- **What is left:** the ~460 untranslated *leaf* strings that are not commands — the rest of the
+  dialogs, menus and context menus, status messages, some task panes, and the function help beyond
+  `zh_functions.rs`'s 159. **Estimate: 20–35 h**, all translation, no engineering.
+  [localization-parity.md](localization-parity.md)
 
 ### 12. Get & Transform, external data, data model (F)
 - No Power Query editor, connections, refresh, From Web/database/folder sources, relationships or
@@ -817,8 +825,16 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 ### 17. Insert objects (F)
 - Ink strokes now survive XLSX save/reopen as editable polylines. Inserted icons still lose their
   identity/artwork on save (#551); native Office InkML import is not implemented.
-- SmartArt, WordArt, equations, signature line, objects, 3-D models, screenshot; 8 shape kinds vs
-  ~170; pictures in cells (#61, PR #105). **Estimate:** 25–40 h.
+- **Landed 11-14: equations.** A drawing shape whose `txBody` carries `a14:m` is read as an
+  equation object (`model/src/equation.rs`), its OMML kept **verbatim** through a save, and
+  `insert.equation` / `equation.setText` create and retype one (a retyped equation is written as
+  plain `m:r/m:t` runs — the file's real math survives only while the text is untouched, which the
+  field docs say). GridCraft paints the **linear** text: full 2-D math layout is out of scope, and
+  the command is **command/control-channel only** until there is an equation editor to type into.
+  Equations do not yet follow row/column inserts, are not in the z-order/Align/Arrange commands,
+  are not in the accessibility check or the PDF export.
+- SmartArt, WordArt, signature line, objects, 3-D models, screenshot; 8 shape kinds vs
+  ~170; pictures in cells (#61, PR #105). **Estimate:** 25–40 h (equations are no longer part of it).
 
 ### 18. Accessibility (U)
 - **Landed 11-02 (alt text + checker):** charts and shapes carry alternative text now — the model
