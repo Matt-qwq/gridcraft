@@ -335,17 +335,36 @@ mod tests {
         }
     }
 
+    /// An entry never gives its English back: the handful that do are a percentage, a colon and a
+    /// browser name, and a new English-into-English entry is a translation that was never
+    /// written (or a key copied with its neighbour's value).
+    #[test]
+    fn no_entry_gives_its_english_back() {
+        // Each of these is text no Chinese build renders differently: `100%` is the same in both
+        // languages, the alpha channel's label keeps its Latin word and only its colon widens.
+        const SAME_IN_BOTH: [&str; 3] = ["100%", "Web", "Alpha:"];
+        for (english, chinese) in zh_catalog() {
+            if SAME_IN_BOTH.contains(&english.as_str()) {
+                continue;
+            }
+            assert_ne!(&english, &chinese, "{english:?} is translated into itself");
+            assert!(
+                chinese.chars().any(|c| {
+                    ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3000}'..='\u{303f}').contains(&c) || ('\u{ff00}'..='\u{ffef}').contains(&c)
+                }),
+                "{english:?} => {chinese:?} holds no Chinese"
+            );
+        }
+    }
+
     /// Every command the engine registers draws its label through `tr` (the command list, the
     /// menus, the tooltips), so a command that lands without a Chinese label puts English on a
     /// Chinese screen. The labels come from the registry — a list here would drift from it — and
-    /// the gap of untranslated ones may only shrink.
+    /// every one of them is translated: the ratchet that allowed 148 untranslated labels while
+    /// the catalog grew was removed once the count reached zero, so a new command has to arrive
+    /// with its Chinese label.
     #[test]
-    fn the_engine_command_catalog_keeps_its_chinese() {
-        // The gap when this guard landed: 148 of 362 registered labels, nearly all of them ribbon
-        // items whose visible label the interface draws from its own table (Draw Border, Field
-        // List, Subtotals). Translating one lowers this number; a command that lands without a
-        // label raises it and fails here.
-        const UNTRANSLATED_MAX: usize = 148;
+    fn every_engine_command_label_has_a_chinese_label() {
         let specs = gridcraft_engine::cmd::command_specs();
         assert!(specs.len() > 300, "the command registry looks empty: {}", specs.len());
         let mut untranslated = Vec::new();
@@ -361,8 +380,8 @@ mod tests {
             }
         }
         assert!(
-            untranslated.len() <= UNTRANSLATED_MAX,
-            "{} of {} engine command labels have no Simplified Chinese (at most {UNTRANSLATED_MAX} may): {untranslated:?}",
+            untranslated.is_empty(),
+            "{} of {} engine command labels have no Simplified Chinese: {untranslated:?}",
             untranslated.len(),
             specs.len()
         );
@@ -370,6 +389,71 @@ mod tests {
         // give a label back unchanged.
         assert_ne!(Language::Zh.tr("Paste"), "Paste");
         assert_eq!(Language::Zh.tr("Paste"), "粘贴");
+    }
+
+    /// A sample of the labels the last wave landed — the ribbon groups, the chart, pivot, slicer
+    /// and automation commands, the Format pane, the Backstage export list and the Insert Function
+    /// category that were still English on a Chinese screen — reads as Chinese in the Chinese
+    /// build and stays English in the English one.
+    #[test]
+    fn the_labels_the_last_wave_landed_read_as_chinese() {
+        for (english, chinese) in [
+            // Home / Insert ribbons.
+            ("Draw Border", "绘制边框"),
+            ("Picture", "图片"),
+            ("Shrink to Fit", "缩小字体填充"),
+            ("New Cell Style…", "新建单元格样式…"),
+            ("Add-ins", "加载项"),
+            // Chart and arrange.
+            ("Change Chart Type…", "更改图表类型…"),
+            ("Change Colors", "更改颜色"),
+            ("Format Data Labels", "设置数据标签格式"),
+            ("Shape Fill", "形状填充"),
+            ("Selection Pane", "选择窗格"),
+            ("Secondary Axis", "次坐标轴"),
+            // Pivot, slicer, timeline.
+            ("Field List", "字段列表"),
+            ("Value Field Settings", "值字段设置"),
+            ("PivotTable Styles", "数据透视表样式"),
+            ("Grand Totals", "总计"),
+            ("Clear Slicer Filter", "清除切片器筛选"),
+            ("Set Timeline Range", "设置日程表范围"),
+            ("Timeline", "日程表"),
+            // Data, formulas, review, view, automate.
+            ("Check Value Against Validation", "用数据验证检查值"),
+            ("Consolidate…", "合并计算…"),
+            ("Selection Statistics", "选择统计信息"),
+            ("List Functions", "列出函数"),
+            ("Insert Function…", "插入函数…"),
+            ("Most Recently Used", "最近使用过的"),
+            ("Resolve Thread", "解决线程"),
+            ("Thesaurus", "同义词库"),
+            ("Split", "拆分"),
+            ("All Scripts", "所有脚本"),
+            ("Toggle Checkbox", "切换复选框"),
+            // The Format pane and the object context menus.
+            ("Format Shape", "设置形状格式"),
+            ("Format Picture", "设置图片格式"),
+            ("Select a chart, shape or picture to format it.", "请选择一个图表、形状或图片，以便设置其格式。"),
+            ("No line", "无线条"),
+            ("Line colour", "线条颜色"),
+            ("Move but don't size with cells", "随单元格移动但不调整大小"),
+            ("Copy Cells", "复制单元格"),
+            ("Fill Formatting Only", "仅填充格式"),
+            ("Format Object…", "设置对象格式…"),
+            // The Backstage export list, the notice bar and the print alerts.
+            ("Parquet (.parquet)", "Parquet 文件 (.parquet)"),
+            ("What this means", "了解详情"),
+            ("Select an available printer in File > Print before submitting.", "提交前请先在“文件 > 打印”中选择可用的打印机。"),
+            ("Couldn't decode the generated PDF.", "无法解码生成的 PDF。"),
+            // Files.
+            ("Export as CSV", "导出为 CSV"),
+            ("Export as Parquet", "导出为 Parquet"),
+            ("Print Preview", "打印预览"),
+        ] {
+            assert_eq!(Language::Zh.tr(english), chinese, "{english:?}");
+            assert_eq!(Language::En.tr(english), english, "{english:?} stays English");
+        }
     }
 
     /// An English string no catalog knows renders as the English it is: the interface never shows
