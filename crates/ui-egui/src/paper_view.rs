@@ -757,6 +757,19 @@ fn edge_at(geo: &Geo, pg: &PageGrid, pos: Pos2, h: bool) -> Option<(Edge, usize)
     best.map(|(_, e, p)| (e, p))
 }
 
+/// A ruler margin's tooltip: the edge's name and the distance from the page's edge.
+///
+/// The number is formatted first so the unit stays part of the template the catalog holds
+/// ("{:.2} cm" reads "{:.2} 厘米" in Chinese); a `format!` would bake the unit in as English. The
+/// label-and-value shape is a key of its own, which is how Chinese joins the two with a fullwidth
+/// colon.
+fn margin_tip(language: crate::i18n::Language, edge: Edge, inches: f32, metric: bool) -> String {
+    let number = if metric { inches * 2.54 } else { inches };
+    let unit = if metric { "{:.2} cm" } else { "{:.2} in" };
+    let value = language.tr(unit).replace("{:.2}", &format!("{number:.2}"));
+    language.tr("{label}: {value}").replace("{label}", language.tr(edge.label())).replace("{value}", &value)
+}
+
 /// Dragging the margin edges on the rulers sets the page margins: a resize cursor and a tooltip
 /// on hover, a live preview while dragging, one `pageLayout.pageSetup` (one undo step) on
 /// release, Esc cancels.
@@ -781,12 +794,7 @@ fn ruler_margins(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, pg: &PageGrid
     let current = margins_in(sh);
     let metric = metric(app);
     let tip = |ui: &egui::Ui, app: &SheetApp, edge: Edge, inches: f32| {
-        // The number is formatted first so the unit stays part of the template the catalog holds
-        // ("{:.2} cm" reads "{:.2} 厘米" in Chinese); a format! would bake the unit in English.
-        let number = if metric { inches * 2.54 } else { inches };
-        let unit = if metric { "{:.2} cm" } else { "{:.2} in" };
-        let value = app.ui.language.tr(unit).replace("{:.2}", &format!("{number:.2}"));
-        let text = format!("{}: {value}", app.ui.language.tr(edge.label()));
+        let text = margin_tip(app.ui.language, edge, inches, metric);
         egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new("ruler_margin_tip"), egui::PopupAnchor::Pointer).show(|ui| {
             ui.label(text);
         });
@@ -843,6 +851,22 @@ fn ruler_margins(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, pg: &PageGrid
     }
 }
 
+/// The Header & Footer tab's presets, with sample values, as the printed page will read them: the
+/// sentences are catalog templates ("Page 1" reads "第 1 页" in Chinese) and only a sheet's own
+/// name and the document's title go in as they are. The second half is the field code each
+/// preset writes.
+fn hf_presets(language: crate::i18n::Language, sheet_name: &str, file: &str) -> [(String, &'static str); 7] {
+    [
+        (language.tr("(none)").to_string(), ""),
+        (language.tr("Page 1").to_string(), "&CPage &P"),
+        (language.tr("Page 1 of ?").to_string(), "&CPage &P of &N"),
+        (sheet_name.to_string(), "&C&A"),
+        (file.to_string(), "&C&F"),
+        (language.tr("{sheet_name}, Page 1").replace("{sheet_name}", sheet_name), "&C&A, Page &P"),
+        (language.tr("{file}, Page 1").replace("{file}", file), "&C&F, Page &P"),
+    ]
+}
+
 /// The Header & Footer contextual ribbon tab.
 pub fn ribbon_tab(app: &mut SheetApp, ui: &mut egui::Ui) {
     use crate::widgets::big_button;
@@ -856,16 +880,7 @@ pub fn ribbon_tab(app: &mut SheetApp, ui: &mut egui::Ui) {
         crate::ribbon::control_keytip(app, ui, &r, key);
         let forced = crate::ribbon::invoke(app, key);
         egui::Popup::menu(&r).open_memory(crate::ribbon::popup_command(forced, r.clicked())).show(|ui| {
-            let presets: [(String, &str); 7] = [
-                (tr(app, "(none)").to_string(), ""),
-                ("Page 1".into(), "&CPage &P"),
-                ("Page 1 of ?".into(), "&CPage &P of &N"),
-                (sheet_name.clone(), "&C&A"),
-                (file.clone(), "&C&F"),
-                (format!("{sheet_name}, Page 1"), "&C&A, Page &P"),
-                (format!("{file}, Page 1"), "&C&F, Page &P"),
-            ];
-            for (text, spec) in presets {
+            for (text, spec) in hf_presets(app.ui.language, &sheet_name, &file) {
                 if ui.button(text).clicked() {
                     let sheet = app.grid.hf_edit.as_ref().map(|e| e.sheet).unwrap_or(0);
                     cancel(app);
@@ -970,5 +985,36 @@ mod tests {
         assert_eq!(margin_from_drag(Edge::Top, 300.0, A4, [0.7, 0.7, 0.75, 0.75, -5.0, f32::INFINITY]), Some(4.17));
         assert_eq!(margin_from_drag(Edge::Header, f64::NAN, A4, m), None);
         assert!(margin_from_drag(Edge::Footer, 10.0, A4, [0.0, 0.0, 1e9, 1e9, 0.3, 1e9]).is_some_and(|v| (0.0..=11.7).contains(&v)));
+    }
+
+    /// The ruler's margin tooltip and the header/footer presets read the interface language: the
+    /// edge name, the unit and the sample values are catalog entries, not English baked in.
+    #[test]
+    fn the_margin_hints_and_page_presets_follow_the_language() {
+        use crate::i18n::Language;
+
+        assert_eq!(margin_tip(Language::En, Edge::Left, 1.0, true), "Left Margin: 2.54 cm");
+        assert_eq!(margin_tip(Language::En, Edge::Footer, 0.5, false), "Footer Margin: 0.50 in");
+        // Chinese names the edge, the unit and joins the two with its own colon.
+        assert_eq!(margin_tip(Language::Zh, Edge::Left, 1.0, true), "左边距：2.54 厘米");
+        assert_eq!(margin_tip(Language::Zh, Edge::Footer, 0.5, false), "页脚边距：0.50 英寸");
+
+        let en = hf_presets(Language::En, "Sales", "Book1");
+        assert_eq!(en[1], ("Page 1".to_string(), "&CPage &P"));
+        assert_eq!(en[5], ("Sales, Page 1".to_string(), "&C&A, Page &P"));
+        assert_eq!(en[6], ("Book1, Page 1".to_string(), "&C&F, Page &P"));
+
+        let zh = hf_presets(Language::Zh, "销售", "Book1");
+        assert_eq!(zh[0], ("(无)".to_string(), ""), "the empty preset");
+        assert_eq!(zh[1], ("第 1 页".to_string(), "&CPage &P"));
+        assert_eq!(zh[2], ("第 1 页，共 ? 页".to_string(), "&CPage &P of &N"));
+        // A sheet's own name stays as the user typed it; the sentence around it is translated.
+        assert_eq!(zh[3].0, "销售");
+        assert_eq!(zh[5], ("销售，第 1 页".to_string(), "&C&A, Page &P"));
+        assert_eq!(zh[6], ("Book1，第 1 页".to_string(), "&C&F, Page &P"));
+        // The field codes are Excel's, identically in both languages.
+        for (a, b) in en.iter().zip(zh.iter()) {
+            assert_eq!(a.1, b.1, "{:?}", a.0);
+        }
     }
 }

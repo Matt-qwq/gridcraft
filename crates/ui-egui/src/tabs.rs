@@ -32,8 +32,13 @@ fn accessibility_status(app: &mut SheetApp) -> (String, usize) {
     }
     let n = app.grid.a11y.as_ref().map(|(_, n)| *n).unwrap_or(0);
     // No new string for the empty case: the entry reads "Accessibility" alone when there is
-    // nothing to fix, and "Accessibility: N" otherwise (Excel shows "Good to go" instead).
-    let label = if n == 0 { app.ui.language.tr("Accessibility").to_string() } else { format!("{}: {n}", app.ui.language.tr("Accessibility")) };
+    // nothing to fix, and "Accessibility: N" otherwise (Excel shows "Good to go" instead). The
+    // count joins the name through a template, which is how Chinese gets its fullwidth colon.
+    let label = if n == 0 {
+        app.ui.language.tr("Accessibility").to_string()
+    } else {
+        app.ui.language.tr("{label}: {n}").replace("{label}", app.ui.language.tr("Accessibility")).replace("{n}", &n.to_string())
+    };
     (label, n)
 }
 

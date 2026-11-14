@@ -39,12 +39,15 @@ pub fn tooltip_shortcut(tip: &str, mac: bool) -> Option<&'static str> {
 }
 
 /// A ribbon tooltip: the translated command name, then its shortcut for this platform, as Excel
-/// shows them ("Bold (Ctrl+B)" on Windows, "Bold (⌘B)" on macOS).
-fn tip_text(ui: &Ui, tip: &str) -> String {
+/// shows them ("Bold (Ctrl+B)" on Windows, "Bold (⌘B)" on macOS). Public so a test can read the
+/// shape of a translated tooltip without hovering a painted button.
+pub fn tooltip_text(ui: &Ui, tip: &str) -> String {
     // A name shared with a two-line ribbon label (Czech "Automatický\nsoučet") reads as one line.
     let name = tr(ui, tip).replace('\n', " ");
     match tooltip_shortcut(tip, cfg!(target_os = "macos")) {
-        Some(keys) => format!("{name} ({keys})"),
+        // The brackets around the shortcut are part of the sentence, not punctuation to assume:
+        // Chinese draws them full width ("粗体（Ctrl+B）"), so the shape is a catalog key too.
+        Some(keys) => tr(ui, "{name} ({keys})").replace("{name}", &name).replace("{keys}", keys),
         None => name.to_string(),
     }
 }
@@ -59,7 +62,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, color: Color32, tip: &str, size: egu
         ui.painter().rect_filled(rect, 4.0, t.hover);
     }
     icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, color);
-    resp.on_hover_text(tip_text(ui, tip))
+    resp.on_hover_text(tooltip_text(ui, tip))
 }
 
 /// A toggle-able small button (e.g. Bold) showing a checked state.
@@ -73,7 +76,7 @@ pub fn toggle_button(ui: &mut Ui, icon: Icon, on: bool, tip: &str) -> Response {
         ui.painter().rect_filled(rect, 4.0, t.hover);
     }
     icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, t.text);
-    resp.on_hover_text(tip_text(ui, tip))
+    resp.on_hover_text(tooltip_text(ui, tip))
 }
 
 /// Large ribbon button: 32px icon over a one- or two-line label.
@@ -108,7 +111,7 @@ pub fn big_button(ui: &mut Ui, icon: Icon, label: &str, tip: &str, dropdown: boo
             );
         }
     }
-    resp.on_hover_text(tip_text(ui, tip))
+    resp.on_hover_text(tooltip_text(ui, tip))
 }
 
 /// Small ribbon button: 16px icon with optional label to the right.
@@ -136,7 +139,7 @@ pub fn small_button(ui: &mut Ui, icon: Icon, label: &str, tip: &str, dropdown: b
             t.text_dim,
         );
     }
-    resp.on_hover_text(tip_text(ui, tip))
+    resp.on_hover_text(tooltip_text(ui, tip))
 }
 
 /// A split button: main part runs the default action, the arrow opens a menu.
@@ -157,7 +160,7 @@ pub fn split_button(ui: &mut Ui, icon: Icon, accent: Option<Color32>, tip: &str)
         ui.painter().rect_filled(Rect::from_min_size(pos2(main.left() + 4.0, main.bottom() - 5.0), vec2(17.0, 3.0)), 0.0, c);
     }
     icons::paint(ui.painter(), Rect::from_center_size(arrow.center(), vec2(10.0, 10.0)), Icon::Chevron, t.text_dim);
-    (m.on_hover_text(tip_text(ui, tip)).clicked(), a)
+    (m.on_hover_text(tooltip_text(ui, tip)).clicked(), a)
 }
 
 /// A one-line text field for a value stored in the workbook, which callers reload every frame. The text being typed is

@@ -1836,6 +1836,19 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "此图表的图例项是它的数据点而不是系列，因此无法在此删除其中任何一项。"
         }
         // zh-grid - entries the grid, the ribbon, the tooltips and the paper view need (wave 4).
+        // The filter list's blank-cells group: chrome, drawn in the interface language.
+        "(Blanks)" => "（空白）",
+        // A ribbon tooltip's shape: the command, then its shortcut in the brackets this language uses.
+        "{name} ({keys})" => "{name}（{keys}）",
+        // A ruler margin's tooltip, the status bar's issue count and the header/footer presets,
+        // whose sample values read as the printed page will.
+        "{label}: {value}" => "{label}：{value}",
+        "{label}: {n}" => "{label}：{n}",
+        "Page 1" => "第 1 页",
+        "Page 1 of ?" => "第 1 页，共 ? 页",
+        "{sheet_name}, Page 1" => "{sheet_name}，第 1 页",
+        "{file}, Page 1" => "{file}，第 1 页",
+        "Move the chart to a chart sheet of its own, or back onto a worksheet" => "将图表移到单独的图表工作表，或移回工作表",
         "Quick Layout" => "快速布局",
         "Read Range" => "读取区域",
         "Recently Used" => "最近使用",

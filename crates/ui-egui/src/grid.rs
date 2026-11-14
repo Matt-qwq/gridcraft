@@ -3752,6 +3752,10 @@ fn filter_table_range(sh: &Sheet, col: u32, row: u32) -> Option<RangeRef> {
     sh.tables.iter().find(|t| t.range.start.row == row && col >= t.range.start.col && col <= t.range.end.col).map(|t| t.range)
 }
 
+/// The filter list's entry for a column's blank cells, as the engine spells it: the one label in
+/// the menu that is chrome rather than a cell's text, so it is drawn in the interface language.
+const FILTER_BLANKS: &str = "(Blanks)";
+
 fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool) {
     let Some((col, row, at)) = app.grid.filter_menu else { return };
     let Some(d) = app.session.active() else { return };
@@ -3825,7 +3829,10 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
                 field.request_focus();
             }
             let needle = search.trim().to_lowercase();
-            let matches = |v: &str| needle.is_empty() || v.to_lowercase().contains(&needle);
+            // The blank-cells entry is chrome, not a cell's text: it is drawn and searched in the
+            // interface language, while the engine keeps spelling it the way the filter stores it.
+            let blanks = crate::widgets::tr(ui, FILTER_BLANKS).to_lowercase();
+            let matches = |v: &str| needle.is_empty() || v.to_lowercase().contains(&needle) || (v == FILTER_BLANKS && blanks.contains(&needle));
             let all = checks.iter().filter(|(v, _)| matches(v)).all(|(_, b)| *b);
             let mut all_new = all;
             let label =
@@ -3839,10 +3846,13 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
             // worked over the values themselves (#432).
             let matching: Vec<usize> = (0..checks.len()).filter(|i| matches(&checks[*i].0)).collect();
             let row_h = ui.spacing().interact_size.y.max(18.0);
+            let blanks_label = crate::widgets::tr(ui, FILTER_BLANKS).to_string();
             egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show_rows(ui, row_h, matching.len(), |ui, range| {
                 for &i in &matching[range] {
                     let (v, on) = &mut checks[i];
-                    ui.checkbox(on, v.as_str());
+                    // Every other entry is a cell's own text, which reads the same in both languages.
+                    let label = if v == FILTER_BLANKS { blanks_label.as_str() } else { v.as_str() };
+                    ui.checkbox(on, label);
                 }
             });
             if more_values {
@@ -3867,8 +3877,8 @@ fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool)
                 let apply = ui.button(crate::widgets::tr(ui, "Apply"));
                 ui.ctx().data_mut(|d| d.insert_temp(buttons_key, vec![ascending.id, descending.id, clear.id, apply.id]));
                 if apply.clicked() || (enter && any) {
-                    let blanks = checks.iter().any(|(v, on)| v == "(Blanks)" && *on);
-                    let vals: Vec<String> = checks.iter().filter(|(v, on)| *on && v != "(Blanks)").map(|(v, _)| v.clone()).collect();
+                    let blanks = checks.iter().any(|(v, on)| v == FILTER_BLANKS && *on);
+                    let vals: Vec<String> = checks.iter().filter(|(v, on)| *on && v != FILTER_BLANKS).map(|(v, _)| v.clone()).collect();
                     let p = if checks.iter().all(|(_, b)| *b) {
                         json!({"column": col_to_letters(col), "clear": true})
                     } else {
