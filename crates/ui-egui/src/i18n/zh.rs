@@ -35,6 +35,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Middle\nAlign" => "垂直居中",
         "Bottom\nAlign" => "底端对齐",
         "Left" => "左对齐",
+        // zh-dialogs - entries the dialogs surface needs (wave 4).
         "Right" => "右对齐",
         "Center" => "居中",
         "Horizontal" => "水平",
@@ -546,6 +547,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Cumulative Percentage" => "累积百分比",
         "Current region" => "当前区域",
         "Custom (%):" => "自定义（%）：",
+        // zh-file - entries the File view, the formula bar and the print dialogs need (wave 4).
         "Custom Sort" => "自定义排序",
         "Damping factor:" => "阻尼系数：",
         "dashed" => "虚线",
@@ -1093,6 +1095,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Show" => "显示",
         "Slicer Styles" => "切片器样式",
         "Stronger colours for the window; the sheet keeps its own" => "窗口使用对比更强的颜色；工作表保持自己的颜色",
+        // zh-panels - entries the task panes and the object previews need (wave 4).
         "Text that Contains" => "包含以下文本",
         "Text that Contains…" => "包含以下文本…",
         "Top/Bottom Rules" => "最前/最后规则",
@@ -1768,6 +1771,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Print Headings" => "打印标题",
         "Print Preview" => "打印预览",
         "Queries & Connections" => "查询和连接",
+        // zh-grid - entries the grid, the ribbon, the tooltips and the paper view need (wave 4).
         "Quick Layout" => "快速布局",
         "Read Range" => "读取区域",
         "Recently Used" => "最近使用",
