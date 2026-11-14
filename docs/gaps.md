@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-03 · **Last updated:** 2026-11-03 · **Change:** minor (round 18: a real-world corpus run — **3,084 workbooks opened, 635 save/reopen with 0 mismatches, 16 files identical in Excel 16** — so #1 is met for beta; the pinned corpus remains for CI. Round 17: `.xls` **embedded charts, autoshapes and text boxes** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** (five chart kinds; five shapes with their text, fill and line); §7 loses its charts and shapes items and is met for beta, leaving OLE objects and chart sheets as full scope. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-13 · **Last updated:** 2026-11-13 · **Change:** minor (11-13: the performance round (§2) and three save-fidelity bugs in filtered sheets found by the command-sequence soak (§3), one case left recorded there with a six-step repro; round 18: a real-world corpus run — **3,084 workbooks opened, 635 save/reopen with 0 mismatches, 16 files identical in Excel 16** — so #1 is met for beta; the pinned corpus remains for CI. Round 17: `.xls` **embedded charts, autoshapes and text boxes** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** (five chart kinds; five shapes with their text, fill and line); §7 loses its charts and shapes items and is met for beta, leaving OLE objects and chart sheets as full scope. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -182,6 +182,25 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   estimate is superseded by those waves.
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)
+- **Landed (11-13, found by the command-sequence soak at 120 steps):** three ways a sheet with an
+  applied filter saved rows that the model did not hold. The filter's hidden rows are a bitmap over
+  logical rows, and a row insert or delete moved the line map but not the bitmap (the rows below an
+  insert stayed hidden one row early); AutoFit wrote a height for a row the filter is hiding, so the
+  row ended up in the line map and the bitmap at once, and the file wrote `hidden` with a height the
+  reader cannot turn back into a filtered row; and a delete could leave a filtered row on a table's
+  totals row, which no filter covers. Fixed by `FilterHidden::insert_rows`/`delete_rows`/`retain`,
+  an autofit guard, and `Sheet::filter_row_ranges` (now also what the reader's
+  `heal_filter_hidden` uses), each with a save/reload regression test. `cargo test --workspace`
+  green (2783 → 2786 with the new tests).
+- **Known, not yet fixed:** a sheet AutoFilter and a table filter can both exist on one sheet, and
+  the file represents a table's filter only in the table part. After a column delete plus a second
+  filter, the model keeps hidden rows whose filter the save cannot express, so a save/reopen differs.
+  Reproduced in six steps from `file.new {"sample":"budget"}`:
+  `insert.table` B10:E12 → `selection.set` D11:H15 → `data.filterBy` column H `>` 56486 →
+  `home.deleteColumns` D:D → `data.filter` E14:H19 → `data.filterBy` column D top 4
+  (`GRIDCRAFT_FUZZ_SEED=97 GRIDCRAFT_FUZZ_STEPS=120 cargo test -p gridcraft-engine --test
+  command_sequence_fuzz`). The design question is which of the two filters owns the bitmap (2–4 h).
+  The default soak budget (6 seeds × 40 steps) passes; 150 × 120 finds it at seed 97.
 - **Landed (10-30, fills and pastes):** a whole-row/whole-column fill narrowed its target to the
   *sheet's* used-range box, so one stray cell far down the sheet made `Ctrl+D` over two columns write
   1,048,576 rows (2,097,102 cells where the sheet held 84, 830 ms); it now narrows to the content in
