@@ -2620,6 +2620,24 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
         }
     }
 
+    // Double-click a PivotTable value: Excel's Show Details, which writes the source rows behind the
+    // number into a sheet of its own. A label cell, a cell outside the report and a cell of another
+    // object's area fall through to the normal double-click edit.
+    if resp.double_clicked()
+        && let Some(p) = pos
+        && !in_col_header
+        && !in_row_header
+    {
+        let at = geo.cell_at(sh, if secondary_drag { geo.mirror_pos(p) } else { p });
+        let in_report = sh.pivots.iter().any(|pt| pt.last_range.is_some_and(|r| r.contains(at)));
+        if in_report && app.run("pivot.showDetails", json!({"cell": at.a1()})).is_ok() {
+            app.grid.drag = Drag::None;
+            app.grid.drag_select = false;
+            resp.request_focus();
+            return;
+        }
+    }
+
     // Double-click the fill handle: a double-click is also a click, so run it before the handle press returns.
     if resp.double_clicked()
         && let Some(p) = pos

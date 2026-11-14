@@ -4,7 +4,7 @@
 
 Each entry is an Excel ribbon or menu command (feature names only). It counts as implemented when GridCraft registers a command with the same id. This measures breadth only; the overall assessment (depth, fidelity, effort) is in [target-app-parity.md](target-app-parity.md).
 
-**Overall: 280 / 295 commands implemented (94.9%).**
+**Overall: 282 / 297 commands implemented (94.9%).**
 
 | Tab | Implemented | Total | Parity |
 |---|---|---|---|
@@ -21,7 +21,7 @@ Each entry is an Excel ribbon or menu command (feature names only). It counts as
 | Table Design | 13 | 13 | 100% |
 | Chart Design | 10 | 10 | 100% |
 | Format | 5 | 5 | 100% |
-| PivotTable Analyze | 13 | 13 | 100% |
+| PivotTable Analyze | 15 | 15 | 100% |
 | PivotTable Design | 4 | 4 | 100% |
 
 ## File (11 / 11, 100%)
@@ -376,7 +376,7 @@ Implemented:
 - `chart.shapeFill` Shape Fill (Shape Styles)
 - `chart.shapeOutline` Shape Outline (Shape Styles)
 
-## PivotTable Analyze (13 / 13, 100%)
+## PivotTable Analyze (15 / 15, 100%)
 
 Implemented:
 
@@ -392,6 +392,8 @@ Implemented:
 - `pivot.sort` Sort (Sort)
 - `pivot.group` Group Field (Group)
 - `pivot.collapse` Collapse Field (Active Field)
+- `pivot.showDetails` Show Details (Active Field)
+- `pivot.getPivotData` Options (PivotTable)
 - `pivot.delete` Clear All (Actions)
 
 ## PivotTable Design (4 / 4, 100%)

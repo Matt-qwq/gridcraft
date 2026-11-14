@@ -67,21 +67,6 @@ fn title_of(kind: Option<&str>) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::title_of;
-
-    #[test]
-    fn the_format_pane_is_titled_after_the_object() {
-        assert_eq!(title_of(Some("shape")), "Format Shape");
-        assert_eq!(title_of(Some("image")), "Format Picture");
-        // A chart, a slicer and an empty selection all keep the chart title the pane shipped with.
-        for other in [Some("chart"), Some("slicer"), Some("timeline"), None] {
-            assert_eq!(title_of(other), "Format Chart Area", "{other:?}");
-        }
-    }
-}
-
 fn comments(app: &mut SheetApp, ui: &mut Ui) {
     let Some(d) = app.session.active() else { return };
     let Some(sh) = d.wb.active() else { return };
@@ -225,4 +210,19 @@ fn selection(app: &mut SheetApp, ui: &mut Ui) {
 
 fn format_chart(app: &mut SheetApp, ui: &mut Ui) {
     crate::chart_format::show(app, ui);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::title_of;
+
+    #[test]
+    fn the_format_pane_is_titled_after_the_object() {
+        assert_eq!(title_of(Some("shape")), "Format Shape");
+        assert_eq!(title_of(Some("image")), "Format Picture");
+        // A chart, a slicer and an empty selection all keep the chart title the pane shipped with.
+        for other in [Some("chart"), Some("slicer"), Some("timeline"), None] {
+            assert_eq!(title_of(other), "Format Chart Area", "{other:?}");
+        }
+    }
 }
