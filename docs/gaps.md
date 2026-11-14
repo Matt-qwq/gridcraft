@@ -702,6 +702,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Estimate:** 0–6 h of the 12–20 left (the missing extras above). [ui-parity.md](ui-parity.md)
 
 ### 10. Crashes and freezes reported from the field (S)
+- **Out of scope (11-14):** the machines these reports came from are not this repository's — they
+  belong upstream — so this entry cannot be closed here and is not a beta gate for us. The local net
+  is the soak (`crates/engine/tests/command_sequence_fuzz.rs`: 6 seeds × 40 steps by default for the
+  gate, `GRIDCRAFT_FUZZ_SEEDS=150 GRIDCRAFT_FUZZ_STEPS=120` for a real soak) plus the fuzz regression
+  files. What it finds is kept: the 10-26 round fixed four, and the 11-13 soak found three
+  save-fidelity bugs in filtered sheets and one open case (§3).
 - **Evidence:** #120 (Intel UHD crash on Windows), #117 (error on close, macOS), #166 (freeze opening
   from Finder; PRs #164, #167), #76 (flashing on Windows 11), #130 (caught panic in table styles).
 - **Landed (10-26): a 100-seed command-sequence soak.** 200 commands a seed in release build, every
