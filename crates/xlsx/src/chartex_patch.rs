@@ -2,7 +2,8 @@
 //!
 //! A chartex part read from a file is kept (`Chart::part`) just like a classic chart part. An
 //! edit rewrites only the elements the model owns — the chart and axis titles, the legend, the
-//! value axis' scaling, each series' fill, data labels and box & whisker quartiles — and copies
+//! value axis' scaling, each series' fill and per-point fills, data labels (their visibility,
+//! position, font and each point's own record) and box & whisker quartiles — and copies
 //! everything else byte for byte: the plot area's layout, tick-label formatting, data-point
 //! callouts, `cx:units`, `cx:subtotals`, `cx:extLst` and the style/colour parts around it.
 //!
@@ -12,7 +13,7 @@
 
 use std::fmt::Write as _;
 
-use gridcraft_model::{AxisOptions, Chart, LabelOptions, LabelPosition, QuartileMethod, Series, Workbook};
+use gridcraft_model::{AxisOptions, Chart, LabelFont, LabelOptions, LabelPosition, PointFormat, QuartileMethod, Series, Workbook};
 
 use crate::chart::label_position_file;
 use crate::chart_patch::{MAX_PATCH_BYTES, Plan, SPPR_ORDER, attr, child, scan};
@@ -41,9 +42,17 @@ const AXIS_ORDER: &[&str] = &[
     "extLst",
 ];
 /// `cx:series`.
-const SERIES_ORDER: &[&str] = &["tx", "spPr", "dataPt", "dataLabels", "dataId", "layoutPr", "axisId", "errBars", "extLst"];
+const SERIES_ORDER: &[&str] =
+    &["tx", "spPr", "valueColors", "valueColorPositions", "dataPt", "dataLabels", "dataId", "layoutPr", "axisId", "errBars", "extLst"];
 /// `cx:dataLabels`.
-const DATALABELS_ORDER: &[&str] = &["visibility", "dataLabel"];
+const DATALABELS_ORDER: &[&str] = &["visibility", "dataLabel", "leaderLines", "numFmt", "spPr", "txPr", "extLst"];
+/// `cx:dataLabel` (one point's own label).
+const DATALABEL_ORDER: &[&str] = &["visibility", "txPr", "extLst"];
+/// `cx:dataPt` (one point's own fill and outline).
+const DATAPT_ORDER: &[&str] = &["spPr", "extLst"];
+
+/// `<cx:visibility>` switching every part off: how a hidden series' or point's labels are written.
+const VISIBILITY_OFF: &str = "<cx:visibility seriesName=\"0\" categoryName=\"0\" value=\"0\"/>";
 
 /// `<cx:title>` around a literal text.
 fn title_xml(t: &str) -> String {
@@ -55,9 +64,28 @@ fn tx_xml(t: &str) -> String {
     format!("<cx:tx><cx:txData><cx:v>{}</cx:v></cx:txData></cx:tx>", esc(t))
 }
 
-/// `<cx:dataLabels>` outside a `pos` attribute: what the labels show.
-pub(super) fn labels_xml(l: &LabelOptions) -> String {
-    format!("<cx:dataLabels{}>{}</cx:dataLabels>", pos_attr(l.position), visibility_xml(l))
+/// `<cx:dataLabels>`: what a series' labels show, where, their own font and the records of the
+/// points that carry one. `None` writes the element that shows nothing (a series whose labels are
+/// switched off but whose points keep a record).
+pub(super) fn labels_xml(l: Option<&LabelOptions>, points: &[PointLabelState], wb: &Workbook) -> String {
+    let mut x = String::from("<cx:dataLabels");
+    if let Some(l) = l.filter(|l| l.position != LabelPosition::Auto) {
+        x.push_str(&pos_attr(l.position));
+    }
+    x.push('>');
+    match l {
+        Some(l) => x.push_str(&visibility_xml(l)),
+        None => x.push_str(VISIBILITY_OFF),
+    }
+    for p in points.iter().filter(|p| !p.is_empty()) {
+        x.push_str(&point_state_xml(p, l, wb));
+    }
+    // `cx:txPr` comes after the points' `cx:dataLabel` elements.
+    if let Some(f) = l.and_then(|l| l.font).filter(|f| f.is_set()) {
+        x.push_str(&label_font_xml(&f, wb));
+    }
+    x.push_str("</cx:dataLabels>");
+    x
 }
 
 /// `pos="…"` for a label position, empty for automatic.
@@ -70,6 +98,102 @@ fn pos_attr(p: LabelPosition) -> String {
 fn visibility_xml(l: &LabelOptions) -> String {
     let value = l.show_value || !l.shows_anything();
     format!("<cx:visibility seriesName=\"{}\" categoryName=\"{}\" value=\"{}\"/>", l.show_series as u8, l.show_category as u8, value as u8)
+}
+
+/// `<cx:txPr>` for a label font, in the same DrawingML body the classic part uses
+/// (`a:CT_TextBody`: size in hundredths of a point, weight and colour).
+pub(super) fn label_font_xml(f: &LabelFont, wb: &Workbook) -> String {
+    let f = f.sane();
+    let mut attrs = String::new();
+    if let Some(size) = f.size {
+        let _ = write!(attrs, " sz=\"{}\"", (size * 100.0).round().clamp(100.0, 40_000.0) as i64);
+    }
+    if let Some(b) = f.bold {
+        let _ = write!(attrs, " b=\"{}\"", b as u8);
+    }
+    let fill = f.color.as_ref().and_then(|c| srgb(c, &wb.theme)).map(|c| format!("<a:solidFill>{c}</a:solidFill>")).unwrap_or_default();
+    format!("<cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr{attrs}>{fill}</a:defRPr></a:pPr><a:endParaRPr lang=\"en-US\"/></a:p></cx:txPr>")
+}
+
+/// A point's own data label as a chartex part spells it. The part has one `cx:dataLabel` per point
+/// and it carries what the label shows (three flags) and its font — no text, position or
+/// percentage, which a classic part's `c:dLbl` holds and this one has no element for.
+#[derive(Clone, Default, PartialEq)]
+pub(super) struct PointLabelState {
+    pub index: u32,
+    /// The label is switched off for this point: every flag is 0 and nothing else is set.
+    pub hidden: bool,
+    /// A flag the point leaves unset follows the series' options; the part always writes all three.
+    pub show_value: Option<bool>,
+    pub show_series: Option<bool>,
+    pub show_category: Option<bool>,
+    pub font: Option<LabelFont>,
+}
+
+impl PointLabelState {
+    /// Nothing the part can hold: no element is written for the point.
+    fn is_empty(&self) -> bool {
+        !self.hidden && !self.shows_anything() && !self.font.is_some_and(|f| f.is_set())
+    }
+
+    /// Whether the point switches any part of the label on or off.
+    fn shows_anything(&self) -> bool {
+        self.show_value.is_some() || self.show_series.is_some() || self.show_category.is_some()
+    }
+
+    /// The flags the point sets, with the ones it leaves unset as the series' options give them.
+    fn flags(&self, o: Option<&LabelOptions>) -> (bool, bool, bool) {
+        if self.hidden {
+            return (false, false, false);
+        }
+        let o = o.cloned().unwrap_or_default();
+        let value = self.show_value.unwrap_or(o.show_value || !o.shows_anything());
+        let series = self.show_series.unwrap_or(o.show_series);
+        let category = self.show_category.unwrap_or(o.show_category);
+        (series, category, value)
+    }
+}
+
+/// `<cx:visibility>` for a point's own label.
+fn point_visibility_xml(p: &PointLabelState, o: Option<&LabelOptions>) -> String {
+    let (series, category, value) = p.flags(o);
+    format!("<cx:visibility seriesName=\"{}\" categoryName=\"{}\" value=\"{}\"/>", series as u8, category as u8, value as u8)
+}
+
+/// `<cx:dataLabel idx="…">` for one point: its flags and its font.
+fn point_state_xml(p: &PointLabelState, o: Option<&LabelOptions>, wb: &Workbook) -> String {
+    let mut x = format!("<cx:dataLabel idx=\"{}\">", p.index);
+    x.push_str(&point_visibility_xml(p, o));
+    if let Some(f) = p.font.filter(|f| f.is_set()) {
+        x.push_str(&label_font_xml(&f, wb));
+    }
+    x.push_str("</cx:dataLabel>");
+    x
+}
+
+/// The points of a series that carry a record of their own: the ones whose label is switched off
+/// (the model's `no_label`) and the ones with their own flags or font. Sorted by index.
+pub(super) fn point_states(ser: &Series) -> Vec<PointLabelState> {
+    let mut out: Vec<PointLabelState> = Vec::new();
+    for p in ser.points.iter().filter(|p| p.no_label).take(crate::chart::MAX_POINTS) {
+        out.push(PointLabelState { index: p.index, hidden: true, ..PointLabelState::default() });
+    }
+    for l in ser.point_labels.iter().take(crate::chart::MAX_POINTS) {
+        let state = PointLabelState {
+            index: l.index,
+            hidden: false,
+            show_value: l.show_value,
+            show_series: l.show_series,
+            show_category: l.show_category,
+            font: l.font,
+        };
+        match out.iter_mut().find(|s| s.index == l.index) {
+            Some(slot) => *slot = state,
+            None => out.push(state),
+        }
+    }
+    out.sort_by_key(|s| s.index);
+    out
 }
 
 /// The label options in force for series `s`: its own, else the chart's; `None` when the chart's
@@ -211,19 +335,15 @@ pub fn patch_chartex(xml: &str, then: &Chart, now: &Chart, wb: &Workbook, _si: u
             };
             plan.set_attr(st, "quartileMethod", Some(method.to_string()));
         }
+        if then_ser.points != now_ser.points {
+            patch_points(&mut plan, xml, ser, &then_ser.points, &now_ser.points, wb);
+        }
         let before = effective(then, then_ser);
         let after = effective(now, now_ser);
-        if before == after {
-            continue;
-        }
-        match (child(ser, "dataLabels"), after) {
-            (None, None) => {}
-            (Some(_), None) => plan.set(ser, SERIES_ORDER, "dataLabels", None),
-            (None, Some(l)) => plan.set(ser, SERIES_ORDER, "dataLabels", Some(labels_xml(l))),
-            (Some(d), Some(l)) => {
-                plan.set(d, DATALABELS_ORDER, "visibility", Some(visibility_xml(l)));
-                plan.set_attr(d, "pos", (l.position != LabelPosition::Auto).then(|| label_position_file(l.position).to_string()));
-            }
+        let then_pts = point_states(then_ser);
+        let now_pts = point_states(now_ser);
+        if before != after || then_pts != now_pts {
+            patch_labels(&mut plan, xml, ser, before, after, &then_pts, &now_pts, wb);
         }
     }
 
@@ -280,4 +400,173 @@ fn patch_series_fill(plan: &mut Plan, ser: &crate::chart_patch::Node, now: &Seri
         None => plan.set(ser, SERIES_ORDER, "spPr", Some(format!("<cx:spPr>{fill}</cx:spPr>"))),
     }
     Some(())
+}
+
+/// A point's `cx:spPr` (its fill and outline) as the part spells it; `None` when the point sets
+/// neither.
+pub(super) fn point_sp_pr(fill: Option<&str>, line: Option<&str>) -> Option<String> {
+    if fill.is_none() && line.is_none() {
+        return None;
+    }
+    let mut s = String::from("<cx:spPr>");
+    if let Some(c) = fill {
+        let _ = write!(s, "<a:solidFill>{c}</a:solidFill>");
+    }
+    if let Some(c) = line {
+        let _ = write!(s, "<a:ln w=\"12700\"><a:solidFill>{c}</a:solidFill></a:ln>");
+    }
+    s.push_str("</cx:spPr>");
+    Some(s)
+}
+
+/// Whether a `cx:dataPt` holds nothing but the children the model owns.
+fn is_own_point(n: &crate::chart_patch::Node) -> bool {
+    n.children.iter().all(|c| c.name == "spPr")
+}
+
+/// Whether a point's `cx:spPr` holds nothing but the fill and outline the model owns.
+fn is_own_sp_pr(n: &crate::chart_patch::Node) -> bool {
+    n.children.iter().all(|c| matches!(c.name.as_str(), "solidFill" | "noFill" | "ln"))
+}
+
+/// Patches each point's own `cx:dataPt`: only a point whose fill or outline changed is touched, so
+/// the parts of the element GridCraft does not model stay.
+fn patch_points(plan: &mut Plan, xml: &str, ser: &crate::chart_patch::Node, then: &[PointFormat], now: &[PointFormat], wb: &Workbook) {
+    let index = |n: &crate::chart_patch::Node| attr(xml, n, "idx").and_then(|v| v.trim().parse::<u32>().ok());
+    let nodes: Vec<(&crate::chart_patch::Node, u32)> =
+        ser.children.iter().filter(|c| c.name == "dataPt").filter_map(|n| Some((n, index(n)?))).collect();
+    for (n, idx) in &nodes {
+        let a = then.iter().find(|p| p.index == *idx);
+        let b = now.iter().find(|p| p.index == *idx);
+        // Only the colour that changed is written: the point's outline keeps its width and dash, and
+        // its fill keeps whatever the file put beside it.
+        let fill_changed = a.and_then(|p| p.fill.as_ref()) != b.and_then(|p| p.fill.as_ref());
+        let line_changed = a.and_then(|p| p.line.as_ref()) != b.and_then(|p| p.line.as_ref());
+        if !fill_changed && !line_changed {
+            continue;
+        }
+        let fill = b.and_then(|p| p.fill.as_ref()).and_then(|c| srgb(c, &wb.theme));
+        let line = b.and_then(|p| p.line.as_ref()).and_then(|c| srgb(c, &wb.theme));
+        match child(n, "spPr") {
+            Some(sp) => {
+                if fill_changed {
+                    plan.set(sp, SPPR_ORDER, "solidFill", fill.clone().map(|c| format!("<a:solidFill>{c}</a:solidFill>")));
+                }
+                if line_changed {
+                    plan.set(sp, SPPR_ORDER, "ln", line.clone().map(|c| format!("<a:ln w=\"12700\"><a:solidFill>{c}</a:solidFill></a:ln>")));
+                }
+                // The point's colours were cleared: its own properties go with them, and the element
+                // too when nothing else is in it.
+                if fill.is_none() && line.is_none() && is_own_sp_pr(sp) {
+                    plan.set(n, DATAPT_ORDER, "spPr", None);
+                    if is_own_point(n)
+                        && let Some(i) = ser.children.iter().position(|c| c.start == n.start)
+                    {
+                        plan.edits(ser, SERIES_ORDER).remove.push(i);
+                    }
+                }
+            }
+            None => {
+                if let Some(text) = point_sp_pr(fill.as_deref(), line.as_deref()) {
+                    plan.set(n, DATAPT_ORDER, "spPr", Some(text));
+                }
+            }
+        }
+    }
+    for p in now.iter().filter(|p| p.fill.is_some() || p.line.is_some()) {
+        if nodes.iter().any(|(_, idx)| *idx == p.index) {
+            continue;
+        }
+        let fill = p.fill.as_ref().and_then(|c| srgb(c, &wb.theme));
+        let line = p.line.as_ref().and_then(|c| srgb(c, &wb.theme));
+        if let Some(sp) = point_sp_pr(fill.as_deref(), line.as_deref()) {
+            plan.add(ser, SERIES_ORDER, "dataPt", format!("<cx:dataPt idx=\"{}\">{sp}</cx:dataPt>", p.index));
+        }
+    }
+}
+
+/// Whether a `cx:dataLabel` holds nothing but the children the model owns.
+fn is_own_label(n: &crate::chart_patch::Node) -> bool {
+    n.children.iter().all(|c| matches!(c.name.as_str(), "visibility" | "txPr"))
+}
+
+/// Patches a series' `cx:dataLabels`: its own visibility flags, position and font when they
+/// changed, and the record of each point whose own label changed. Only the changed children are
+/// written, so everything the model does not own (a callout outline, leader lines, an extension)
+/// stays where it was.
+#[allow(clippy::too_many_arguments)]
+fn patch_labels(
+    plan: &mut Plan,
+    xml: &str,
+    ser: &crate::chart_patch::Node,
+    before: Option<&LabelOptions>,
+    after: Option<&LabelOptions>,
+    then: &[PointLabelState],
+    now: &[PointLabelState],
+    wb: &Workbook,
+) {
+    let Some(d) = child(ser, "dataLabels") else {
+        // A series that had no label element: the whole record is new.
+        if after.is_some() || now.iter().any(|p| !p.is_empty()) {
+            plan.set(ser, SERIES_ORDER, "dataLabels", Some(labels_xml(after, now, wb)));
+        }
+        return;
+    };
+    if before.map(|b| (b.show_value, b.show_series, b.show_category)) != after.map(|a| (a.show_value, a.show_series, a.show_category)) {
+        let text = match after {
+            Some(a) => visibility_xml(a),
+            None => VISIBILITY_OFF.to_string(),
+        };
+        plan.set(d, DATALABELS_ORDER, "visibility", Some(text));
+    }
+    if before.and_then(|b| b.font) != after.and_then(|a| a.font) {
+        let text = after.and_then(|a| a.font).filter(|f| f.is_set()).map(|f| label_font_xml(&f, wb));
+        plan.set(d, DATALABELS_ORDER, "txPr", text);
+    }
+    if before.map(|b| b.position) != after.map(|a| a.position) {
+        let pos = after.filter(|a| a.position != LabelPosition::Auto).map(|a| label_position_file(a.position).to_string());
+        plan.set_attr(d, "pos", pos);
+    }
+    let mut indices: Vec<u32> = then.iter().chain(now).map(|p| p.index).collect();
+    indices.sort_unstable();
+    indices.dedup();
+    for idx in indices {
+        let a = then.iter().find(|p| p.index == idx);
+        let b = now.iter().find(|p| p.index == idx);
+        if a == b {
+            continue;
+        }
+        let node = d.children.iter().find(|n| n.name == "dataLabel" && attr(xml, n, "idx").and_then(|v| v.trim().parse::<u32>().ok()) == Some(idx));
+        let Some(b) = b.filter(|b| !b.is_empty()) else {
+            // The point no longer carries a record: drop the children the model owns, and the
+            // element itself when there is nothing else in it.
+            if let Some(n) = node {
+                if is_own_label(n) {
+                    if let Some(i) = d.children.iter().position(|c| c.start == n.start) {
+                        plan.edits(d, DATALABELS_ORDER).remove.push(i);
+                    }
+                } else {
+                    let pe = plan.edits(n, DATALABEL_ORDER);
+                    pe.set("visibility", None);
+                    pe.set("txPr", None);
+                }
+            }
+            continue;
+        };
+        match node {
+            Some(n) => {
+                let flags_changed = a.map(|s| (s.hidden, s.show_value, s.show_series, s.show_category))
+                    != Some((b.hidden, b.show_value, b.show_series, b.show_category));
+                let font_changed = a.and_then(|s| s.font) != b.font;
+                let pe = plan.edits(n, DATALABEL_ORDER);
+                if flags_changed {
+                    pe.set("visibility", Some(point_visibility_xml(b, after)));
+                }
+                if font_changed {
+                    pe.set("txPr", b.font.filter(|f| f.is_set()).map(|f| label_font_xml(&f, wb)));
+                }
+            }
+            None => plan.add(d, DATALABELS_ORDER, "dataLabel", point_state_xml(b, after, wb)),
+        }
+    }
 }

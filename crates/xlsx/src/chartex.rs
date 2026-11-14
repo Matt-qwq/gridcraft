@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use gridcraft_core::RangeRef;
 use gridcraft_formula::{Expr, SheetSel};
-use gridcraft_model::{Anchor, AxisOptions, Chart, ChartKind, LabelOptions, LegendPos, QuartileMethod, Series, Workbook};
+use gridcraft_model::{Anchor, AxisOptions, Chart, ChartKind, LabelOptions, LegendPos, PointFormat, PointLabel, QuartileMethod, Series, Workbook};
 
 use crate::drawing::{dml_color, srgb};
 use crate::package::Rel;
@@ -109,8 +109,8 @@ fn text(tx: &El) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// A series' `<cx:dataLabels>`: what its labels show and where. A record with every part off means
-/// the series' labels are switched off.
+/// A series' `<cx:dataLabels>`: what its labels show, where and with which font. A record with
+/// every part off means the series' labels are switched off.
 fn read_labels(d: &El) -> LabelOptions {
     let vis = d.child("visibility");
     let flag = |k: &str| vis.and_then(|v| v.attr_bool(k)).unwrap_or(false);
@@ -119,9 +119,53 @@ fn read_labels(d: &El) -> LabelOptions {
         show_category: flag("categoryName"),
         show_series: flag("seriesName"),
         position: d.attr("pos").and_then(crate::chart::label_position).unwrap_or_default(),
+        // The labels' own text formatting, in the same DrawingML body a classic part uses.
+        font: crate::chart::read_label_font(d),
         ..LabelOptions::default()
     };
-    if options.shows_anything() { options } else { LabelOptions { hidden: true, ..options } }
+    // A record that switches every part off says the labels are off — unless it carries a font,
+    // which is an option of its own (the classic part stores one the same way).
+    if options.shows_anything() || options.font.is_some() { options } else { LabelOptions { hidden: true, ..options } }
+}
+
+/// A series' per-point records: the fill and outline of each `<cx:dataPt>`, and each point's own
+/// label (`<cx:dataLabels><cx:dataLabel idx="…">`) — its three visibility flags and its font. A
+/// point whose label is off in every part reads back as the model's deleted point label.
+///
+/// A point's fill is read the way a series' fill is: an override the model keeps. The colours a
+/// chartex writer gives a treemap's boxes or a waterfall's decreases are `cx:dataPt` fills in the
+/// file, so they come back as the points' own colours (the same pixels, held explicitly).
+fn read_points(s: &El) -> (Vec<PointFormat>, Vec<PointLabel>) {
+    let mut points: Vec<PointFormat> = Vec::new();
+    for d in s.kids("dataPt").take(crate::chart::MAX_POINTS) {
+        let Some(index) = d.attr("idx").and_then(|v| v.trim().parse::<u32>().ok()) else { continue };
+        let sp = d.child("spPr");
+        points.push(PointFormat {
+            index,
+            fill: sp.and_then(|p| p.child("solidFill")).and_then(dml_color),
+            line: sp.and_then(|p| p.path(&["ln", "solidFill"])).and_then(dml_color),
+            ..PointFormat::default()
+        });
+    }
+    let mut labels: Vec<PointLabel> = Vec::new();
+    for dl in s.path(&["dataLabels"]).into_iter().flat_map(|d| d.kids("dataLabel")).take(crate::chart::MAX_POINTS) {
+        let Some(index) = dl.attr("idx").and_then(|v| v.trim().parse::<u32>().ok()) else { continue };
+        let vis = dl.child("visibility");
+        let flag = |k: &str| vis.and_then(|v| v.attr_bool(k));
+        let font = crate::chart::read_label_font(dl);
+        let (series, category, value) = (flag("seriesName"), flag("categoryName"), flag("value"));
+        if [series, category, value].iter().all(|f| *f == Some(false)) && font.is_none() {
+            match points.iter_mut().find(|p| p.index == index) {
+                Some(p) => p.no_label = true,
+                None => points.push(PointFormat { index, no_label: true, ..PointFormat::default() }),
+            }
+            continue;
+        }
+        labels.push(PointLabel { index, show_series: series, show_category: category, show_value: value, font, ..PointLabel::default() });
+    }
+    points.sort_by_key(|p| p.index);
+    labels.sort_by_key(|l| l.index);
+    (points, labels)
 }
 
 /// The value axis' options from `<cx:valScaling>`. A chartex category axis carries only a gap width,
@@ -172,7 +216,8 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
         let id = s.child_val("dataId").unwrap_or("");
         let (cat, val) = data.iter().find(|(i, _, _)| i == id).map(|(_, c, v)| (c.clone(), v.clone())).unwrap_or_default();
         let labels = s.child("dataLabels").map(read_labels);
-        data_labels |= labels.as_ref().is_some_and(|l| l.shows_anything());
+        data_labels |= labels.as_ref().is_some_and(|l| l.shows_anything() || l.font.is_some());
+        let (points, point_labels) = read_points(s);
         series.push(Series {
             quartiles: match s.path(&["layoutPr", "statistics"]).and_then(|el| el.attr("quartileMethod")) {
                 Some("inclusive") => QuartileMethod::Inclusive,
@@ -182,6 +227,8 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
             categories: cat,
             values: val.unwrap_or_default(),
             labels,
+            points,
+            point_labels,
             // The default colour (the series' theme accent, which the writer spells out) isn't kept.
             color: s
                 .path(&["spPr", "solidFill"])
@@ -396,28 +443,17 @@ pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<Strin
         if let Some(n) = &ser.name {
             s.push_str(&tx_xml(n, wb, si, names));
         }
-        // Fills are written out: they don't come from the style part. Waterfall decreases and
-        // treemap/sunburst boxes get their own colours.
+        // Fills are written out: they don't come from the style part.
         let color = ser.color.as_ref().and_then(|c| srgb(c, &wb.theme)).unwrap_or_else(|| accent(i));
         s.push_str(&fill_xml(&color, ch.kind == ChartKind::BoxWhisker));
-        let points = || crate::chart::ref_values(wb, si, &ser.values).unwrap_or_default().into_iter().take(10_000).enumerate();
-        match ch.kind {
-            ChartKind::Waterfall => {
-                for (j, v) in points() {
-                    if v.as_f64().is_some_and(|n| n < 0.0) {
-                        let _ = write!(s, "<cx:dataPt idx=\"{j}\">{}</cx:dataPt>", fill_xml(&accent(i + 1), false));
-                    }
-                }
-            }
-            ChartKind::Treemap | ChartKind::Sunburst if ser.color.is_none() => {
-                for (j, _) in points() {
-                    let _ = write!(s, "<cx:dataPt idx=\"{j}\">{}</cx:dataPt>", fill_xml(&accent(j), false));
-                }
-            }
-            _ => {}
-        }
-        if let Some(l) = chartex_patch::effective(ch, ser) {
-            s.push_str(&chartex_patch::labels_xml(l));
+        // Per-point fills, and the colours the kind gives points of its own (waterfall decreases,
+        // treemap and sunburst boxes).
+        s.push_str(&series_points_xml(wb, si, ch, ser, i));
+        // Labels: the series' own record, plus one for each point that carries one.
+        let labels = chartex_patch::effective(ch, ser);
+        let states = chartex_patch::point_states(ser);
+        if labels.is_some() || !states.is_empty() {
+            s.push_str(&chartex_patch::labels_xml(labels, &states, wb));
         }
         let _ = write!(s, "<cx:dataId val=\"{i}\"/>");
         match ch.kind {
@@ -486,6 +522,35 @@ pub fn write_chartex(wb: &Workbook, si: usize, ch: &Chart, names: &mut Vec<Strin
     // A part regenerated from the model gets the default style: the file's style and colour parts
     // described a chart whose kind or series changed, so they no longer fit it.
     crate::chart::ChartXml { xml: s, style: None, colors: None }
+}
+
+/// Most per-point fills written for a series: a file's own data must not grow the part without a
+/// bound.
+const MAX_POINT_FILLS: usize = 10_000;
+
+/// The `cx:dataPt` elements of a series: the fill and outline the model gives a point, and the
+/// colours the kind gives points of its own (a waterfall's decreases, a treemap's boxes).
+fn series_points_xml(wb: &Workbook, si: usize, ch: &Chart, ser: &Series, i: usize) -> String {
+    let vals = crate::chart::ref_values(wb, si, &ser.values).unwrap_or_default();
+    let last = ser.points.last().map(|p| (p.index as usize).saturating_add(1)).unwrap_or(0);
+    let count = vals.len().max(last).min(MAX_POINT_FILLS);
+    let mut s = String::new();
+    for j in 0..count {
+        let p = ser.point(j);
+        let line = p.and_then(|p| p.line.as_ref()).and_then(|c| srgb(c, &wb.theme));
+        let auto = match ch.kind {
+            ChartKind::Waterfall if vals.get(j).and_then(|v| v.as_f64()).is_some_and(|n| n < 0.0) => Some(accent(i + 1)),
+            ChartKind::Treemap | ChartKind::Sunburst if ser.color.is_none() => Some(accent(j)),
+            _ => None,
+        };
+        let fill = p.and_then(|p| p.fill.as_ref()).and_then(|c| srgb(c, &wb.theme)).or(auto);
+        if fill.is_none() && line.is_none() {
+            continue;
+        }
+        let sp = chartex_patch::point_sp_pr(fill.as_deref(), line.as_deref()).unwrap_or_default();
+        let _ = write!(s, "<cx:dataPt idx=\"{j}\">{sp}</cx:dataPt>");
+    }
+    s
 }
 
 /// The model as the chartex part read it, with its hidden `_xlchart` names resolved to references

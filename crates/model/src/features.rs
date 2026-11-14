@@ -569,6 +569,9 @@ pub enum LabelPosition {
 
 /// A label's own text formatting (`c:txPr/a:p/a:pPr/a:defRPr`): its size, weight and colour.
 ///
+/// A chartex part spells the same three fields the same way (`cx:txPr/a:p/a:pPr/a:defRPr`), so a
+/// label's font can be set on either kind of part.
+///
 /// The typeface, italic and the label's fill are not modelled: they stay with the part while the
 /// element is untouched and are lost when the point's or series' label font is edited.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -600,20 +603,37 @@ impl LabelFont {
 #[serde(default)]
 pub struct LabelOptions {
     pub show_value: bool,
+    /// A chartex part has no percentage flag (`cx:visibility` carries the value, the category name
+    /// and the series name only), so this is not written to one.
     pub show_percentage: bool,
     pub show_series: bool,
     pub show_category: bool,
     /// The legend key (a colour square) is drawn beside the label.
+    ///
+    /// Only a classic part stores one (`c:showLegendKey`): a chartex label has no legend key, so
+    /// this is not written to one.
     pub show_legend_key: bool,
+    /// A chartex part keeps it as the `pos` attribute of `cx:dataLabels` (`ctr`, `outEnd`, `l`…).
     pub position: LabelPosition,
     /// Separator between the parts (`, ` when absent).
+    ///
+    /// Only a classic part stores one (`c:separator`): a chartex `cx:dataLabels` has none, so this
+    /// is not written to one.
     pub separator: Option<String>,
     /// Number format of the label text; `None` follows the plotted values.
+    ///
+    /// Only a classic part stores one (`c:numFmt`): GridCraft writes no `cx:numFmt`, so this is
+    /// not written to a chartex part.
     pub number_format: Option<String>,
     /// No labels at all for this series (`c:dLbls/c:delete`): Excel hides one series' labels
     /// while the others keep theirs.
+    ///
+    /// A chartex part has no deletion element: a series whose labels are hidden is written with
+    /// every visibility flag 0 instead.
     pub hidden: bool,
     /// The labels' own text formatting; a point's own font overrides it for that point.
+    ///
+    /// Both part kinds store it (`c:dLbls/c:txPr`, `cx:dataLabels/cx:txPr`).
     pub font: Option<LabelFont>,
 }
 
@@ -671,14 +691,23 @@ pub struct PointFormat {
     /// 0-based point index within the series.
     pub index: u32,
     /// The point's fill colour.
+    ///
+    /// A chartex part keeps it in `cx:dataPt/cx:spPr`, beside the series' own `cx:spPr`.
     pub fill: Option<Color>,
-    /// The point's outline colour.
+    /// The point's outline colour (`cx:dataPt/cx:spPr/a:ln` in a chartex part).
     pub line: Option<Color>,
     /// The point's marker colour (line and scatter series).
+    ///
+    /// Only a classic part stores one (`c:dPt/c:marker`): no chartex kind draws markers, so this
+    /// is not written to a chartex part.
     pub marker: Option<Color>,
     /// The point's own marker size in points (2–72); `None` follows the series default (5).
+    ///
+    /// Chartex kinds have no marker, so this is not written to a chartex part.
     pub marker_size: Option<u8>,
     /// The point's data label is deleted (`c:dLbl` with `delete`).
+    ///
+    /// A chartex part spells it as a `cx:dataLabel` for the point whose visibility flags are all 0.
     pub no_label: bool,
 }
 
@@ -687,19 +716,31 @@ pub struct PointFormat {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PointLabel {
-    /// 0-based point index within the series (`c:idx`).
+    /// 0-based point index within the series (`c:idx`, the `idx` attribute of `cx:dataLabel`).
     pub index: u32,
     /// `c:tx`: a cell reference (`Data!$C$2`) or literal text; `None` composes the label from the
     /// show flags instead.
+    ///
+    /// Only a classic part stores one: a chartex `cx:dataLabel` carries its visibility and a font,
+    /// so this is not written to a chartex part.
     pub text: Option<String>,
     /// `None` follows the series' or the chart's label options.
+    ///
+    /// A chartex part writes the flag the point does not set as the value the series' options give
+    /// it (`cx:visibility` always carries all three), so a file reads back with them all set.
     pub show_value: Option<bool>,
     pub show_series: Option<bool>,
     pub show_category: Option<bool>,
+    /// A chartex part has no percentage flag, so this is not written to one.
     pub show_percentage: Option<bool>,
     /// `Auto` keeps the series' or the chart's position (`c:dLblPos` absent).
+    ///
+    /// A chartex part keeps one position for the whole `cx:dataLabels` element, so a point's own
+    /// position is not written to one.
     pub position: LabelPosition,
     /// This label's own text formatting (`c:txPr`), overriding the series' or the chart's.
+    ///
+    /// Both part kinds store it (`cx:dataLabel/cx:txPr` in a chartex part).
     pub font: Option<LabelFont>,
 }
 
@@ -991,6 +1032,9 @@ pub struct Chart {
     #[serde(default)]
     pub y2_axis: AxisOptions,
     /// What data labels show; `data_labels` turns them on and off.
+    ///
+    /// A chartex part has no chart-wide label element (its `cx:dataLabels` sit on the series), so
+    /// the chart's options reach a chartex chart by being written into each series' own record.
     #[serde(default)]
     pub labels: LabelOptions,
     /// The chart part as read from a file, for options GridCraft does not model. Not serialized.

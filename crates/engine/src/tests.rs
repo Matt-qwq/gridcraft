@@ -5840,10 +5840,15 @@ fn a_label_font_is_set_at_each_level_and_survives_a_save() {
     assert!(s.execute("chart.setDataLabels", json!({"fontSize": 401})).is_err());
     assert!(s.execute("chart.setDataLabels", json!({"color": "not a colour"})).is_err());
 
-    // A chartex chart keeps its label font where GridCraft cannot model it, so it says so.
+    // A chartex chart keeps its label font in its series' own `cx:dataLabels`, so it takes one too.
     s.execute("insert.chart", json!({"type": "treemap", "range": "A1:E7"})).unwrap();
     let treemap = s.doc().unwrap().wb.active().unwrap().charts[1].id;
-    assert!(s.execute("chart.setDataLabels", json!({"chart": treemap, "fontSize": 10})).is_err(), "a chartex label font is not modelled");
+    s.execute("chart.setDataLabels", json!({"chart": treemap, "fontSize": 10})).unwrap();
+    assert_eq!(
+        chart(&s).series[0].labels.as_ref().and_then(|l| l.font),
+        Some(LabelFont { size: Some(10.0), ..LabelFont::default() }),
+        "a chartex label font lives on the series"
+    );
 
     // Every level survives a save and reopen.
     let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
@@ -5947,8 +5952,12 @@ fn chart_options_are_refused_where_they_cannot_be_saved() {
     assert!(l.show_value && l.show_category && !l.hidden);
     assert!(h.execute("chart.setDataLabels", json!({"percentage": true})).is_err(), "a chartex label has no percentage");
     assert!(h.execute("chart.setDataLabels", json!({"separator": " / "})).is_err(), "no separator in a chartex part");
-    assert!(h.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "text": "x"})).is_err(), "no per-point labels");
-    assert!(h.execute("chart.formatPoint", json!({"series": 0, "point": 0, "fill": "FF0000"})).is_err());
+    assert!(h.execute("chart.setDataLabels", json!({"series": 0, "point": 0, "text": "x"})).is_err(), "a chartex point label has no text");
+    // A chartex point keeps its own fill and outline; only its markers have no element.
+    h.execute("chart.formatPoint", json!({"series": 0, "point": 1, "fill": "FF0000", "line": "00B050"})).unwrap();
+    let p = h.doc().unwrap().wb.active().unwrap().charts[0].series[0].point(1).copied().expect("point format");
+    assert_eq!((p.fill, p.line), (Some(gridcraft_model::Color::Rgb(0xFF0000)), Some(gridcraft_model::Color::Rgb(0x00B050))));
+    assert!(h.execute("chart.formatPoint", json!({"series": 0, "point": 1, "marker": "FF0000"})).is_err(), "no markers on chartex points");
     // A treemap has no value axis at all.
     let mut t = s();
     chart_data(&mut t);
@@ -5972,6 +5981,49 @@ fn a_chartex_axis_and_label_option_survive_a_save() {
     assert!(c.data_labels);
     let l = c.series[0].labels.as_ref().expect("the series labels came back");
     assert!(l.show_value && l.show_category && l.position == gridcraft_model::LabelPosition::OutsideEnd);
+}
+
+#[test]
+fn a_chartex_point_and_point_label_survive_a_save() {
+    use gridcraft_model::{Color, LabelFont};
+    let mut s = s();
+    chart_data(&mut s);
+    s.execute("insert.chart", json!({"type": "waterfall", "range": "A1:B7"})).unwrap();
+    // The series' labels take a size, one point its own fill and outline, another its own weight and
+    // colour, and a third has its label switched off.
+    s.execute("chart.setDataLabels", json!({"series": 0, "value": true, "fontSize": 9})).unwrap();
+    s.execute("chart.formatPoint", json!({"series": 0, "point": 1, "fill": "FF0000", "line": "0070C0"})).unwrap();
+    s.execute("chart.setDataLabels", json!({"series": 0, "point": 2, "bold": true, "color": "C00000"})).unwrap();
+    s.execute("chart.setDataLabels", json!({"deletePoint": 3})).unwrap();
+    // A chartex part keeps one position for the whole series, not one per point, and no chartex
+    // kind draws markers.
+    assert!(s.execute("chart.setDataLabels", json!({"series": 0, "point": 1, "position": "top"})).is_err());
+    assert!(s.execute("chart.formatPoint", json!({"series": 0, "point": 1, "markerSize": 6})).is_err(), "no markers");
+    let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    assert_eq!(c.series[0].labels.as_ref().and_then(|l| l.font), Some(LabelFont { size: Some(9.0), ..LabelFont::default() }));
+    assert_eq!(c.series[0].point(1).map(|p| (p.fill, p.line)), Some((Some(Color::Rgb(0xFF0000)), Some(Color::Rgb(0x0070C0)))));
+    assert_eq!(
+        c.series[0].point_label(2).and_then(|l| l.font),
+        Some(LabelFont { bold: Some(true), color: Some(Color::Rgb(0xC00000)), ..LabelFont::default() })
+    );
+    assert!(c.series[0].point(3).is_some_and(|p| p.no_label));
+    // They are patched into the chartex part and read back.
+    let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    let b64 = r["base64"].as_str().unwrap().to_string();
+    s.execute("file.open", json!({"name": "waterfall.xlsx", "base64": b64})).unwrap();
+    let c = s.doc().unwrap().wb.active().unwrap().charts[0].clone();
+    assert_eq!(c.kind, gridcraft_model::ChartKind::Waterfall);
+    assert_eq!(c.series[0].labels.as_ref().and_then(|l| l.font), Some(LabelFont { size: Some(9.0), ..LabelFont::default() }));
+    assert!(c.series[0].labels.as_ref().is_some_and(|l| l.show_value));
+    assert_eq!(c.series[0].point(1).map(|p| (p.fill, p.line)), Some((Some(Color::Rgb(0xFF0000)), Some(Color::Rgb(0x0070C0)))));
+    assert_eq!(
+        c.series[0].point_label(2).and_then(|l| l.font),
+        Some(LabelFont { bold: Some(true), color: Some(Color::Rgb(0xC00000)), ..LabelFont::default() })
+    );
+    assert!(c.series[0].point(3).is_some_and(|p| p.no_label), "the point whose label is off stays off: {:?}", c.series[0].points);
+    // A second save is stable: nothing drifts through the part.
+    let again = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+    assert_eq!(again["base64"], json!(b64));
 }
 
 #[test]

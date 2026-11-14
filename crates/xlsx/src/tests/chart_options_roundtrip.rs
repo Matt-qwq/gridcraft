@@ -1017,6 +1017,250 @@ fn a_chartex_box_whisker_quartile_edit_patches_the_statistics_element() {
     assert_eq!(again.sheets[0].charts[0].series[0].quartiles, gridcraft_model::QuartileMethod::Inclusive);
 }
 
+// ---------------------------------------------------------------- chartex point and label options
+
+/// Four rows of data and one chartex chart on sheet Data: the package the chartex part goes into.
+fn chartex_workbook(c: Chart) -> Workbook {
+    let mut s = Sheet::new("Data");
+    for (i, name) in ["Name", "Sales"].iter().enumerate() {
+        s.set_value(CellRef::new(0, i as u32), gridcraft_core::Value::Text((*name).into()));
+    }
+    for (r, (name, v)) in [("One", -2.0), ("Two", 4.0), ("Three", 9.0), ("Four", 16.0)].into_iter().enumerate() {
+        s.set_value(CellRef::new(r as u32 + 1, 0), gridcraft_core::Value::Text(name.into()));
+        s.set_value(CellRef::new(r as u32 + 1, 1), gridcraft_core::Value::Number(v));
+    }
+    s.charts.push(c);
+    Workbook { sheets: vec![Arc::new(s)], ..Workbook::default() }
+}
+
+/// A waterfall with every chartex point and label option the model owns: each one is written into
+/// the part and read back.
+#[test]
+fn chartex_point_formats_and_label_fonts_round_trip() {
+    let mut c = chart(1, ChartKind::Waterfall);
+    c.title = None;
+    c.legend = LegendPos::None;
+    c.data_labels = true;
+    c.series[0].labels = Some(LabelOptions {
+        show_value: true,
+        show_category: true,
+        position: LabelPosition::Center,
+        font: Some(LabelFont { size: Some(9.0), bold: Some(true), color: Some(Color::Rgb(0x1F4E79)) }),
+        ..LabelOptions::default()
+    });
+    c.series[0].points = vec![
+        PointFormat { index: 1, fill: Some(Color::Rgb(0xC00000)), line: Some(Color::Rgb(0x00B050)), ..PointFormat::default() },
+        PointFormat { index: 3, no_label: true, ..PointFormat::default() },
+    ];
+    c.series[0].point_labels = vec![PointLabel {
+        index: 2,
+        show_value: Some(false),
+        show_category: Some(true),
+        font: Some(LabelFont { bold: Some(true), ..LabelFont::default() }),
+        ..PointLabel::default()
+    }];
+    let wanted_labels = c.series[0].labels.clone();
+    let mut wanted_point_labels = c.series[0].point_labels.clone();
+    // A flag a point leaves unset is written as the value the series' options give it, so the file
+    // reads back with all three set.
+    wanted_point_labels[0].show_series = Some(false);
+
+    let bytes = write_xlsx(&chartex_workbook(c)).unwrap();
+    let part = chartex_part_of(&bytes);
+    // A waterfall's decrease keeps the colour the kind gives it; a point's own fill and outline go
+    // in cx:dataPt, the outline at the width the writer uses for one.
+    assert!(
+        part.contains(r##"<cx:dataPt idx="0"><cx:spPr><a:solidFill><a:schemeClr val="accent2"/></a:solidFill></cx:spPr></cx:dataPt>"##),
+        "{part}"
+    );
+    assert!(
+        part.contains(
+            r##"<cx:dataPt idx="1"><cx:spPr><a:solidFill><a:srgbClr val="C00000"/></a:solidFill><a:ln w="12700"><a:solidFill><a:srgbClr val="00B050"/></a:solidFill></a:ln></cx:spPr></cx:dataPt>"##
+        ),
+        "{part}"
+    );
+    // The series' labels: position, flags, then the points' records, then the labels' font.
+    assert!(part.contains(r##"<cx:dataLabels pos="ctr"><cx:visibility seriesName="0" categoryName="1" value="1"/>"##), "{part}");
+    assert!(part.contains(r##"<cx:dataLabel idx="2"><cx:visibility seriesName="0" categoryName="1" value="0"/><cx:txPr>"##), "{part}");
+    assert!(
+        part.contains(r##"<cx:dataLabel idx="3"><cx:visibility seriesName="0" categoryName="0" value="0"/></cx:dataLabel>"##),
+        "a point whose label is off: {part}"
+    );
+    assert!(part.contains(r##"<a:defRPr sz="900" b="1"><a:solidFill><a:srgbClr val="1F4E79"/></a:solidFill></a:defRPr>"##), "{part}");
+
+    let (back, _rep) = read_xlsx(&bytes).unwrap();
+    let s = &back.sheets[0].charts[0].series[0];
+    assert_eq!(s.labels, wanted_labels, "the series' labels came back");
+    assert_eq!(s.point_labels, wanted_point_labels, "the point's own record came back");
+    // The point's own fill and outline come back; the waterfall's own colour for the decrease
+    // (accent 2) is read as an explicit point colour, which is what the file says.
+    assert_eq!(
+        s.points.iter().find(|p| p.index == 1),
+        Some(&PointFormat { index: 1, fill: Some(Color::Rgb(0xC00000)), line: Some(Color::Rgb(0x00B050)), ..PointFormat::default() })
+    );
+    assert_eq!(s.points.iter().find(|p| p.index == 3).map(|p| p.no_label), Some(true), "{:?}", s.points);
+    assert_eq!(s.points.iter().find(|p| p.index == 0).and_then(|p| p.fill), Some(Color::Theme(5, 0)), "{:?}", s.points);
+    // A second save writes the same part: nothing drifts.
+    assert_eq!(chartex_part_of(&write_xlsx(&back).unwrap()), part);
+}
+
+/// A chartex part carrying more than GridCraft models: a point's own properties with an unknown
+/// child, a data label's callout outline, leader lines, a number format, a subtotal, the chart's
+/// text body and extension blocks. The chartex twin of the classic RICH_PART fixture.
+const CHARTEX_RICH: &str = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cx:chartSpace xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"><cx:chartData><cx:data id="0"><cx:strDim type="cat"><cx:f>_xlchart.v1.0</cx:f><cx:lvl ptCount="4"><cx:pt idx="0">One</cx:pt><cx:pt idx="1">Two</cx:pt><cx:pt idx="2">Three</cx:pt><cx:pt idx="3">Four</cx:pt></cx:lvl></cx:strDim><cx:numDim type="val"><cx:f>_xlchart.v1.2</cx:f></cx:numDim></cx:data></cx:chartData><cx:chart><cx:title pos="t" align="ctr" overlay="0"><cx:tx><cx:txData><cx:v>Old</cx:v></cx:txData></cx:tx></cx:title><cx:plotArea><cx:plotAreaRegion><cx:series layoutId="waterfall" uniqueId="{00000000-0000-0000-0000-000000000001}"><cx:tx><cx:txData><cx:f>_xlchart.v1.1</cx:f><cx:v>Sales</cx:v></cx:txData></cx:tx><cx:spPr><a:solidFill><a:schemeClr val="accent1"/></a:solidFill><a:ln w="28575"><a:solidFill><a:srgbClr val="203864"/></a:solidFill></a:ln></cx:spPr><cx:dataPt idx="1"><cx:spPr><a:solidFill><a:srgbClr val="C00000"/></a:solidFill><a:ln w="28575"><a:solidFill><a:srgbClr val="00B050"/></a:solidFill></a:ln></cx:spPr><cx:unknownPtThing xmlns:cx15="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" val="7"/></cx:dataPt><cx:dataLabels pos="ctr"><cx:visibility seriesName="0" categoryName="1" value="1"/><cx:dataLabel idx="2"><cx:visibility seriesName="0" categoryName="0" value="1"/><cx:spPr><a:ln w="9525"><a:solidFill><a:srgbClr val="7F7F7F"/></a:solidFill></a:ln></cx:spPr></cx:dataLabel><cx:leaderLines><cx:spPr><a:ln w="9525"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln></cx:spPr></cx:leaderLines><cx:numFmt formatCode="0.0&quot;%&quot;" sourceLinked="0"/><cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900" b="0"/></a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr></cx:dataLabels><cx:dataId val="0"/><cx:layoutPr><cx:subtotals><cx:idx val="3"/></cx:subtotals></cx:layoutPr><cx:extLst><cx:ext uri="{55555555-5555-5555-5555-555555555555}"><cx15:unknownSerThing xmlns:cx15="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" val="7"/></cx:ext></cx:extLst></cx:series></cx:plotAreaRegion><cx:axis id="0"><cx:catScaling gapWidth="0.5"/><cx:tickLabels/></cx:axis><cx:axis id="1"><cx:valScaling min="0" max="20"/><cx:majorGridlines><cx:spPr><a:ln w="6350"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln></cx:spPr></cx:majorGridlines><cx:tickLabels><cx:spPr><a:ln><a:noFill/></a:ln></cx:spPr></cx:tickLabels></cx:axis></cx:plotArea><cx:legend pos="b" align="ctr" overlay="0"/></cx:chart><cx:spPr><a:solidFill><a:schemeClr val="bg1"/></a:solidFill></cx:spPr><cx:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="1000"/></a:pPr><a:endParaRPr lang="en-US"/></a:p></cx:txPr><cx:extLst><cx:ext uri="{66666666-6666-6666-6666-666666666666}"><cx15:unknownChartThing xmlns:cx15="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex" val="1"/></cx:ext></cx:extLst></cx:chartSpace>"##;
+
+/// Everything in CHARTEX_RICH GridCraft has no field for: each must still be in the part after an
+/// edit and a save.
+const CHARTEX_SURVIVORS: &[&str] = &[
+    r#"<cx:numFmt formatCode="0.0&quot;%&quot;" sourceLinked="0"/>"#,
+    "<cx:leaderLines>",
+    r#"<a:srgbClr val="7F7F7F"/>"#,
+    r#"<a:ln w="28575">"#,
+    r#"<a:srgbClr val="203864"/>"#,
+    "<cx:subtotals>",
+    "<cx:unknownPtThing",
+    "unknownSerThing",
+    "unknownChartThing",
+    r#"<a:defRPr sz="1000"/>"#,
+    "<a:noFill/>",
+    r#"<a:schemeClr val="bg1"/>"#,
+];
+
+#[test]
+fn chartex_point_and_label_edits_keep_the_rest_of_the_part() {
+    let (mut wb, _rep) = read_xlsx(&chartex_package(CHARTEX_RICH)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        let c = &mut sheet.charts[0];
+        assert_eq!(c.kind, ChartKind::Waterfall);
+        let s = &mut c.series[0];
+        // Read from the part: the point's fill and outline, the series' labels and their font, and
+        // the one point that carries a record of its own.
+        assert_eq!(s.points.len(), 1, "{:?}", s.points);
+        assert_eq!(
+            s.points[0],
+            PointFormat { index: 1, fill: Some(Color::Rgb(0xC00000)), line: Some(Color::Rgb(0x00B050)), ..PointFormat::default() }
+        );
+        let labels = s.labels.as_ref().expect("series labels");
+        assert!(labels.show_value && labels.show_category && !labels.show_series);
+        assert_eq!(labels.position, LabelPosition::Center);
+        assert_eq!(labels.font, Some(LabelFont { size: Some(9.0), bold: Some(false), color: None }));
+        assert_eq!(s.point_labels.len(), 1, "{:?}", s.point_labels);
+        assert_eq!((s.point_labels[0].index, s.point_labels[0].show_value), (2, Some(true)));
+        // The edits: one point's fill, the labels' font, and the point's own flags.
+        s.points[0].fill = Some(Color::Rgb(0x123456));
+        if let Some(l) = s.labels.as_mut() {
+            l.font = Some(LabelFont { size: Some(12.0), bold: Some(true), color: Some(Color::Rgb(0xFF0000)) });
+        }
+        let mut point_label = s.point_labels[0].clone();
+        point_label.show_value = Some(false);
+        point_label.show_category = Some(true);
+        s.set_point_label(point_label);
+    }
+    let back = write_xlsx(&wb).unwrap();
+    let part = chartex_part_of(&back);
+    for needle in CHARTEX_SURVIVORS {
+        assert!(part.contains(needle), "the edit dropped {needle}:\n{part}");
+    }
+    // The point keeps its own properties: only the fill's colour changed, so the outline's width
+    // and colour are still the file's.
+    assert!(part.contains(r##"<a:srgbClr val="123456"/>"##), "{part}");
+    assert!(part.contains(r##"<a:ln w="28575"><a:solidFill><a:srgbClr val="00B050"/>"##), "the point's outline: {part}");
+    // The labels' font changed and the point's flags with it; everything else is byte for byte the
+    // part as read.
+    let patch = [
+        (r##"<a:defRPr sz="1200" b="1"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:defRPr>"##, r##"<a:defRPr sz="900" b="0"/>"##),
+        (
+            r##"<cx:dataLabel idx="2"><cx:visibility seriesName="0" categoryName="1" value="0"/>"##,
+            r##"<cx:dataLabel idx="2"><cx:visibility seriesName="0" categoryName="0" value="1"/>"##,
+        ),
+        (r##"<a:srgbClr val="123456"/>"##, r##"<a:srgbClr val="C00000"/>"##),
+    ];
+    let mut unpatched = part.clone();
+    for (new, old) in patch {
+        assert!(unpatched.contains(new), "the edit did not write {new}:\n{unpatched}");
+        unpatched = unpatched.replace(new, old);
+    }
+    assert_eq!(unpatched, CHARTEX_RICH, "the patch touched more than the edited fields:\n{part}");
+    // The model comes back with the edits.
+    let (again, _rep) = read_xlsx(&back).unwrap();
+    let s = &again.sheets[0].charts[0].series[0];
+    assert_eq!(s.points[0].fill, Some(Color::Rgb(0x123456)));
+    assert_eq!(s.labels.as_ref().and_then(|l| l.font), Some(LabelFont { size: Some(12.0), bold: Some(true), color: Some(Color::Rgb(0xFF0000)) }));
+    assert_eq!(s.point_labels[0].show_value, Some(false));
+    assert_eq!(s.point_labels[0].show_category, Some(true));
+    // A second save of the reopened workbook changes nothing.
+    assert_eq!(chartex_part_of(&write_xlsx(&again).unwrap()), part);
+    // Saving the edited workbook again is stable too.
+    assert_eq!(chartex_part_of(&write_xlsx(&wb).unwrap()), part);
+}
+
+#[test]
+fn a_chartex_points_label_is_switched_off_with_its_own_record() {
+    let (mut wb, _rep) = read_xlsx(&chartex_package(CHARTEX_RICH)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        let s = &mut sheet.charts[0].series[0];
+        // The edit: point 1's label goes (the model's per-point deletion), keeping its format.
+        let mut p = s.point(1).copied().expect("the point's format");
+        p.no_label = true;
+        s.set_point(p);
+    }
+    let part = chartex_part_of(&write_xlsx(&wb).unwrap());
+    assert!(
+        part.contains(r##"<cx:dataLabel idx="1"><cx:visibility seriesName="0" categoryName="0" value="0"/></cx:dataLabel>"##),
+        "a point whose label is off: {part}"
+    );
+    // Every other element is the file's, and the point's own properties are untouched.
+    assert_eq!(
+        part.replace(r##"<cx:dataLabel idx="1"><cx:visibility seriesName="0" categoryName="0" value="0"/></cx:dataLabel>"##, ""),
+        CHARTEX_RICH,
+        "the patch touched more than the point's label:\n{part}"
+    );
+    for needle in CHARTEX_SURVIVORS {
+        assert!(part.contains(needle), "the edit dropped {needle}:\n{part}");
+    }
+    let (again, _rep) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    assert!(again.sheets[0].charts[0].series[0].point(1).is_some_and(|p| p.no_label), "the deleted label comes back");
+    // A second save is stable.
+    assert_eq!(chartex_part_of(&write_xlsx(&again).unwrap()), part);
+}
+
+#[test]
+fn an_unrelated_chartex_edit_keeps_every_point_and_label_element() {
+    let (mut wb, _rep) = read_xlsx(&chartex_package(CHARTEX_RICH)).unwrap();
+    {
+        let sheet = Arc::make_mut(&mut wb.sheets[0]);
+        sheet.charts[0].title = Some("Edited".into());
+    }
+    let part = chartex_part_of(&write_xlsx(&wb).unwrap());
+    // The title is the only byte that changed: the point's properties, the label records, their
+    // font and every unmodelled element are the file's.
+    assert_eq!(part.replace("<cx:v>Edited</cx:v>", "<cx:v>Old</cx:v>"), CHARTEX_RICH, "the patch touched more than the title:\n{part}");
+}
+
+/// Every chartex kind writes a point's fill into its series and reads it back.
+#[test]
+fn every_chartex_kind_keeps_a_point_fill() {
+    for kind in [ChartKind::Histogram, ChartKind::Waterfall, ChartKind::BoxWhisker, ChartKind::Funnel, ChartKind::Treemap, ChartKind::Sunburst] {
+        let mut c = chart(1, kind);
+        c.title = None;
+        c.legend = LegendPos::None;
+        c.series[0].points = vec![PointFormat { index: 1, fill: Some(Color::Rgb(0xC00000)), ..PointFormat::default() }];
+        let bytes = write_xlsx(&chartex_workbook(c)).unwrap();
+        let part = chartex_part_of(&bytes);
+        assert!(
+            part.contains(r##"<cx:dataPt idx="1"><cx:spPr><a:solidFill><a:srgbClr val="C00000"/></a:solidFill></cx:spPr></cx:dataPt>"##),
+            "{kind:?}: {part}"
+        );
+        let (back, _rep) = read_xlsx(&bytes).unwrap();
+        let s = &back.sheets[0].charts[0].series[0];
+        assert_eq!(s.points.iter().find(|p| p.index == 1).and_then(|p| p.fill), Some(Color::Rgb(0xC00000)), "{kind:?}");
+        assert_eq!(chartex_part_of(&write_xlsx(&back).unwrap()), part, "{kind:?}: a second save drifted");
+    }
+}
+
 // ---------------------------------------------------------------- per-point labels
 
 #[test]

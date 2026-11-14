@@ -352,6 +352,15 @@ fn draw_label_colored(
     ctx.text_styled(tx, y, text, size, color, bold, align, valign);
 }
 
+/// A text primitive drawn with a label's own font: its size, weight and colour when it set them.
+/// The colour of the call site is kept for the parts the font leaves unset, so a label inside a
+/// shape still contrasts with it.
+fn styled_text(ctx: &mut Ctx, text: &str, x: f32, y: f32, color: Rgba, font: Option<LabelStyle>, align: HAlign, valign: VAlign) {
+    let f = font.unwrap_or_default();
+    let size = f.size.unwrap_or(LABEL_SIZE).clamp(4.0, 400.0);
+    ctx.text_styled(x, y, text, size, f.color.unwrap_or(color), f.bold.unwrap_or(false), align, valign);
+}
+
 /// The formatting override of point `j`, if any. The list is sorted by index (resolve sorts it).
 fn point_style(s: &SeriesData, j: usize) -> Option<&PointStyle> {
     s.points.binary_search_by_key(&j, |p| p.index).ok().and_then(|i| s.points.get(i))
@@ -2007,10 +2016,12 @@ fn histogram(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     for (b, c) in counts.iter().enumerate() {
         let top = plot.bottom() - ys.frac(*c as f64) * plot.h;
         let x = plot.x + b as f32 * cw;
-        ctx.rect(x, top, cw, plot.bottom() - top, s.color, Some((WHITE, 0.75)));
+        // A histogram's points are its bins, so a point's own fill colours one bar.
+        let fill = point_fill(s, b);
+        ctx.rect(x, top, cw, plot.bottom() - top, fill, Some((point_line(s, b).unwrap_or(WHITE), 0.75)));
         ctx.hit_rect(Hit::Series { index: 0, point: Some(b) }, x, top, cw, plot.bottom() - top);
         if chart.data_labels {
-            ctx.text(x + cw / 2.0, top - 2.0, &c.to_string(), LABEL_SIZE, TEXT, HAlign::Center, VAlign::Bottom);
+            styled_text(ctx, &c.to_string(), x + cw / 2.0, top - 2.0, TEXT, label_style(s, b, data), HAlign::Center, VAlign::Bottom);
         }
     }
 }
@@ -2068,14 +2079,15 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let bw = cw / 1.5;
     let vy = |v: f64| plot.bottom() - ys.frac(v) * plot.h;
     for (j, (b, t, kind)) in bars.iter().enumerate() {
-        let color = match kind {
+        // A point's own fill wins over the increase, decrease and total colours.
+        let color = point_style(s, j).and_then(|p| p.fill).unwrap_or(match kind {
             1 => UP,
             2 => DOWN,
             _ => s.color,
-        };
+        });
         let x = plot.x + (j as f32 + 0.5) * cw - bw / 2.0;
         let (yb, yt) = (vy(*b), vy(*t));
-        ctx.rect(x, yb.min(yt), bw, (yb - yt).abs().max(0.5), color, None);
+        ctx.rect(x, yb.min(yt), bw, (yb - yt).abs().max(0.5), color, point_line(s, j).map(|c| (c, 1.0)));
         ctx.hit_rect(Hit::Series { index: 0, point: Some(j) }, x, yb.min(yt), bw, (yb - yt).abs().max(0.5));
         if j + 1 < bars.len() && ncat <= 500 {
             ctx.out.push(Prim::Line { pts: vec![[x + bw, yt], [x + cw, yt]], color: AXIS, width: 0.75, dash: true });
@@ -2089,7 +2101,7 @@ fn waterfall(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                     x + bw / 2.0,
                     yb.min(yt) - 2.0,
                     &text,
-                    s.color,
+                    color,
                     TEXT,
                     label_style(s, j, data),
                     HAlign::Center,
@@ -2127,16 +2139,18 @@ fn funnel(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         let bw = (*v / max) as f32 * plot.w;
         let x = plot.x + (plot.w - bw) / 2.0;
         let y = plot.y + j as f32 * slot + (slot - bh) / 2.0;
+        // A funnel's points are its bands, so a point's own fill colours one band.
+        let fill = point_fill(s, j);
         if bw > 0.0 {
-            ctx.rect(x, y, bw, bh, s.color, None);
+            ctx.rect(x, y, bw, bh, fill, point_line(s, j).map(|c| (c, 1.0)));
             ctx.hit_rect(Hit::Series { index: 0, point: Some(j) }, x, y, bw, bh);
         }
         if show {
             let yc = y + bh / 2.0;
             let o = series_labels(chart, s);
             if let Some(t) = label_text(chart, data, s, j, Some(total)) {
-                let color = if ctx.tw(&t, LABEL_SIZE) + 4.0 <= bw { on(s.color) } else { TEXT };
-                draw_label_colored(ctx, o, plot.cx(), yc, &t, s.color, color, label_style(s, j, data), HAlign::Center, VAlign::Middle);
+                let color = if ctx.tw(&t, LABEL_SIZE) + 4.0 <= bw { on(fill) } else { TEXT };
+                draw_label_colored(ctx, o, plot.cx(), yc, &t, fill, color, label_style(s, j, data), HAlign::Center, VAlign::Middle);
             }
             let l = ctx.fit(labels.get(j).map(String::as_str).unwrap_or(""), LABEL_SIZE, lw - 8.0);
             ctx.text(plot.x - 6.0, yc, &l, LABEL_SIZE, TEXT, HAlign::Right, VAlign::Middle);
@@ -2287,15 +2301,18 @@ fn treemap(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
     let f = Fmt::new(&s.number_format);
     for (j, b) in squarify(&items, area) {
         let fill = point_color(data, j);
-        ctx.rect(b.x, b.y, b.w, b.h, fill, Some((WHITE, 1.5)));
+        ctx.rect(b.x, b.y, b.w, b.h, fill, Some((point_line(s, j).unwrap_or(WHITE), 1.5)));
         ctx.hit_rect(Hit::Series { index: 0, point: Some(j) }, b.x, b.y, b.w, b.h);
         if b.w > 24.0 && b.h > LABEL_SIZE * 1.6 {
-            let name = ctx.fit(&cat_label(data, j), LABEL_SIZE, b.w - 8.0);
-            ctx.text(b.x + 4.0, b.y + 4.0, &name, LABEL_SIZE, on(fill), HAlign::Left, VAlign::Top);
+            // A box's name and value carry the point's own label font, if it set one.
+            let font = label_style(s, j, data);
+            let size = font.and_then(|f| f.size).unwrap_or(LABEL_SIZE).clamp(4.0, 400.0);
+            let name = ctx.fit(&cat_label(data, j), size, b.w - 8.0);
+            styled_text(ctx, &name, b.x + 4.0, b.y + 4.0, on(fill), font, HAlign::Left, VAlign::Top);
             if chart.data_labels && b.h > LABEL_SIZE * 3.2 && !s.points.iter().any(|p| p.index == j && p.no_label) {
                 let v = items.iter().find(|x| x.0 == j).map(|x| x.1).unwrap_or(0.0);
-                let t = ctx.fit(&f.format(v, None), LABEL_SIZE, b.w - 8.0);
-                ctx.text(b.x + 4.0, b.y + 4.0 + LABEL_SIZE * 1.4, &t, LABEL_SIZE, on(fill), HAlign::Left, VAlign::Top);
+                let t = ctx.fit(&f.format(v, None), size, b.w - 8.0);
+                styled_text(ctx, &t, b.x + 4.0, b.y + 4.0 + size * 1.4, on(fill), font, HAlign::Left, VAlign::Top);
             }
         }
     }
@@ -2443,19 +2460,21 @@ fn box_whisker(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
         let whi = v.iter().rev().copied().find(|x| *x <= fhi).unwrap_or(q3);
         let mean = v.iter().sum::<f64>() / v.len() as f64;
         let c = plot.x + (i as f32 + 0.5) * cw;
-        ctx.vline(c, vy(whi), vy(q3), s.color, 1.25);
-        ctx.vline(c, vy(q1), vy(wlo), s.color, 1.25);
-        ctx.hline(c - bw / 4.0, c + bw / 4.0, vy(whi), s.color, 1.25);
-        ctx.hline(c - bw / 4.0, c + bw / 4.0, vy(wlo), s.color, 1.25);
+        // One box per point: a point's own fill colours its box and whiskers.
+        let color = point_style(s, i).and_then(|p| p.fill).unwrap_or(s.color);
+        ctx.vline(c, vy(whi), vy(q3), color, 1.25);
+        ctx.vline(c, vy(q1), vy(wlo), color, 1.25);
+        ctx.hline(c - bw / 4.0, c + bw / 4.0, vy(whi), color, 1.25);
+        ctx.hline(c - bw / 4.0, c + bw / 4.0, vy(wlo), color, 1.25);
         let (yt, yb) = (vy(q3), vy(q1));
-        ctx.rect(c - bw / 2.0, yt, bw, (yb - yt).max(0.5), s.color, None);
+        ctx.rect(c - bw / 2.0, yt, bw, (yb - yt).max(0.5), color, point_line(s, i).map(|c| (c, 1.0)));
         ctx.hit_rect(Hit::Series { index: i, point: None }, c - bw / 2.0, yt, bw, (yb - yt).max(0.5));
         ctx.hline(c - bw / 2.0, c + bw / 2.0, vy(med), WHITE, 1.5);
         let (mx, my, d) = (c, vy(mean), 3.0);
         ctx.line(vec![[mx - d, my - d], [mx + d, my + d]], WHITE, 1.25);
         ctx.line(vec![[mx - d, my + d], [mx + d, my - d]], WHITE, 1.25);
         for o in v.iter().filter(|x| **x < flo || **x > fhi).take(MAX_MARKERS) {
-            ctx.out.push(Prim::Circle { cx: c, cy: vy(*o), r: 2.5, fill: None, stroke: Some((s.color, 1.0)) });
+            ctx.out.push(Prim::Circle { cx: c, cy: vy(*o), r: 2.5, fill: None, stroke: Some((color, 1.0)) });
         }
     }
 }

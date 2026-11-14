@@ -402,7 +402,7 @@ pub(crate) struct ParentEdits {
     /// Repeated elements added at a schema position (per-point formats, trendlines, deleted labels).
     extra: Vec<(usize, String)>,
     /// Indices of direct children to drop.
-    remove: Vec<usize>,
+    pub(crate) remove: Vec<usize>,
 }
 
 impl ParentEdits {
@@ -410,7 +410,7 @@ impl ParentEdits {
         Self { order, ..Self::default() }
     }
 
-    fn set(&mut self, tag: &'static str, text: Option<String>) {
+    pub(crate) fn set(&mut self, tag: &'static str, text: Option<String>) {
         match self.edits.iter_mut().find(|(t, _)| *t == tag) {
             Some(slot) => slot.1 = text,
             None => self.edits.push((tag, text)),

@@ -1194,6 +1194,100 @@ fn funnel_value_labels_follow_the_data_labels_flag() {
     }
 }
 
+/// A chartex series' own point fills reach the drawn primitives: a funnel band, a treemap box, a
+/// waterfall bar and a box & whisker box take the point's colour over the series' one.
+#[test]
+fn a_point_fill_overrides_the_series_fill_for_chartex_kinds() {
+    let fill = [0xC0, 0x00, 0x00, 0xFF];
+    let line = [0x00, 0x70, 0xC0, 0xFF];
+    for kind in [ChartKind::Funnel, ChartKind::Treemap, ChartKind::Waterfall, ChartKind::BoxWhisker] {
+        let mut c = chart(kind);
+        c.data_labels = false;
+        let mut d = ChartData {
+            label_font: None,
+            category_levels: vec![],
+            palette: vec![],
+            categories: vec!["a".into(), "b".into(), "c".into()],
+            series: vec![series("S", &[10.0, 20.0, 30.0], [20, 96, 130, 255], kind)],
+        };
+        let before = render(&c, &d, 500.0, 350.0, &ApproxMeasure);
+        let series_colour = d.series[0].color;
+        assert!(
+            before.iter().any(|p| matches!(p, Prim::Rect { fill: Some(f), .. } if *f == series_colour)),
+            "{kind:?}: the series colour is not drawn to begin with"
+        );
+        let bars = |prims: &[Prim]| prims.iter().filter(|p| matches!(p, Prim::Rect { fill: Some(f), .. } if *f == series_colour)).count();
+        // A box & whisker draws one box per point (one per series), so its first point is index 0.
+        let pi = if kind == ChartKind::BoxWhisker { 0 } else { 1 };
+        d.series[0].points = vec![PointStyle { index: pi, fill: Some(fill), line: Some(line), ..PointStyle::default() }];
+        let after = render(&c, &d, 500.0, 350.0, &ApproxMeasure);
+        assert!(after.iter().any(|p| matches!(p, Prim::Rect { fill: Some(f), .. } if *f == fill)), "{kind:?}: the point's own fill is not drawn");
+        // Its outline is the point's too.
+        assert!(
+            after.iter().any(|p| matches!(p, Prim::Rect { fill: Some(f), stroke: Some((s, _)), .. } if *f == fill && *s == line)),
+            "{kind:?}: the point's own outline is not drawn"
+        );
+        // Where the kind paints every band in the series colour, the point's colour replaces one
+        // rather than being drawn over it (a treemap colours its boxes from the palette instead).
+        if matches!(kind, ChartKind::Funnel | ChartKind::BoxWhisker) {
+            assert!(bars(&after) < bars(&before), "{kind:?}: the series colour is still drawn under the point's");
+        }
+    }
+}
+
+/// A label's font is resolved field by field: the chart's size and colour, the series' weight and a
+/// point's own colour or size all reach the drawn label.
+#[test]
+fn a_label_font_is_resolved_field_by_field_for_a_chartex_kind() {
+    let chart_colour = [0x11, 0x22, 0x33, 0xFF];
+    let series_colour = [0x44, 0x55, 0x66, 0xFF];
+    let point_colour = [0x77, 0x88, 0x99, 0xFF];
+    let mut c = chart(ChartKind::Funnel);
+    c.data_labels = true;
+    c.labels = LabelOptions::values();
+    let mut d = ChartData {
+        label_font: Some(LabelStyle { size: Some(18.0), bold: None, color: Some(chart_colour) }),
+        category_levels: vec![],
+        palette: vec![],
+        categories: vec!["a".into(), "b".into(), "c".into()],
+        series: vec![series("S", &[10.0, 20.0, 30.0], [20, 96, 130, 255], ChartKind::Funnel)],
+    };
+    // The series sets the weight and a colour; the size stays the chart's.
+    d.series[0].label_font = Some(LabelStyle { size: None, bold: Some(true), color: Some(series_colour) });
+    // Point 1 sets a colour of its own, point 2 a size of its own.
+    d.series[0].point_labels = vec![
+        PointLabelData { index: 1, font: Some(LabelStyle { size: None, bold: None, color: Some(point_colour) }), ..PointLabelData::default() },
+        PointLabelData { index: 2, font: Some(LabelStyle { size: Some(7.0), bold: None, color: None }), ..PointLabelData::default() },
+    ];
+    let prims = render(&c, &d, 520.0, 360.0, &ApproxMeasure);
+    let label = |text: &str| {
+        prims
+            .iter()
+            .find_map(|p| match p {
+                Prim::Text { text: t, size, color, bold, .. } if t == text => Some((*size, *color, *bold)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no label {text}"))
+    };
+    // The values, drawn as the funnel's own labels: the chart's size, the series' weight and then
+    // the point's own field over one of them.
+    assert_eq!(label("$10"), (18.0, series_colour, true), "the series' weight and colour, the chart's size");
+    assert_eq!(label("$20"), (18.0, point_colour, true), "the point's colour over the series' one");
+    assert_eq!(label("$30"), (7.0, series_colour, true), "the point's size over the chart's");
+    // The chart's own colour is the one neither the series nor the point overrode: a third point
+    // with no font at all falls back to it.
+    let mut d2 = d.clone();
+    d2.series[0].label_font = None;
+    d2.series[0].point_labels.clear();
+    let prims = render(&c, &d2, 520.0, 360.0, &ApproxMeasure);
+    assert!(
+        prims
+            .iter()
+            .any(|p| matches!(p, Prim::Text { text, color, size, bold: false, .. } if text == "$10" && *color == chart_colour && *size == 18.0)),
+        "the chart's font is the last level"
+    );
+}
+
 #[test]
 fn pie_points_follow_workbook_theme() {
     let mut wb = Workbook::new();

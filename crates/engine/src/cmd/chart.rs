@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Format Data Labels",
             ["Chart Design", "Chart Layouts"],
             None,
-            "{chart?, series?: index (default every series), point?: index (needs series: that point's own label), text?: reference or text for the point's label, on?: bool (default true), value?, percentage?, seriesName?, categoryName?, legendKey?, position?: auto|center|insideEnd|insideBase|outsideEnd|bestFit|left|right|top|bottom, separator?, numberFormat?, deletePoint?: index (hides that label), showPoint?: index, fontSize?: 1..400 (the label's own size), bold?: bool, color?: hex or none}",
+            "{chart?, series?: index (default every series), point?: index (needs series: that point's own label), text?: reference or text for the point's label, on?: bool (default true), value?, percentage?, seriesName?, categoryName?, legendKey?, position?: auto|center|insideEnd|insideBase|outsideEnd|bestFit|left|right|top|bottom, separator?, numberFormat?, deletePoint?: index (hides that label), showPoint?: index, fontSize?: 1..400 (the label's own size), bold?: bool, color?: hex or none} (a chartex chart stores the value, seriesName and categoryName flags, the position, the font and each point's own flags; it has no percentage, legend key, separator, number format or per-point text, so those are refused)",
             has_doc,
             set_data_labels
         ),
@@ -63,7 +63,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Format Data Point",
             ["Format", "Current Selection"],
             None,
-            "{chart?, series: index, point: index, fill?: hex|\"none\", line?: hex|\"none\", marker?: hex|\"none\", markerSize?: 2..72, deleteLabel?: bool, clear?: bool}",
+            "{chart?, series: index, point: index, fill?: hex|\"none\", line?: hex|\"none\", marker?: hex|\"none\", markerSize?: 2..72, deleteLabel?: bool, clear?: bool} (a chartex chart's points take the fill, the outline and the label deletion; no chartex kind draws markers)",
             has_doc,
             format_point
         ),
@@ -600,13 +600,12 @@ fn set_data_labels(s: &mut Session, p: &Json) -> Result<Json> {
             return Err(bad(cmd, "no such series"));
         }
         if c.kind.is_chartex() {
-            if delete.is_some() || show.is_some() {
-                return Err(bad(cmd, "a chartex chart has no per-point labels GridCraft can save"));
+            // A chartex point label is a record of what it shows and its font: the part has no text
+            // element for one point's label.
+            if text.is_some() {
+                return Err(bad(cmd, "a chartex point label has no text of its own: give its visibility flags or a font"));
             }
-            if font_given {
-                return Err(bad(cmd, "a chartex chart keeps its label font in a part GridCraft does not model"));
-            }
-            return set_chartex_labels(c, cmd, on, series, point, &flags, position, separator.clone(), number_format.clone());
+            return set_chartex_labels(c, cmd, on, series, point, &flags, position, separator.clone(), number_format.clone(), font, delete, show);
         }
         if let (Some(i), Some(pi)) = (series, point) {
             set_one_point_label(c, i, pi, on, text, position, &flags, any_flag, font);
@@ -750,8 +749,9 @@ fn set_one_point_label(
 }
 
 /// A chartex chart's labels: one `<cx:dataLabels>` per series, holding the value, category and
-/// series-name flags and a position. The part has no percentage, legend key, separator, number
-/// format or per-point label, so those are refused.
+/// series-name flags, a position and the labels' font, plus one `<cx:dataLabel idx="…">` per point
+/// that carries its own flags or font. The part has no percentage, legend key, separator, number
+/// format or per-point text, so those are refused.
 #[allow(clippy::too_many_arguments)]
 fn set_chartex_labels(
     c: &mut Chart,
@@ -763,10 +763,10 @@ fn set_chartex_labels(
     position: Option<LabelPosition>,
     separator: Option<String>,
     number_format: Option<String>,
+    font: Option<LabelFont>,
+    delete: Option<u32>,
+    show: Option<u32>,
 ) -> Result<()> {
-    if point.is_some() {
-        return Err(bad(cmd, "a chartex chart has no per-point labels GridCraft can save"));
-    }
     if let Some((key, _)) = flags.iter().find(|(k, v)| v.is_some() && matches!(*k, "percentage" | "legendKey")) {
         return Err(bad(cmd, format!("a chartex data label has no `{key}`: Excel's chartex part stores the value, category and series name only")));
     }
@@ -780,13 +780,74 @@ fn set_chartex_labels(
         Some(i) => vec![i],
         None => (0..c.series.len()).collect(),
     };
+    // One point's own record: its flags and its font, in the series' `cx:dataLabels`.
+    if let Some(pi) = point {
+        if position.is_some() {
+            return Err(bad(cmd, "a chartex chart keeps one labels' position for the whole series, not one per point"));
+        }
+        let Some(i) = series else { return Err(bad(cmd, "`point` needs `series`: a label belongs to one point of one series")) };
+        let Some(se) = c.series.get_mut(i) else { return Err(bad(cmd, "no such series")) };
+        if !on {
+            // `on: false` for one point hides its label, the model's per-point deletion.
+            let mut pt = se.point(pi as usize).copied().unwrap_or(PointFormat { index: pi, ..PointFormat::default() });
+            pt.index = pi;
+            pt.no_label = true;
+            se.set_point(pt);
+            return Ok(());
+        }
+        let mut label = se.point_label(pi as usize).cloned().unwrap_or(PointLabel { index: pi, ..PointLabel::default() });
+        label.index = pi;
+        if let Some(f) = font {
+            label.font = Some(merge_font(label.font, f));
+        }
+        for (key, value) in flags {
+            let Some(v) = value else { continue };
+            match *key {
+                "value" => label.show_value = Some(*v),
+                "seriesName" => label.show_series = Some(*v),
+                "categoryName" => label.show_category = Some(*v),
+                _ => {}
+            }
+        }
+        let given = flags.iter().any(|(_, v)| v.is_some()) || label.font.is_some();
+        if given {
+            se.set_point_label(label);
+        }
+        // Either way the point's label shows again.
+        if let Some(pt) = se.point(pi as usize).copied()
+            && pt.no_label
+        {
+            se.set_point(PointFormat { no_label: false, ..pt });
+        }
+        c.data_labels = true;
+        return Ok(());
+    }
+    // Per-point visibility applies to one series (or all of them).
+    for target in (0..c.series.len()).filter(|i| series.is_none_or(|s| s == *i)) {
+        if let Some(se) = c.series.get_mut(target) {
+            if let Some(idx) = delete {
+                let mut pt = se.point(idx as usize).copied().unwrap_or(PointFormat { index: idx, ..PointFormat::default() });
+                pt.index = idx;
+                pt.no_label = true;
+                se.set_point(pt);
+            }
+            if let Some(idx) = show
+                && let Some(pt) = se.point(idx as usize).copied()
+            {
+                se.set_point(PointFormat { no_label: false, ..pt });
+            }
+        }
+    }
     for i in targets {
         let Some(se) = c.series.get_mut(i) else { continue };
         let mut o = se.labels.clone().unwrap_or_else(|| c.labels.clone());
         o.hidden = !on;
         if on {
             apply_label_options(&mut o, flags, position, separator.clone(), number_format.clone());
-            if !o.shows_anything() && !flags.iter().any(|(_, v)| v.is_some()) {
+            if let Some(f) = font {
+                o.font = Some(merge_font(o.font, f));
+            }
+            if !o.shows_anything() && !flags.iter().any(|(_, v)| v.is_some()) && o.font.is_none() {
                 o = LabelOptions::values();
             }
         }
@@ -916,7 +977,13 @@ fn format_point(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(bad(cmd, "give a fill, line, marker colour, markerSize, deleteLabel or clear"));
     }
     with_chart(s, p, |c| {
-        require_classic(c, cmd)?;
+        if c.kind.is_chartex() {
+            // A chartex part keeps a point's fill and outline (`cx:dataPt`) and its label's state,
+            // but no chartex kind draws markers.
+            if marker.is_some() || marker_size.is_some() {
+                return Err(bad(cmd, "a chartex chart's points have no markers: give a fill, an outline or `deleteLabel`"));
+            }
+        }
         if marker.is_some() || marker_size.is_some() {
             use ChartKind::*;
             let plot = gridcraft_chart::series_plot_kind(c, si);
