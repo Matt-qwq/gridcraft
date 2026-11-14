@@ -1836,6 +1836,18 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
             "此图表的图例项是它的数据点而不是系列，因此无法在此删除其中任何一项。"
         }
         // zh-grid - entries the grid, the ribbon, the tooltips and the paper view need (wave 4).
+        // The UI-only commands `engine.commands` adds (the command palette lists them).
+        "Ribbon Tab" => "功能区选项卡",
+        "Collapse Ribbon" => "折叠功能区",
+        "Display Theme" => "显示主题",
+        "Interface Size" => "界面大小",
+        "Open Dialog" => "打开对话框",
+        "File (Backstage view)" => "文件（后台视图）",
+        "Print Settings" => "打印设置",
+        "Submit Print Job" => "提交打印作业",
+        "Interface Language" => "界面语言",
+        "Interface Language: English" => "界面语言：英语",
+
         // The filter list's blank-cells group: chrome, drawn in the interface language.
         "(Blanks)" => "（空白）",
         // A ribbon tooltip's shape: the command, then its shortcut in the brackets this language uses.
