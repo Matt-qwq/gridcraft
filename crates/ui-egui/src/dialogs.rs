@@ -1985,7 +1985,8 @@ fn format_cells(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: 
                         code = c;
                     }
                 }
-                cols[1].label(egui::RichText::new(lang.tr("Sample")).strong());
+                // Keyed by context: the sheet tab menu's "Sample" is not this dialog's preview.
+                cols[1].label(egui::RichText::new(lang.tr("Format Cells|Sample")).strong());
                 let preview = app.session.active().map(|doc| gridcraft_engine::display::format(&sample, &code, &doc.wb).text).unwrap_or_default();
                 cols[1].label(egui::RichText::new(preview).font(theme::ui_font(15.0)));
                 cols[1].add_space(8.0);
@@ -2060,7 +2061,8 @@ fn format_cells(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: 
                     ui.selectable_value(&mut st.font.name, f.clone(), f.clone());
                 }
             });
-            ui.add(egui::Slider::new(&mut st.font.size, 6.0..=72.0).text(lang.tr("Size")));
+            // Keyed by context: Page Setup's "Size" is paper size, this one is type size.
+            ui.add(egui::Slider::new(&mut st.font.size, 6.0..=72.0).text(lang.tr("Format Cells|Size")));
             ui.horizontal(|ui| {
                 ui.checkbox(&mut st.font.bold, lang.tr("Bold"));
                 ui.checkbox(&mut st.font.italic, lang.tr("Italic"));
@@ -2097,18 +2099,20 @@ fn format_cells(app: &mut SheetApp, ui: &mut egui::Ui, d: &mut Dialog, confirm: 
                 if ui.button(lang.tr("None")).clicked() {
                     st.borders = Default::default();
                 }
-                if ui.button(lang.tr("Outline")).clicked() {
+                if ui.button(lang.tr("Format Cells|Outline")).clicked() {
                     st.borders.top = line;
                     st.borders.bottom = line;
                     st.borders.left = line;
                     st.borders.right = line;
                 }
             });
+            // Keyed by context: the Alignment tab's "Top" and "Left" are cell alignment, these are
+            // the four border sides ("上框线 细线", not "靠上 细线").
             for (n, slot) in [
-                ("Top", &mut st.borders.top),
-                ("Bottom", &mut st.borders.bottom),
-                ("Left", &mut st.borders.left),
-                ("Right", &mut st.borders.right),
+                ("Format Cells|Top", &mut st.borders.top),
+                ("Format Cells|Bottom", &mut st.borders.bottom),
+                ("Format Cells|Left", &mut st.borders.left),
+                ("Format Cells|Right", &mut st.borders.right),
                 ("Diagonal ↘", &mut st.borders.diag_down),
                 ("Diagonal ↗", &mut st.borders.diag_up),
             ] {
