@@ -548,6 +548,19 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   write is out of scope without an `.xls` writer. [file-format-parity.md](file-format-parity.md)
 
 ### 8. PivotTables: data-model pivots and a real-world corpus (F)
+- **Landed 11-14 (a data-model report is carried, not dropped).** Opening a Power Pivot / OLAP
+  workbook used to lose the report **and the whole `xl/model/` data model** on the next save. Now
+  such a PivotTable is read as `PivotSourceKind::DataModel` with a `read_only_reason`, its report
+  cells left exactly as the file's cached values, and its `pivotTable`/`pivotCacheDefinition`/
+  `pivotCacheRecords`/`xl/model/*` parts reproduced byte for byte (cache ids reserved so a
+  computed report cannot collide; the model is related from the workbook, which is what keeps it
+  alive when the report is deleted). Every recompute or reshape command — refresh, addField,
+  moveField, layout, filter, sort, group, collapse, valueSettings, grandTotals, calculated field or
+  item, changeSource, showDetails — refuses with the reason, `pivot.fields`/`pivot.list` report
+  `kind`/`readOnly`/`readOnlyReason`, and `data.refreshAll` lists them under `skipped` instead of
+  failing. `pivot.delete` still works. **What a real data-model pivot still needs is N3** (see §12):
+  a records source, typed cache fields and measures, OLAP filter/sort/group semantics, a refresh
+  that queries the model, and a writer that regenerates the report instead of carrying it.
 - **Landed 10-30 (slicers and timelines):** a slicer and a timeline are **model objects** now — cache
   field, the PivotTables they filter, item values with their selected flags, name, caption, style,
   column count, timeline unit and anchor — read into the model and written once from it, so
@@ -785,6 +798,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 ### 12. Get & Transform, external data, data model (F)
 - No Power Query editor, connections, refresh, From Web/database/folder sources, relationships or
   data model (`data.fromWeb`, `data.relationships` missing). **Estimate:** 60–100 h.
+- **Landed 11-14 (the file half):** a workbook's `xl/model/*` (the Power Pivot data model) is kept
+  and written back byte for byte, related from the workbook with the file's own `powerPivotData`
+  type, and it survives deleting every report that used it; PivotTables built on it are carried
+  read-only (see §8). What is still missing is the engine: no records, no measures, no refresh, no
+  recomputation. The seam is `PivotSourceKind::DataModel` + `read_only_reason` — swapping a model
+  reader in there is what turns a carried report into a computed one.
 
 ### 13. Analysis tools: Solver, Analysis ToolPak, Forecast Sheet (F)
 - `data.solver`, `data.analysisToolPak` missing. Forecast Sheet (`data.forecastSheet`) and the
