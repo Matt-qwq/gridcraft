@@ -29,6 +29,7 @@ edit into a kept part), the option matrix below, merged PRs #62, #116,
 | Histogram, Pareto | 2 | 1 of 2 | no Pareto |
 | Box & Whisker | 1 | 1 of 1 | exclusive (default) and inclusive quartiles per series; XLSX round-trip; `chart.set {quartiles}` changes all series |
 | Waterfall, Funnel | 2 | 2 of 2 | written as chartex parts (PR #161); kind survives a round-trip |
+| Chart sheets | any chart on a sheet of its own | yes | `chart.moveToSheet` / `chart.moveToObject` (11-14): the tab is present with its glyph, the chart fills the viewport keeping its proportions, clicks still pick elements, and the whole round trip keeps page setup, margins, header/footer and printer settings |
 | Filled map | 1 | 0 | needs geographic boundary data (licensing decision) |
 | Combo | custom combinations, secondary axis | yes (line on secondary axis) | |
 | **Total** | ~60 subtypes | **25 (~42%)** | usage-weighted breadth higher (~65%): column, bar, line, pie and scatter dominate |

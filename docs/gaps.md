@@ -229,7 +229,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   names, no stale `Override`, no duplicate rel ids) runs inside `write_xlsx` for every save in the
   crate's tests. The earlier set (#330) still holds: custom XML, external links, connections, sheet
   query tables, printer settings, controls/ActiveX/OLE/backgrounds, header-footer pictures,
-  chart sheets, workbook and worksheet `extLst`.
+  workbook and worksheet `extLst`. **Chart sheets are modelled since 11-14** (they used to be kept
+  whole and invisible): the part is read into a sheet of its own kind and written back as a real
+  `chartsheet`, with page setup, margins, header/footer, printer settings and `extLst` kept as
+  fragments; a part whose chart is missing or unmodelled still falls back to the passthrough rather
+  than being half-modelled.
 - **Missing:** the data model (Power Pivot `xl/model/…`, `powerPivotData`), chart `extLst` and chart
   details (a chart part has no stable identity to key a fragment on; chart depth is #4), Strict Open
   XML content. A renamed table or PivotTable loses its extras by policy — misattaching a query table
@@ -319,8 +323,11 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   patched, drawn and settable from `chart.setDataLabels {fontSize, bold, color}` and the Format
   pane's Data Labels and Data Point sections. Levels combine **field by field**: a point that sets
   only a colour keeps its series' size and the chart's weight, and the renderer draws the size,
-  weight and colour it ends up with. A chartex chart's label font is refused with the reason rather
-  than stored and dropped. The typeface, italic and the label's own fill/callout stay unmodelled
+  weight and colour it ends up with. **A chartex chart's label font is modelled since 11-14** in
+  the series' own `cx:txPr` (chart → series → point, field by field, drawn), together with per-point
+  `cx:dataPt/cx:spPr` fills and outlines and the label position and visibility flags; what chartex
+  has no element for (percentage, separator, per-point text, markers) is still refused with the
+  reason. The typeface, italic and the label's own fill/callout stay unmodelled
   (kept while their element is untouched, lost when that label's font is edited).
 - **Missing:** a label's typeface, italic, fill and callout shape are not modelled; date-axis units
   are kept but not editable; from-cells labels, callouts added through the UI, chart templates and
