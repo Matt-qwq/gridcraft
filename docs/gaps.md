@@ -141,6 +141,21 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   column map's runs, so a dense block is **2.5–3.3 ns/cell** (was 30.6), and the owned/formula gate
   resolves a band once (1M paged rows 0.84 ms, was 9.5). `diff` keeps its documented physical
   contract; `diff_logical` is the O(cells) map-independent diagnostic for tests/fuzz.
+- **Landed (11-13): the per-frame and per-cell work.** `CellStore::used_range` is cached (a
+  1M-row call was **6.5 ms** and sized both scrollbars every repaint; now 10 ns, grown on write and
+  re-walked only when a mutation can shrink it). Conditional-format statistics, chart drawings (with
+  the hit regions the click test reads) and sparkline paths live on the grid state keyed by
+  (document uid, revision, sheet) and are dropped on any edit — grid paint on a 100k-row data bar
+  falls **10.7 → 1.4 ms/frame**. A defined name that stands for cells is a precedent rather than a
+  dynamic reference, so an unrelated edit no longer re-seeds every formula that mentions one
+  (100k-row name column: **100,000 cells/158 ms → 1 cell/5 µs**), and `Evaluator::name` reads the
+  same `NameCache` instead of scanning and re-parsing per cell (**100k evaluations 117 → 76 ms**, at
+  parity with the reference written inline: 31 vs 35 ms per 100k-cell edit). `check_arrays` asks
+  the store whether the sheet holds a multi-cell array instead of diffing it (**1M-row keystroke
+  4.6 → 0.9 ms**). A rebuild hands each formula the tree it parsed back to its cell, and a save
+  writes a formula whose file spelling is its own text without rebuilding it (**200k formula cells:
+  12 % of a save**, bytes identical). No behaviour change; the engine suite is green again (a stale
+  `custom_filter_blanks` had been reading the pre-bitmap hidden flag since `d2c55e7a`).
 - **Missing:** dependent chains that never become a wave of leaves remain sequential; whole-sheet
   clear/copy/paste still clone the stored cells (they scale with the data, not the file); the
   per-band value dictionaries still cost full price when values do not repeat;
@@ -148,7 +163,12 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   gap-scoped candidates, snapshot-safe page replacement, `document.compact` and a save hook,
   `PageCacheStats`); a page-file rewrite remains;
   whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
-  a ten-row used range in 0.0 ms). The 159 cells that still differ from the cached values of the
+  a ten-row used range in 0.0 ms). Cheap wins measured but not taken (11-13): `MODE`/`MODE.MULT`
+  count with a linear scan (O(n²) over distinct values), `VLOOKUP` copies its key column and `MATCH`
+  clones the haystack before the text index can answer, `criterion::matches` allocates three to four
+  times per visited cell, `check_arrays` still walks the whole store on a sheet that *does* hold a
+  multi-cell array, and the grid's per-cell path still clones a `Cell`/`Style` and formats a font
+  family name per cell (~1.5–3 ms/frame of a 60×30 viewport). The 159 cells that still differ from the cached values of the
   1.28 GB report are Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the
   same workbook cache `#N/A` — not a calculation difference.
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `crates/model/src/line.rs`,
