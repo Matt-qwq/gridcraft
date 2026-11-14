@@ -1,12 +1,19 @@
-//! The Format pane's chart sections: the chart area, axes, data labels, error bars and data
-//! points. Every control calls one of the engine's chart commands through
+//! The Format pane's chart sections: the chart area, the legend, gridlines, axes, data labels,
+//! error bars and data points. Every control calls one of the engine's chart commands through
 //! [`SheetApp::run_or_alert`](crate::SheetApp::run_or_alert); the pane holds no copy of the chart
 //! and never edits the model itself, so what a control offers is what the file, the renderer and
 //! the command agree on.
 //!
-//! A control the current chart kind cannot store is disabled with the reason, and the reason is
-//! the one `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars` or `chart.formatPoint`
-//! refuses the option with: the UI does not offer what the command would reject.
+//! What the current chart kind cannot store is not offered: a section that stores nothing says why
+//! (a pie has no axes, error bars belong to cartesian series), and a single option the kind cannot
+//! hold is replaced by the reason `chart.setAxis`, `chart.setDataLabels`, `chart.setErrorBars`,
+//! `chart.formatPoint`, `chart.setGridlines` or `chart.setLegend` would refuse it with. The UI
+//! never offers what the command would reject, and never leaves a control that would do nothing.
+//!
+//! A chartex chart (histogram, waterfall, funnel, treemap, sunburst, box & whisker) is no longer
+//! refused outright: its part keeps per-point fills and outlines and label fonts, so the Data Point
+//! section and the label font controls work on it; it has no marker, no percentage or legend key,
+//! no separator, no number format and no minor gridline, and those say so.
 
 use std::ops::RangeInclusive;
 
@@ -22,10 +29,22 @@ use crate::SheetApp;
 use crate::theme::{self, Tokens};
 use crate::widgets::tr;
 
-/// Why a chartex chart offers no formatting here.
+/// Why a chartex chart stores none of its axis scaling, error bars or axis frames here.
 const CHARTEX: &str = "This chart type keeps its options in a chartex part, which GridCraft does not model.";
 /// Why a pie has no axis options.
 const NO_AXES: &str = "This chart type has no axes.";
+/// Why a chartex chart's gridlines are the value axis's major set alone.
+const CHARTEX_MAJOR_ONLY: &str = "A chartex part stores the value axis's major gridlines only: its minor set has no element to be stored in.";
+/// Why a chartex kind with no axis frame has no gridlines at all.
+const NO_AXIS_FRAME: &str = "This chart type has no axis frame to draw gridlines on.";
+/// Why only the value axis of a chartex chart takes gridlines.
+const CHARTEX_VALUE_AXIS_ONLY: &str = "A chartex part stores gridlines on its value axis only.";
+/// Why a radar chart has no category gridlines.
+const RADAR_SPOKES: &str = "A radar chart's category axis is its ring of spokes: it has no category gridlines.";
+/// Why a chartex point has no marker.
+const NO_CHARTEX_MARKER: &str = "No chartex chart type draws markers: a chartex point takes a fill and an outline only.";
+/// Why a pie-like chart's legend entries cannot be deleted from the pane.
+const LEGEND_ENTRIES_ARE_POINTS: &str = "This chart's legend entries are its points, not its series, so none of them can be deleted from here.";
 
 /// What the Format pane is editing, from its "Current selection" list (Excel's Chart Elements
 /// dropdown).
@@ -190,28 +209,82 @@ pub fn error_bar_reason(chart: &Chart) -> Option<&'static str> {
     (!drawn).then_some("Error bars are drawn on 2-D column, bar, line, area, scatter and bubble series only.")
 }
 
-/// Why one series' points cannot be formatted.
-pub fn point_reason(chart: &Chart, series: usize) -> Option<&'static str> {
+/// Whether `chart`'s category axis (or a scatter's numeric X axis, `x_axis`) or its value axis
+/// can store gridlines, and if not, why. Mirrors `chart.setGridlines`'s refusals.
+pub fn gridlines_reason(chart: &Chart, x_axis: bool) -> Option<&'static str> {
     if chart.kind.is_chartex() {
-        return Some(CHARTEX);
+        // Only the chartex kinds with a value axis draw any: a gridline needs an axis frame, and a
+        // chartex part keeps just the value axis's major set.
+        if !matches!(chart.kind, ChartKind::Histogram | ChartKind::BoxWhisker | ChartKind::Waterfall) {
+            return Some(NO_AXIS_FRAME);
+        }
+        return x_axis.then_some(CHARTEX_VALUE_AXIS_ONLY);
     }
+    if matches!(chart.kind, ChartKind::Pie | ChartKind::Doughnut) {
+        return Some(NO_AXES);
+    }
+    (x_axis && chart.kind == ChartKind::Radar).then_some(RADAR_SPOKES)
+}
+
+/// Why the minor gridline set cannot be switched on here (a chartex part has no such element).
+pub fn gridline_minor_reason(chart: &Chart) -> Option<&'static str> {
+    chart.kind.is_chartex().then_some(CHARTEX_MAJOR_ONLY)
+}
+
+/// Why one series' points cannot be formatted. A chartex chart's points take a fill, an outline and
+/// their label's state (its part keeps them in `cx:dataPt`), so only a selection that names no
+/// series is refused.
+pub fn point_reason(chart: &Chart, series: usize) -> Option<&'static str> {
     (series >= chart.series.len()).then_some("Select a series first.")
 }
 
-/// Why a marker colour cannot be set on a point of `series`.
+/// Why a marker colour cannot be set on a point of `series`: no chartex kind draws markers, and a
+/// classic chart draws them on its line-like series only.
 pub fn marker_reason(chart: &Chart, series: usize) -> Option<&'static str> {
     use ChartKind::*;
     if let Some(r) = point_reason(chart, series) {
         return Some(r);
+    }
+    if chart.kind.is_chartex() {
+        return Some(NO_CHARTEX_MARKER);
     }
     let line_like =
         matches!(gridcraft_chart::series_plot_kind(chart, series), Line | LineMarkers | LineStacked | Scatter | ScatterLines | Bubble | Radar);
     (!line_like).then_some("A marker colour applies to line, scatter, bubble and radar points only.")
 }
 
-/// Why this chart's label options cannot be stored (only a chartex chart refuses them).
-pub fn labels_reason(chart: &Chart) -> Option<&'static str> {
-    chart.kind.is_chartex().then_some(CHARTEX)
+/// One option of a chart's data labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelOption {
+    /// Show each value as a percentage of the total.
+    Percentage,
+    /// Show the legend key beside the label.
+    LegendKey,
+    /// Where the label sits relative to its point.
+    Position,
+    /// The text between the parts a label shows.
+    Separator,
+    /// The number format a label's value is written in.
+    NumberFormat,
+    /// The label's own size, weight and colour.
+    Font,
+}
+
+/// Why `option` of `chart`'s data labels cannot be stored. A classic chart stores every one; a
+/// chartex part keeps what a label shows (value, series name, category name), its position and its
+/// font, and nothing else. Mirrors `chart.setDataLabels`'s refusals.
+pub fn label_reason(chart: &Chart, option: LabelOption) -> Option<&'static str> {
+    use LabelOption::*;
+    if !chart.kind.is_chartex() {
+        return None;
+    }
+    match option {
+        Percentage => Some("A chartex data label has no percentage: it shows the value, the series name, the category name and its font."),
+        LegendKey => Some("A chartex data label has no legend key."),
+        Separator => Some("A chartex data label joins nothing: it has no separator."),
+        NumberFormat => Some("A chartex data label has no number format of its own."),
+        Position | Font => None,
+    }
 }
 
 /// A starting interval for "fix the major unit": 1, 2 or 5 times a power of ten.
@@ -338,6 +411,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
     match selection {
         Selection::Chart => {
             chart_area(app, ui, &chart, id);
+            gridlines(app, ui, &chart, id);
             data_labels(app, ui, &chart, id, None);
             error_bars(app, ui, &chart, id, None);
             data_point(app, ui, &chart, id, None);
@@ -424,15 +498,29 @@ fn chart_area(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
                 }
             }
         });
+        let mut overlay = chart.legend_overlay;
+        if ui.checkbox(&mut overlay, crate::widgets::tr(ui, "Overlay the legend on the plot area")).changed() {
+            run_legend(app, id, json!({"overlay": overlay}));
+        }
+        // An entry belongs to a series (the model stores its deletion on the series), so the list
+        // follows the series' own order and the names the chart draws.
+        if !chart.kind.legend_entries_are_series() {
+            ui.label(RichText::new(crate::widgets::tr(ui, LEGEND_ENTRIES_ARE_POINTS)).small().color(Tokens::get(ui.ctx()).text_dim));
+            return;
+        }
+        let names = series_names(app, chart);
+        for (i, ser) in chart.series.iter().enumerate() {
+            let mut shown = !ser.legend_deleted;
+            let name = names.get(i).cloned().unwrap_or_else(|| format!("{} {}", crate::widgets::tr(ui, "Series"), i + 1));
+            if ui.checkbox(&mut shown, name).changed() {
+                run_legend(app, id, if shown { json!({"showEntry": i}) } else { json!({"deleteEntry": i}) });
+            }
+        }
     });
     ui.collapsing(tr(ui, "Elements"), |ui| {
         let mut dl = chart.data_labels;
         if ui.checkbox(&mut dl, crate::widgets::tr(ui, "Data Labels")).changed() {
             app.run_or_alert("chart.set", json!({"chart": id, "dataLabels": dl}));
-        }
-        let mut gl = chart.gridlines;
-        if ui.checkbox(&mut gl, crate::widgets::tr(ui, "Gridlines")).changed() {
-            app.run_or_alert("chart.set", json!({"chart": id, "gridlines": gl}));
         }
         for (label, current, key) in
             [("Horizontal axis title:", chart.x_title.as_deref(), "xTitle"), ("Vertical axis title:", chart.y_title.as_deref(), "yTitle")]
@@ -483,6 +571,67 @@ fn chart_area(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
             ui.data_mut(|d| d.remove::<(f32, f32)>(draft));
         }
     });
+}
+
+/// Format Gridlines (Chart Design ▸ Add Chart Element ▸ Gridlines): one axis at a time, its major
+/// and minor set, read from the model and written through `chart.setGridlines`.
+fn gridlines(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32) {
+    let t = Tokens::get(ui.ctx());
+    // Which axis the section is editing, remembered per chart.
+    let key = egui::Id::new(("gridcraft.gridlines_axis", id));
+    let mut x_axis = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+    // A scatter's category axis is its numeric X axis, so that is what it is called.
+    let x_name = match chart.kind {
+        ChartKind::Scatter | ChartKind::ScatterLines | ChartKind::Bubble => "X axis",
+        _ => "Category axis",
+    };
+    ui.collapsing(tr(ui, "Gridlines"), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(tr(ui, "Axis"));
+            egui::ComboBox::from_id_salt(("gridcraft.gridlines_axis_box", id))
+                .selected_text(tr(ui, if x_axis { x_name } else { "Value axis" }))
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(!x_axis, tr(ui, "Value axis")).clicked() {
+                        x_axis = false;
+                        ui.data_mut(|d| d.insert_temp(key, x_axis));
+                    }
+                    if ui.selectable_label(x_axis, tr(ui, x_name)).clicked() {
+                        x_axis = true;
+                        ui.data_mut(|d| d.insert_temp(key, x_axis));
+                    }
+                });
+        });
+        if let Some(r) = gridlines_reason(chart, x_axis) {
+            ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
+            return;
+        }
+        let g = if x_axis { chart.x_gridlines } else { chart.y_gridlines() };
+        let mut major = g.major;
+        if ui.checkbox(&mut major, tr(ui, "Major gridlines")).changed() {
+            run_gridlines(app, id, x_axis, json!({"major": major}));
+        }
+        match gridline_minor_reason(chart) {
+            // A chartex part has no minor set: the words say so instead of a control that could not
+            // be stored.
+            Some(r) => {
+                ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
+            }
+            None => {
+                let mut minor = g.minor;
+                if ui.checkbox(&mut minor, tr(ui, "Minor gridlines")).changed() {
+                    run_gridlines(app, id, x_axis, json!({"minor": minor}));
+                }
+            }
+        }
+    });
+}
+
+/// The series' names as the chart draws them in its legend (the model stores a reference and the
+/// chart crate resolves it), so the legend entry list names each entry it deletes.
+fn series_names(app: &SheetApp, chart: &Chart) -> Vec<String> {
+    let Some(d) = app.session.active() else { return Vec::new() };
+    let data = gridcraft_chart::resolve(&d.wb, d.wb.active_sheet, chart);
+    data.series.iter().map(|s| s.name.clone()).collect()
 }
 
 /// One series' own fill, as the Chart Area's Series list had it.
@@ -662,6 +811,27 @@ fn run_axis(app: &mut SheetApp, id: u32, axis: &str, params: Json) {
     app.run_or_alert("chart.setAxis", Json::Object(all));
 }
 
+/// One axis's gridline set, through `chart.setGridlines`.
+fn run_gridlines(app: &mut SheetApp, id: u32, x_axis: bool, params: Json) {
+    let mut all = Map::new();
+    all.insert("chart".into(), json!(id));
+    all.insert("axis".into(), json!(if x_axis { "x" } else { "y" }));
+    if let Json::Object(m) = params {
+        all.extend(m);
+    }
+    app.run_or_alert("chart.setGridlines", Json::Object(all));
+}
+
+/// One legend option, through `chart.setLegend`.
+fn run_legend(app: &mut SheetApp, id: u32, params: Json) {
+    let mut all = Map::new();
+    all.insert("chart".into(), json!(id));
+    if let Json::Object(m) = params {
+        all.extend(m);
+    }
+    app.run_or_alert("chart.setLegend", Json::Object(all));
+}
+
 fn crossing_json(crosses: AxisCrossing) -> Json {
     match crosses {
         AxisCrossing::AutoZero => json!("autoZero"),
@@ -733,6 +903,10 @@ fn number(ui: &mut Ui, id: egui::Id, value: f64, range: RangeInclusive<f64>, lab
 
 /// Format Data Labels: what a label shows, where, its separator and format. `series` scopes it
 /// to one series (Excel's per-series labels); `None` sets the chart's labels for every series.
+///
+/// A chartex chart keeps the value, series name and category name flags, the position and the font
+/// in each series' own record, so those controls work on it; its part has no percentage, legend
+/// key, separator or number format, so those say why instead of offering a value it would refuse.
 fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: Option<usize>) {
     let t = Tokens::get(ui.ctx());
     let o: LabelOptions = match series {
@@ -740,7 +914,7 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
         None => chart.labels.clone(),
     };
     let shown = chart.data_labels && !o.hidden;
-    section(ui, "Data Labels", labels_reason(chart), |ui| {
+    section(ui, "Data Labels", None, |ui| {
         let mut on = shown;
         if ui.checkbox(&mut on, tr(ui, if series.is_some() { "Show labels for this series" } else { "Show labels" })).changed() {
             run_labels(app, id, series, json!({"on": on}));
@@ -749,13 +923,18 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
             ui.label(RichText::new(crate::widgets::tr(ui, "Turn the labels on to choose what they show.")).small().color(t.text_dim));
         }
         ui.add_enabled_ui(shown, |ui| {
-            for (label, key, on) in [
-                ("Value", "value", o.show_value),
-                ("Percentage", "percentage", o.show_percentage),
-                ("Series name", "seriesName", o.show_series),
-                ("Category name", "categoryName", o.show_category),
-                ("Legend key", "legendKey", o.show_legend_key),
+            for (label, key, on, option) in [
+                ("Value", "value", o.show_value, None),
+                ("Percentage", "percentage", o.show_percentage, Some(LabelOption::Percentage)),
+                ("Series name", "seriesName", o.show_series, None),
+                ("Category name", "categoryName", o.show_category, None),
+                ("Legend key", "legendKey", o.show_legend_key, Some(LabelOption::LegendKey)),
             ] {
+                // A part the chart kind cannot store leaves the reason where its checkbox would be.
+                if let Some(r) = option.and_then(|o| label_reason(chart, o)) {
+                    ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
+                    continue;
+                }
                 let mut checked = on;
                 if ui.checkbox(&mut checked, tr(ui, label)).changed() {
                     run_labels(app, id, series, json!({key: checked}));
@@ -783,20 +962,34 @@ fn data_labels(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: 
                     }
                 });
             });
-            ui.horizontal(|ui| {
-                ui.label(tr(ui, "Separator"));
-                let field = egui::Id::new(("gridcraft.chart_label_sep", id, series));
-                if let Some(text) = crate::widgets::committed_text(ui, field, o.separator.as_deref().unwrap_or(", "), Some(60.0)) {
-                    run_labels(app, id, series, json!({"separator": text}));
+            match label_reason(chart, LabelOption::Separator) {
+                Some(r) => {
+                    ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.label(tr(ui, "Number format"));
-                let field = egui::Id::new(("gridcraft.chart_label_numfmt", id, series));
-                if let Some(text) = crate::widgets::committed_text(ui, field, o.number_format.as_deref().unwrap_or(""), Some(90.0)) {
-                    run_labels(app, id, series, json!({"numberFormat": text}));
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(ui, "Separator"));
+                        let field = egui::Id::new(("gridcraft.chart_label_sep", id, series));
+                        if let Some(text) = crate::widgets::committed_text(ui, field, o.separator.as_deref().unwrap_or(", "), Some(60.0)) {
+                            run_labels(app, id, series, json!({"separator": text}));
+                        }
+                    });
                 }
-            });
+            }
+            match label_reason(chart, LabelOption::NumberFormat) {
+                Some(r) => {
+                    ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(ui, "Number format"));
+                        let field = egui::Id::new(("gridcraft.chart_label_numfmt", id, series));
+                        if let Some(text) = crate::widgets::committed_text(ui, field, o.number_format.as_deref().unwrap_or(""), Some(90.0)) {
+                            run_labels(app, id, series, json!({"numberFormat": text}));
+                        }
+                    });
+                }
+            }
             label_font_controls(app, ui, id, series, None, o.font);
         });
     });
@@ -1000,30 +1193,33 @@ fn data_point(app: &mut SheetApp, ui: &mut Ui, chart: &Chart, id: u32, series: O
         for (label, key) in [("Fill", "fill"), ("point|Line", "line")] {
             point_colour(app, ui, &theme, id, scope, index, label, key, colour_of(&pt, key));
         }
-        let marker = marker_reason(chart, scope);
-        ui.add_enabled_ui(marker.is_none(), |ui| {
-            point_colour(app, ui, &theme, id, scope, index, "Marker", "marker", pt.marker);
-            ui.horizontal(|ui| {
-                ui.label(tr(ui, "Marker size"));
-                if let Some(v) = number(
-                    ui,
-                    egui::Id::new(("gridcraft.chart_point_marker_size", id, scope, index)),
-                    f64::from(pt.marker_size.unwrap_or(5)),
-                    2.0..=72.0,
-                    "",
-                ) {
-                    let mut m = Map::new();
-                    m.insert("chart".into(), json!(id));
-                    m.insert("series".into(), json!(scope));
-                    m.insert("point".into(), json!(index));
-                    m.insert("markerSize".into(), json!(v.round() as u32));
-                    app.run_or_alert("chart.formatPoint", Json::Object(m));
-                }
-                ui.label(RichText::new(tr(ui, "pt")).small().color(t.text_dim));
-            });
-        });
-        if let Some(r) = marker {
-            ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
+        // A marker is offered only where the chart kind draws one; otherwise the words say why, so
+        // no control is left doing nothing.
+        match marker_reason(chart, scope) {
+            Some(r) => {
+                ui.label(RichText::new(tr(ui, r)).small().color(t.text_dim));
+            }
+            None => {
+                point_colour(app, ui, &theme, id, scope, index, "Marker", "marker", pt.marker);
+                ui.horizontal(|ui| {
+                    ui.label(tr(ui, "Marker size"));
+                    if let Some(v) = number(
+                        ui,
+                        egui::Id::new(("gridcraft.chart_point_marker_size", id, scope, index)),
+                        f64::from(pt.marker_size.unwrap_or(5)),
+                        2.0..=72.0,
+                        "",
+                    ) {
+                        let mut m = Map::new();
+                        m.insert("chart".into(), json!(id));
+                        m.insert("series".into(), json!(scope));
+                        m.insert("point".into(), json!(index));
+                        m.insert("markerSize".into(), json!(v.round() as u32));
+                        app.run_or_alert("chart.formatPoint", Json::Object(m));
+                    }
+                    ui.label(RichText::new(tr(ui, "pt")).small().color(t.text_dim));
+                });
+            }
         }
         let mut no_label = pt.no_label;
         if ui.checkbox(&mut no_label, crate::widgets::tr(ui, "Hide this point's label")).changed() {
@@ -1459,14 +1655,48 @@ mod tests {
     }
 
     #[test]
-    fn a_chartex_kind_refuses_every_chart_format_option() {
+    fn a_chartex_kind_refuses_only_what_its_part_cannot_store() {
         for kind in ["treemap", "sunburst", "waterfall", "funnel", "histogram"] {
             let s = chart(kind);
             let c = only_chart(&s);
             assert_eq!(axis_reason(&c, true, AxisOption::Bounds), Some(CHARTEX), "{kind}");
-            assert_eq!(labels_reason(&c), Some(CHARTEX), "{kind}");
             assert_eq!(error_bar_reason(&c), Some(CHARTEX), "{kind}");
-            assert_eq!(point_reason(&c, 0), Some(CHARTEX), "{kind}");
+            // The part keeps a point's fill, its outline and its label's state, and the label font
+            // at chart, series and point level; it has no markers and no percentage, legend key,
+            // separator or number format.
+            assert_eq!(point_reason(&c, 0), None, "{kind}");
+            assert_eq!(marker_reason(&c, 0), Some(NO_CHARTEX_MARKER), "{kind}");
+            for option in [LabelOption::Font, LabelOption::Position] {
+                assert_eq!(label_reason(&c, option), None, "{kind}: {option:?}");
+            }
+            for option in [LabelOption::Percentage, LabelOption::LegendKey, LabelOption::Separator, LabelOption::NumberFormat] {
+                assert!(label_reason(&c, option).is_some(), "{kind}: {option:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn gridlines_follow_the_axis_frame_each_kind_draws() {
+        // A column chart draws both axes; a pie draws none; a radar has no category gridlines.
+        let c = only_chart(&chart("column"));
+        assert_eq!((gridlines_reason(&c, false), gridlines_reason(&c, true)), (None, None));
+        assert_eq!(gridline_minor_reason(&c), None);
+        let c = only_chart(&chart("pie"));
+        assert_eq!(gridlines_reason(&c, false), Some(NO_AXES));
+        assert_eq!(gridlines_reason(&c, true), Some(NO_AXES));
+        let c = only_chart(&chart("radar"));
+        assert_eq!(gridlines_reason(&c, false), None);
+        assert_eq!(gridlines_reason(&c, true), Some(RADAR_SPOKES));
+        // Only the chartex kinds with a value axis take any, and only its major set.
+        for (kind, value_axis) in [("histogram", true), ("waterfall", true), ("treemap", false), ("funnel", false), ("sunburst", false)] {
+            let c = only_chart(&chart(kind));
+            assert_eq!(gridlines_reason(&c, false).is_none(), value_axis, "{kind}");
+            if value_axis {
+                assert!(gridlines_reason(&c, true).is_some(), "{kind}");
+                assert_eq!(gridline_minor_reason(&c), Some(CHARTEX_MAJOR_ONLY), "{kind}");
+            } else {
+                assert_eq!(gridlines_reason(&c, false), Some(NO_AXIS_FRAME), "{kind}");
+            }
         }
     }
 

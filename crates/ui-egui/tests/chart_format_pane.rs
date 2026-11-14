@@ -22,6 +22,29 @@ fn fixture(kind: &str) -> (Harness, u32) {
     session.execute("selection.set", json!({"range": "A1:B5"})).unwrap();
     let chart = session.execute("insert.chart", json!({"type": kind, "subtype": subtype, "at": "D2", "width": 420, "height": 260})).unwrap();
     let id = chart["chart"].as_u64().unwrap() as u32;
+    (open(session, id), id)
+}
+
+/// The same block with a second value column (Q1 and Q2), so the chart has two series and its legend
+/// two entries.
+fn two_series(kind: &str) -> (Harness, u32) {
+    let (kind, subtype) = kind.split_once(' ').unwrap_or((kind, ""));
+    let mut session = Session::new();
+    session.new_workbook();
+    session
+        .execute(
+            "range.setValues",
+            json!({"range": "A1", "values": [["Region", "Q1", "Q2"], ["North", 48, 30], ["South", 39, 41], ["East", 55, 52], ["West", 61, 44]]}),
+        )
+        .unwrap();
+    session.execute("selection.set", json!({"range": "A1:C5"})).unwrap();
+    let chart = session.execute("insert.chart", json!({"type": kind, "subtype": subtype, "at": "E2", "width": 420, "height": 260})).unwrap();
+    let id = chart["chart"].as_u64().unwrap() as u32;
+    (open(session, id), id)
+}
+
+/// The app in a harness with the Format pane open on chart `id`.
+fn open(session: Session, id: u32) -> Harness {
     let mut h = egui_kittest::Harness::builder().with_size(vec2(1300.0, 1000.0)).build_ui_state(
         |ui, app: &mut SheetApp| {
             let ctx = ui.ctx().clone();
@@ -34,7 +57,7 @@ fn fixture(kind: &str) -> (Harness, u32) {
     h.state_mut().selected_chart = Some(id);
     h.state_mut().grid.pane = Some("formatChart".into());
     h.run_steps(2);
-    (h, id)
+    h
 }
 
 fn chart(h: &Harness, id: u32) -> Chart {
@@ -193,17 +216,115 @@ fn what_the_chart_kind_cannot_store_is_disabled_with_its_reason() {
     assert!(h.query_by_label("Labels every").is_some());
     assert!(h.query_by_label("Values in reverse order").is_some());
 
-    // A chartex chart stores none of these options in a part GridCraft models.
+    // A chartex chart keeps the label flags, the position and the font of a series, and its
+    // points' fill and outline, but no percentage, legend key, separator, number format or marker;
+    // its error bars are not modelled at all.
     let (mut h, id) = fixture("treemap");
     select(&mut h, Selection::Series(0));
     expand(&mut h, "Data Labels");
-    assert!(h.query_by_label_contains("chartex part").is_some(), "the pane says why");
-    assert!(h.query_by_label("Show labels for this series").is_none());
+    assert!(h.query_by_label("Show labels for this series").is_some(), "a chartex series turns its labels on");
+    assert!(h.query_by_label_contains("no percentage").is_some(), "the percentage says why it is missing");
+    assert!(h.query_by_label("Percentage").is_none(), "the control is not offered");
+    assert!(h.query_by_label("Legend key").is_none());
+    assert!(h.query_by_label("Label size").is_some(), "a chartex label takes a font");
     expand(&mut h, "Error Bars");
-    expand(&mut h, "Data Point");
-    assert!(h.query_all_by_label_contains("chartex part").count() >= 2, "each open section says why");
-    assert!(h.query_by_label("Hide this point's label").is_none());
+    assert!(h.query_by_label_contains("chartex part").is_some(), "error bars are not modelled for a chartex chart");
     assert!(chart(&h, id).kind.is_chartex());
+}
+
+#[test]
+fn the_gridlines_section_sets_both_axes_of_a_column_chart() {
+    let (mut h, id) = fixture("column");
+    expand(&mut h, "Gridlines");
+    let c = chart(&h, id);
+    assert!(c.y_gridlines().major && !c.y_gridlines().minor, "a new chart draws the value axis's major set only");
+    // The value axis's own two sets, both ways round.
+    click(&mut h, "Major gridlines");
+    assert!(!chart(&h, id).y_gridlines().major, "unticking the major set reaches the command");
+    click(&mut h, "Major gridlines");
+    click(&mut h, "Minor gridlines");
+    let c = chart(&h, id);
+    assert!(c.y_gridlines().major, "the major set is on again");
+    assert!(c.y_gridlines().minor, "and the minor set is on");
+    // The category axis has its own, and ticking one leaves the value axis alone.
+    choose(&mut h, "Value axis", "Category axis");
+    assert!(h.query_by_label("Minor gridlines").is_some(), "the other axis offers the same two sets");
+    click(&mut h, "Minor gridlines");
+    let c = chart(&h, id);
+    assert!(c.x_gridlines.minor, "the category axis's minor set is on");
+    assert!(!c.x_gridlines.major);
+    assert!(c.y_gridlines().minor, "the value axis keeps its own minor set");
+    // Unticking reaches the command the other way too.
+    click(&mut h, "Minor gridlines");
+    assert!(!chart(&h, id).x_gridlines.minor);
+    assert!(h.state().session.journal.iter().any(|(cmd, _)| cmd == "chart.setGridlines"), "the pane ran the command");
+}
+
+#[test]
+fn a_scatter_offers_gridlines_on_its_numeric_x_axis() {
+    let (mut h, id) = fixture("scatter");
+    expand(&mut h, "Gridlines");
+    // A scatter's category axis is its numeric X axis, and it takes the same two sets.
+    choose(&mut h, "Value axis", "X axis");
+    click(&mut h, "Major gridlines");
+    let c = chart(&h, id);
+    assert!(c.x_gridlines.major, "the X axis's major set");
+    assert!(c.y_gridlines().major, "the value axis keeps its own major set");
+    choose(&mut h, "X axis", "Value axis");
+    click(&mut h, "Minor gridlines");
+    let c = chart(&h, id);
+    assert!(c.y_gridlines().minor, "the value axis's minor set");
+    assert!(!c.x_gridlines.minor, "the X axis's stays off: each set is its own");
+}
+
+#[test]
+fn the_legend_section_sets_the_overlay_and_deletes_one_entry() {
+    let (mut h, id) = two_series("column");
+    assert_eq!(chart(&h, id).series.len(), 2, "two value columns make two series");
+    expand(&mut h, "Legend");
+    assert!(!chart(&h, id).legend_overlay);
+    click(&mut h, "Overlay the legend on the plot area");
+    assert!(chart(&h, id).legend_overlay, "the legend lies over the plot area");
+    // One checkbox per series, in the series' own order and under its own name.
+    click(&mut h, "Q1");
+    let c = chart(&h, id);
+    assert!(c.series[0].legend_deleted, "Q1's entry is deleted");
+    assert!(!c.series[1].legend_deleted, "Q2's stays");
+    click(&mut h, "Q1");
+    assert!(!chart(&h, id).series[0].legend_deleted, "showing it again brings the entry back");
+    click(&mut h, "Q2");
+    let c = chart(&h, id);
+    assert!(!c.series[0].legend_deleted && c.series[1].legend_deleted, "the second checkbox is the second series");
+    assert!(h.state().session.journal.iter().any(|(cmd, _)| cmd == "chart.setLegend"), "the pane ran the command");
+}
+
+#[test]
+fn a_pie_like_legend_says_its_entries_are_its_points() {
+    let (mut h, _) = fixture("pie");
+    expand(&mut h, "Legend");
+    assert!(h.query_by_label_contains("its points, not its series").is_some(), "a pie's entries cannot be deleted here");
+}
+
+#[test]
+fn a_treemap_takes_a_points_fill_from_the_data_point_section() {
+    let (mut h, id) = fixture("treemap");
+    select(&mut h, Selection::Series(0));
+    expand(&mut h, "Data Point");
+    assert!(h.query_by_label("Hide this point's label").is_some(), "a chartex point keeps its label's state");
+    assert!(h.query_by_label("Marker size").is_none(), "no chartex kind draws markers");
+    assert!(h.query_by_label_contains("No chartex chart type draws markers").is_some(), "the pane says why");
+    // The palette's keyboard highlight reaches chart.formatPoint: the Fill row's menu is the first.
+    h.get_all_by_label("Colour…").next().expect("the fill's colour menu").click();
+    h.run_steps(2);
+    h.key_press(Key::ArrowRight);
+    h.run_steps(2);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    let theme = h.state().session.doc().unwrap().wb.theme.clone();
+    let pts = chart(&h, id).series[0].points.clone();
+    let filled = pts.first().and_then(|p| p.fill).expect("the point took a fill");
+    assert_eq!(filled.hex(&theme), Some(format!("#{:06X}", theme.colors[1])), "the picked swatch is the point's fill");
+    assert!(h.state().session.journal.iter().any(|(cmd, _)| cmd == "chart.formatPoint"), "the pane ran the command");
 }
 
 #[test]
