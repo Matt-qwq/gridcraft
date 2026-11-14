@@ -1559,7 +1559,7 @@ fn insert(app: &mut SheetApp, ui: &mut Ui) {
                     ui.painter().rect_filled(r, 4.0, Tokens::get(ui.ctx()).hover);
                 }
                 icons::paint(ui.painter(), r.shrink(6.0), *icon, Tokens::get(ui.ctx()).text);
-                if resp.on_hover_text(*name).clicked() {
+                if resp.on_hover_text(crate::widgets::tr(ui, name)).clicked() {
                     act(app, "insert.icons", json!({"name": name}));
                     ui.close();
                 }
