@@ -134,31 +134,38 @@ fn file_options_opens_the_options_page_and_pages_are_reachable_by_command() {
 
 #[test]
 fn translated_options_headings_show_no_context_prefix() {
-    for (code, headings, prefixed, (view, view_prefixed)) in [
-        ("fr", ["Général", "Enregistrer"], ["Options|Général", "Options|Enregistrer"], ("Affichage", "Options de la feuille|Affichage")),
-        ("sr", ["Opšte", "Sačuvaj"], ["Opcije|Opšte", "Opcije|Sačuvaj"], ("Prikaz", "Opcije lista|Prikaz")),
-        ("nl", ["Algemeen", "Opslaan"], ["Opties|Algemeen", "Opties|Opslaan"], ("Weergeven", "Bladopties|Weergeven")),
-        ("ro", ["General", "Salvare"], ["Opțiuni|General", "Opțiuni|Salvare"], ("Vizualizare", "Opțiuni foaie|Vizualizare")),
-    ] {
-        let mut h = harness(Services::default());
-        h.state_mut().run("app.language.set", serde_json::json!({"language": code})).unwrap();
-        h.state_mut().run("file.options", serde_json::json!({})).unwrap();
-        h.run_steps(3);
-        assert_eq!(page(&h), Some("options"));
-        for heading in headings {
-            assert!(h.query_all_by_label(heading).next().is_some(), "{code}: no {heading} heading");
-        }
-        for label in prefixed {
-            assert!(h.query_by_label(label).is_none(), "{code}: {label} shows its context");
-        }
-        // Page Layout › Sheet Options: the Gridlines and Headings "View" checkboxes had the same
-        // prefix. The View tab may share the word, so count at least the two checkboxes.
-        h.state_mut().run("ui.backstage", serde_json::json!({"page": "close"})).unwrap();
-        h.state_mut().ui.ribbon_tab = "Page Layout".into();
-        h.run_steps(3);
-        assert!(h.query_by_label(view_prefixed).is_none(), "{code}: {view_prefixed} shows its context");
-        assert!(h.query_all_by_label(view).count() >= 2, "{code}: the Sheet Options checkboxes don't read {view}");
+    // English and Simplified Chinese ship; the point is that a translated label shows without its
+    // `context|` prefix (the key the catalog uses to tell two identical words apart).
+    let mut h = harness(Services::default());
+    h.state_mut().run("app.language.set", serde_json::json!({"language": "zh"})).unwrap();
+    h.state_mut().run("file.options", serde_json::json!({})).unwrap();
+    h.run_steps(3);
+    assert_eq!(page(&h), Some("options"));
+    for heading in ["常规", "保存"] {
+        assert!(h.query_all_by_label(heading).next().is_some(), "no {heading} heading");
     }
+    for label in ["Options|常规", "Options|保存"] {
+        assert!(h.query_by_label(label).is_none(), "{label} shows its context");
+    }
+    // Page Layout › Sheet Options: the Gridlines and Headings checkboxes read 屏幕, which the View
+    // tab spells 视图. The key is prefixed; the label must not show the prefix.
+    h.state_mut().run("ui.backstage", serde_json::json!({"page": "close"})).unwrap();
+    h.state_mut().ui.ribbon_tab = "Page Layout".into();
+    h.run_steps(3);
+    assert!(h.query_by_label("Sheet Options|屏幕").is_none(), "Sheet Options|屏幕 shows its context");
+    assert!(h.query_all_by_label("屏幕").count() >= 2, "the Sheet Options checkboxes don't read 屏幕");
+}
+
+/// Only English and Simplified Chinese ship: the command refuses anything else, including the
+/// languages that used to be there.
+#[test]
+fn a_removed_language_is_refused() {
+    let mut h = harness(Services::default());
+    for code in ["fr", "ja", "de", "es"] {
+        let err = h.state_mut().run("app.language.set", serde_json::json!({"language": code})).unwrap_err();
+        assert!(err.contains("unknown language"), "{code}: {err}");
+    }
+    assert!(h.state_mut().run("app.language.set", serde_json::json!({"language": "zh"})).is_ok());
 }
 
 #[test]
