@@ -2066,3 +2066,286 @@ fn a_label_font_sets_its_size_weight_and_colour() {
     let prims = render(&c, &d, 640.0, 400.0, &m);
     assert!(prims.iter().all(|p| !matches!(p, Prim::Text { size, .. } if !size.is_finite() || *size > 400.0)), "no absurd text");
 }
+
+// ---------------------------------------------------------------- combo charts: one category axis, two value axes
+
+/// A chart with no title, legend, data labels or gridlines: the numbers these tests pin belong to
+/// the plot, not to its decoration.
+fn bare(kind: ChartKind) -> Chart {
+    let mut c = chart(kind);
+    c.kind = kind;
+    c.title = None;
+    c.legend = LegendPos::None;
+    c.data_labels = false;
+    c.gridlines = false;
+    c.x_title = None;
+    c.y_title = None;
+    c
+}
+
+/// First series colour of the combo tests.
+const P: Rgba = [10, 20, 30, 255];
+/// Second series colour of the combo tests.
+const S: Rgba = [200, 30, 40, 255];
+
+/// Series of values drawn as one kind in one colour, optionally against the secondary value axis.
+fn drawn(name: &str, values: &[f64], colour: Rgba, kind: ChartKind, secondary: bool) -> SeriesData {
+    let mut s = series(name, values, colour, kind);
+    s.number_format = "General".into();
+    s.secondary = secondary;
+    s
+}
+
+fn cats(n: usize) -> Vec<String> {
+    ["A", "B", "C", "D"].iter().take(n).map(|s| s.to_string()).collect()
+}
+
+/// The plot rectangle (left, width), read from the band a click on the category axis selects: it
+/// runs along the bottom of the plot and is as wide as it.
+fn plot_span(d: &Drawing) -> (f32, f32) {
+    d.hits
+        .iter()
+        .filter_map(|r| match (&r.hit, &r.shape) {
+            (Hit::AxisX, HitShape::Rect { x, w, h, .. }) if *h > 4.0 && *w > 4.0 => Some((*x, *w)),
+            _ => None,
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("the category axis is a click target")
+}
+
+/// The (left, width) of every bar filled in a colour, in draw order.
+fn bars(prims: &[Prim], colour: Rgba) -> Vec<(f32, f32)> {
+    prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Rect { x, w, fill: Some(f), .. } if *f == colour && *w > 1.0 => Some((*x, *w)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The points of the polyline drawn in a colour (a line series' path, one point per category).
+fn polyline(prims: &[Prim], colour: Rgba) -> Vec<[f32; 2]> {
+    prims
+        .iter()
+        .find_map(|p| match p {
+            Prim::Line { pts, color, dash: false, .. } if *color == colour && pts.len() > 2 => Some(pts.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The centres of the markers drawn in a colour.
+fn markers(prims: &[Prim], colour: Rgba) -> Vec<f32> {
+    prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Circle { cx, fill: Some(f), .. } if *f == colour => Some(*cx),
+            _ => None,
+        })
+        .collect()
+}
+
+fn near(a: f32, b: f32) -> bool {
+    (a - b).abs() < 0.01
+}
+
+fn assert_near(what: &str, a: f32, b: f32) {
+    assert!(near(a, b), "{what}: {a} != {b}");
+}
+
+/// (a) Two column series, one of them on the secondary axis: one category slot per category, both
+/// groups inside it, the second group beside the first (never on top of it), the pair centred on
+/// the slot. Excel's default gap width (150%) is what makes each bar cw / 3.5 wide for two bars.
+#[test]
+fn combo_bar_groups_share_the_category_slot() {
+    let m = ApproxMeasure;
+    let d = ChartData {
+        categories: cats(3),
+        series: vec![
+            drawn("primary", &[1.0, 2.0, 3.0], P, ChartKind::ColumnClustered, false),
+            drawn("secondary", &[10.0, 20.0, 30.0], S, ChartKind::ColumnClustered, true),
+        ],
+        ..ChartData::default()
+    };
+    let drawing = draw(&bare(ChartKind::Combo), &d, 640.0, 400.0, &m);
+    let (px, pw) = plot_span(&drawing);
+    let cw = pw / 3.0;
+    let bw = cw / 3.5;
+    let (p, s) = (bars(&drawing.prims, P), bars(&drawing.prims, S));
+    assert_eq!(p.len(), 3, "three primary bars: {p:?}");
+    assert_eq!(s.len(), 3, "three secondary bars: {s:?}");
+    for j in 0..3 {
+        let centre = px + (j as f32 + 0.5) * cw;
+        let (left, right) = (px + j as f32 * cw, px + (j as f32 + 1.0) * cw);
+        assert_near("bar width", p[j].1, bw);
+        assert_near("bar width", s[j].1, bw);
+        // Side by side: the primary bar ends exactly where the secondary one starts.
+        assert_near("the groups meet, they do not overlap", p[j].0 + p[j].1, s[j].0);
+        // And the pair is centred on the slot, so neither group is half-offset.
+        assert_near("the pair is centred on the slot", (p[j].0 + s[j].0 + s[j].1) / 2.0, centre);
+        assert!(p[j].0 >= left - 0.01 && s[j].0 + s[j].1 <= right + 0.01, "inside slot {j}: {:?} {:?}", p[j], s[j]);
+    }
+    // The exact geometry of the 640 x 400 chart: moving it moves every two-group column chart.
+    assert_near("plot left", px, 30.85);
+    assert_near("plot width", pw, 583.25);
+    assert!(near(p[0].0, 72.51) && near(p[0].1, 55.55), "primary bar 0: {:?}", p[0]);
+    assert!(near(s[0].0, 128.06) && near(s[0].1, 55.55), "secondary bar 0: {:?}", s[0]);
+    assert!(near(p[2].0, 461.34), "primary bar 2: {:?}", p[2]);
+    assert!(near(s[2].0, 516.89), "secondary bar 2: {:?}", s[2]);
+}
+
+/// (b) A column series and a line series on the secondary axis: the single column group fills the
+/// slot (a bar is cw / 2.5 wide) and the line's points sit on the slot centres, read against the
+/// secondary scale (reversed here, so the heights prove which axis they come from).
+#[test]
+fn combo_line_on_the_secondary_axis_meets_the_bar_centre() {
+    let m = ApproxMeasure;
+    let mut c = bare(ChartKind::Combo);
+    c.y2_axis.reversed = true;
+    let d = ChartData {
+        categories: cats(3),
+        series: vec![
+            drawn("primary", &[1.0, 2.0, 3.0], P, ChartKind::ColumnClustered, false),
+            drawn("secondary", &[10.0, 20.0, 30.0], S, ChartKind::LineMarkers, true),
+        ],
+        ..ChartData::default()
+    };
+    let drawing = draw(&c, &d, 640.0, 400.0, &m);
+    let (px, pw) = plot_span(&drawing);
+    let cw = pw / 3.0;
+    let b = bars(&drawing.prims, P);
+    let pts = polyline(&drawing.prims, S);
+    assert_eq!(b.len(), 3, "three bars: {b:?}");
+    assert_eq!(pts.len(), 3, "three line points: {pts:?}");
+    for j in 0..3 {
+        let centre = px + (j as f32 + 0.5) * cw;
+        assert_near("bar width", b[j].1, cw / 2.5);
+        assert_near("the bar is centred on the slot", b[j].0 + b[j].1 / 2.0, centre);
+        assert_near("the line point is on the slot centre", pts[j][0], centre);
+    }
+    // The exact x of the line's points in the 640 x 400 chart.
+    assert!(near(pts[0][0], 128.06) && near(pts[2][0], 516.89), "{pts:?}");
+    // A reversed secondary axis draws 30 below 10: the line is plotted against y2, not the primary.
+    assert!(pts[0][1] < pts[2][1], "the line reads the secondary axis: {pts:?}");
+    // Markers land on the same centres.
+    let mut mk = markers(&drawing.prims, S);
+    let mut want: Vec<f32> = (0..3).map(|j| px + (j as f32 + 0.5) * cw).collect();
+    mk.sort_by(f32::total_cmp);
+    want.sort_by(f32::total_cmp);
+    assert_eq!(mk.len(), 3, "a marker per point: {mk:?}");
+    for (a, b) in mk.iter().zip(&want) {
+        assert_near("marker centre", *a, *b);
+    }
+}
+
+/// (c) A scatter series on the secondary axis under a category primary. Excel refuses to pair the
+/// two, so the series is drawn as a category line on the secondary scale: its points keep the
+/// primary's slot centres and its numeric X values are not used.
+#[test]
+fn combo_scatter_on_the_secondary_axis_keeps_the_category_slots() {
+    let m = ApproxMeasure;
+    let c = bare(ChartKind::Combo);
+    let with_x = |xs: [f64; 3]| {
+        let dots = SeriesData { x: Some(xs.iter().map(|x| Some(*x)).collect()), ..drawn("dots", &[10.0, 20.0, 30.0], S, ChartKind::Scatter, true) };
+        ChartData {
+            categories: cats(3),
+            series: vec![drawn("primary", &[1.0, 2.0, 3.0], P, ChartKind::ColumnClustered, false), dots],
+            ..ChartData::default()
+        }
+    };
+    let drawing = draw(&c, &with_x([10.0, 20.0, 30.0]), 640.0, 400.0, &m);
+    let (px, pw) = plot_span(&drawing);
+    let cw = pw / 3.0;
+    let pts = polyline(&drawing.prims, S);
+    assert_eq!(pts.len(), 3, "one point per category: {pts:?}");
+    for (j, p) in pts.iter().enumerate() {
+        assert_near("the scatter point is on the category slot centre", p[0], px + (j as f32 + 0.5) * cw);
+    }
+    // The X values do not move it: the same picture comes from any of them.
+    let other = draw(&c, &with_x([1.0, 2.0, 3.0]), 640.0, 400.0, &m);
+    assert_eq!(polyline(&other.prims, S), pts, "a category plot ignores the scatter's X values");
+}
+
+/// A reversed and cropped category axis moves both axes' groups together: the secondary bar keeps
+/// the slot the primary one is in, wherever that slot is.
+#[test]
+fn combo_bar_groups_keep_their_slot_on_a_reversed_cropped_axis() {
+    let m = ApproxMeasure;
+    let mut c = bare(ChartKind::Combo);
+    c.x_axis.reversed = true;
+    c.x_axis.min = Some(2.0);
+    c.x_axis.max = Some(4.0);
+    let d = ChartData {
+        categories: cats(4),
+        series: vec![
+            drawn("primary", &[1.0, 2.0, 3.0, 4.0], P, ChartKind::ColumnClustered, false),
+            drawn("secondary", &[10.0, 20.0, 30.0, 40.0], S, ChartKind::ColumnClustered, true),
+        ],
+        ..ChartData::default()
+    };
+    let drawing = draw(&c, &d, 640.0, 400.0, &m);
+    let (px, pw) = plot_span(&drawing);
+    let cw = pw / 3.0;
+    let (p, s) = (bars(&drawing.prims, P), bars(&drawing.prims, S));
+    assert_eq!(p.len(), 3, "categories 2..4 only: {p:?}");
+    assert_eq!(s.len(), 3);
+    for i in 0..3 {
+        // Categories 2..4 with the axis reversed: category 2 is the right-hand slot.
+        let centre = px + (2.0 - i as f32 + 0.5) * cw;
+        assert_near("the pair is centred on the slot", (p[i].0 + s[i].0 + s[i].1) / 2.0, centre);
+        assert_near("side by side", p[i].0 + p[i].1, s[i].0);
+    }
+}
+
+/// The single-axis charts the combo layout sits on: one column group of one, two and three series,
+/// and a line's points. These are the numbers a regression would move.
+#[test]
+fn single_axis_geometry_is_unchanged() {
+    let m = ApproxMeasure;
+    let data = |n: usize| ChartData {
+        categories: cats(4),
+        series: (0..n).map(|i| drawn(&format!("s{i}"), &[1.0, 2.0, 3.0, 4.0], P, ChartKind::ColumnClustered, false)).collect(),
+        ..ChartData::default()
+    };
+    // One series: a bar is cw / 2.5 wide (gap width 150%) and centred on the slot.
+    let one = draw(&bare(ChartKind::ColumnClustered), &data(1), 640.0, 400.0, &m);
+    let (px, pw) = plot_span(&one);
+    let cw = pw / 4.0;
+    assert_near("plot left", px, 20.95);
+    assert_near("plot width", pw, 605.05);
+    let b = bars(&one.prims, P);
+    assert_eq!(b.len(), 4);
+    for (j, bar) in b.iter().enumerate() {
+        assert_near("bar width", bar.1, cw / 2.5);
+        assert_near("centred", bar.0 + bar.1 / 2.0, px + (j as f32 + 0.5) * cw);
+    }
+    assert!(near(b[0].0, 66.33) && near(b[0].1, 60.50), "first bar: {:?}", b[0]);
+    // More series narrow the bars in the same slot: 3.5 and 4.5 bar widths per slot.
+    for (n, per) in [(2usize, 3.5f32), (3, 4.5)] {
+        let d = draw(&bare(ChartKind::ColumnClustered), &data(n), 640.0, 400.0, &m);
+        let (px, pw) = plot_span(&d);
+        let (cw, bw) = (pw / 4.0, pw / 4.0 / per);
+        let b = bars(&d.prims, P);
+        assert_eq!(b.len(), 4 * n, "{n} series: {b:?}");
+        for j in 0..4 {
+            let centre = px + (j as f32 + 0.5) * cw;
+            for k in 0..n {
+                // Bars are drawn series by series, a whole series before the next one.
+                let bar = b[k * 4 + j];
+                assert_near("bar width", bar.1, bw);
+                assert_near("bars do not overlap", bar.0, centre - n as f32 * bw / 2.0 + k as f32 * bw);
+            }
+        }
+    }
+    // A line: the points are the slot centres.
+    let line = ChartData { series: vec![drawn("line", &[1.0, 2.0, 3.0, 4.0], P, ChartKind::LineMarkers, false)], ..data(1) };
+    let d = draw(&bare(ChartKind::LineMarkers), &line, 640.0, 400.0, &m);
+    let (px, pw) = plot_span(&d);
+    let cw = pw / 4.0;
+    let pts = polyline(&d.prims, P);
+    assert_eq!(pts.len(), 4);
+    for (j, p) in pts.iter().enumerate() {
+        assert_near("line point on the slot centre", p[0], px + (j as f32 + 0.5) * cw);
+    }
+}
