@@ -373,9 +373,20 @@ fn bound() -> &'static std::sync::RwLock<HashSet<String>> {
     BOUND.get_or_init(|| std::sync::RwLock::new(HashSet::new()))
 }
 
+/// Counts changes to the registry: [`crate::theme::cell_family`] memoises its answers per thread
+/// and drops them when this moves, so a font set rebuilt (or a face bound late, after the
+/// background scan) is picked up on the next lookup.
+static BOUND_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current generation of the bound-family registry (see [`set_bound`]).
+pub fn bound_generation() -> u64 {
+    BOUND_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record the role families a freshly built [`egui::FontDefinitions`] bound.
 pub fn set_bound(keys: impl IntoIterator<Item = String>) {
     *bound().write().unwrap_or_else(|e| e.into_inner()) = keys.into_iter().collect();
+    BOUND_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Is this exact role family bound to font data?

@@ -642,9 +642,11 @@ impl Geo {
     }
 }
 
-/// Resolved look of a cell for painting.
-struct Look {
-    style: Style,
+/// Resolved look of a cell for painting. The style is borrowed from the workbook's (interned)
+/// style table unless something — a table style or a conditional format — overrides it: cloning a
+/// `Style` copies its font name `String`, once per visible cell, every frame.
+struct Look<'a> {
+    style: std::borrow::Cow<'a, Style>,
     fill: Option<Color32>,
     text_color: Color32,
 }
@@ -666,15 +668,17 @@ fn center_across_end(start: u32, limit: u32, continues: impl Fn(u32) -> bool) ->
     end
 }
 
-fn look(wb: &Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut CfCache) -> (Look, Option<CfLook>) {
-    let mut style = wb.styles.get(sh.style_id(c)).clone();
+fn look<'a>(wb: &'a Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut CfCache) -> (Look<'a>, Option<CfLook>) {
+    let mut style = std::borrow::Cow::Borrowed(wb.styles.get(sh.style_id(c)));
     if let Some(t) = sh.table_at(c) {
-        style = gridcraft_engine::tables::table_cell_style(wb, si, t, c);
+        style = std::borrow::Cow::Owned(gridcraft_engine::tables::table_cell_style(wb, si, t, c));
     }
     let cfl = cf.look(wb, si, c);
     if let Some(l) = &cfl
         && let Some(st) = &l.style
     {
+        // Copied only now, when a conditional format actually changes something.
+        let style = style.to_mut();
         if st.fill.pattern != PatternType::None {
             style.fill = st.fill;
         }
@@ -765,6 +769,44 @@ fn display_text(
     }
     let f = gridcraft_engine::display::format(v, code, wb);
     (f.text, f.color.map(numfmt_color), f.numeric, f.fill)
+}
+
+/// Widths of a plain digit, memoised for one painted quadrant: laying `"0"` out is a font-set
+/// lock, a shape run and a galley per call, and the grid asks for it once per visible cell, every
+/// frame. A viewport holds a handful of fonts (one per size and style), so a linear scan beats
+/// hashing.
+#[derive(Default)]
+struct ZeroWidths {
+    measured: Vec<(FontId, f32)>,
+}
+
+impl ZeroWidths {
+    /// Fonts remembered at most. A quadrant with more sizes and styles than this stops
+    /// remembering rather than growing without bound.
+    const MAX: usize = 32;
+
+    /// Width of `"0"` in `font`, at least one point so callers can divide by it.
+    fn of(&mut self, p: &Painter, font: &FontId) -> f32 {
+        if let Some((_, w)) = self.measured.iter().find(|(f, _)| f == font) {
+            return *w;
+        }
+        let w = p.layout_no_wrap("0".to_string(), font.clone(), Color32::PLACEHOLDER).size().x.max(1.0);
+        if self.measured.len() < Self::MAX {
+            self.measured.push((font.clone(), w));
+        }
+        w
+    }
+}
+
+/// The one line Excel draws when Wrap Text is off: every explicit line break removed, everything
+/// else kept (#1604). Nearly every cell has no break at all, and this runs for every visible cell
+/// on every frame, so that case borrows the text instead of copying it through a filter.
+fn first_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains(['\n', '\r']) {
+        std::borrow::Cow::Owned(text.chars().filter(|&ch| ch != '\n' && ch != '\r').collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
@@ -1327,7 +1369,7 @@ pub(crate) fn paint_quadrant(
     }
     let empty_ok = |c: CellRef| -> bool { sh.value_ref(c).is_none_or(|v| v.is_empty()) && in_merge(c).is_none() };
     // Backgrounds.
-    let mut looks: Vec<(CellRef, Rect, Look, Option<CfLook>)> = Vec::with_capacity(cells.len().min(20_000));
+    let mut looks: Vec<(CellRef, Rect, Look<'_>, Option<CfLook>)> = Vec::with_capacity(cells.len().min(20_000));
     for &c in &cells {
         let (rect, anchor) = match in_merge(c) {
             Some(m) if m.start != c && !(c.row == r0.max(m.start.row) && c.col == c0.max(m.start.col)) => continue,
@@ -1344,7 +1386,7 @@ pub(crate) fn paint_quadrant(
     }
     // Text cells just outside the quadrant whose text may overflow into it: the nearest non-empty
     // cell left of `c0` and right of `c1` in each row (within the same frozen / scrolled pane).
-    let mut outside: Vec<(CellRef, Rect, Look, Option<CfLook>)> = Vec::new();
+    let mut outside: Vec<(CellRef, Rect, Look<'_>, Option<CfLook>)> = Vec::new();
     let same_pane = |col: u32| (col < geo.fc) == (c0 < geo.fc);
     for r in r0..=r1 {
         if sh.row_height(r) == 0.0 {
@@ -1360,13 +1402,30 @@ pub(crate) fn paint_quadrant(
         }
     }
     // Text and per-cell decorations.
+    let mut zero_widths = ZeroWidths::default();
+    // The store rebuilds a whole `Cell` per lookup (and has no borrowed accessor: cells live in
+    // packed, paged bands), so the cell is asked for once here and the answers the pass below
+    // needs again are kept: the value, whether it is a formula, and the background error check's
+    // answer (a number stored as text draws a green corner).
+    let mut corners: Vec<bool> = Vec::with_capacity(looks.len().saturating_add(outside.len()));
     for (c, rect, lk, cfl) in looks.iter().chain(&outside) {
         let c = *c;
+        let cell = sh.cell(c);
+        // Only the quadrant's own cells (the first leg of the chain) draw corners; the overflow
+        // neighbours keep the lookup they already needed and skip the parse.
+        let in_quadrant = corners.len() < looks.len();
+        corners.push(in_quadrant && !sh.show_formulas && cell.as_ref().and_then(gridcraft_engine::cmd::formulas::number_stored_as_text).is_some());
         if let Some(picture) = sh.cell_pictures.get(&c) {
             crate::cell_pictures::paint(p, *rect, picture);
             continue;
         }
-        let v = sh.value(c);
+        let is_formula = cell.as_ref().is_some_and(|cell| cell.formula.is_some());
+        // The same answer `Sheet::value` gives, without a second store lookup: a cell that holds
+        // nothing of its own shows the dynamic array value spilled onto it, if any.
+        let v = match &cell {
+            Some(cell) if !cell.value.is_empty() || cell.formula.is_some() => cell.value.clone(),
+            _ => sh.spill.get(&c).cloned().unwrap_or(Value::Empty),
+        };
         if let Some(l) = cfl
             && let Some((frac, rgb, gradient)) = l.bar
         {
@@ -1427,10 +1486,10 @@ pub(crate) fn paint_quadrant(
         let fam = theme::cell_family(&st.font.name, st.font.bold, st.font.italic);
         let font = FontId::new(size, fam);
         // Digits fit by the cell's own font and size, not the default 11pt (9pt marks in narrow columns).
-        let char_w = p.layout_no_wrap("0".to_string(), font.clone(), Color32::PLACEHOLDER).size().x.max(1.0);
+        let char_w = zero_widths.of(p, &font);
         let avail_w = rect.right() - text_left;
         let (mut text, ncolor, numeric, fill_char) = display_text(wb, sh, c, &v, st, avail_w / z.max(0.1) * z, char_w);
-        if sh.show_formulas && sh.cell(c).is_some_and(|cell| cell.formula.is_some()) {
+        if sh.show_formulas && is_formula {
             text = crate::formula_locale::display(&text, crate::i18n::current(p.ctx()).formula_locale(), wb, si);
         }
         if text.is_empty() {
@@ -1501,7 +1560,7 @@ pub(crate) fn paint_quadrant(
             continue;
         }
         // Wrap Text off: Excel ignores the line breaks and draws the whole string on one line.
-        let first_line: String = text.chars().filter(|&ch| ch != '\n' && ch != '\r').collect();
+        let first_line = first_line(&text);
         // The fill position indexes `text`; move it back by the breaks removed before it.
         let fill_char = fill_char.map(|(ch, pos)| (ch, pos.saturating_sub(text.get(..pos).map_or(0, |s| s.matches(['\n', '\r']).count()))));
         // One line of shaped text: bidi runs in visual order, Arabic joined, Indic reordered. The
@@ -1546,7 +1605,7 @@ pub(crate) fn paint_quadrant(
             let base_w = w;
             let cw = p.layout_no_wrap(ch.to_string(), font.clone(), color).size().x.max(1.0);
             let n = (((avail_w - 2.0 * pad) - base_w) / cw).floor().max(0.0) as usize;
-            let mut s = first_line.clone();
+            let mut s = first_line.to_string();
             if first_line.is_char_boundary(pos) {
                 s.insert_str(pos, &ch.to_string().repeat(n));
             }
@@ -1640,7 +1699,7 @@ pub(crate) fn paint_quadrant(
         }
     }
     // Borders (over fills and text).
-    for (c, rect, lk, _) in &looks {
+    for (i, (c, rect, lk, _)) in looks.iter().enumerate() {
         let b = &lk.style.borders;
         let merge = merges.iter().find(|m| m.start == *c);
         let edges = match merge {
@@ -1678,8 +1737,10 @@ pub(crate) fn paint_quadrant(
                 Stroke::NONE,
             ));
         }
-        // Background error checking: a number stored as text gets Excel's green corner (#1994).
-        if !sh.show_formulas && sh.cell(*c).as_ref().and_then(gridcraft_engine::cmd::formulas::number_stored_as_text).is_some() {
+        // Background error checking: a number stored as text gets Excel's green corner (#1994),
+        // answered by the text pass above (`corners`, in `looks` order) so no cell is looked up
+        // twice a frame.
+        if corners.get(i).copied().unwrap_or(false) {
             let s = 6.0 * z.max(0.7);
             p.add(egui::Shape::convex_polygon(
                 vec![rect.left_top(), pos2(rect.left() + s, rect.top()), pos2(rect.left(), rect.top() + s)],
@@ -4594,6 +4655,62 @@ mod tests {
         assert!((at(400.0) / at(100.0) - 4.0).abs() < 1e-4, "four times as large at 400%");
         assert!(at(200.0) > at(100.0) && at(400.0) > at(200.0));
         assert_eq!(at(10.0), 8.5, "never below a readable size");
+    }
+
+    /// Wrap Text off draws one line: the fast path (which copies nothing when there is no break to
+    /// drop) must equal the filtered copy it replaced, character for character, over the shapes
+    /// cell text comes in — breaks, CRLF, tabs, CJK, combining marks, an empty string, breaks only.
+    #[test]
+    fn one_line_text_fast_path_equals_the_filtered_copy() {
+        for text in [
+            "",
+            "plain text",
+            "Active\n\nUnits: LF 2x10\r\nBand: 60-20000 Hz",
+            "a\rb\nc\r\n",
+            "\n",
+            "\r\n\r\n",
+            "tab\tseparated\ttext",
+            "漢字、かな、한글 中文",
+            "e\u{301}\u{308} combining, ü, и\u{308}",
+            "😀 emoji\nwith a break",
+            "trailing\n",
+        ] {
+            let filtered: String = text.chars().filter(|&ch| ch != '\n' && ch != '\r').collect();
+            let fast = first_line(text);
+            assert_eq!(fast.as_ref(), filtered.as_str(), "{text:?}");
+            // Borrowed exactly when there is no break: that is where the saving is.
+            assert_eq!(matches!(fast, std::borrow::Cow::Borrowed(_)), !text.contains(['\n', '\r']), "{text:?}");
+        }
+    }
+
+    /// The digit width is laid out once per font and answered from the memo after that, with the
+    /// same value a fresh measure gives (a new frame starts with an empty memo).
+    #[test]
+    fn digit_width_is_measured_once_per_font() {
+        let ctx = crate::text::test_context("test-ubuntu", epaint_default_fonts::UBUNTU_LIGHT, 0);
+        let mut widths = super::ZeroWidths::default();
+        let font = FontId::new(13.0, egui::FontFamily::Name("test-ubuntu".into()));
+        let mut checked = false;
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            let p = ui.painter();
+            let first = widths.of(p, &font);
+            // A second ask for the same font is answered from the memo: one entry, same value.
+            assert_eq!(widths.of(p, &font), first);
+            assert_eq!(widths.measured.len(), 1);
+            // A fresh memo (what the next frame starts with) measures the same width.
+            let mut fresh = super::ZeroWidths::default();
+            assert_eq!(fresh.of(p, &font), first);
+            // The size is part of the key: another size is measured, not reused.
+            let big = FontId::new(26.0, egui::FontFamily::Name("test-ubuntu".into()));
+            let wide = fresh.of(p, &big);
+            assert!(wide > first, "{wide} > {first}");
+            assert_eq!(widths.of(p, &big), wide);
+            assert_eq!(widths.measured.len(), 2);
+            checked = true;
+        });
+        // The fonts were first used while laying out: the atlas update has to be claimed.
+        out.textures_delta.clear();
+        assert!(checked, "the frame ran");
     }
     use super::*;
 

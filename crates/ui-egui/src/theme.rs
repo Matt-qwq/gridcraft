@@ -238,13 +238,73 @@ pub fn ui_bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(UI_BOLD.into()))
 }
 
+/// How many [`cell_family`] answers a thread keeps. A workbook draws nearly every cell in one
+/// family, and the table is direct-mapped, so a sheet with more families than this only loses
+/// hits, never correctness.
+const FAMILY_SLOTS: usize = 8;
+
+/// One memoised [`cell_family`] answer, tagged with the font-set generation it was computed under.
+struct FamilySlot {
+    generation: u64,
+    name: String,
+    bold: bool,
+    italic: bool,
+    family: FontFamily,
+}
+
+thread_local! {
+    /// [`cell_family`]'s memo. Building the role key, taking the bound-family lock and hashing a
+    /// `HashSet<String>` per visible cell is measurable on a full viewport, and the answer only
+    /// changes when the font set is rebuilt (see [`crate::fonts::bound_generation`]).
+    static FAMILY_MEMO: std::cell::RefCell<[Option<FamilySlot>; FAMILY_SLOTS]> =
+        std::cell::RefCell::new(std::array::from_fn(|_| None));
+}
+
+/// The slot a lookup uses: the font name hashed with FNV-1a (a few bytes, no dependency) mixed
+/// with the weight and slant, so families differing only in style rarely share one.
+fn family_slot(name: &str, bold: bool, italic: bool) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^= (u64::from(bold) << 1) | (u64::from(italic) << 2);
+    (h % FAMILY_SLOTS as u64) as usize
+}
+
 /// The font family to use for a cell font name and weight.
 ///
 /// When the name is an installed font whose faces were bound by [`font_definitions`], that family
 /// is used; otherwise the name is bucketed to one of the built-in roles (mono/serif/cell). egui
 /// panics on a family that was never bound, so the installed branch is gated on
 /// [`crate::fonts::is_bound`] and never names a family egui hasn't been given.
+///
+/// The answer is memoised per thread (see [`FAMILY_MEMO`]): the grid asks once per visible cell,
+/// every frame, and this is on that path.
 pub fn cell_family(name: &str, bold: bool, italic: bool) -> FontFamily {
+    let generation = crate::fonts::bound_generation();
+    let slot = family_slot(name, bold, italic);
+    let remembered = FAMILY_MEMO.with(|memo| {
+        let memo = memo.borrow();
+        match memo.get(slot).and_then(Option::as_ref) {
+            Some(e) if e.generation == generation && e.bold == bold && e.italic == italic && e.name == name => Some(e.family.clone()),
+            _ => None,
+        }
+    });
+    if let Some(family) = remembered {
+        return family;
+    }
+    let family = resolve_cell_family(name, bold, italic);
+    FAMILY_MEMO.with(|memo| {
+        if let Some(slot) = memo.borrow_mut().get_mut(slot) {
+            *slot = Some(FamilySlot { generation, name: name.to_owned(), bold, italic, family: family.clone() });
+        }
+    });
+    family
+}
+
+/// [`cell_family`] without the memo: the role family built from the name and style.
+fn resolve_cell_family(name: &str, bold: bool, italic: bool) -> FontFamily {
     let role = crate::fonts::role_key(name, bold, italic);
     if crate::fonts::is_bound(&role) {
         return FontFamily::Name(role.into());
@@ -1358,6 +1418,32 @@ mod tests {
         assert!(first_liberation.is_some() && first_liberation > last_dejavu, "Liberation Mono must follow DejaVu Sans Mono: {mono:?}");
         let noto = mono.iter().position(|p| p == "/usr/share/fonts/google-noto-vf/NotoSansMono[wght].ttf");
         assert!(noto.is_some() && noto.unwrap_or(0) + 1 == mono.len(), "Fedora's default Noto Sans Mono must be the last resort: {mono:?}");
+    }
+
+    /// [`cell_family`] is asked once per visible cell every frame, so it memoises per thread. The
+    /// memo must answer the live slot as it stands, ignore a slot from an older font set, and keep
+    /// keys that differ only in weight or slant apart. (White-box on purpose: planting the slot is
+    /// the only way to tell a hit from a recompute without timing.)
+    #[test]
+    fn cell_family_memo_answers_from_the_slot_and_follows_the_font_set() {
+        const NAME: &str = "GridCraft Memo Test Face";
+        let slot = family_slot(NAME, true, false);
+        let generation = crate::fonts::bound_generation();
+        // Nothing binds that name, so the answer is the built-in bold role family.
+        assert_eq!(cell_family(NAME, true, false), FontFamily::Name(CELL_BOLD.into()));
+        assert_eq!(cell_family(NAME, true, false), resolve_cell_family(NAME, true, false), "the memo agrees with the real answer");
+        let planted =
+            |generation: u64| FamilySlot { generation, name: NAME.to_owned(), bold: true, italic: false, family: FontFamily::Name(SERIF.into()) };
+        // A live slot is used as it stands: that is what makes this a memo and not a recompute.
+        FAMILY_MEMO.with(|memo| memo.borrow_mut()[slot] = Some(planted(generation)));
+        assert_eq!(cell_family(NAME, true, false), FontFamily::Name(SERIF.into()));
+        // A slot from a font set ago is not: it is recomputed (and the slot rewritten).
+        FAMILY_MEMO.with(|memo| memo.borrow_mut()[slot] = Some(planted(generation.wrapping_sub(1))));
+        assert_eq!(cell_family(NAME, true, false), FontFamily::Name(CELL_BOLD.into()));
+        // The weight and slant are part of the key, so these never read the bold slot above.
+        assert_eq!(cell_family(NAME, false, false), FontFamily::Name(CELL.into()));
+        assert_eq!(cell_family(NAME, false, true), FontFamily::Name(CELL_ITALIC.into()));
+        assert_eq!(cell_family(NAME, true, true), FontFamily::Name(CELL_BOLD_ITALIC.into()));
     }
 
     #[test]
