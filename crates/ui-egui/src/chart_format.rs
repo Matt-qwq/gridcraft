@@ -1751,6 +1751,59 @@ mod tests {
         assert!(after.reversed, "the other options stay");
     }
 
+    /// Every reason the pane prints in place of a control reads Chinese: a reason is a sentence,
+    /// and a sentence with no catalog entry is English on a Chinese screen. The sweep drives the
+    /// functions the pane asks (not a hand-kept list of the strings they return, which would drift).
+    #[test]
+    fn every_reason_the_pane_prints_reads_chinese() {
+        let mut reasons: Vec<&'static str> = Vec::new();
+        let kinds = ["column", "bar", "line", "area", "pie", "doughnut", "scatter", "bubble", "radar", "treemap", "sunburst", "waterfall", "funnel"];
+        for kind in kinds {
+            let s = chart(kind);
+            let c = only_chart(&s);
+            for value_axis in [true, false] {
+                reasons.extend(axis_group_reason(&c, value_axis));
+                reasons.extend(gridlines_reason(&c, value_axis));
+                for option in [
+                    AxisOption::Bounds,
+                    AxisOption::MajorUnit,
+                    AxisOption::LogBase,
+                    AxisOption::Reversed,
+                    AxisOption::Crossing,
+                    AxisOption::DisplayUnits,
+                    AxisOption::NumberFormat,
+                ] {
+                    reasons.extend(axis_reason(&c, value_axis, option));
+                }
+            }
+            reasons.extend(gridline_minor_reason(&c));
+            reasons.extend(error_bar_reason(&c));
+            reasons.extend(point_reason(&c, 0));
+            reasons.extend(marker_reason(&c, 0));
+            for option in [
+                LabelOption::Percentage,
+                LabelOption::LegendKey,
+                LabelOption::Position,
+                LabelOption::Separator,
+                LabelOption::NumberFormat,
+                LabelOption::Font,
+            ] {
+                reasons.extend(label_reason(&c, option));
+            }
+            if !c.kind.legend_entries_are_series() {
+                reasons.push(LEGEND_ENTRIES_ARE_POINTS);
+            }
+        }
+        // A selection that names no series has its own words too.
+        reasons.extend(point_reason(&only_chart(&chart("column")), 99));
+        assert!(reasons.len() > 12, "the sweep found only {} reasons", reasons.len());
+        for reason in reasons {
+            let chinese = crate::i18n::Language::Zh.tr(reason);
+            assert_ne!(chinese, reason, "{reason:?} has no Chinese entry");
+            assert!(chinese.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)), "{reason:?} => {chinese:?} holds no Chinese");
+        }
+    }
+
     #[test]
     fn the_selection_parses_and_labels() {
         assert_eq!(Selection::parse("chart"), Selection::Chart);

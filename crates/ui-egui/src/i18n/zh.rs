@@ -1771,6 +1771,21 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Print Headings" => "打印标题",
         "Print Preview" => "打印预览",
         "Queries & Connections" => "查询和连接",
+        "A chartex part stores the value axis's major gridlines only: its minor set has no element to be stored in." => {
+            "chartex 部件只保存数值轴的主要网格线：没有可供次要网格线存放的元素。"
+        }
+        "A chartex data label has no percentage: it shows the value, the series name, the category name and its font." => {
+            "chartex 数据标签没有百分比：它显示值、系列名称、分类名称及其字体。"
+        }
+        "A radar chart's category axis is its ring of spokes: it has no category gridlines." => {
+            "雷达图的分类轴就是它的一圈辐射线，因此没有分类网格线。"
+        }
+        "No chartex chart type draws markers: a chartex point takes a fill and an outline only." => {
+            "chartex 图表类型都不绘制标记：chartex 数据点只接受填充和轮廓。"
+        }
+        "This chart's legend entries are its points, not its series, so none of them can be deleted from here." => {
+            "此图表的图例项是它的数据点而不是系列，因此无法在此删除其中任何一项。"
+        }
         // zh-grid - entries the grid, the ribbon, the tooltips and the paper view need (wave 4).
         "Quick Layout" => "快速布局",
         "Read Range" => "读取区域",
