@@ -1822,6 +1822,19 @@ impl PivotValueFilter {
     }
 }
 
+/// What a PivotTable's records come from, and whether GridCraft can compute the report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PivotSourceKind {
+    /// A cell range (`Sheet1!$A$1:$E$200`), a table or a defined name: GridCraft reads the records
+    /// and recomputes the report.
+    #[default]
+    Range,
+    /// A data model (Power Pivot) or an OLAP cube: GridCraft carries the report and the values the
+    /// file cached, and never queries the source, so it never recomputes the report. The seam an
+    /// OLAP engine plugs into: what it has to fill in is the records.
+    DataModel,
+}
+
 /// A PivotTable: its definition plus where its output was last written. The output itself is
 /// static cell values and styles on the sheet, rewritten on every refresh.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1829,8 +1842,15 @@ impl PivotValueFilter {
 pub struct PivotTable {
     pub id: u32,
     pub name: String,
-    /// Source: range formula text (`Sheet1!$A$1:$E$200`), a table name or a defined name.
+    /// Source: range formula text (`Sheet1!$A$1:$E$200`), a table name or a defined name. Empty
+    /// for a report GridCraft does not compute (see `source_kind`).
     pub source: String,
+    /// What the report is built on: a range GridCraft computes, or a data model / OLAP source it
+    /// only carries.
+    pub source_kind: PivotSourceKind,
+    /// Why a report GridCraft does not compute is read-only, in words for the user. `None` for a
+    /// range source.
+    pub read_only_reason: Option<String>,
     /// Top-left of the output body on the pivot's sheet.
     pub anchor: CellRef,
     pub rows: Vec<PivotField>,
@@ -1896,12 +1916,27 @@ pub struct PivotCalcItem {
     pub formula: String,
 }
 
+impl PivotTable {
+    /// Whether GridCraft computes this report from its source. A report it does not compute keeps
+    /// the values the file cached; refreshing it or moving its fields is refused.
+    pub fn is_read_only(&self) -> bool {
+        self.source_kind != PivotSourceKind::Range
+    }
+
+    /// Why the report is read-only, as shown to the user. Empty for a report GridCraft computes.
+    pub fn read_only_text(&self) -> &str {
+        self.read_only_reason.as_deref().unwrap_or("").trim()
+    }
+}
+
 impl Default for PivotTable {
     fn default() -> Self {
         PivotTable {
             id: 0,
             name: "PivotTable1".into(),
             source: String::new(),
+            source_kind: PivotSourceKind::Range,
+            read_only_reason: None,
             anchor: CellRef::default(),
             rows: vec![],
             columns: vec![],

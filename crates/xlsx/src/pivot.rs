@@ -10,7 +10,13 @@
 //!
 //! Reading: the cache's source and field names plus the table's areas, functions, show-values-as,
 //! layout flags, grand totals and style become a model [`PivotTable`]. Anything we don't model
-//! (OLAP sources, calculated fields, numeric grouping…) becomes a warning.
+//! (calculated fields without a readable formula, numeric grouping…) becomes a warning.
+//!
+//! A cache that is not a worksheet range — a data model (Power Pivot), an OLAP cube, a connection
+//! — is a report GridCraft does not compute: it is read as a [`PivotTable`] with
+//! [`PivotSourceKind::DataModel`] and a reason, its cached values stay the cells they are, and
+//! its parts are carried by the pass-through byte for byte. An OLAP engine plugs in here: it fills
+//! in the records instead of the range reader, and the report stops being read-only.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -21,7 +27,7 @@ use gridcraft_formula::quote_sheet;
 use gridcraft_model::pivot_item;
 use gridcraft_model::{
     PivotCalcField, PivotCalcItem, PivotDateGroup, PivotField, PivotFilter, PivotFilterArea, PivotFunc, PivotLayout, PivotNumberGroup, PivotShowAs,
-    PivotSort, PivotTable, PivotValue, Workbook,
+    PivotSort, PivotSourceKind, PivotTable, PivotValue, Workbook,
 };
 
 use crate::IoError;
@@ -292,6 +298,11 @@ pub struct PivotWriter {
     caches: Vec<(u32, String)>,
     pending: Vec<Pending>,
     tables: u32,
+    /// The cache ids the file's own reports keep (see [`Self::add_read_only`]): their parts are
+    /// written as they came, so a report GridCraft computes must not take the same id.
+    taken_cache_ids: HashSet<u32>,
+    /// Whether the ids those reports keep have been collected from the whole workbook yet.
+    reserved: bool,
 }
 
 struct Pending {
@@ -309,12 +320,23 @@ impl PivotWriter {
     /// PivotTable parts. Pivots whose source can't be resolved are not written.
     pub fn add_sheet(&mut self, wb: &Workbook, si: usize, out: &mut Out, rels: &mut Rels, slicers: &crate::slicer::SlicerWriter) {
         let Some(sheet) = wb.sheet(si) else { return };
+        if !self.reserved {
+            self.reserved = true;
+            self.reserve_read_only(wb);
+        }
         for (idx, pt) in sheet.pivots.iter().enumerate() {
+            // A report GridCraft does not compute is carried, not built: its parts come back as the
+            // file had them (the cache id it names included), and the cells under it are its
+            // cached values, which nothing here touches.
+            if pt.is_read_only() {
+                self.add_read_only(sheet, pt, out, rels);
+                continue;
+            }
             // Fields a modelled slicer shows are itemized in the cache so its `<i x>` can point at
             // them; the slicer's field is checked before the sheet loop (`SlicerWriter::new`).
             let fields = slicers.fields_for_pivot(&pt.name);
             let Some(cache) = build_cache(wb, pt, si, &fields) else { continue };
-            let n = self.caches.len() as u32 + 1;
+            let n = self.next_cache_id();
             let cache_part = format!("xl/pivotCache/pivotCacheDefinition{n}.xml");
             let mut cr = Rels::default();
             let rec_rid = if let Some((count, xml)) = &cache.records {
@@ -345,6 +367,73 @@ impl PivotWriter {
                 cache,
             });
         }
+    }
+
+    /// The cache id to write a report GridCraft computes' cache under: the lowest one no other
+    /// report of the package took (a carried report keeps the id the file gave it).
+    fn next_cache_id(&mut self) -> u32 {
+        let taken = |id: u32, caches: &[(u32, String)]| caches.iter().any(|(c, _)| *c == id);
+        let mut n = 1u32;
+        while self.taken_cache_ids.contains(&n) || taken(n, &self.caches) {
+            if n == u32::MAX {
+                break;
+            }
+            n = n.saturating_add(1);
+        }
+        self.taken_cache_ids.insert(n);
+        n
+    }
+
+    /// Records the cache ids the workbook's carried reports keep, before anything is written: the
+    /// reports come in sheet order, and one of them can be on a later sheet than a report GridCraft
+    /// computes.
+    fn reserve_read_only(&mut self, wb: &Workbook) {
+        for sheet in &wb.sheets {
+            for pt in sheet.pivots.iter().filter(|p| p.is_read_only()) {
+                if let Some((table, _)) = kept_read_only(sheet, &pt.name) {
+                    self.taken_cache_ids.insert(cache_id_of(&table));
+                }
+            }
+        }
+    }
+
+    /// Writes a PivotTable GridCraft does not compute: its own part, its cache definition, its
+    /// records and the data model behind them, exactly as the file had them. Only the part names
+    /// are ours (the report keeps its `pivotTableN.xml` numbering and its cache the id it names),
+    /// and its `cacheId` therefore still points at its own cache. Nothing is recomputed and
+    /// nothing is repaired: the report is a document, not a query.
+    fn add_read_only(&mut self, sheet: &gridcraft_model::Sheet, pt: &PivotTable, out: &mut Out, rels: &mut Rels) {
+        let Some((table, cache)) = kept_read_only(sheet, &pt.name) else { return };
+        let Some(key) = crate::passthrough::pivot_key(&pt.name) else { return };
+        let cache_id = cache_id_of(&table);
+        let t = self.tables.saturating_add(1);
+        // The report part, its cache and the cache's records take names of our own (the report's
+        // `cacheId` is in its bytes, so the cache keeps that number); every other part of the
+        // graph — the data model above all — keeps the name it came with.
+        let same = |a: &str, b: &str| crate::package::normalize(a) == crate::package::normalize(b);
+        let target_of = |part: &gridcraft_model::PreservedPart, kind: &str| {
+            part.rels.iter().find(|r| r.rel_type.rsplit('/').next() == Some(kind) && !r.external).map(|r| r.target.clone())
+        };
+        let records = target_of(&cache, "pivotCacheRecords");
+        let name_of = |q: &gridcraft_model::PreservedPart| -> String {
+            if same(&q.name, &table.name) {
+                format!("xl/pivotTables/pivotTable{t}.xml")
+            } else if same(&q.name, &cache.name) {
+                format!("xl/pivotCache/pivotCacheDefinition{cache_id}.xml")
+            } else if records.as_deref().is_some_and(|r| same(&q.name, r)) {
+                format!("xl/pivotCache/pivotCacheRecords{cache_id}.xml")
+            } else {
+                q.name.clone()
+            }
+        };
+        let (_, names) = crate::passthrough::write_pivot_parts(sheet.preserved.as_deref(), Some(&key), out, &name_of);
+        let written = |original: &str| names.get(&crate::package::normalize(original)).cloned();
+        let (Some(table_part), Some(cache_part)) = (written(&table.name), written(&cache.name)) else { return };
+        self.tables = t;
+        self.taken_cache_ids.insert(cache_id);
+        let target = table_part.strip_prefix("xl/").unwrap_or(&table_part);
+        rels.add("pivotTable", &format!("../{target}"));
+        self.caches.push((cache_id, cache_part.strip_prefix("xl/").unwrap_or(&cache_part).to_string()));
     }
 
     /// Adds the workbook relationships to the caches; returns the `<pivotCaches>` element (empty
@@ -412,6 +501,29 @@ impl PivotWriter {
             out.part(&p.rels_part, None, tr.xml().into_bytes());
         }
     }
+}
+
+/// The kept parts of a carried report: its own pivotTable part and its cache definition part, as
+/// the pass-through kept them. `None` when the file had nothing to carry (a report GridCraft
+/// created, or one whose parts were dropped on read).
+fn kept_read_only(sheet: &gridcraft_model::Sheet, name: &str) -> Option<(gridcraft_model::PreservedPart, gridcraft_model::PreservedPart)> {
+    let key = crate::passthrough::pivot_key(name)?;
+    let (parts, sources) = crate::passthrough::owner_kept(sheet.preserved.as_deref(), Some(&key));
+    let find = |kind: &str| -> Option<gridcraft_model::PreservedPart> {
+        let r = sources.iter().find(|r| r.rel_type.rsplit('/').next() == Some(kind) && !r.external)?;
+        parts.iter().find(|q| crate::package::normalize(&q.name) == crate::package::normalize(&r.target)).cloned()
+    };
+    let table = find("pivotTable")?;
+    // The cache definition is the report part's own relationship (the one its `cacheId` means).
+    let target = table.rels.iter().find(|r| r.rel_type.rsplit('/').next() == Some("pivotCacheDefinition") && !r.external)?;
+    let cache = parts.iter().find(|q| crate::package::normalize(&q.name) == crate::package::normalize(&target.target)).cloned()?;
+    Some((table, cache))
+}
+
+/// The `cacheId` a carried report part names: the id its cache is written under, which the report
+/// part keeps byte for byte.
+fn cache_id_of(table: &gridcraft_model::PreservedPart) -> u32 {
+    crate::xml::parse(&table.data).ok().and_then(|x| x.attr_u32("cacheId")).unwrap_or(0)
 }
 
 /// Resolves a pivot source to (sheet, range including the header row, worksheetSource XML).
@@ -1312,6 +1424,9 @@ struct CalcIn {
 #[derive(Clone, Debug, Default)]
 struct CacheIn {
     source: String,
+    /// Why GridCraft can't compute this report (its cache is not a worksheet range): the file's
+    /// cached values are kept, the source is never queried. `None` for a range cache.
+    read_only_reason: Option<String>,
     fields: Vec<FieldIn>,
     calc_items: Vec<CalcIn>,
 }
@@ -1351,6 +1466,25 @@ fn item_label_el(e: &El, sys: DateSystem) -> String {
     }
 }
 
+/// Why a PivotTable whose cache is not a worksheet range is read-only, in words for the user.
+/// Only a range cache (the one kind GridCraft computes) skips this.
+fn not_computed_reason(cx: &mut Ctx<'_>, part: &str, ty: &str) -> String {
+    // A data-model cache carries its records in `xl/model/*`, related to the cache definition
+    // with the `powerPivotData` type; an OLAP cube's cache holds no such part. Either way the
+    // parts are kept and the source is never queried, so only the wording differs.
+    let model = cx.pkg.rels(part).map(|r| r.iter().any(|q| q.kind.eq_ignore_ascii_case("powerPivotData"))).unwrap_or(false);
+    match (ty, model) {
+        ("olap", true) => "built on the workbook's data model (Power Pivot), which GridCraft keeps but does not query".to_string(),
+        ("olap", false) => "built on an OLAP connection, which GridCraft keeps but does not query".to_string(),
+        ("external", _) => "built on an external data source, which GridCraft keeps but does not query".to_string(),
+        ("consolidation", _) => "built on several consolidated ranges, which GridCraft keeps but does not query".to_string(),
+        _ => {
+            cx.warn(format!("a PivotTable source of type \"{ty}\" is not computed by GridCraft; it is kept as it is"));
+            format!("built on \"{ty}\" data, which GridCraft keeps but does not query")
+        }
+    }
+}
+
 fn read_cache(cx: &mut Ctx<'_>, part: &str, sheet_name: &str) -> Option<CacheIn> {
     let x = cx.optional_xml(part).ok().flatten()?;
     if x.name != "pivotCacheDefinition" {
@@ -1359,28 +1493,32 @@ fn read_cache(cx: &mut Ctx<'_>, part: &str, sheet_name: &str) -> Option<CacheIn>
     }
     let src = x.child("cacheSource");
     let ty = src.and_then(|s| s.attr("type")).unwrap_or("worksheet");
-    if ty != "worksheet" {
-        cx.warn(format!("PivotTables with a {ty} data source are not supported; kept as plain cells"));
-        return None;
-    }
+    // A cache GridCraft does not query (a data model, an OLAP cube, a connection): the report is
+    // read as one GridCraft does not compute. Its cached values stay on the sheet, and the parts
+    // the pass-through kept are written back as they came — never recomputed over a made-up range.
+    let read_only_reason = (ty != "worksheet").then(|| not_computed_reason(cx, part, ty));
     let ws = src.and_then(|s| s.child("worksheetSource"));
-    let source = match ws {
-        Some(w) if w.attr("name").is_some_and(|n| !n.trim().is_empty()) => w.attr("name").unwrap_or("").trim().to_string(),
-        Some(w) => {
-            if w.attr("id").is_some() {
-                cx.warn("a PivotTable's source is in another workbook; its source reference may not resolve");
+    let source = if read_only_reason.is_some() {
+        String::new()
+    } else {
+        match ws {
+            Some(w) if w.attr("name").is_some_and(|n| !n.trim().is_empty()) => w.attr("name").unwrap_or("").trim().to_string(),
+            Some(w) => {
+                if w.attr("id").is_some() {
+                    cx.warn("a PivotTable's source is in another workbook; its source reference may not resolve");
+                }
+                let r = w.attr("ref").map(|r| r.replace('$', "")).and_then(|r| RangeRef::parse(&r));
+                let Some(r) = r else {
+                    cx.warn("a PivotTable's source reference is missing or invalid; kept as plain cells");
+                    return None;
+                };
+                let sheet = w.attr("sheet").filter(|s| !s.is_empty()).unwrap_or(sheet_name);
+                format!("{}!{}", quote_sheet(sheet), abs_range(&r))
             }
-            let r = w.attr("ref").map(|r| r.replace('$', "")).and_then(|r| RangeRef::parse(&r));
-            let Some(r) = r else {
-                cx.warn("a PivotTable's source reference is missing or invalid; kept as plain cells");
+            None => {
+                cx.warn("a PivotTable's cache has no worksheet source; kept as plain cells");
                 return None;
-            };
-            let sheet = w.attr("sheet").filter(|s| !s.is_empty()).unwrap_or(sheet_name);
-            format!("{}!{}", quote_sheet(sheet), abs_range(&r))
-        }
-        None => {
-            cx.warn("a PivotTable's cache has no worksheet source; kept as plain cells");
-            return None;
+            }
         }
     };
     let sys = cx.date_system;
@@ -1434,6 +1572,9 @@ fn read_cache(cx: &mut Ctx<'_>, part: &str, sheet_name: &str) -> Option<CacheIn>
         cx.warn("a PivotTable's cache has no fields; kept as plain cells");
         return None;
     }
+    if let Some(reason) = &read_only_reason {
+        cx.warn(format!("a PivotTable is read-only: it is {reason}. Its cached values are kept as they are"));
+    }
     // Calculated items are a child of the cache definition: `Field[item]` references, the item's
     // index among its field's shared items, and the field's position on the axis.
     let mut calc_items: Vec<CalcIn> = Vec::new();
@@ -1451,7 +1592,7 @@ fn read_cache(cx: &mut Ctx<'_>, part: &str, sheet_name: &str) -> Option<CacheIn>
             calc_items.push(CalcIn { field: field as usize, item: item as usize, formula });
         }
     }
-    Some(CacheIn { source, fields, calc_items })
+    Some(CacheIn { source, read_only_reason, fields, calc_items })
 }
 
 /// Reads the PivotTables related to a worksheet part.
@@ -1522,6 +1663,10 @@ fn field_ref(cx: &mut Ctx<'_>, cache: &CacheIn, i: usize) -> Option<(String, Piv
 
 fn read_table(cx: &mut Ctx<'_>, x: &El, cache: &CacheIn, id: u32) -> Option<PivotTable> {
     let mut pt = PivotTable { id, ..PivotTable::default() };
+    if let Some(reason) = &cache.read_only_reason {
+        pt.source_kind = PivotSourceKind::DataModel;
+        pt.read_only_reason = Some(reason.clone());
+    }
     if let Some(n) = x.attr("name").filter(|n| !n.trim().is_empty()) {
         pt.name = n.to_string();
     } else {

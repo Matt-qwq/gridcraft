@@ -346,6 +346,23 @@ fn show_as_name(v: PivotShowAs) -> &'static str {
     }
 }
 
+fn source_kind_name(k: PivotSourceKind) -> &'static str {
+    match k {
+        PivotSourceKind::Range => "range",
+        PivotSourceKind::DataModel => "dataModel",
+    }
+}
+
+/// The error a command that would recompute or reshape a report GridCraft does not compute
+/// returns, naming the reason the report is read-only.
+fn read_only_error(pt: &PivotTable) -> EngineError {
+    let why = match pt.read_only_text() {
+        "" => "its source is one GridCraft does not query".to_string(),
+        t => format!("it is {t}"),
+    };
+    other(format!("PivotTable \"{}\" is read-only: {why}. Its cached values are left as they are.", pt.name))
+}
+
 fn layout_name(l: PivotLayout) -> &'static str {
     match l {
         PivotLayout::Compact => "compact",
@@ -599,6 +616,17 @@ fn remove_from_area(cmd: &str, pt: &mut PivotTable, field: &str, area: &str) -> 
 /// Applies `f` to the targeted pivot and re-renders it, as one undo step.
 fn update(s: &mut Session, p: &Json, f: impl FnOnce(&mut PivotTable, &pv::Source, &Workbook) -> Result<Json>) -> Result<Json> {
     let (si, pi) = find_pivot(s, p)?;
+    // Every command here changes the report and has it recomputed from its source. A report
+    // GridCraft does not compute has no source to read here: refusing keeps its cached values
+    // intact instead of overwriting them from a range that isn't there.
+    {
+        let d = s.doc()?;
+        if let Some(pt) = d.wb.sheet(si).and_then(|sh| sh.pivots.get(pi))
+            && pt.is_read_only()
+        {
+            return Err(read_only_error(pt));
+        }
+    }
     let replace = bool_param(p, "replace").unwrap_or(false);
     edit(s, |cx| {
         let pt = cx.wb.sheet(si).and_then(|sh| sh.pivots.get(pi)).cloned().ok_or_else(|| other("There's no such PivotTable."))?;
@@ -864,6 +892,9 @@ fn pivot_json(wb: &Workbook, si: usize, pt: &PivotTable) -> Json {
         "anchor": pt.anchor.a1(),
         "range": pt.last_range.map(|r| r.a1()),
         "source": pt.source,
+        "kind": source_kind_name(pt.source_kind),
+        "readOnly": pt.is_read_only(),
+        "readOnlyReason": pt.read_only_reason,
         "rows": pt.rows.iter().map(axis_json).collect::<Vec<_>>(),
         "columns": pt.columns.iter().map(axis_json).collect::<Vec<_>>(),
         "values": pt.values.iter().map(|v| json!({"field": v.source_col, "func": func_name(v.func), "name": v.name, "showAs": show_as_name(v.show_as), "numberFormat": v.number_format})).collect::<Vec<_>>(),
@@ -888,6 +919,22 @@ fn fields(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
     let pt = d.wb.sheet(si).and_then(|sh| sh.pivots.get(pi)).ok_or_else(|| other("There's no such PivotTable."))?;
     let mut out = pivot_json(&d.wb, si, pt);
+    // A report GridCraft does not compute has no source to read: its fields are the ones the file
+    // says it is built on, without record counts or samples. `kind`/`readOnlyReason` say why.
+    if pt.is_read_only() {
+        let list = read_only_fields(pt);
+        let mut list = list;
+        for c in &pt.calculated_fields {
+            let areas: Vec<&str> = if pt.values.iter().any(|v| v.source_col.eq_ignore_ascii_case(&c.name)) { vec!["values"] } else { vec![] };
+            list.push(
+                json!({"name": c.name, "numeric": true, "date": false, "samples": [], "areas": areas, "calculated": true, "formula": c.formula}),
+            );
+        }
+        if let Some(m) = out.as_object_mut() {
+            m.insert("fields".into(), Json::Array(list));
+        }
+        return Ok(out);
+    }
     let src = pv::read_source(&d.wb, &pt.source, si);
     let list: Vec<Json> = match &src {
         Ok(src) => src
@@ -934,6 +981,45 @@ fn fields(s: &mut Session, p: &Json) -> Result<Json> {
         }
     }
     Ok(out)
+}
+
+/// The fields a report GridCraft does not compute names, with the area each is in. The source
+/// itself is never read, so there are no samples and no record count.
+fn read_only_fields(pt: &PivotTable) -> Vec<Json> {
+    let mut names: Vec<&str> = Vec::new();
+    fn push<'a>(n: &'a str, names: &mut Vec<&'a str>) {
+        if !n.trim().is_empty() && !names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+            names.push(n);
+        }
+    }
+    for f in pt.rows.iter().chain(pt.columns.iter()) {
+        push(&f.source_col, &mut names);
+    }
+    for v in &pt.values {
+        push(&v.source_col, &mut names);
+    }
+    for f in &pt.filters {
+        push(&f.source_col, &mut names);
+    }
+    names
+        .into_iter()
+        .map(|h| {
+            let mut areas = vec![];
+            if pt.rows.iter().any(|f| f.source_col.eq_ignore_ascii_case(h)) {
+                areas.push("rows");
+            }
+            if pt.columns.iter().any(|f| f.source_col.eq_ignore_ascii_case(h)) {
+                areas.push("columns");
+            }
+            if pt.values.iter().any(|f| f.source_col.eq_ignore_ascii_case(h)) {
+                areas.push("values");
+            }
+            if pt.filters.iter().any(|f| f.source_col.eq_ignore_ascii_case(h)) && !in_axes(pt, h) {
+                areas.push("filters");
+            }
+            json!({"name": h, "numeric": false, "date": false, "samples": [], "areas": areas})
+        })
+        .collect()
 }
 
 fn list(s: &mut Session, _: &Json) -> Result<Json> {
@@ -1702,10 +1788,19 @@ fn refresh_all(s: &mut Session, p: &Json) -> Result<Json> {
     edit(s, |cx| {
         let mut n = 0;
         let mut errors = vec![];
+        let mut skipped = vec![];
         for si in 0..cx.wb.sheets.len() {
             let count = cx.wb.sheet(si).map(|sh| sh.pivots.len()).unwrap_or(0);
             for pi in 0..count {
-                let name = cx.wb.sheet(si).and_then(|sh| sh.pivots.get(pi)).map(|p| p.name.clone()).unwrap_or_default();
+                let pivot = cx.wb.sheet(si).and_then(|sh| sh.pivots.get(pi)).cloned();
+                let Some(pt) = pivot else { continue };
+                let name = pt.name.clone();
+                // A report GridCraft does not compute has no source to read: it is left as it is,
+                // and said so rather than counted as refreshed.
+                if pt.is_read_only() {
+                    skipped.push(json!({"pivot": name, "reason": pt.read_only_text()}));
+                    continue;
+                }
                 match pv::refresh(&mut cx.wb, si, pi, replace) {
                     Ok(_) => n += 1,
                     Err(e) => errors.push(json!({"pivot": name, "error": e})),
@@ -1713,7 +1808,7 @@ fn refresh_all(s: &mut Session, p: &Json) -> Result<Json> {
             }
         }
         cx.structural = n > 0;
-        Ok(json!({"refreshed": n, "errors": errors}))
+        Ok(json!({"refreshed": n, "errors": errors, "skipped": skipped}))
     })
 }
 
@@ -2021,6 +2116,11 @@ fn show_details(s: &mut Session, p: &Json) -> Result<Json> {
         let wb = &d.wb;
         let sh = wb.sheet(si).ok_or(EngineError::NoDocument)?;
         let pt = sh.pivots.get(pi).ok_or_else(|| other("There's no such PivotTable."))?;
+        // Show Details needs the records behind a cell, and a report GridCraft does not compute has
+        // no source to read them from.
+        if pt.is_read_only() {
+            return Err(read_only_error(pt));
+        }
         // The cell: `cell`, else the active cell when it is in the report, else its corner.
         let active = d.selection.active;
         let at = cell_param_on(s, p, "cell", si)?.unwrap_or_else(|| {
@@ -3352,5 +3452,108 @@ mod tests {
         assert_eq!(sh.value(CellRef::new(1, 3)), Value::Number(150.0));
         assert_eq!(before.len(), 2);
         assert_eq!(before[1][2], "Pears");
+    }
+
+    // ------------------------------------------------ reports GridCraft does not compute
+
+    /// A report carried from a file: its cached values on the sheet, and a source GridCraft does
+    /// not query (a data model). What the reader builds for a Power Pivot PivotTable.
+    fn carried() -> Session {
+        let mut s = sales();
+        s.execute("insert.pivotTable", json!({"rows": ["Region"], "values": ["Sales"]})).unwrap();
+        {
+            let d = s.doc_mut().unwrap();
+            let si = d.wb.active_sheet;
+            let wb = std::sync::Arc::make_mut(&mut d.wb);
+            let sh = std::sync::Arc::make_mut(&mut wb.sheets[si]);
+            let p = &mut sh.pivots[0];
+            p.source = String::new();
+            p.source_kind = gridcraft_model::PivotSourceKind::DataModel;
+            p.read_only_reason = Some("built on the workbook's data model (Power Pivot), which GridCraft keeps but does not query".into());
+        }
+        s
+    }
+
+    /// Every cell of the report, as the file wrote them.
+    fn report_cells(s: &Session) -> Vec<(String, String)> {
+        let p = pt(s);
+        let Some(r) = p.last_range else { return vec![] };
+        let mut v = vec![];
+        for row in r.start.row..=r.end.row {
+            for col in r.start.col..=r.end.col {
+                let a = CellRef::new(row, col).a1();
+                v.push((a.clone(), val(s, &a).display()));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn a_carried_report_refuses_every_command_that_would_recompute_it() {
+        let mut s = carried();
+        let before = report_cells(&s);
+        assert!(before.iter().any(|(a, v)| a == "B4" && v == "415"), "{before:?}");
+        let attempts = [
+            ("pivot.refresh", json!({})),
+            ("pivot.addField", json!({"field": "Product", "area": "rows"})),
+            ("pivot.removeField", json!({"field": "Region"})),
+            ("pivot.moveField", json!({"field": "Region", "from": "rows", "to": "columns"})),
+            ("pivot.group", json!({"field": "Region", "by": "years"})),
+            ("pivot.filter", json!({"field": "Region", "selected": ["East"]})),
+            ("pivot.sort", json!({"field": "Region", "order": "desc"})),
+            ("pivot.collapse", json!({"field": "Region"})),
+            ("pivot.layout", json!({"layout": "tabular"})),
+            ("pivot.grandTotals", json!({"rows": false})),
+            ("pivot.valueSettings", json!({"index": 0, "func": "average"})),
+            ("pivot.changeSource", json!({"source": "Sheet1!A1:E13"})),
+            ("pivot.showDetails", json!({"cell": "B4"})),
+            ("pivot.calculatedField", json!({"name": "Double", "formula": "=Sales*2"})),
+            ("pivot.calculatedItem", json!({"field": "Region", "name": "Both", "formula": "=East+West"})),
+        ];
+        for (cmd, params) in attempts {
+            let e = s.execute(cmd, params).unwrap_err().to_string();
+            assert!(e.contains("read-only"), "{cmd}: {e}");
+            assert!(e.contains("data model"), "{cmd} names the reason: {e}");
+            assert!(e.contains("PivotTable1"), "{cmd} names the report: {e}");
+        }
+        // The cached values are still exactly the file's: nothing was recomputed over a source
+        // that isn't there, and nothing was reshaped.
+        assert_eq!(report_cells(&s), before);
+        assert_eq!(pt(&s).read_only_text(), "built on the workbook's data model (Power Pivot), which GridCraft keeps but does not query");
+    }
+
+    #[test]
+    fn the_fields_of_a_carried_report_say_why_it_is_read_only() {
+        let mut s = carried();
+        let r = s.execute("pivot.fields", json!({})).unwrap();
+        assert_eq!(r["name"], "PivotTable1");
+        assert_eq!(r["kind"], "dataModel");
+        assert_eq!(r["readOnly"], true);
+        let why = r["readOnlyReason"].as_str().unwrap_or_default();
+        assert!(why.contains("data model"), "{why}");
+        assert_eq!(r["source"], "", "there is no range to name");
+        let fields = r["fields"].as_array().cloned().unwrap_or_default();
+        let region = fields.iter().find(|f| f["name"] == "Region").unwrap_or_else(|| panic!("{r}"));
+        assert_eq!(region["areas"], json!(["rows"]));
+        let sales = fields.iter().find(|f| f["name"] == "Sales").unwrap_or_else(|| panic!("{r}"));
+        assert_eq!(sales["areas"], json!(["values"]));
+        // No source was read, so there is no record count and no error to report.
+        assert!(r.get("records").is_none(), "{r}");
+        assert!(r.get("error").is_none(), "{r}");
+        // The list command says the same thing about it.
+        let list = s.execute("pivot.list", json!({})).unwrap();
+        assert_eq!(list[0]["kind"], "dataModel");
+        assert_eq!(list[0]["readOnly"], true);
+    }
+
+    #[test]
+    fn refresh_all_leaves_a_carried_report_as_it_is() {
+        let mut s = carried();
+        let before = report_cells(&s);
+        let r = s.execute("data.refreshAll", json!({})).unwrap();
+        assert_eq!(r["refreshed"], 0);
+        assert_eq!(r["skipped"][0]["pivot"], "PivotTable1");
+        assert!(r["skipped"][0]["reason"].as_str().unwrap_or_default().contains("data model"), "{r}");
+        assert_eq!(report_cells(&s), before);
     }
 }

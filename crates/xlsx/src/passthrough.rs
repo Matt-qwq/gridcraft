@@ -39,8 +39,13 @@
 //!   Cell and sheet references inside kept parts (a control's linked cell, a query table's range, a
 //!   cell mapped to an XML element, a slicer cache's `pivotCacheId`) are kept as they were, not
 //!   adjusted to inserted or deleted rows or reordered sheets.
-//! - Not kept: the data model (Power Pivot parts), chart `<extLst>` children and chart details, and
-//!   Strict Open XML files (their namespaces differ from what we write).
+//! - A PivotTable GridCraft reads but does not compute (a data-model or OLAP cache) is carried
+//!   whole: its own part, its cache definition, its records and the data model behind them, byte
+//!   for byte, keyed to the report's name. The workbook's data model (`xl/model/*`) is kept with
+//!   the workbook on its own, so it survives even every report built on it being deleted. The
+//!   model is never read, only carried.
+//! - Not kept: chart `<extLst>` children and chart details, and Strict Open XML files (their
+//!   namespaces differ from what we write).
 //! - Sizes are bounded: per part, per owner and per workbook.
 
 use std::borrow::Cow;
@@ -49,7 +54,7 @@ use std::fmt::Write as _;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
-use gridcraft_model::{Preserved, PreservedPart, PreservedRel, PreservedSheet, PreservedXml, Sheet, Visibility, Workbook};
+use gridcraft_model::{PivotTable, Preserved, PreservedPart, PreservedRel, PreservedSheet, PreservedXml, Sheet, Visibility, Workbook};
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
@@ -123,6 +128,13 @@ const WORKBOOK_ROOTS: &[&str] = &["customXml", "connections", "xmlMaps"];
 const WORKBOOK_CACHES: &[&str] = &["slicerCache", "timelineCache"];
 /// Relationship kinds a table part owns that GridCraft doesn't write (its query table).
 const TABLE_OWNED: &[&str] = &["queryTable"];
+/// The relationship type that ties a pivot cache definition to the workbook's data model
+/// (Power Pivot), and the model part to the workbook when GridCraft keeps it on its own.
+const POWER_PIVOT_KINDS: &[&str] = &["powerPivotData"];
+/// The relationships inside a PivotTable's kept content. GridCraft writes these parts from the
+/// model, so they are normally rewritten; a report it does not compute is carried whole instead,
+/// and the walk goes through them to the cache, its records and the data model behind them.
+const PIVOT_GRAPH: &[&str] = &["pivotTable", "pivotCacheDefinition", "pivotCacheRecords", "powerPivotData"];
 /// Relationship kinds kept from a sheet without a sheet element.
 const SHEET_ROOTS: &[&str] = &["queryTable", "tableSingleCells"];
 /// Sheet relationship kinds that mean the sheet XML may hold elements worth keeping.
@@ -219,6 +231,7 @@ const OWN_DIRS: &[&str] = &[
     "xl/activex/",
     "xl/webextensions/",
     "xl/printersettings/",
+    "xl/model/",
 ];
 
 fn kind(rel_type: &str) -> &str {
@@ -272,6 +285,17 @@ fn split_owner(id: &str) -> Option<(&str, &str)> {
 /// A kept relationship id of a rewritten part, prefixed with its owner key.
 fn prefixed(key: &str, id: &str) -> String {
     format!("{key}{KS}{id}")
+}
+
+/// The model's PivotTable for the pivotTable part `part`, when GridCraft reads it but does not
+/// compute it (a data-model or OLAP cache). Its parts are carried whole instead of rewritten.
+fn read_only_pivot<'a>(cx: &mut Ctx<'_>, part: &str, pivots: &'a [PivotTable]) -> Option<&'a PivotTable> {
+    if !pivots.iter().any(PivotTable::is_read_only) {
+        return None;
+    }
+    let bytes = cx.pkg.read_limited(part, MAX_META).ok().flatten()?;
+    let name = xml::parse(&bytes).ok()?.attr("name").map(str::to_string)?;
+    pivots.iter().find(|p| p.is_read_only() && p.name.eq_ignore_ascii_case(name.trim()))
 }
 
 /// A part's relationships with full type URIs. `Ok(vec![])` when it has none; an error when the
@@ -709,6 +733,11 @@ impl KeptReader {
         // name. Their part bytes, relationships and content types are kept as they are.
         let wb_exts = cx.pkg.read_limited(wb_part, MAX_META).ok().flatten().and_then(|b| scan_exts(&b)).map(|s| s.exts).unwrap_or_default();
         self.keep_exts(cx, wb_part, &wb_rels, &wb_exts, &[CALC_FEATURES_URI], "", WORKBOOK_CACHES, &mut p, &mut seen);
+        // The data model (Power Pivot): the parts hold the user's own model — the tables, measures
+        // and relationships of Power Pivot — and are worth more than the reports that point at
+        // them, so they hang off the workbook instead of a PivotTable. They come back byte for
+        // byte even after every report built on them is deleted.
+        self.keep_data_model(cx, wb_xml, &wb_rels, &mut p, &mut seen);
         // Chart sheets: the sheet entry (name, state, position) plus the chart sheet part and the
         // drawing, chart, style and colour parts behind it.
         for (worksheets, se) in chart_sheet_entries(wb_xml, &wb_rels, file_to_model) {
@@ -779,8 +808,34 @@ impl KeptReader {
         (!p.is_empty()).then(|| Arc::new(p))
     }
 
-    /// Sheet-level content of the sheet part `part`.
-    pub fn sheet(&mut self, cx: &mut Ctx<'_>, part: &str, name: &str) -> Option<Arc<Preserved>> {
+    /// The parts of the workbook's data model (Power Pivot), kept with the workbook however the
+    /// reports that name them fare. A workbook whose cache definitions relate a `powerPivotData`
+    /// part has one; its content is opaque to GridCraft and is never read.
+    fn keep_data_model(&mut self, cx: &mut Ctx<'_>, wb_xml: &xml::El, wb_rels: &[PreservedRel], p: &mut Preserved, seen: &mut HashSet<String>) {
+        let caches: Vec<String> = wb_xml
+            .child("pivotCaches")
+            .map(|l| l.kids("pivotCache").filter_map(|c| c.attr("id")).map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut roots: Vec<PreservedRel> = Vec::new();
+        for id in caches {
+            let Some(cache) = wb_rels.iter().find(|r| r.id == id && !r.external && is_kind(r, &["pivotCacheDefinition"])) else { continue };
+            roots.extend(raw_rels(cx, &cache.target).unwrap_or_default().into_iter().filter(|r| !r.external && is_kind(r, POWER_PIVOT_KINDS)));
+        }
+        if roots.is_empty() {
+            return;
+        }
+        // One root per part: a model shared by two caches is written once (the writer dedupes).
+        let mut seen_parts: HashSet<String> = HashSet::new();
+        roots.retain(|r| seen_parts.insert(normalize(&r.target)));
+        match self.keep_through(cx, p, &roots, seen, PIVOT_GRAPH) {
+            Ok(()) => cx.warn("the workbook's data model was kept; GridCraft carries it and does not read it"),
+            Err(why) => cx.warn(format!("the workbook's data model was dropped: {why}")),
+        }
+    }
+
+    /// Sheet-level content of the sheet part `part`. `pivots` are the PivotTables the model read
+    /// from it: a report GridCraft does not compute is carried whole, not rewritten.
+    pub fn sheet(&mut self, cx: &mut Ctx<'_>, part: &str, name: &str, pivots: &[PivotTable]) -> Option<Arc<Preserved>> {
         if !self.on {
             return None;
         }
@@ -805,6 +860,22 @@ impl KeptReader {
             self.keep_owner(cx, &r.target, "table", None, &[], TABLE_OWNED, &mut p);
         }
         for r in rels.iter().filter(|r| is_kind(r, &["pivotTable"]) && !r.external) {
+            // A report GridCraft does not compute (a data-model or OLAP cache) is carried whole:
+            // its own part, its cache definition, its records and the data model behind them are
+            // kept byte for byte, keyed to the report's name so a deleted or renamed report takes
+            // them with it. Its cached values stay on the sheet as the cells they already are.
+            //
+            // The pivot's relationships that name another part (the cache definition, then its
+            // records) are followed through the kinds GridCraft normally rewrites: keeping the
+            // whole graph is the point, and the graph is never recomputed.
+            if let Some(read_only) = read_only_pivot(cx, &r.target, pivots) {
+                let root = owner_key("pivot", &read_only.name).map(|key| PreservedRel { id: prefixed(&key, &r.id), ..r.clone() });
+                match root.map(|root| self.keep_through(cx, &mut p, std::slice::from_ref(&root), &mut seen, PIVOT_GRAPH)) {
+                    Some(Ok(())) => continue,
+                    Some(Err(why)) => cx.warn(format!("the read-only PivotTable \"{}\" was dropped: {why}", read_only.name)),
+                    None => cx.warn(format!("PivotTable \"{}\" has no usable name; its parts were dropped", read_only.name)),
+                }
+            }
             let key = self.keep_owner(cx, &r.target, "pivot", None, MODELED_PIVOT_EXTS, &[], &mut p);
             if let Some(key) = key
                 && let Some(cache) =
@@ -1336,6 +1407,10 @@ fn map_start(e: &BytesStart<'_>, prefixes: &mut HashSet<Vec<u8>>, map: &mut dyn 
 struct PartFacts {
     pivots: HashSet<String>,
     caches: HashSet<String>,
+    /// Keep every part, whatever it names. Content carried for a PivotTable GridCraft does not
+    /// compute is never repaired: the parts are written as they came, and a part dropped behind
+    /// one of them would leave the relationship ids its own bytes name pointing at nothing.
+    keep_all: bool,
 }
 
 /// Names given to kept parts while a package is written.
@@ -1382,6 +1457,19 @@ impl KeptOut {
     /// The shape block of the `n`th notes drawing.
     pub fn notes_block(&self, n: u32) -> u32 {
         n.saturating_add(self.vml_blocks)
+    }
+
+    /// Gives the kept part `original` the name `preferred` when nothing has taken it, else the
+    /// name [`Self::claim`] would give it. Idempotent: a part reached from two owners keeps the
+    /// first name it was given.
+    pub fn name_as(&mut self, original: &str, preferred: &str) -> String {
+        let key = normalize(original);
+        if let Some(n) = self.names.get(&key) {
+            return n.clone();
+        }
+        let name = if self.used.insert(preferred.to_ascii_lowercase()) { preferred.to_string() } else { self.claim(original) };
+        self.names.insert(key, name.clone());
+        name
     }
 
     /// A part name for a kept part: its original name when that can't collide with anything
@@ -1481,6 +1569,9 @@ fn pivot_names_ok(pivots: &HashSet<String>, p: &PreservedPart) -> bool {
 /// renamed) would leave the part pointing at nothing. The part goes, and with it whatever only it
 /// reaches — no relationship to a part that isn't written is ever left behind.
 fn part_usable(facts: &PartFacts, p: &PreservedPart) -> bool {
+    if facts.keep_all {
+        return true;
+    }
     if is_cache_part(p) {
         return pivot_names_ok(&facts.pivots, p);
     }
@@ -1491,6 +1582,46 @@ fn part_usable(facts: &PartFacts, p: &PreservedPart) -> bool {
     let Ok(x) = xml::parse(&p.data) else { return false };
     let names: Vec<&str> = x.children.iter().filter(|c| c.name == "slicer" || c.name == "timeline").filter_map(|c| c.attr("cache")).collect();
     names.iter().all(|n| n.trim().is_empty() || facts.caches.contains(&n.to_lowercase()))
+}
+
+/// The parts and relationships [`Keep::sheet`] kept for a PivotTable GridCraft does not compute
+/// (its own part, its cache definition, its records, the data model behind them).
+pub fn owner_kept(owner: Option<&Preserved>, key: Option<&str>) -> (Vec<PreservedPart>, Vec<PreservedRel>) {
+    let (Some(p), Some(key)) = (owner, key) else { return (vec![], vec![]) };
+    let (parts, sources, _frags) = owner_parts(p, key, &PartFacts { keep_all: true, ..PartFacts::default() });
+    (parts, sources)
+}
+
+/// Writes the parts of a PivotTable GridCraft does not compute, under the names `name_of` gives
+/// them (the writer's own: a kept report keeps its `pivotTableN.xml` numbering and its cache the
+/// id it was written with, so the report's `cacheId` still names its cache, and every part comes
+/// back byte for byte). Returns the kept relationships with their targets rewritten to the written
+/// parts: the report's own relationship to its cache definition among them — and the name each
+/// part was written under (original part name, normalized, to written name). Both are empty when
+/// the report kept nothing.
+pub fn write_pivot_parts(
+    owner: Option<&Preserved>,
+    key: Option<&str>,
+    out: &mut Out,
+    name_of: &dyn Fn(&PreservedPart) -> String,
+) -> (Vec<PreservedRel>, NameMap) {
+    let (Some(p), Some(key)) = (owner, key) else { return (vec![], NameMap::new()) };
+    // Nothing behind the report is dropped: its parts come back as they came.
+    let keep_all = std::mem::replace(&mut out.kept.facts.keep_all, true);
+    let (parts, sources, _frags) = owner_parts(p, key, &out.kept.facts);
+    for q in &parts {
+        out.kept.name_as(&q.name, &name_of(q));
+    }
+    let names = write_parts(out, &parts);
+    out.kept.facts.keep_all = keep_all;
+    let rels = sources
+        .iter()
+        .filter_map(|r| {
+            let written = names.get(&normalize(&r.target))?.clone();
+            Some(PreservedRel { id: r.id.clone(), rel_type: r.rel_type.clone(), target: written, external: r.external })
+        })
+        .collect();
+    (rels, names)
 }
 
 /// Adds the owner's relationships; returns old id → new id.

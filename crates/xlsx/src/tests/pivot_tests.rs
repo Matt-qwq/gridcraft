@@ -85,6 +85,8 @@ fn workbook() -> Workbook {
         id: 1,
         name: "Sales by Region".into(),
         source: "Data!$A$1:$F$9".into(),
+        source_kind: PivotSourceKind::Range,
+        read_only_reason: None,
         anchor: at("A4"),
         rows: vec![PivotField { source_col: "Region".into(), sort: PivotSort::Asc, collapsed_items: vec!["East".into()], ..PivotField::default() }],
         columns: vec![PivotField { sort: PivotSort::None, ..field("Product") }],
@@ -127,6 +129,8 @@ fn workbook() -> Workbook {
         id: 2,
         name: "Trend".into(),
         source: "SalesTbl".into(),
+        source_kind: PivotSourceKind::Range,
+        read_only_reason: None,
         anchor: at("K4"),
         rows: vec![
             PivotField {
@@ -926,4 +930,232 @@ fn a_page_filter_on_an_axis_field_keeps_its_page_row() {
     assert!(!t1.contains("<pageFields"), "no page field for an axis filter: {t1}");
     let (back, _) = read_xlsx(&bytes).unwrap();
     assert_eq!(back.sheet(1).unwrap().pivots[0].filters[0].area, PivotFilterArea::Axis);
+}
+
+// ================================================================ data-model (OLAP) PivotTables
+
+const CT_PT: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml";
+const CT_PCD: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml";
+const CT_PCR: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml";
+
+/// A PivotTable part of a report built on a data model: the x14 extensions a Power Pivot report
+/// carries, and a cached report at D3:E6.
+const MODEL_PIVOT_TABLE: &str = r#"<?xml version="1.0"?><pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="ModelPivot" cacheId="1" dataCaption="Values" updatedVersion="6" minRefreshableVersion="3" createdVersion="6" refreshedVersion="6" refreshOnLoad="1"><location ref="D3:E6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="2"><pivotField axis="axisRow" showAll="0"><items count="2"><item x="0"/><item x="1"/></items></pivotField><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><rowItems count="2"><i><x/></i><i t="grand"><x/></i></rowItems><dataFields count="1"><dataField name="Sum of Amount" fld="1" baseField="0" baseItem="0"/></dataFields><extLst><ext uri="{962EF5D1-5CA2-4c93-8EF4-DBF5C05439D2}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:pivotTable hideValuesRow="0"><x14:pivotField>carried</x14:pivotField></x14:pivotTable></ext></extLst></pivotTableDefinition>"#;
+
+/// A cache of a data-model report: cacheSource type="olap", no worksheet source at all, and the
+/// x14 extension a Power Pivot cache carries.
+const MODEL_CACHE: &str = r#"<?xml version="1.0"?><pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" saveData="0" refreshOnLoad="1" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3" recordCount="2"><cacheSource type="olap"><extLst><ext uri="{725AE2AE-9491-48be-B2B4-4EB974FC3084}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:pivotCacheDefinition pivotCacheId="0"><x14:cacheField name="Region" numFmtId="0"/><x14:cacheField name="Amount" numFmtId="0"/></x14:pivotCacheDefinition></ext></extLst></cacheSource><cacheFields count="2"><cacheField name="Region" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="1"><s v="East"/><s v="West"/></sharedItems></cacheField><cacheField name="Amount" numFmtId="0"><sharedItems containsSemiMixedTypes="0" containsString="0"/></cacheField></cacheFields></pivotCacheDefinition>"#;
+
+const MODEL_RECORDS: &str = r#"<?xml version="1.0"?><pivotCacheRecords xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" count="2"><r><s v="East"/><n v="100"/></r><r><s v="West"/><n v="50"/></r></pivotCacheRecords>"#;
+
+/// The workbook's data model: a part GridCraft never reads, only carries. Not XML on purpose.
+const MODEL_DATA: &[u8] = b"\x00\x01MODEL-DATA\x00\x02 the user's own measures\x00";
+
+const MODEL_WB_RELS: &str = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+
+const MODEL_PT_RELS: &str = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+
+const MODEL_CACHE_RELS: &str = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" Target="pivotCacheRecords1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2007/relationships/powerPivotData" Target="../model/item.data"/></Relationships>"#;
+
+/// A slicer cache a report's own relationships name (a slicer cache hangs off its PivotTable's
+/// part, not off the workbook, when the workbook lists none).
+const MODEL_SLICER_CACHE: &str = r#"<?xml version="1.0"?><slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="Slicer_Region" sourceName="Region"><pivotTables><pivotTable tabId="1" name="ModelPivot"/></pivotTables><data><olap><pivotCacheId>1</pivotCacheId></olap></data></slicerCacheDefinition>"#;
+
+const MODEL_PT_RELS_WITH_SLICER: &str = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/><Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2007/relationships/slicerCache" Target="../slicerCaches/slicerCache1.xml"/></Relationships>"#;
+
+/// A workbook holding a data-model (Power Pivot) PivotTable and the model parts behind it: the
+/// shape a file saved by Excel with "Add this data to the Data Model" has.
+fn data_model_package() -> Vec<u8> {
+    data_model_package_with(false)
+}
+
+/// [`data_model_package`], optionally with a slicer cache the report's own part relates.
+fn data_model_package_with(slicer: bool) -> Vec<u8> {
+    let slicer_ct = if slicer {
+        r#"<Override PartName="/xl/slicerCaches/slicerCache1.xml" ContentType="application/vnd.ms-excel.slicerCache+xml"/>"#
+    } else {
+        ""
+    };
+    let ct = format!(
+        r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/pivotTables/pivotTable1.xml" ContentType="{CT_PT}"/><Override PartName="/xl/pivotCache/pivotCacheDefinition1.xml" ContentType="{CT_PCD}"/><Override PartName="/xl/pivotCache/pivotCacheRecords1.xml" ContentType="{CT_PCR}"/><Override PartName="/xl/model/item.data" ContentType="application/vnd.ms-excel.datamodel"/>{slicer_ct}</Types>"#
+    );
+    let wb = r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets><pivotCaches><pivotCache cacheId="1" r:id="rId9"/></pivotCaches></workbook>"#;
+    // The report's cached values, as the file wrote them: GridCraft shows these cells as they are.
+    let sheet = r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="3"><c r="D3" t="inlineStr"><is><t>Row Labels</t></is></c><c r="E3" t="inlineStr"><is><t>Sum of Amount</t></is></c></row><row r="4"><c r="D4" t="inlineStr"><is><t>East</t></is></c><c r="E4"><v>100</v></c></row><row r="5"><c r="D5" t="inlineStr"><is><t>West</t></is></c><c r="E5"><v>50</v></c></row><row r="6"><c r="D6" t="inlineStr"><is><t>Grand Total</t></is></c><c r="E6"><v>150</v></c></row></sheetData></worksheet>"#;
+    let sheet_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>"#;
+    let mut bytes: Vec<(&str, &[u8])> = vec![
+        ("[Content_Types].xml", ct.as_bytes()),
+        ("_rels/.rels", super::ROOT_RELS.as_bytes()),
+        ("xl/workbook.xml", wb.as_bytes()),
+        ("xl/_rels/workbook.xml.rels", MODEL_WB_RELS.as_bytes()),
+        ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+        ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels.as_bytes()),
+        ("xl/pivotTables/pivotTable1.xml", MODEL_PIVOT_TABLE.as_bytes()),
+        ("xl/pivotTables/_rels/pivotTable1.xml.rels", if slicer { MODEL_PT_RELS_WITH_SLICER.as_bytes() } else { MODEL_PT_RELS.as_bytes() }),
+        ("xl/pivotCache/pivotCacheDefinition1.xml", MODEL_CACHE.as_bytes()),
+        ("xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", MODEL_CACHE_RELS.as_bytes()),
+        ("xl/pivotCache/pivotCacheRecords1.xml", MODEL_RECORDS.as_bytes()),
+        ("xl/model/item.data", MODEL_DATA),
+    ];
+    if slicer {
+        bytes.push(("xl/slicerCaches/slicerCache1.xml", MODEL_SLICER_CACHE.as_bytes()));
+    }
+    super::make_zip(&bytes)
+}
+
+/// The parts of a data-model PivotTable that must come back byte for byte.
+const MODEL_PARTS: [&str; 4] =
+    ["xl/pivotTables/pivotTable1.xml", "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", "xl/model/item.data"];
+
+#[test]
+fn a_data_model_pivot_is_read_only_and_keeps_its_cached_values() {
+    let (wb, report) = read_xlsx(&data_model_package()).unwrap();
+    let sheet = wb.sheet(0).unwrap();
+    assert_eq!(sheet.pivots.len(), 1, "{:?}", report.warnings);
+    let pt = &sheet.pivots[0];
+    assert_eq!(pt.name, "ModelPivot");
+    assert!(pt.is_read_only(), "a data-model report is not ours to compute");
+    assert_eq!(pt.source_kind, PivotSourceKind::DataModel);
+    assert_eq!(pt.source, "", "there is no range to compute it over");
+    let why = pt.read_only_text();
+    assert!(why.contains("data model"), "the reason names the data model: {why}");
+    // The report's fields are what the file says it is built on.
+    assert_eq!(pt.rows[0].source_col, "Region");
+    assert_eq!(pt.values[0].source_col, "Amount");
+    assert_eq!(pt.last_range.map(|r| r.a1()), Some("D3:E6".to_string()));
+    // Its cached values are the cells they were written as.
+    assert_eq!(sheet.value(at("E4")), Value::Number(100.0));
+    assert_eq!(sheet.value(at("E6")), Value::Number(150.0));
+    assert_eq!(sheet.value(at("D6")).display(), "Grand Total");
+    // A read-only report is said out loud.
+    assert!(report.warnings.iter().any(|w| w.contains("read-only") && w.contains("data model")), "{:?}", report.warnings);
+}
+
+#[test]
+fn saving_a_data_model_pivot_reproduces_its_parts_byte_for_byte() {
+    let (wb, _) = read_xlsx(&data_model_package()).unwrap();
+    let out = write_xlsx(&wb).unwrap();
+    let after = unzip(&out);
+    crate::testing::check_package(&out).expect("the package with a carried data model is valid");
+    let before = unzip(&data_model_package());
+    for name in MODEL_PARTS {
+        let a = before.get(name).unwrap_or_else(|| panic!("the fixture has {name}"));
+        let b = after.get(name).unwrap_or_else(|| panic!("the save kept {name}"));
+        assert!(a == b, "{name} changed ({} bytes in, {} out)", a.len(), b.len());
+    }
+    // The parts are still related the way they came: the report to its cache, the cache to its
+    // records and to the data model.
+    let cache_rels = String::from_utf8(after.get("xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels").unwrap().clone()).unwrap();
+    assert!(cache_rels.contains("powerPivotData"), "{cache_rels}");
+    assert!(cache_rels.contains("model/item.data"), "{cache_rels}");
+    let wb_rels = String::from_utf8(after.get("xl/_rels/workbook.xml.rels").unwrap().clone()).unwrap();
+    assert!(wb_rels.contains("pivotCache/pivotCacheDefinition1.xml"), "{wb_rels}");
+    let wbx = String::from_utf8(after.get("xl/workbook.xml").unwrap().clone()).unwrap();
+    assert!(wbx.contains("<pivotCache cacheId=\"1\""), "the cache id is the file's own: {wbx}");
+    let sheet_rels = String::from_utf8(after.get("xl/worksheets/_rels/sheet1.xml.rels").unwrap().clone()).unwrap();
+    assert!(sheet_rels.contains("pivotTables/pivotTable1.xml"), "{sheet_rels}");
+    // Reading the save back gives the same read-only report: nothing was recomputed in between.
+    let (again, _) = read_xlsx(&out).unwrap();
+    let sheet = again.sheet(0).unwrap();
+    assert!(sheet.pivots[0].is_read_only());
+    assert_eq!(sheet.value(at("E6")), Value::Number(150.0));
+}
+
+#[test]
+fn the_data_model_survives_deleting_every_report_built_on_it() {
+    let (mut wb, _) = read_xlsx(&data_model_package()).unwrap();
+    // The user deletes the report; the data and the model behind it stay.
+    Arc::make_mut(&mut wb.sheets[0]).pivots.clear();
+    let out = write_xlsx(&wb).unwrap();
+    crate::testing::check_package(&out).expect("the package is valid without the report");
+    let parts = unzip(&out);
+    assert_eq!(parts.get("xl/model/item.data").map(|p| p.as_slice()), Some(MODEL_DATA), "the data model is still there");
+    let wb_rels = String::from_utf8(parts.get("xl/_rels/workbook.xml.rels").unwrap().clone()).unwrap();
+    assert!(wb_rels.contains("model/item.data"), "and still related: {wb_rels}");
+    assert!(parts.keys().all(|n| !n.starts_with("xl/pivotTables/")), "the report's parts went with it");
+}
+
+#[test]
+fn a_range_pivot_is_still_computed() {
+    // The regression: a report on a cell range is modelled as before — not read-only, no reason,
+    // and a refresh rewrites its report cells from the source.
+    let bytes = with_pivot(
+        r#"<pivotTableDefinition name="RangePivot" cacheId="1"><location ref="D3:E4"/><pivotFields count="2"><pivotField axis="axisRow"><items><item x="0"/><item x="1"/></items></pivotField><pivotField dataField="1"/></pivotFields><rowFields><field x="0"/></rowFields><dataFields><dataField name="Total" fld="1"/></dataFields></pivotTableDefinition>"#,
+        Some(GOOD_CACHE),
+    );
+    let (wb, report) = read_xlsx(&bytes).unwrap();
+    let pt = &wb.sheet(0).unwrap().pivots[0];
+    assert_eq!(pt.source_kind, PivotSourceKind::Range);
+    assert!(!pt.is_read_only());
+    assert_eq!(pt.read_only_reason, None);
+    assert_eq!(pt.source, "Data!$A$1:$B$3");
+    assert!(!report.warnings.iter().any(|w| w.contains("read-only")), "{:?}", report.warnings);
+}
+
+#[test]
+fn a_computed_report_and_a_carried_one_keep_separate_caches() {
+    // Both kinds of report can live in one workbook. The carried one keeps the cache id it was
+    // written with (its part is carried byte for byte), so the report GridCraft computes takes
+    // the next free one instead of colliding with it.
+    let (mut wb, _) = read_xlsx(&data_model_package()).unwrap();
+    {
+        let sh = Arc::make_mut(&mut wb.sheets[0]);
+        sh.cells.set(at("A1"), Cell::value(Value::text("K")));
+        sh.cells.set(at("B1"), Cell::value(Value::text("V")));
+        sh.cells.set(at("A2"), Cell::value(Value::text("East")));
+        sh.cells.set(at("B2"), Cell::value(Value::number(10.0)));
+        sh.cells.set(at("A3"), Cell::value(Value::text("West")));
+        sh.cells.set(at("B3"), Cell::value(Value::number(20.0)));
+        sh.pivots.push(PivotTable {
+            id: 9,
+            name: "RangePivot".into(),
+            source: "Data!$A$1:$B$3".into(),
+            anchor: at("H3"),
+            rows: vec![field("K")],
+            values: vec![PivotValue { source_col: "V".into(), ..PivotValue::default() }],
+            ..PivotTable::default()
+        });
+    }
+    let out = write_xlsx(&wb).unwrap();
+    crate::testing::check_package(&out).expect("a package with both kinds of report is valid");
+    let parts = unzip(&out);
+    assert_eq!(
+        parts.get("xl/pivotCache/pivotCacheDefinition1.xml").map(|p| p.as_slice()),
+        Some(MODEL_CACHE.as_bytes()),
+        "the carried cache is untouched"
+    );
+    assert!(parts.contains_key("xl/pivotTables/pivotTable1.xml"), "the carried report keeps its part");
+    assert!(parts.contains_key("xl/pivotTables/pivotTable2.xml"), "the computed report is written beside it");
+    assert!(parts.contains_key("xl/pivotCache/pivotCacheDefinition2.xml"), "under a cache id of its own");
+    let wbx = String::from_utf8(parts.get("xl/workbook.xml").unwrap().clone()).unwrap();
+    assert!(wbx.contains("<pivotCache cacheId=\"1\""), "{wbx}");
+    assert!(wbx.contains("<pivotCache cacheId=\"2\""), "{wbx}");
+    let cache2 = String::from_utf8(parts.get("xl/pivotCache/pivotCacheDefinition2.xml").unwrap().clone()).unwrap();
+    assert!(cache2.contains("<cacheSource type=\"worksheet\">"), "{cache2}");
+    // Reopening gives both reports, each with its own kind.
+    let (back, _) = read_xlsx(&out).unwrap();
+    let pivots = &back.sheet(0).unwrap().pivots;
+    assert_eq!(pivots.len(), 2, "{pivots:?}");
+    assert_eq!(pivots[0].name, "ModelPivot");
+    assert!(pivots[0].is_read_only());
+    assert_eq!(pivots[1].name, "RangePivot");
+    assert!(!pivots[1].is_read_only());
+}
+
+#[test]
+fn the_parts_behind_a_carried_report_are_not_repaired_away() {
+    // A slicer cache hangs off its report's own part. The report is carried whole, so the cache
+    // behind it is carried too — dropping it would leave the relationship id the report's bytes
+    // name pointing at nothing.
+    let (wb, _) = read_xlsx(&data_model_package_with(true)).unwrap();
+    let out = write_xlsx(&wb).unwrap();
+    crate::testing::check_package(&out).expect("every part behind the carried report is there");
+    let after = unzip(&out);
+    assert_eq!(
+        after.get("xl/slicerCaches/slicerCache1.xml").map(|p| p.as_slice()),
+        Some(MODEL_SLICER_CACHE.as_bytes()),
+        "the slicer cache is carried as it came"
+    );
+    let rels = String::from_utf8(after.get("xl/pivotTables/_rels/pivotTable1.xml.rels").unwrap().clone()).unwrap();
+    assert!(rels.contains("slicerCaches/slicerCache1.xml"), "{rels}");
 }
