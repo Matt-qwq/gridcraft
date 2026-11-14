@@ -26,7 +26,7 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
                 "comments" => "Comments",
                 "watch" => "Watch Window",
                 "selection" => "Selection",
-                "formatChart" => "Format Chart Area",
+                "formatChart" => format_pane_title(app),
                 _ => "",
             };
             ui.label(egui::RichText::new(crate::widgets::tr(ui, title)).font(theme::ui_bold(15.0)));
@@ -48,6 +48,38 @@ pub fn show(app: &mut SheetApp, ui: &mut Ui) {
             _ => {}
         });
     });
+}
+
+/// The Format pane's title: the same pane serves a chart, a shape and a picture, and Excel names it
+/// after the selected object.
+fn format_pane_title(app: &SheetApp) -> &'static str {
+    let kind =
+        app.session.active().and_then(|d| d.wb.active()).and_then(|sh| crate::grid::selected_object(sh, app.selected_chart)).map(|(kind, _, _)| kind);
+    title_of(kind)
+}
+
+/// The title for a selected object kind (`grid::selected_object`'s first field).
+fn title_of(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("shape") => "Format Shape",
+        Some("image") => "Format Picture",
+        _ => "Format Chart Area",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::title_of;
+
+    #[test]
+    fn the_format_pane_is_titled_after_the_object() {
+        assert_eq!(title_of(Some("shape")), "Format Shape");
+        assert_eq!(title_of(Some("image")), "Format Picture");
+        // A chart, a slicer and an empty selection all keep the chart title the pane shipped with.
+        for other in [Some("chart"), Some("slicer"), Some("timeline"), None] {
+            assert_eq!(title_of(other), "Format Chart Area", "{other:?}");
+        }
+    }
 }
 
 fn comments(app: &mut SheetApp, ui: &mut Ui) {
