@@ -1,6 +1,6 @@
 # Gaps
 
-> **Last reviewed:** 2026-11-13 · **Last updated:** 2026-11-13 · **Change:** minor (11-13: the performance round (§2) and three save-fidelity bugs in filtered sheets found by the command-sequence soak (§3), one case left recorded there with a six-step repro; round 18: a real-world corpus run — **3,084 workbooks opened, 635 save/reopen with 0 mismatches, 16 files identical in Excel 16** — so #1 is met for beta; the pinned corpus remains for CI. Round 17: `.xls` **embedded charts, autoshapes and text boxes** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** (five chart kinds; five shapes with their text, fill and line); §7 loses its charts and shapes items and is met for beta, leaving OLE objects and chart sheets as full scope. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
+> **Last reviewed:** 2026-11-14 · **Last updated:** 2026-11-14 · **Change:** minor (11-14: the per-cell half of the performance round — `MODE` 2.66 s → 15 ms, `VLOOKUP` 2.9–4.9× and text `MATCH` 7.2×, wildcard `COUNTIF` 2.0×, grid paint 1.60 → 1.07 ms/frame, all in §2; and §3's filtered-sheet save bugs were found by a 150-seed soak. 11-13: the performance round (§2) and three save-fidelity bugs in filtered sheets found by the command-sequence soak (§3), one case left recorded there with a six-step repro; round 18: a real-world corpus run — **3,084 workbooks opened, 635 save/reopen with 0 mismatches, 16 files identical in Excel 16** — so #1 is met for beta; the pinned corpus remains for CI. Round 17: `.xls` **embedded charts, autoshapes and text boxes** are read — group kind and variants, series ranges, cached names, title, legend and the `msosptChart` anchor — and **verified in Excel 16** (five chart kinds; five shapes with their text, fill and line); §7 loses its charts and shapes items and is met for beta, leaving OLE objects and chart sheets as full scope. **RC4 is not an ECMA-376 Standard cipher**: [MS-OFFCRYPTO] 2.3.4.5 requires AES and Excel refuses a hand-made RC4 `.xlsx` at 40 and 128 bits, so "RC4 write" is really encrypted `.xls` output and waits for a `.xls` writer. No score change) · **Target:** Microsoft Excel (Microsoft 365)
 
 Every known shortfall against Excel, one entry each, ranked by user impact (what blocks someone
 using GridCraft for real work first). This is the work list: pick from the top, check the open
@@ -163,12 +163,21 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   gap-scoped candidates, snapshot-safe page replacement, `document.compact` and a save hook,
   `PageCacheStats`); a page-file rewrite remains;
   whole-column references are already clipped (`SUM(A:A)` folds a million numeric cells in 21.5 ms,
-  a ten-row used range in 0.0 ms). Cheap wins measured but not taken (11-13): `MODE`/`MODE.MULT`
-  count with a linear scan (O(n²) over distinct values), `VLOOKUP` copies its key column and `MATCH`
-  clones the haystack before the text index can answer, `criterion::matches` allocates three to four
-  times per visited cell, `check_arrays` still walks the whole store on a sheet that *does* hold a
-  multi-cell array, and the grid's per-cell path still clones a `Cell`/`Style` and formats a font
-  family name per cell (~1.5–3 ms/frame of a 60×30 viewport). The 159 cells that still differ from the cached values of the
+  a ten-row used range in 0.0 ms). The cheap wins that round measured were taken on 11-14, again
+  measured before and after: `MODE`/`MODE.MULT` counted with a linear scan (`MODE` over 100k
+  distinct values took **2.66 s**, ~5·10⁹ comparisons) — now **15 ms**, a hash count that keeps the
+  first-occurrence order; `VLOOKUP`/`HLOOKUP` copied the whole key column per call and `MATCH`
+  cloned the haystack before the host's text index could answer — the searches read the column in
+  place now (**VLOOKUP exact 2.9×, approximate 4.9×, MATCH 7.2×**), and `XMATCH`/`XLOOKUP` use the
+  index too; `criterion::matches` cloned the cell and re-tokenised its wildcard pattern per visited
+  cell (**wildcard `COUNTIF` 2.0×, `SUMIFS` 1.4×** — a numeric `SUMIF` was already allocation-free
+  and does not move); and the grid's per-cell path stopped cloning a `Cell`/`Style`, formatting a
+  font-family name, copying one-line text and laying out `"0"` per cell (**grid paint 1.60 → 1.07 ms**
+  min, 2.25 → 1.25 ms median on a 1,600-cell frame; the offscreen snapshot is byte-identical).
+  What is left there: a *borrowed* cell accessor in the store (the UI reads `sh.spill` itself to
+  stand in for `Sheet::value`), `display_text`'s per-cell `String`, `check_arrays` still walking the
+  store on a sheet that holds a multi-cell array, and `VLOOKUP`'s linear scan for the first match,
+  which is its semantics. The 159 cells that still differ from the cached values of the
   1.28 GB report are Excel's stale cache — 276 cells of the same `IFERROR(XLOOKUP(...))` shape in the
   same workbook cache `#N/A` — not a calculation difference.
 - **Evidence:** `crates/xlsx/src/sheet_read.rs`, `crates/model/src/store.rs`, `crates/model/src/line.rs`,
