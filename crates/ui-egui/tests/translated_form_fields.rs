@@ -24,11 +24,11 @@ fn harness() -> egui_kittest::Harness<'static, SheetApp> {
 #[test]
 fn form_fields_are_translated() {
     for (dialog, translated, english) in [
-        ("pageSetup", ["Margem esquerda (pol.):", "Rodapé (pol.):"], ["Left margin (in):", "Footer (in):"]),
-        ("insertPaste", ["Deslocar células para a direita", "Deslocar células para baixo"], ["Shift cells right", "Shift cells down"]),
+        ("pageSetup", ["左边距（英寸）：", "页脚（英寸）："], ["Left margin (in):", "Footer (in):"]),
+        ("insertPaste", ["右移单元格", "下移单元格"], ["Shift cells right", "Shift cells down"]),
     ] {
         let mut h = harness();
-        h.state_mut().run("app.language.set", json!({"language": "pt"})).unwrap();
+        h.state_mut().run("app.language.set", json!({"language": "zh"})).unwrap();
         h.state_mut().open_dialog(dialog, json!({}));
         h.run_steps(3);
         for label in translated {
@@ -45,7 +45,7 @@ fn notes_with_a_pipe_show_in_full() {
     // `tr` reads `|` as a context separator; the Open Hyperlink note carries the URL, which must
     // be shown whole so the user sees where the link really goes.
     let url = "https://example.com/report|evil.example";
-    for language in ["en", "pt"] {
+    for language in ["en", "zh"] {
         let mut h = harness();
         h.state_mut().run("app.language.set", json!({"language": language})).unwrap();
         h.state_mut().open_dialog("openLink", json!({"url": url}));

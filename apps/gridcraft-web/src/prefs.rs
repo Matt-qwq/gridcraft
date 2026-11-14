@@ -86,7 +86,7 @@ mod tests {
         let mut app = SheetApp::new(Session::new(), Services::default());
         // As `web::start` sets it up before restoring.
         app.ui.system_theme = true;
-        app.ui.language = Language::De;
+        app.ui.language = Language::Zh;
         app
     }
 
@@ -143,9 +143,12 @@ mod tests {
         let mut a = app();
         restore(&mut a, Some(r#"{"dark":true}"#), None);
         assert!(a.ui.dark);
-        assert_eq!(a.ui.language, Language::De);
+        assert_eq!(a.ui.language, Language::Zh);
+        restore(&mut a, Some(r#"{"language":"en"}"#), None);
+        assert_eq!(a.ui.language, Language::En);
+        // A code an older visit stored for a language this build dropped reads as English.
         restore(&mut a, Some(r#"{"language":"fr"}"#), None);
-        assert_eq!(a.ui.language, Language::Fr);
+        assert_eq!(a.ui.language, Language::En);
     }
 
     #[test]
@@ -155,7 +158,7 @@ mod tests {
             let mut a = app();
             restore(&mut a, junk, junk);
             assert!(a.ui.system_theme && !a.ui.dark, "{junk:?}");
-            assert_eq!(a.ui.language, Language::De);
+            assert_eq!(a.ui.language, Language::Zh);
             assert_eq!(a.session.prefs.enter_direction, "down");
         }
     }

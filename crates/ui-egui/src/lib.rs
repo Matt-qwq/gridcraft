@@ -689,7 +689,7 @@ impl SheetApp {
                 }
             }
             "app.language.set" => {
-                // `{"language": "ja"}`; `code` is accepted as an alias.
+                // `{"language": "zh"}`; `code` is accepted as an alias.
                 let code = p.get("language").or_else(|| p.get("code")).and_then(Json::as_str).unwrap_or("");
                 match i18n::Language::parse(code) {
                     Some(l) => {
@@ -702,10 +702,6 @@ impl SheetApp {
             "app.language.english" => {
                 self.ui.language = i18n::Language::En;
                 Ok(json!({"language": i18n::Language::En}))
-            }
-            "app.language.japanese" => {
-                self.ui.language = i18n::Language::Ja;
-                Ok(json!({"language": i18n::Language::Ja}))
             }
             "ui.backstage" => {
                 // `{"page": "info"}` opens File › Info; `{"page": "close"}` returns to the sheet.

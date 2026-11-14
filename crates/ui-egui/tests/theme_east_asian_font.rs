@@ -30,12 +30,14 @@ fn the_theme_east_asian_face_is_the_one_the_app_binds() {
 }
 
 #[test]
-fn a_language_with_its_own_script_picks_that_entry() {
+fn every_shipped_language_reads_the_hans_entry() {
+    // Both interface languages read Simplified Chinese glyph shapes; only a Japanese interface
+    // (which no longer ships) would have asked for the Jpan entry.
     let mut app = SheetApp::new(chinese_theme_session(), Default::default());
-    app.ui.language = gridcraft_ui_egui::i18n::Language::Ja;
-    assert_eq!(app.ea_fonts(), ["游ゴシック"], "Japanese reads the Jpan entry");
-    app.ui.language = gridcraft_ui_egui::i18n::Language::En;
-    assert_eq!(app.ea_fonts(), ["宋体"], "an English UI still draws the file's Chinese as it says");
+    for language in gridcraft_ui_egui::i18n::Language::ALL {
+        app.ui.language = language;
+        assert_eq!(app.ea_fonts(), ["宋体"], "{language:?} reads the theme's Hans entry");
+    }
 }
 
 #[test]

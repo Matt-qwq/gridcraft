@@ -161,20 +161,13 @@ mod tests {
     /// only when the interface language has them all.
     #[test]
     fn function_help_follows_the_interface_language_and_the_formula_syntax() {
-        use FormulaLocale::{En, Es};
-        // Spanish help over English formulas: the name and `,` stay as typed; brackets, indexes
-        // and `...` survive.
-        assert_eq!(sig("IF", En, Language::Es), "IF(prueba_lógica, [valor_si_verdadero], [valor_si_falso])");
-        assert_eq!(sig("SUM", En, Language::Es), "SUM(número1, [número2], ...)");
-        assert_eq!(description("IF", En, Language::Es).as_deref(), Some("Devuelve un valor según una condición."));
-        // Spanish names and separators, from a localized name.
-        assert_eq!(sig("suma", Es, Language::Es), "SUMA(número1; [número2]; ...)");
-        assert_eq!(description("SUMA", Es, Language::Es).as_deref(), Some("Suma los números."));
-        // An argument list Spanish covers only in part stays English instead of mixing (the name
-        // is whatever the Spanish formula table calls SUMIFS).
-        let sumifs = sig("SUMIFS", Es, Language::Es);
-        assert!(sumifs.ends_with("(sum_range; criteria_range1; criteria1; ...)"), "{sumifs}");
-        assert_eq!(description("SUMIFS", Es, Language::Es).as_deref(), Some("Adds the cells that meet every condition."));
-        assert_eq!(sig("IF", En, Language::En), "IF(logical_test, [value_if_true], [value_if_false])");
+        // English formulas with Chinese help: the name and `,` stay as typed; brackets and `...`
+        // survive, and an argument's index stays on its translated name.
+        assert_eq!(sig("IF", FormulaLocale::En, Language::Zh), "IF(逻辑判断, [条件为真时的值], [条件为假时的值])");
+        assert_eq!(sig("SUM", FormulaLocale::En, Language::Zh), "SUM(数值1, [数值2], ...)");
+        assert_eq!(description("IF", FormulaLocale::En, Language::Zh).as_deref(), Some("条件为 TRUE 时返回一个值，为 FALSE 时返回另一个值。"));
+        // English help and English formulas are unchanged, argument names included.
+        assert_eq!(sig("IF", FormulaLocale::En, Language::En), "IF(logical_test, [value_if_true], [value_if_false])");
+        assert_eq!(sig("SUM", FormulaLocale::En, Language::En), "SUM(number1, [number2], ...)");
     }
 }

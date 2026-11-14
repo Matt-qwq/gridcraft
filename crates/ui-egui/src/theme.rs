@@ -564,15 +564,20 @@ pub fn font_definitions() -> FontDefinitions {
 /// languages with the same order needs no font rebuild.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HanOrder {
-    /// Japanese glyph shapes first (the interface is Japanese).
+    /// Japanese glyph shapes first, for Japanese workbook text.
     Japanese,
-    /// Simplified Chinese first: the widest Han coverage, for every other interface language.
+    /// Simplified Chinese first: the widest Han coverage, and the order both shipped interface
+    /// languages read.
     Chinese,
 }
 
 impl HanOrder {
     pub fn of(language: crate::i18n::Language) -> Self {
-        if language == crate::i18n::Language::Ja { Self::Japanese } else { Self::Chinese }
+        match language {
+            // English only draws the CJK inside workbook text and the Chinese interface is
+            // Chinese: neither asks for Japanese glyph shapes.
+            crate::i18n::Language::En | crate::i18n::Language::Zh => Self::Chinese,
+        }
     }
 }
 
@@ -1127,11 +1132,10 @@ mod tests {
     fn fallback_faces_are_appended_to_every_family() {
         // Structural: whatever loaded, the non-Latin fallback keys must sit at the end of each chain
         // (after the Latin/default fonts) so Latin still wins for Latin text, in the language's order.
-        for han in [HanOrder::Chinese, HanOrder::Japanese] {
-            let language = if han == HanOrder::Japanese { Language::Ja } else { Language::Zh };
+        for language in Language::ALL {
             let fonts = font_definitions_for_language(language);
             let fb_keys: Vec<String> =
-                fallback_faces(han).into_iter().map(|(k, _)| k.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
+                fallback_faces(HanOrder::of(language)).into_iter().map(|(k, _)| k.to_string()).filter(|k| fonts.font_data.contains_key(k)).collect();
             if fb_keys.is_empty() {
                 return; // no fallback face on this machine (minimal Linux)
             }
@@ -1194,9 +1198,8 @@ mod tests {
                 "sys-symbols-2"
             ]
         );
-        assert_eq!(HanOrder::of(Language::Ja), HanOrder::Japanese);
-        for l in [Language::En, Language::Zh, Language::Ko, Language::Ru, Language::PtBr, Language::De, Language::Cs, Language::Fr, Language::Tr] {
-            assert_eq!(HanOrder::of(l), HanOrder::Chinese, "{l:?} shares the default order (no font rebuild)");
+        for l in Language::ALL {
+            assert_eq!(HanOrder::of(l), HanOrder::Chinese, "{l:?} reads Chinese glyph shapes (no font rebuild)");
         }
     }
 
@@ -1231,7 +1234,7 @@ mod tests {
     fn fallback_faces_load_each_file_once() {
         // The region-merged Noto Sans CJK .ttc serves Japanese, Chinese and Hangul; it must be loaded
         // once, not once per script (tens of MB each).
-        for language in [Language::En, Language::Ja] {
+        for language in Language::ALL {
             let fonts = font_definitions_for_language(language);
             let present: Vec<&Arc<FontData>> =
                 fallback_faces(HanOrder::of(language)).into_iter().filter_map(|(k, _)| fonts.font_data.get(k)).collect();
@@ -1259,7 +1262,7 @@ mod tests {
             // Czech interface labels: every Czech accented letter, in both cases.
             ("ui", candidates(UI), "Příliš žluťoučký kůň úpěl ďábelské ódy ŘŠČŽÝÁÍÉÚŮĚŤĎŇÓ"),
         ];
-        for language in [Language::En, Language::Ja] {
+        for language in Language::ALL {
             let ctx = egui::Context::default();
             ctx.set_fonts(font_definitions_for_language(language));
             let mut out = ctx.run_ui(egui::RawInput::default(), |_ui| {});

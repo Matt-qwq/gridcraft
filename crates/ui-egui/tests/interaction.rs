@@ -412,20 +412,10 @@ fn language_switch_translates_the_ribbon_and_persists() {
         panic!("engine.commands returns a response");
     };
     let ids: Vec<&str> = listed["result"].as_array().into_iter().flatten().filter_map(|c| c["id"].as_str()).collect();
-    for id in ["app.language.set", "app.language.english", "app.language.japanese"] {
+    for id in ["app.language.set", "app.language.english"] {
         assert!(ids.contains(&id), "engine.commands lists {id}");
     }
-    for (language, expected) in [
-        (Language::Zh, "数据"),
-        (Language::Ja, "データ"),
-        (Language::Ko, "데이터"),
-        (Language::Ru, "Данные"),
-        (Language::PtBr, "Dados"),
-        (Language::De, "Daten"),
-        (Language::Fr, "Données"),
-        (Language::Tr, "Veri"),
-        (Language::It, "Dati"),
-    ] {
+    for (language, expected) in [(Language::En, "Data"), (Language::Zh, "数据")] {
         h.state_mut().run("app.language.set", json!({"language": language.code()})).unwrap();
         h.run_steps(2); // every locale renders the ribbon without panicking
         assert_eq!(h.state().ui.language, language);
@@ -433,13 +423,10 @@ fn language_switch_translates_the_ribbon_and_persists() {
         let restored: gridcraft_ui_egui::UiState = serde_json::from_str(&serde_json::to_string(&h.state().ui).unwrap()).unwrap();
         assert_eq!(restored.language, language);
     }
-    // Czech spells "Data" as English does, so the Czech table is checked on a label that differs.
-    h.state_mut().run("app.language.set", json!({"language": "cs"})).unwrap();
+    // A language this build no longer ships is not taken; the interface stays where it was.
+    assert!(h.state_mut().run("app.language.set", json!({"language": "cs"})).is_err());
     h.run_steps(2);
-    assert_eq!(h.state().ui.language, Language::Cs);
-    assert_eq!(Language::Cs.tr("Formulas"), "Vzorce");
-    let restored: gridcraft_ui_egui::UiState = serde_json::from_str(&serde_json::to_string(&h.state().ui).unwrap()).unwrap();
-    assert_eq!(restored.language, Language::Cs);
+    assert_eq!(h.state().ui.language, Language::Zh);
     h.state_mut().run("app.language.set", json!({"language": "en"})).unwrap();
     assert_eq!(h.state().ui.language, Language::En);
 }
@@ -450,15 +437,15 @@ fn pivot_fields_pane_follows_the_interface_language() {
     let mut h = harness(blank());
     h.state_mut().run("range.setValues", json!({"range": "A1:B3", "values": [["Region", "Sales"], ["North", 10], ["South", 20]]})).unwrap();
     h.state_mut().run("insert.pivotTable", json!({"source": "Sheet1!$A$1:$B$3", "rows": ["Region"]})).unwrap();
-    h.state_mut().run("app.language.set", json!({"language": "es"})).unwrap();
+    h.state_mut().run("app.language.set", json!({"language": "zh"})).unwrap();
     h.run_steps(4);
-    for label in ["Campos de tabla dinámica", "Filas", "Valores", "Actualizar", "Campo calculado…"] {
+    for label in ["数据透视表字段", "行", "值", "刷新", "计算字段…"] {
         assert!(h.query_by_label(label).is_some(), "the pane shows `{label}`");
     }
     assert!(h.query_by_label("PivotTable Fields").is_none());
     h.get_by_label("Region ▾").click();
     h.run_steps(2);
-    for label in ["Mover a rótulos de columna", "Agrupar por años", "Quitar campo"] {
+    for label in ["移到列标签", "按年组合", "删除字段"] {
         assert!(h.query_by_label(label).is_some(), "the field menu shows `{label}`");
     }
     assert!(h.query_by_label("Remove Field").is_none());
@@ -489,12 +476,12 @@ fn pivot_fields_pane_reuses_its_field_list_until_the_workbook_changes() {
 #[test]
 fn format_cells_draws_its_labels_in_the_interface_language() {
     let mut h = harness(blank());
-    h.state_mut().run("app.language.set", json!({"language": "de"})).unwrap();
+    h.state_mut().run("app.language.set", json!({"language": "zh"})).unwrap();
     h.state_mut().open_dialog("formatCells", json!({"tab": "Number"}));
     h.run_steps(2);
-    assert!(h.query_by_label("Wissenschaftlich").is_some(), "the Number tab's categories are translated");
+    assert!(h.query_by_label("科学记数法").is_some(), "the Number tab's categories are translated");
     assert!(h.query_by_label("Scientific").is_none(), "no English category is left");
-    h.get_by_label("Wissenschaftlich").click();
+    h.get_by_label("科学记数法").click();
     h.run_steps(2);
     let style = &h.state().dialog.as_ref().unwrap().values["style"];
     assert_eq!(style["num_fmt"], json!("0.00E+00"), "a translated category still applies its code");
