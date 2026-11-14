@@ -823,6 +823,66 @@ impl KeptReader {
         (!p.is_empty()).then(|| Arc::new(p))
     }
 
+    /// A chart sheet's own content that the model has no room for: page margins, page setup, header
+    /// and footer, protection and its extensions. Each child is kept as a fragment, its relationship
+    /// ids rewritten on save (printer settings, the only part a chart sheet may reference that
+    /// GridCraft does not write, are kept with it). The drawing and the chart behind it are
+    /// modelled, so they are not kept here: writing them twice would give the package two charts.
+    pub fn chart_sheet(&mut self, cx: &mut Ctx<'_>, part: &str, name: &str) -> Option<Arc<Preserved>> {
+        if !self.on {
+            return None;
+        }
+        let bytes = match cx.pkg.read_limited(part, MAX_META) {
+            Ok(Some(b)) => b,
+            Ok(None) => return None,
+            Err(IoError::TooLarge(_)) => {
+                cx.warn(format!("chart sheet \"{name}\": its page setup and header could not be read (the part is too large) and were dropped"));
+                return None;
+            }
+            Err(e) => {
+                cx.warn(format!("chart sheet \"{name}\": its page setup and header could not be read ({e}) and were dropped"));
+                return None;
+            }
+        };
+        let children = match scan_chart_sheet(&bytes) {
+            Some(c) => c,
+            None => {
+                cx.warn(format!("chart sheet \"{name}\": its page setup and header could not be read and were dropped"));
+                return None;
+            }
+        };
+        let rels = match raw_rels(cx, part) {
+            Ok(r) => r,
+            Err(e) => {
+                cx.warn(format!("chart sheet \"{name}\": its relationships could not be read ({e}); unmodelled content was dropped"));
+                return None;
+            }
+        };
+        let mut p = Preserved::default();
+        let mut seen = HashSet::new();
+        for (tag, xml, ids) in children {
+            // The drawing (and the chart it frames) is written from the model, and so is <sheetPr>
+            // (tab colour and fit-to-page are model fields).
+            if tag == "drawing" || tag == "sheetPr" {
+                continue;
+            }
+            let roots: Option<Vec<PreservedRel>> =
+                ids.iter().map(|id| rels.iter().find(|r| r.id == *id && !r.external && is_kind(r, &["printerSettings"])).cloned()).collect();
+            let Some(roots) = roots else {
+                cx.warn(format!("chart sheet \"{name}\": its <{tag}> names a part GridCraft does not keep, so it was dropped"));
+                continue;
+            };
+            if !roots.is_empty()
+                && let Err(why) = self.keep(cx, &mut p, &roots, &mut seen)
+            {
+                cx.warn(format!("chart sheet \"{name}\": its <{tag}> was dropped: {why}"));
+                continue;
+            }
+            p.elements.push(PreservedXml { slot: format!("{CHART_SHEET_SLOT}{tag}"), xml });
+        }
+        (!p.is_empty()).then(|| Arc::new(p))
+    }
+
     fn sheet_elements(&mut self, cx: &mut Ctx<'_>, part: &str, name: &str, rels: &[PreservedRel], p: &mut Preserved, seen: &mut HashSet<String>) {
         let scan = match cx.pkg.read(part) {
             Ok(Some(bytes)) => scan_sheet(&bytes),
@@ -944,6 +1004,65 @@ struct SheetScan {
     legacy_drawing_hf: Option<String>,
     /// The relationship id on `<pageSetup>` (printer settings).
     page_setup: Option<String>,
+}
+
+/// The slot prefix of a chart sheet's kept children (`chartSheet:pageSetup`), so they cannot be
+/// confused with a worksheet's kept sheet elements.
+const CHART_SHEET_SLOT: &str = "chartSheet:";
+
+/// One kept child of a chart sheet part: its element name, its XML with the namespace declarations
+/// it needs, and the relationship ids it names.
+type ChartSheetChild = (String, String, Vec<String>);
+
+/// A chart sheet's top-level children, in document order: everything the model has no room for
+/// (page margins, page setup, header and footer, protection, extensions) is written back around the
+/// chart the model does keep. `None` when the part is damaged.
+fn scan_chart_sheet(bytes: &[u8]) -> Option<Vec<ChartSheetChild>> {
+    let data = xml::to_utf8(bytes);
+    let text = std::str::from_utf8(&data).ok()?;
+    let mut reader = Reader::from_str(text);
+    let mut decls: Vec<(String, String)> = vec![];
+    let mut out: Vec<ChartSheetChild> = vec![];
+    let mut in_root = false;
+    loop {
+        let start = usize::try_from(reader.buffer_position()).ok()?;
+        match reader.read_event().ok()? {
+            Event::Eof => break,
+            Event::Start(e) if !in_root => {
+                in_root = true;
+                for a in e.attributes().with_checks(false).flatten() {
+                    if let Some(p) = a.key.as_ref().strip_prefix(b"xmlns:")
+                        && let (Ok(p), Ok(v)) = (std::str::from_utf8(p), std::str::from_utf8(&a.value))
+                        && !v.contains('"')
+                    {
+                        decls.push((p.to_string(), v.to_string()));
+                    }
+                }
+            }
+            Event::Start(e) if in_root => {
+                let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                reader.read_to_end(e.name()).ok()?;
+                let end = usize::try_from(reader.buffer_position()).ok()?;
+                out.push(chart_sheet_child(text, start, end, &decls, tag)?);
+            }
+            Event::Empty(e) if in_root => {
+                let tag = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                let end = usize::try_from(reader.buffer_position()).ok()?;
+                out.push(chart_sheet_child(text, start, end, &decls, tag)?);
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+fn chart_sheet_child(text: &str, start: usize, end: usize, decls: &[(String, String)], tag: String) -> Option<ChartSheetChild> {
+    if end.saturating_sub(start) > MAX_FRAGMENT {
+        return None;
+    }
+    let frag = with_decls(text.get(start..end)?, decls);
+    let ids = rel_ids(&frag)?;
+    Some((tag, frag, ids))
 }
 
 /// Finds the sheet's `<picture>`, `<oleObjects>`, `<controls>` (also inside
@@ -1691,6 +1810,15 @@ impl<'a> SheetKept<'a> {
     pub fn page_setup_id(&self) -> Option<&str> {
         let old = &self.p?.elements.iter().find(|e| e.slot == "pageSetup")?.xml;
         self.ids.get(old).map(String::as_str)
+    }
+
+    /// A chart sheet's kept child `tag` (`pageMargins`, `pageSetup`, `headerFooter`, `extLst`…),
+    /// relationship ids rewritten. `None` when the file had none, or when an id it names is not
+    /// one of the parts kept with it (a dangling reference is never written).
+    pub fn chart_sheet_element(&self, tag: &str) -> Option<String> {
+        let slot = format!("{CHART_SHEET_SLOT}{tag}");
+        let xml = self.p?.elements.iter().find(|e| e.slot == slot)?.xml.clone();
+        remap(&xml, &self.ids)
     }
 
     /// The kept sheet elements, in schema order.

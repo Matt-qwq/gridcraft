@@ -269,6 +269,14 @@ impl Workbook {
     pub fn next_sheet_name(&self) -> String {
         (1..).map(|n| format!("Sheet{n}")).find(|n| self.sheet_index(n).is_none()).unwrap_or_else(|| "Sheet".into())
     }
+    /// A fresh chart sheet name `ChartN` not in use: the name Move Chart ▸ New sheet suggests.
+    pub fn next_chart_sheet_name(&self) -> String {
+        (1..).map(|n| format!("Chart{n}")).find(|n| self.sheet_index(n).is_none()).unwrap_or_else(|| "Chart".into())
+    }
+    /// The indices of the workbook's chart sheets, in tab order.
+    pub fn chart_sheets(&self) -> impl Iterator<Item = usize> + '_ {
+        self.sheets.iter().enumerate().filter(|(_, s)| s.is_chart_sheet()).map(|(i, _)| i)
+    }
     /// Validates a sheet name like Excel: 1–31 chars, none of `: \ / ? * [ ]`, not starting or
     /// ending with `'`, unique (case-insensitive) unless it is `except`'s own name.
     pub fn check_sheet_name(&self, name: &str, except: Option<usize>) -> Result<(), String> {

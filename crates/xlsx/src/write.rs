@@ -18,6 +18,7 @@ pub const NS_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/
 pub const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
 
 pub const CT_WORKSHEET: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+pub const CT_CHARTSHEET: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml";
 pub const CT_DRAWING: &str = "application/vnd.openxmlformats-officedocument.drawing+xml";
 pub const CT_CHART: &str = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml";
 pub const CT_TABLE: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml";
@@ -429,11 +430,38 @@ fn write_xlsx_impl(wb: &Workbook, kind: XlsxKind, book_name: Option<&str>, preco
     // The `sheetId` each model sheet is written with: a slicer/timeline cache names its PivotTable's
     // sheet by it (`pivotTable/@tabId`), and only the workbook assembly knows it.
     let mut sheet_ids: Vec<u32> = Vec::with_capacity(wb.sheets.len());
+    let mut chart_sheets = 0usize;
     for (i, sheet) in wb.sheets.iter().enumerate() {
         sheet_ids.push(sheet_id as u32);
         let (before, next) = kept.sheet_entries(i, false, sheet_id);
         sheets_xml.push_str(&before);
         sheet_id = next;
+        if sheet.is_chart_sheet() {
+            // A chart sheet is its own part (`xl/chartsheets/sheetN.xml`) with one chart: no cells,
+            // no worksheet.
+            chart_sheets += 1;
+            let (xml, rels) = crate::sheet_write::write_chart_sheet(wb, i, i == active, &mut out);
+            let name = format!("xl/chartsheets/sheet{chart_sheets}.xml");
+            if precompress_sheets {
+                out.part_precompressed(&name, Some(CT_CHARTSHEET), xml.into_bytes())?;
+            } else {
+                out.part(&name, Some(CT_CHARTSHEET), xml.into_bytes());
+            }
+            if !rels.is_empty() {
+                out.part(&format!("xl/chartsheets/_rels/sheet{chart_sheets}.xml.rels"), None, rels.xml().into_bytes());
+            }
+            let rid = wb_rels.add("chartsheet", &format!("chartsheets/sheet{chart_sheets}.xml"));
+            let state = match sheet.visibility {
+                Visibility::Visible => "",
+                _ if !any_visible && i == active => "",
+                Visibility::Hidden => " state=\"hidden\"",
+                Visibility::VeryHidden => " state=\"veryHidden\"",
+            };
+            let name: String = sheet.name.chars().take(31).collect();
+            let _ = write!(sheets_xml, "<sheet name=\"{}\" sheetId=\"{sheet_id}\"{state} r:id=\"{rid}\"/>", esc_attr(&name));
+            sheet_id += 1;
+            continue;
+        }
         let (xml, mut rels) = crate::sheet_write::write_sheet(wb, i, i == active, &mut out, &slicers);
         pivots.add_sheet(wb, i, &mut out, &mut rels, &slicers);
         let name = format!("xl/worksheets/sheet{}.xml", i + 1);

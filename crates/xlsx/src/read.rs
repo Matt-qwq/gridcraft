@@ -340,8 +340,32 @@ fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadRepor
             continue;
         };
         if rel.kind == "chartsheet" {
-            // Kept as it is and written back in place (see `passthrough`); nothing to model.
-            file_to_model.push(None);
+            // A chart sheet: one chart on a tab of its own, no cells. Modelled like a worksheet, so
+            // it is saved as a real chartsheet part instead of being carried through untouched.
+            let name = unique_name(&wb, &name, i);
+            let mut sheet = Sheet::empty_chart_sheet(name.clone());
+            let representable = match read_chart_sheet(&mut cx, &rel.target, &name, &mut sheet) {
+                Ok(ok) => ok,
+                Err(IoError::TooLarge(m)) => return Err(IoError::TooLarge(m)),
+                Err(e) => {
+                    cx.warn(format!("chart sheet \"{name}\" could not be read ({e}); it was kept as it was and is not shown"));
+                    false
+                }
+            };
+            if !representable {
+                // Kept whole through the pass-through, exactly as before chart sheets were modelled:
+                // a sheet GridCraft cannot represent is never half-modelled.
+                file_to_model.push(None);
+                continue;
+            }
+            sheet.visibility = match se.attr("state") {
+                Some("hidden") => Visibility::Hidden,
+                Some("veryHidden") => Visibility::VeryHidden,
+                _ => Visibility::Visible,
+            };
+            sheet.preserved = kept.chart_sheet(&mut cx, &rel.target, &name);
+            file_to_model.push(Some(wb.sheets.len()));
+            wb.sheets.push(Arc::new(sheet));
             continue;
         }
         if rel.kind != "worksheet" {
@@ -484,6 +508,49 @@ fn read_package(pkg: Package<'_>, plan: ReadPlan) -> Result<(Workbook, ReadRepor
     wb.styles = cx.styles;
     wb.phonetics = cx.phonetics;
     Ok((wb, cx.report))
+}
+
+/// Reads the chart a chart sheet shows: `<chartsheet><drawing r:id="…"/></chartsheet>` → a
+/// drawing part → one chart frame → the chart part (ECMA-376 Part 1, §19.3 chart sheets). Returns
+/// whether the sheet can be represented at all, warning about what stopped it (a missing drawing or
+/// chart part, a chart kind GridCraft does not model). `false` leaves the sheet to the
+/// pass-through, which keeps it byte for byte — a sheet is never half-modelled.
+fn read_chart_sheet(cx: &mut Ctx<'_>, part: &str, name: &str, sheet: &mut Sheet) -> Result<bool, IoError> {
+    let Some(x) = cx.optional_xml(part)? else { return Ok(false) };
+    let Some(rid) = x.child("drawing").and_then(|d| d.attr("id")) else {
+        cx.warn(format!("chart sheet \"{name}\" shows no drawing: it was kept as it was and is not shown"));
+        return Ok(false);
+    };
+    let rels = cx.pkg.rels(part)?;
+    let Some(rel) = rels.iter().find(|r| r.id == rid && !r.external) else {
+        cx.warn(format!("chart sheet \"{name}\": the relationship {rid} of its drawing names nothing; it was kept as it was"));
+        return Ok(false);
+    };
+    let drawing = rel.target.clone();
+    crate::drawing::read_drawing(cx, &drawing, sheet)?;
+    // A chart sheet is one chart and nothing else: pictures and shapes a drawing carries there are
+    // not part of the sheet, and only the first chart fits.
+    sheet.images.clear();
+    sheet.shapes.clear();
+    if !sheet.kept_charts.is_empty() {
+        sheet.kept_charts.clear();
+        sheet.charts.clear();
+        cx.warn(format!("chart sheet \"{name}\" holds a chart kind GridCraft does not model; it was kept as it was and is not shown"));
+        return Ok(false);
+    }
+    match sheet.charts.len() {
+        0 => {
+            cx.warn(format!("chart sheet \"{name}\": its chart part is missing or damaged; it was kept as it was and is not shown"));
+            Ok(false)
+        }
+        n => {
+            if n > 1 {
+                cx.warn(format!("chart sheet \"{name}\" holds {n} charts; a chart sheet shows one, so the rest were dropped"));
+            }
+            sheet.charts.truncate(1);
+            Ok(true)
+        }
+    }
 }
 
 pub(crate) fn unique_name(wb: &Workbook, name: &str, i: usize) -> String {

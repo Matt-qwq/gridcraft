@@ -3,9 +3,11 @@
 //! Each command changes the model only; the chart crate draws what is stored and the xlsx writer
 //! saves it, so an option that survives a save is the same one the UI draws.
 
+use std::sync::Arc;
+
 use gridcraft_model::{
-    AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, Gridlines, LabelFont, LabelOptions,
-    LabelPosition, LegendPos, PointFormat, PointLabel, Series,
+    Anchor, AnchorMode, AxisCrossing, AxisOptions, Chart, ChartKind, Color, DisplayUnits, ErrorBarDirection, ErrorBarKind, ErrorBars, Gridlines,
+    LabelFont, LabelOptions, LabelPosition, LegendPos, PointFormat, PointLabel, Series, Sheet,
 };
 use serde_json::{Value as Json, json};
 
@@ -75,6 +77,24 @@ pub fn specs() -> Vec<CommandSpec> {
             "{chart?, series: index, secondary?: bool (default true), type?: chart type, subtype?: stacked|stacked100|markers|lines} (moves one series to the secondary value axis, optionally changing its kind, as Change Chart Type does) → {chart, series, secondary}",
             has_doc,
             set_series_axis
+        ),
+        cmd!(
+            "chart.moveToSheet",
+            "Move Chart to a New Sheet",
+            ["Chart Design", "Location"],
+            None,
+            "{chart?: id, name?: sheet name (default ChartN)}: moves the chart onto a chart sheet of its own, right after the sheet it is on. One undo step; undo puts the chart back where it was → {chart, sheet, name}",
+            has_doc,
+            move_to_sheet
+        ),
+        cmd!(
+            "chart.moveToObject",
+            "Move Chart to a Sheet",
+            ["Chart Design", "Location"],
+            None,
+            "{sheet?: name | index (default: the worksheet before it), at?: \"C3\", width?, height?: pixels, dx?, dy?: pixels}: puts the active chart sheet's chart back on a worksheet as a floating object, and removes the chart sheet → {chart, sheet}",
+            has_doc,
+            move_to_object
         ),
     ]
 }
@@ -267,6 +287,103 @@ fn with_chart(s: &mut Session, p: &Json, f: impl FnOnce(&mut Chart) -> Result<()
         f(c)?;
         Ok(json!({"chart": c.id}))
     })
+}
+
+/// Excel's Move Chart ▸ New sheet: the chart leaves its worksheet and becomes a chart sheet of its
+/// own, right after the sheet it was on, which becomes active. One undo step: the model goes back
+/// with the chart back on its worksheet where it was.
+fn move_to_sheet(s: &mut Session, p: &Json) -> Result<Json> {
+    const C: &str = "chart.moveToSheet";
+    if s.doc()?.wb.protected_structure {
+        return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
+    }
+    let (si, ci) = find_chart(s, p)?;
+    let d = s.doc()?;
+    let sh = d.wb.sheet(si).ok_or(EngineError::NoDocument)?;
+    if sh.is_chart_sheet() {
+        return Err(bad(C, "the chart is already on a chart sheet"));
+    }
+    let name = match str_param(p, "name") {
+        Some(n) => n.trim().to_string(),
+        None => d.wb.next_chart_sheet_name(),
+    };
+    d.wb.check_sheet_name(&name, None).map_err(EngineError::Other)?;
+    let chart_id = sh.charts.get(ci).map(|c| c.id).unwrap_or_default();
+    let at = edit(s, |cx| {
+        let chart = {
+            let sheet = cx.sheet_mut(si)?;
+            let chart = sheet.charts.get(ci).cloned().ok_or_else(|| bad(C, "no such chart"))?;
+            sheet.charts.remove(ci);
+            chart
+        };
+        // Right after the chart's own sheet, as Excel places it.
+        let at = si.saturating_add(1).min(cx.wb.sheets.len());
+        cx.wb.sheets.insert(at, Arc::new(Sheet::chart_sheet(name.clone(), chart)));
+        // Names scoped to later sheets shift.
+        for n in cx.wb.names.iter_mut() {
+            if let Some(sc) = n.scope.as_mut()
+                && *sc >= at
+            {
+                *sc += 1;
+            }
+        }
+        cx.wb.active_sheet = at;
+        *cx.sel = crate::Selection::default();
+        cx.structural = true;
+        Ok(at)
+    })?;
+    let d = s.doc_mut()?;
+    d.sheet_selections.insert(at.min(d.sheet_selections.len()), crate::Selection::default());
+    Ok(json!({"chart": chart_id, "sheet": at, "name": name}))
+}
+
+/// The way back (Excel's Move Chart ▸ Object in): the chart of the active chart sheet becomes a
+/// floating object on worksheet `sheet`, and the chart sheet goes away with it. One undo step.
+fn move_to_object(s: &mut Session, p: &Json) -> Result<Json> {
+    const C: &str = "chart.moveToObject";
+    if s.doc()?.wb.protected_structure {
+        return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
+    }
+    let d = s.doc()?;
+    let si = d.wb.active_sheet;
+    let sh = d.wb.sheet(si).ok_or(EngineError::NoDocument)?;
+    if !sh.is_chart_sheet() {
+        return Err(bad(C, "the active sheet is not a chart sheet (chart.moveToSheet puts a chart on one)"));
+    }
+    let mut chart = sh.charts.first().cloned().ok_or_else(|| bad(C, "the chart sheet shows no chart to move"))?;
+    // Where it lands: the sheet named, or the nearest worksheet before the chart sheet — a chart
+    // sheet is never a place for an object.
+    let target = match p.get("sheet") {
+        Some(_) => Some(super::target_sheet(s, p)?),
+        None => (0..si).rev().find(|i| d.wb.sheet(*i).is_some_and(|s| !s.is_chart_sheet())),
+    };
+    let Some(target) = target else { return Err(bad(C, "there is no worksheet to put the chart on")) };
+    if d.wb.sheet(target).is_some_and(|s| s.is_chart_sheet()) {
+        return Err(bad(C, "a chart sheet holds its own chart and no objects: choose a worksheet"));
+    }
+    let at = cell_param_on(s, p, "at", target)?.unwrap_or_default();
+    let size = |v: f32, fallback: f32| f64::from(if v >= 1.0 { v } else { fallback });
+    let width = f64_param(p, "width").unwrap_or(size(chart.anchor.width, 480.0)).clamp(1.0, 10_000.0) as f32;
+    let height = f64_param(p, "height").unwrap_or(size(chart.anchor.height, 300.0)).clamp(1.0, 10_000.0) as f32;
+    let dx = f64_param(p, "dx").unwrap_or(0.0).clamp(0.0, 10_000.0) as f32;
+    let dy = f64_param(p, "dy").unwrap_or(0.0).clamp(0.0, 10_000.0) as f32;
+    let chart_id = chart.id;
+    let placed = edit(s, |cx| {
+        // The chart sheet goes first, so the target's index is the one it has afterwards.
+        super::sheet::drop_sheet(cx, si);
+        let target = if target > si { target.saturating_sub(1) } else { target };
+        chart.anchor = Anchor { cell: at, dx, dy, width, height, mode: AnchorMode::MoveAndSize };
+        cx.sheet_mut(target)?.charts.push(chart);
+        cx.wb.active_sheet = target;
+        *cx.sel = crate::Selection::default();
+        cx.structural = true;
+        Ok(target)
+    })?;
+    let d = s.doc_mut()?;
+    if si < d.sheet_selections.len() {
+        d.sheet_selections.remove(si);
+    }
+    Ok(json!({"chart": chart_id, "sheet": placed}))
 }
 
 /// Which axis of a chart an option command addresses.
@@ -1016,4 +1133,149 @@ fn format_point(s: &mut Session, p: &Json) -> Result<Json> {
         se.set_point(p);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    /// A workbook with a two-column block and one chart on it.
+    fn session() -> (Session, u32) {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Q1"], ["North", 48], ["South", 39], ["East", 55], ["West", 61]]}))
+            .unwrap();
+        s.execute("selection.set", json!({"range": "A1:B5"})).unwrap();
+        let chart = s.execute("insert.chart", json!({"type": "column", "at": "D2", "width": 420, "height": 260})).unwrap();
+        let id = u32::try_from(chart["chart"].as_u64().unwrap()).unwrap();
+        (s, id)
+    }
+
+    /// Move Chart ▸ New sheet, and undo: the chart is back on its worksheet, where it was, in one
+    /// step, and the chart sheet is gone.
+    #[test]
+    fn move_to_sheet_puts_the_chart_on_a_chart_sheet_and_undo_puts_it_back() {
+        let (mut s, id) = session();
+        assert_eq!(s.doc().unwrap().wb.sheets.len(), 1);
+        let r = s.execute("chart.moveToSheet", json!({"chart": id})).unwrap();
+        assert_eq!(r["sheet"], json!(1));
+        assert_eq!(r["name"], json!("Chart1"));
+        {
+            let d = s.doc().unwrap();
+            assert_eq!(d.wb.sheets.len(), 2);
+            assert_eq!(d.wb.active_sheet, 1);
+            let cs = d.wb.sheet(1).unwrap();
+            assert!(cs.is_chart_sheet());
+            assert_eq!(cs.name, "Chart1");
+            assert_eq!(cs.charts.len(), 1);
+            assert_eq!(cs.charts[0].id, id);
+            assert!(cs.charts[0].series[0].values.contains("Sheet1!"));
+            // The worksheet no longer holds it, and its cells are untouched.
+            assert!(d.wb.sheet(0).unwrap().charts.is_empty());
+            assert_eq!(d.wb.sheet(0).unwrap().value(gridcraft_core::CellRef::new(1, 1)), gridcraft_core::Value::Number(48.0));
+        }
+        // One undo step takes the whole move back.
+        s.execute("edit.undo", json!({})).unwrap();
+        {
+            let d = s.doc().unwrap();
+            assert_eq!(d.wb.sheets.len(), 1);
+            assert_eq!(d.wb.active_sheet, 0);
+            assert!(!d.wb.sheet(0).unwrap().is_chart_sheet());
+            assert_eq!(d.wb.sheet(0).unwrap().charts.iter().map(|c| c.id).collect::<Vec<_>>(), vec![id]);
+        }
+    }
+
+    /// The chart sheet can be renamed, moved, hidden and deleted like any other sheet.
+    #[test]
+    fn a_chart_sheet_is_a_sheet_for_the_sheet_commands() {
+        let (mut s, _id) = session();
+        s.execute("chart.moveToSheet", json!({"name": "Sales chart"})).unwrap();
+        s.execute("sheet.rename", json!({"sheet": 1, "name": "Revenue"})).unwrap();
+        s.execute("sheet.move", json!({"sheet": 1, "to": 0})).unwrap();
+        {
+            let d = s.doc().unwrap();
+            assert_eq!(d.wb.sheets[0].name, "Revenue");
+            assert!(d.wb.sheets[0].is_chart_sheet());
+            assert_eq!(d.wb.active_sheet, 0);
+        }
+        s.execute("sheet.hide", json!({"sheet": 0})).unwrap();
+        assert_eq!(s.doc().unwrap().wb.sheets[0].visibility, gridcraft_model::Visibility::Hidden);
+        // The last visible sheet cannot go (Excel's rule); unhide, then delete the chart sheet.
+        s.execute("sheet.unhide", json!({"sheet": 0})).unwrap();
+        s.execute("home.deleteSheet", json!({"sheet": 0})).unwrap();
+        let d = s.doc().unwrap();
+        assert_eq!(d.wb.sheets.len(), 1);
+        assert!(!d.wb.sheet(0).unwrap().is_chart_sheet());
+    }
+
+    /// The way back: chart.moveToObject puts the chart on a worksheet as a floating object and
+    /// removes the chart sheet, in one undoable step.
+    #[test]
+    fn move_to_object_brings_the_chart_back_and_undo_returns_the_chart_sheet() {
+        let (mut s, id) = session();
+        s.execute("chart.moveToSheet", json!({})).unwrap();
+        let r = s.execute("chart.moveToObject", json!({"sheet": 0, "at": "F4", "width": 300, "height": 180})).unwrap();
+        assert_eq!(r["sheet"], json!(0));
+        {
+            let d = s.doc().unwrap();
+            assert_eq!(d.wb.sheets.len(), 1);
+            let sh = d.wb.sheet(0).unwrap();
+            let ch = sh.charts.iter().find(|c| c.id == id).unwrap();
+            assert_eq!(ch.anchor.cell, gridcraft_core::CellRef::new(3, 5));
+            assert_eq!((ch.anchor.width, ch.anchor.height), (300.0, 180.0));
+            assert!(!sh.is_chart_sheet());
+        }
+        s.execute("edit.undo", json!({})).unwrap();
+        {
+            let d = s.doc().unwrap();
+            assert_eq!(d.wb.sheets.len(), 2);
+            assert!(d.wb.sheet(1).unwrap().is_chart_sheet());
+            assert!(d.wb.sheet(0).unwrap().charts.is_empty());
+        }
+    }
+
+    /// A chart sheet never takes a floating chart, and a chart sheet's chart cannot be deleted on
+    /// its own: the sheet is what goes.
+    #[test]
+    fn a_chart_sheet_takes_no_objects_and_its_chart_is_deleted_with_it() {
+        let (mut s, _id) = session();
+        s.execute("chart.moveToSheet", json!({})).unwrap();
+        assert!(s.execute("chart.moveToObject", json!({"sheet": 1})).is_err(), "a chart sheet holds no objects");
+        s.execute("sheet.activate", json!({"sheet": 1})).unwrap();
+        assert!(s.execute("chart.delete", json!({})).is_err(), "the chart is the sheet");
+        s.execute("home.deleteSheet", json!({"sheet": 1})).unwrap();
+        let d = s.doc().unwrap();
+        assert_eq!(d.wb.sheets.len(), 1);
+        assert!(!d.wb.sheet(0).unwrap().is_chart_sheet());
+    }
+
+    /// Printing and PDF export walk every sheet: a chart sheet is a page, not a crash.
+    #[test]
+    fn a_chart_sheet_prints_and_exports_pdf() {
+        let (mut s, _id) = session();
+        s.execute("chart.moveToSheet", json!({})).unwrap();
+        // The chart sheet is the active sheet now.
+        let r = s.execute("file.exportPdf", json!({})).unwrap();
+        assert!(r["pages"].as_u64().unwrap_or(0) >= 1, "a chart sheet is a page: {r:?}");
+        let r = s.execute("file.exportPdf", json!({"sheets": "all"})).unwrap();
+        assert!(r["pages"].as_u64().unwrap_or(0) >= 2, "both sheets print: {r:?}");
+        assert!(s.execute("review.checkAccessibility", json!({})).is_ok());
+        assert!(s.execute("file.printPreview", json!({})).is_ok());
+    }
+
+    /// Cells typed on a chart sheet are refused at the model's door: nothing is stored where a
+    /// save would drop it.
+    #[test]
+    fn a_chart_sheet_never_stores_cells() {
+        let (mut s, _id) = session();
+        s.execute("chart.moveToSheet", json!({})).unwrap();
+        let _ = s.execute("cell.set", json!({"cell": "A1", "input": "12"}));
+        let d = s.doc().unwrap();
+        let cs = d.wb.sheet(1).unwrap();
+        assert!(cs.is_chart_sheet());
+        assert!(cs.cells.is_empty(), "a chart sheet holds no cells");
+        assert_eq!(cs.used_range(), None);
+    }
 }

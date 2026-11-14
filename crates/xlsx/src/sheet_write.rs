@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use gridcraft_core::{CellError, CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_model::{
-    Cell, CfOperator, CfRule, CfValueKind, Color, CondFormat, ErrorStyle, FilterCriterion, LineInfo, NoteBox, NoteCorner, Orientation, Sheet,
+    Cell, CfOperator, CfRule, CfValueKind, Chart, Color, CondFormat, ErrorStyle, FilterCriterion, LineInfo, NoteBox, NoteCorner, Orientation, Sheet,
     SparklineKind, Style, Table, TotalsFn, Validation, ValidationKind, Workbook, default_icon_thresholds, icon_count,
 };
 
@@ -95,6 +95,141 @@ fn write_style_parts(out: &mut Out, n: u32, chartex: bool, kept: (Option<&str>, 
         rels.add_uri(crate::chartex::REL_COLORS, &format!("colors{n}.xml"));
     }
     rels
+}
+
+/// Writes chart `ch`'s part (a classic `chartN.xml` or a `chartExN.xml`) and its own style and
+/// colour parts, and adds the relationship that frames it in a drawing to `drawing`. Returns the
+/// relationship id the frame names.
+fn write_chart_part(wb: &Workbook, si: usize, ch: &Chart, out: &mut Out, drawing: &mut Rels) -> String {
+    out.charts += 1;
+    let n = out.charts;
+    if ch.kind.is_chartex() {
+        let written = crate::chartex::write_chartex(wb, si, ch, &mut out.chart_names);
+        out.part(&format!("xl/charts/chartEx{n}.xml"), Some(crate::chartex::CT_CHARTEX), written.xml.into_bytes());
+        // A file's own style and colour parts are kept; a regenerated part gets the defaults.
+        let crels = write_style_parts(out, n, true, (written.style.as_deref(), written.colors.as_deref()));
+        out.part(&format!("xl/charts/_rels/chartEx{n}.xml.rels"), None, crels.xml().into_bytes());
+        drawing.add_uri(crate::chartex::REL_CHARTEX, &format!("../charts/chartEx{n}.xml"))
+    } else {
+        let written = crate::chart::write_chart(wb, si, ch, &out.book_name);
+        out.part(&format!("xl/charts/chart{n}.xml"), Some(CT_CHART), written.xml.into_bytes());
+        let crels = write_style_parts(out, n, false, (written.style.as_deref(), written.colors.as_deref()));
+        if !crels.is_empty() {
+            out.part(&format!("xl/charts/_rels/chart{n}.xml.rels"), None, crels.xml().into_bytes());
+        }
+        drawing.add("chart", &format!("../charts/chart{n}.xml"))
+    }
+}
+
+/// A chart sheet part's children in schema order (ECMA-376 Part 1, §19.3): what the model keeps,
+/// and the drawing that places its chart.
+const CHART_SHEET_SLOTS: &[&str] = &["sheetViews", "sheetProtection", "customSheetViews", "pageMargins", "pageSetup", "headerFooter"];
+
+/// The chart sheet's drawing: one chart frame with an absolute anchor. A chart sheet has no grid to
+/// anchor to, and Excel writes an absolute anchor there; the frame is the whole window, so its size
+/// only says how large the chart was laid out.
+fn chart_sheet_drawing(ch: &Chart, rid: &str) -> String {
+    let emu = |v: f32| (clamp_size(v.max(1.0)) as f64 * crate::tables::EMU_PER_PX).round() as i64;
+    let ext = format!("<xdr:ext cx=\"{}\" cy=\"{}\"/>", emu(ch.anchor.width), emu(ch.anchor.height));
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\">",
+    );
+    s.push_str(&format!("<xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"0\"/>{ext}"));
+    if ch.kind.is_chartex() {
+        let (prefix, ns) = crate::chartex::requires(ch.kind);
+        s.push_str(&format!(
+            "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice xmlns:{prefix}=\"{ns}\" Requires=\"{prefix}\"><xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"2\" name=\"Chart 1\"{}/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri=\"http://schemas.microsoft.com/office/drawing/2014/chartex\"><cx:chart xmlns:cx=\"http://schemas.microsoft.com/office/drawing/2014/chartex\" r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro=\"\" textlink=\"\"><xdr:nvSpPr><xdr:cNvPr id=\"0\" name=\"\"/><xdr:cNvSpPr><a:spLocks noTextEdit=\"1\"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/>{ext}</a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr><xdr:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\"/><a:t>This chart type can't be shown by this application.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent>",
+            alt_attr(ch.alt.as_deref())
+        ));
+    } else {
+        s.push_str(&format!(
+            "<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"2\" name=\"Chart 1\"{}/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>",
+            alt_attr(ch.alt.as_deref())
+        ));
+    }
+    s.push_str("<xdr:clientData/></xdr:absoluteAnchor></xdr:wsDr>");
+    s
+}
+
+/// The largest side of an object the writer stores, in pixels (the same bound the drawing writer
+/// clamps to): anchors come from files and commands, so their numbers are hostile.
+fn clamp_size(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(1.0, 1_000_000.0) } else { 1.0 }
+}
+
+/// A drawing object's alternative text (`xdr:cNvPr/@descr`), trimmed and capped; empty is nothing.
+fn alt_attr(alt: Option<&str>) -> String {
+    match alt.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => format!(" descr=\"{}\"", esc_attr(&t.chars().take(1024).collect::<String>())),
+        None => String::new(),
+    }
+}
+
+/// A chart sheet part (`xl/chartsheets/sheetN.xml`): one chart, no cells. Its chart part, the
+/// drawing that frames it and its kept page setup are written beside it.
+///
+/// Everything the model has no room for — page margins, page setup, header and footer, protection,
+/// extensions — comes from the pass-through, so a chart sheet opened and saved keeps them.
+pub fn write_chart_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (String, Rels) {
+    let mut rels = Rels::default();
+    let Some(sheet) = wb.sheet(si) else { return (String::new(), rels) };
+    let kept = crate::passthrough::SheetKept::write(sheet, &mut rels, out);
+    // A chart sheet needs a view (the tab it is shown in) and page margins; where the file had its
+    // own, they are kept as they were.
+    let views = kept.chart_sheet_element("sheetViews").unwrap_or_else(|| {
+        format!(
+            "<sheetViews><sheetView{}{} workbookViewId=\"0\"/></sheetViews>",
+            if selected { " tabSelected=\"1\"" } else { "" },
+            if sheet.zoom == 100 { String::new() } else { format!(" zoomScale=\"{}\"", sheet.zoom.clamp(10, 400)) }
+        )
+    });
+    let margins = kept
+        .chart_sheet_element("pageMargins")
+        .unwrap_or_else(|| "<pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/>".to_string());
+    let mut s = format!("{XML_DECL}<chartsheet xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\">");
+    // Tab colour and "fit to page" come from the model, as they do for a worksheet: the file's own
+    // <sheetPr> is not kept, so changing either on a chart sheet is saved like any other edit.
+    let fit = sheet.print.fit_to.is_some();
+    if sheet.tab_color.is_some() || fit {
+        s.push_str("<sheetPr>");
+        if let Some(c) = &sheet.tab_color {
+            let _ = write!(s, "<tabColor {}/>", color_attrs(c));
+        }
+        if fit {
+            s.push_str("<pageSetUpPr fitToPage=\"1\"/>");
+        }
+        s.push_str("</sheetPr>");
+    }
+    for tag in CHART_SHEET_SLOTS {
+        match *tag {
+            "sheetViews" => s.push_str(&views),
+            "pageMargins" => s.push_str(&margins),
+            other => {
+                if let Some(x) = kept.chart_sheet_element(other) {
+                    s.push_str(&x);
+                }
+            }
+        }
+    }
+    if let Some(ch) = sheet.chart_sheet_chart() {
+        out.drawings += 1;
+        let dn = out.drawings;
+        let mut drels = Rels::default();
+        let rid = write_chart_part(wb, si, ch, out, &mut drels);
+        out.part(&format!("xl/drawings/drawing{dn}.xml"), Some(CT_DRAWING), chart_sheet_drawing(ch, &rid).into_bytes());
+        if !drels.is_empty() {
+            out.part(&format!("xl/drawings/_rels/drawing{dn}.xml.rels"), None, drels.xml().into_bytes());
+        }
+        let drid = rels.add("drawing", &format!("../drawings/drawing{dn}.xml"));
+        let _ = write!(s, "<drawing r:id=\"{drid}\"/>");
+    }
+    for tag in ["legacyDrawing", "legacyDrawingHF", "drawingHF", "picture", "webPublishItems", "tableParts", "extLst"] {
+        if let Some(x) = kept.chart_sheet_element(tag) {
+            s.push_str(&x);
+        }
+    }
+    s.push_str("</chartsheet>");
+    (s, rels)
 }
 
 pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slicers: &crate::slicer::SlicerWriter) -> (String, Rels) {
@@ -598,24 +733,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out, slic
             objs.push(Obj::Image(img, rid));
         }
         for ch in &sheet.charts {
-            out.charts += 1;
-            let n = out.charts;
-            let rid = if ch.kind.is_chartex() {
-                let written = crate::chartex::write_chartex(wb, si, ch, &mut out.chart_names);
-                out.part(&format!("xl/charts/chartEx{n}.xml"), Some(crate::chartex::CT_CHARTEX), written.xml.into_bytes());
-                // A file's own style and colour parts are kept; a regenerated part gets the defaults.
-                let crels = write_style_parts(out, n, true, (written.style.as_deref(), written.colors.as_deref()));
-                out.part(&format!("xl/charts/_rels/chartEx{n}.xml.rels"), None, crels.xml().into_bytes());
-                drels.add_uri(crate::chartex::REL_CHARTEX, &format!("../charts/chartEx{n}.xml"))
-            } else {
-                let written = crate::chart::write_chart(wb, si, ch, &out.book_name);
-                out.part(&format!("xl/charts/chart{n}.xml"), Some(CT_CHART), written.xml.into_bytes());
-                let crels = write_style_parts(out, n, false, (written.style.as_deref(), written.colors.as_deref()));
-                if !crels.is_empty() {
-                    out.part(&format!("xl/charts/_rels/chart{n}.xml.rels"), None, crels.xml().into_bytes());
-                }
-                drels.add("chart", &format!("../charts/chart{}.xml", out.charts))
-            };
+            let rid = write_chart_part(wb, si, ch, out, &mut drels);
             objs.push(Obj::Chart(ch, rid));
         }
         for ch in &sheet.kept_charts {

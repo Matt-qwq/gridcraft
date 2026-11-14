@@ -76,11 +76,14 @@ pub fn element_at(
         return None;
     }
     let (w, h) = (chart.anchor.width.max(1.0), chart.anchor.height.max(1.0));
-    let z = rect.width() / w;
+    // The chart is laid out at its own size and scaled to fit the rect, centered: on a worksheet
+    // that is the zoom factor exactly, and on a chart sheet the fit that fills the window.
+    let z = (rect.width() / w).min(rect.height() / h);
     if !(w.is_finite() && h.is_finite() && z.is_finite() && z > 0.0) {
         return None;
     }
-    let (x, y) = ((at.x - rect.left()) / z, (at.y - rect.top()) / z);
+    let origin = rect.center() - vec2(w * z, h * z) / 2.0;
+    let (x, y) = ((at.x - origin.x) / z, (at.y - origin.y) / z);
     if let Some(hits) = hits {
         return gridcraft_chart::hit_at(hits, x, y);
     }
@@ -633,8 +636,22 @@ pub(crate) fn paint_objects(
         }
         done(start, r);
     }
+    // A chart sheet is its chart: one chart, filling the window instead of sitting in a
+    // cell-anchored frame (Excel paints the chart sheet's chart over the whole page area).
+    let chart_sheet = sh.is_chart_sheet();
     for (i, ch) in sh.charts.iter().enumerate() {
-        let r = anchor_rect(geo, sh, &ch.anchor);
+        let (w, h) = (ch.anchor.width, ch.anchor.height);
+        let (r, z) = if chart_sheet {
+            // Laid out at its own size and fitted to the window, keeping its proportions; the
+            // drawing is laid out once per size, so the click regions stay the ones painted.
+            let view = geo.cells;
+            let (w, h) = (w.max(1.0), h.max(1.0));
+            let fit = (view.width() / w).min(view.height() / h);
+            let z = if fit.is_finite() && fit > 0.0 { fit } else { geo.z };
+            (Rect::from_center_size(view.center(), vec2(w * z, h * z)), z)
+        } else {
+            (anchor_rect(geo, sh, &ch.anchor), geo.z)
+        };
         if !r.intersects(p.clip_rect()) {
             continue;
         }
@@ -645,18 +662,24 @@ pub(crate) fn paint_objects(
         // Laying a chart out (axis ticks, measured labels) is far too slow for every frame: the
         // drawing — primitives and click regions — is kept until the document or the anchor size
         // changes.
-        let size = (ch.anchor.width.to_bits(), ch.anchor.height.to_bits());
+        let size = (w.to_bits(), h.to_bits());
         if cache.chart_stale(i, size) {
             let data = gridcraft_chart::resolve(wb, si, ch);
-            let m = EguiMeasure { painter: p, z: geo.z, text: Some(&app.text) };
-            let drawing = gridcraft_chart::draw(ch, &data, ch.anchor.width, ch.anchor.height, &m);
+            let m = EguiMeasure { painter: p, z, text: Some(&app.text) };
+            let drawing = gridcraft_chart::draw(ch, &data, w, h, &m);
             cache.put_chart(i, size, drawing);
         }
         if let Some(drawing) = cache.chart(i) {
-            paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &drawing.prims, geo.z, Some(&app.text));
+            paint_prims(&p.with_clip_rect(r.intersect(p.clip_rect())), r.min, &drawing.prims, z, Some(&app.text));
         }
         if app.selected_chart == Some(ch.id) {
-            selection_frame(p, r);
+            if chart_sheet {
+                // The chart sheet's chart is the window's size: a resize frame would promise
+                // something the sheet cannot do.
+                p.rect_stroke(r, 0.0, Stroke::new(1.5, theme::Tokens::get(p.ctx()).accent), StrokeKind::Outside);
+            } else {
+                selection_frame(p, r);
+            }
         }
         // The source-data highlight below is in cell space: mirrored with the cells.
         done(start, r);

@@ -10,6 +10,9 @@ use crate::SheetApp;
 use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 
+/// Space a chart sheet's tab gives its chart glyph before the name, in screen points.
+const TAB_GLYPH: f32 = 16.0;
+
 /// The rename field asks for focus only while it has not got it yet. Asking again on the frame it lost focus (Enter or a click elsewhere)
 /// would keep the field focused after it is closed, so the keyboard stayed stuck in the sheet name.
 fn rename_needs_focus(has_focus: bool, lost_focus: bool) -> bool {
@@ -99,12 +102,12 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
             }
             ui.add_space(8.0);
             let Some(d) = app.session.active() else { return };
-            let sheets: Vec<(usize, String, Option<[u8; 3]>, bool)> =
+            let sheets: Vec<(usize, String, Option<[u8; 3]>, bool, bool)> =
                 d.wb.sheets
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| s.visibility == Visibility::Visible)
-                    .map(|(i, s)| (i, s.name.clone(), s.tab_color.and_then(|c| c.resolve(&d.wb.theme)), i == d.wb.active_sheet))
+                    .map(|(i, s)| (i, s.name.clone(), s.tab_color.and_then(|c| c.resolve(&d.wb.theme)), i == d.wb.active_sheet, s.is_chart_sheet()))
                     .collect();
             // Keep worksheet tabs in their own horizontally scrollable viewport. As in Excel, the
             // tabs get up to 60% of the bar and the grid's horizontal scrollbar the rest; a strip
@@ -141,12 +144,19 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
                         }
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            for (i, name, color, active) in sheets {
+                            for (i, name, color, active, chart_sheet) in sheets {
                                 let renaming = app.grid.renaming_tab == Some(i);
                                 let font = if active { theme::ui_bold(13.0) } else { theme::ui_font(13.0) };
                                 let tw = ui.painter().layout_no_wrap(name.clone(), font.clone(), t.text).size().x;
-                                let w = (tw + 32.0).max(72.0);
+                                // A chart sheet (one chart, no cells) is marked like Excel marks it,
+                                // with a chart glyph before its name.
+                                let glyph = if chart_sheet { TAB_GLYPH } else { 0.0 };
+                                let w = (tw + glyph + 32.0).max(72.0);
                                 let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click_and_drag());
+                                // The tab's name is what a screen reader reads for it; a chart
+                                // sheet says so, as its glyph does on screen.
+                                let label = if chart_sheet { format!("{}, {}", name, app.ui.language.tr("Chart sheet")) } else { name.clone() };
+                                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
                                 if active && reveal_active {
                                     resp.scroll_to_me(None);
                                 }
@@ -185,7 +195,13 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
                                         app.grid.renaming_tab = None;
                                     }
                                 } else {
-                                    ui.painter().text(r.center(), Align2::CENTER_CENTER, &name, font, if active { t.accent } else { t.text });
+                                    let ink = if active { t.accent } else { t.text };
+                                    if chart_sheet {
+                                        let glyph_rect =
+                                            Rect::from_center_size(pos2(r.center().x - tw / 2.0 - glyph / 4.0, r.center().y), vec2(14.0, 14.0));
+                                        icons::paint(ui.painter(), glyph_rect, Icon::Chart, if active { t.accent } else { t.text_dim });
+                                    }
+                                    ui.painter().text(pos2(r.center().x + glyph / 4.0, r.center().y), Align2::CENTER_CENTER, &name, font, ink);
                                 }
                                 // A right-click activates the tab too, as in Excel, so the menu's sheet commands (Protect
                                 // Sheet, Select All Sheets) act on the sheet that was clicked rather than the one that was active.

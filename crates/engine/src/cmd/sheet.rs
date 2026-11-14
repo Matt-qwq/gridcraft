@@ -732,6 +732,49 @@ fn edit_doc<R>(d: &mut crate::DocState, f: impl FnOnce(&mut Ctx) -> Result<R>) -
     super::commit(d, f)
 }
 
+/// Removes sheet `i` from the workbook model, the way Delete Sheet does: formulas anywhere that
+/// name it become `#REF!`, the names scoped to it go, later scopes shift down, and the active
+/// sheet moves back. The caller resets the selection, sets `structural` and drops the sheet's own
+/// saved selection. A chart sheet is removed with it: deleting a chart sheet deletes its chart.
+pub(crate) fn drop_sheet(cx: &mut Ctx, i: usize) {
+    let Some(sheet) = cx.wb.sheet(i) else { return };
+    let name = sheet.name.clone();
+    let order: Vec<String> = cx.wb.sheets.iter().map(|s| s.name.clone()).collect();
+    cx.wb.sheets.remove(i);
+    for si in 0..cx.wb.sheets.len() {
+        let keys: Vec<(CellRef, Arc<gridcraft_model::Formula>)> =
+            cx.wb.sheets.get(si).map(|s| s.cells.iter().filter_map(|(c, x)| x.formula.clone().map(|f| (c, f))).collect()).unwrap_or_default();
+        let Some(sh) = cx.wb.sheet_mut(si) else { continue };
+        for (c, f) in keys {
+            if let Some(e) = f.expr() {
+                let ne = gridcraft_formula::adjust::delete_sheet(e, &name, &order);
+                if let Some(mut cell) = sh.cells.get(c) {
+                    cell.formula = Some(Arc::new(gridcraft_model::Formula::from_expr(ne)));
+                    sh.cells.set(c, cell);
+                }
+            }
+        }
+    }
+    cx.wb.names.retain(|n| n.scope != Some(i));
+    for n in cx.wb.names.iter_mut() {
+        if let Some(sc) = n.scope.as_mut()
+            && *sc > i
+        {
+            *sc -= 1;
+        }
+        // Names referring to the sheet become #REF!.
+        if let Ok(e) = gridcraft_formula::parse_name(&n.formula) {
+            let ne = gridcraft_formula::adjust::delete_sheet(e.clone(), &name, &order);
+            if ne != e {
+                n.formula = gridcraft_formula::print(&ne);
+            }
+        }
+    }
+    if cx.wb.active_sheet >= cx.wb.sheets.len() || cx.wb.active_sheet > i {
+        cx.wb.active_sheet = cx.wb.active_sheet.saturating_sub(1).min(cx.wb.sheets.len().saturating_sub(1));
+    }
+}
+
 /// Sheet protection for inserting or deleting rows/columns: the protection must allow it, and
 /// deleted lines must not hold locked cells.
 fn check_lines_protection(s: &Session, p: &Json, axis: Axis, at: u32, count: u32, insert: bool) -> Result<()> {
@@ -774,43 +817,9 @@ fn delete_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     if d.wb.sheets.iter().filter(|s| s.visibility == Visibility::Visible).count() <= 1 {
         return Err(EngineError::Other("A workbook must contain at least one visible worksheet.".into()));
     }
-    let name = d.wb.sheet(i).map(|s| s.name.clone()).unwrap_or_default();
-    let order: Vec<String> = d.wb.sheets.iter().map(|s| s.name.clone()).collect();
     let d = s.doc_mut()?;
     edit_doc(d, |cx| {
-        cx.wb.sheets.remove(i);
-        for si in 0..cx.wb.sheets.len() {
-            let keys: Vec<(CellRef, Arc<gridcraft_model::Formula>)> =
-                cx.wb.sheets.get(si).map(|s| s.cells.iter().filter_map(|(c, x)| x.formula.clone().map(|f| (c, f))).collect()).unwrap_or_default();
-            let Some(sh) = cx.wb.sheet_mut(si) else { continue };
-            for (c, f) in keys {
-                if let Some(e) = f.expr() {
-                    let ne = gridcraft_formula::adjust::delete_sheet(e, &name, &order);
-                    if let Some(mut cell) = sh.cells.get(c) {
-                        cell.formula = Some(Arc::new(gridcraft_model::Formula::from_expr(ne)));
-                        sh.cells.set(c, cell);
-                    }
-                }
-            }
-        }
-        cx.wb.names.retain(|n| n.scope != Some(i));
-        for n in cx.wb.names.iter_mut() {
-            if let Some(sc) = n.scope.as_mut()
-                && *sc > i
-            {
-                *sc -= 1;
-            }
-            // Names referring to the sheet become #REF!.
-            if let Ok(e) = gridcraft_formula::parse_name(&n.formula) {
-                let ne = gridcraft_formula::adjust::delete_sheet(e.clone(), &name, &order);
-                if ne != e {
-                    n.formula = gridcraft_formula::print(&ne);
-                }
-            }
-        }
-        if cx.wb.active_sheet >= cx.wb.sheets.len() || cx.wb.active_sheet > i {
-            cx.wb.active_sheet = cx.wb.active_sheet.saturating_sub(1).min(cx.wb.sheets.len().saturating_sub(1));
-        }
+        drop_sheet(cx, i);
         *cx.sel = crate::Selection::default();
         cx.structural = true;
         Ok(())

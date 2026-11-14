@@ -885,7 +885,16 @@ fn insert_chart(s: &mut Session, p: &Json) -> Result<Json> {
     let (sheet, chart) = build_chart(s, p)?;
     let id = chart.id;
     edit(s, |cx| {
-        cx.sheet_mut(sheet)?.charts.push(chart);
+        let sh = cx.sheet_mut(sheet)?;
+        // A chart sheet is one chart and nothing else: a second one there would be invisible and
+        // lost on save.
+        if sh.is_chart_sheet() {
+            return Err(bad(
+                "insert.chart",
+                "a chart sheet holds its own chart: add the chart to a worksheet (or move it with chart.moveToSheet and a name that exists)",
+            ));
+        }
+        sh.charts.push(chart);
         Ok(json!({"chart": id}))
     })
 }
@@ -1032,6 +1041,14 @@ fn series_block(series: &[Series]) -> Option<(String, bool)> {
 
 fn chart_delete(s: &mut Session, p: &Json) -> Result<Json> {
     let (si, ci) = find_chart(s, p)?;
+    // A chart sheet *is* its chart: Excel has no way to delete the chart and keep the sheet, so the
+    // sheet has to go (Delete Sheet), or the chart moves onto a worksheet first.
+    if s.doc()?.wb.sheet(si).is_some_and(|sh| sh.is_chart_sheet()) {
+        return Err(bad(
+            "chart.delete",
+            "a chart sheet's chart cannot be deleted on its own: delete the sheet (home.deleteSheet) or move the chart onto a worksheet (chart.moveToObject)",
+        ));
+    }
     edit(s, |cx| {
         cx.sheet_mut(si)?.charts.remove(ci);
         Ok(Json::Null)

@@ -50,6 +50,33 @@ impl SheetViewMode {
     }
 }
 
+/// What a sheet holds. A *worksheet* is a grid of cells; a *chart sheet* (Excel's
+/// Move Chart ▸ New sheet) is one chart on a tab of its own, with no cells and no grid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SheetKind {
+    #[default]
+    Worksheet,
+    ChartSheet,
+}
+
+impl SheetKind {
+    /// The XLSX / JSON spelling: worksheet or chartSheet.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SheetKind::Worksheet => "worksheet",
+            SheetKind::ChartSheet => "chartSheet",
+        }
+    }
+    pub fn parse(s: &str) -> Option<SheetKind> {
+        match s {
+            "worksheet" => Some(SheetKind::Worksheet),
+            "chartSheet" => Some(SheetKind::ChartSheet),
+            _ => None,
+        }
+    }
+}
+
 /// Drops one row from a list of inclusive row spans, splitting the span that holds it.
 fn drop_row(spans: &mut Vec<(u32, u32)>, row: u32) {
     let mut out = Vec::with_capacity(spans.len().saturating_add(1));
@@ -146,6 +173,14 @@ pub struct Sheet {
     /// tables). Goes away with the sheet; not in JSON.
     #[serde(skip)]
     pub preserved: Option<Arc<crate::preserved::Preserved>>,
+    /// Whether this is a grid of cells or one chart on a tab of its own.
+    ///
+    /// A chart sheet holds **no cells**: everything a worksheet keeps in cells, merges, tables,
+    /// pivots, validations… stays empty, and the sheet's whole content is the single chart in
+    /// charts (see Sheet::chart_sheet, the only way to make one). Its chart fills the window, so
+    /// its anchor is unused. Older JSON without the field is a worksheet.
+    #[serde(default)]
+    pub kind: SheetKind,
 }
 
 /// Default width of a column and height of a row (pixels at 96 dpi) for the default font.
@@ -203,7 +238,37 @@ impl Sheet {
             view_top_left: CellRef::default(),
             view: SheetViewMode::Normal,
             preserved: None,
+            kind: SheetKind::Worksheet,
         }
+    }
+
+    /// A chart sheet named `name` showing `chart`: a tab whose whole content is one chart, the
+    /// sheet Excel's Move Chart ▸ New sheet makes. It has no cells, no grid and no headings, and
+    /// the chart in `charts` is the sheet — so nothing else is ever put on it.
+    pub fn chart_sheet(name: impl Into<String>, chart: Chart) -> Sheet {
+        Sheet { kind: SheetKind::ChartSheet, charts: vec![chart], show_gridlines: false, show_headings: false, ..Sheet::new(name) }
+    }
+
+    /// A chart sheet whose chart has not been read yet: the file reader makes the sheet, reads the
+    /// chart into it, and drops the whole sheet (keeping the file's own part) when the chart cannot
+    /// be read. Prefer Sheet::chart_sheet.
+    pub fn empty_chart_sheet(name: impl Into<String>) -> Sheet {
+        Sheet { kind: SheetKind::ChartSheet, show_gridlines: false, show_headings: false, ..Sheet::new(name) }
+    }
+
+    /// Whether this sheet is one chart on a tab of its own rather than a grid of cells.
+    pub fn is_chart_sheet(&self) -> bool {
+        self.kind == SheetKind::ChartSheet
+    }
+
+    /// The chart a chart sheet is (`None` on a worksheet). A chart sheet holds exactly one.
+    pub fn chart_sheet_chart(&self) -> Option<&Chart> {
+        if self.is_chart_sheet() { self.charts.first() } else { None }
+    }
+
+    /// The chart a chart sheet is, to change.
+    pub fn chart_sheet_chart_mut(&mut self) -> Option<&mut Chart> {
+        if self.is_chart_sheet() { self.charts.first_mut() } else { None }
     }
 
     pub fn cell(&self, c: CellRef) -> Option<Cell> {
@@ -275,12 +340,22 @@ impl Sheet {
         self.set_cell(c, Cell { value: v, formula: None, style });
     }
     /// Replaces content, removing any picture at this address. Style-only edits use set_style.
+    ///
+    /// A chart sheet has no cells, so a write to one is dropped here, at the model's own door: no
+    /// code path can leave cells on a chart sheet, where they would be invisible and lost on save.
     pub fn set_cell(&mut self, c: CellRef, cell: Cell) {
+        if self.is_chart_sheet() {
+            return;
+        }
         self.cell_pictures.remove(&c);
         self.cells.set(c, cell);
     }
     /// Stores a whole row of cells at once (what a file reader does); see [`CellStore::set_row`].
+    /// Dropped on a chart sheet, which has no cells.
     pub fn set_row_cells(&mut self, row: u32, cells: &mut Vec<(u32, Cell)>) {
+        if self.is_chart_sheet() {
+            return;
+        }
         self.cells.set_row(row, cells);
     }
     pub fn remove_cell(&mut self, c: CellRef) -> Option<Cell> {
@@ -293,7 +368,11 @@ impl Sheet {
         self.cells.take_range(range)
     }
     /// Pictures retain a scalar fallback for calculation and unsupported consumers.
+    /// Dropped on a chart sheet, which has no cells to hold one.
     pub fn set_picture(&mut self, c: CellRef, picture: Arc<CellPicture>) {
+        if self.is_chart_sheet() {
+            return;
+        }
         let style = self.style_id(c);
         self.cells.set(c, Cell { value: Value::Error(gridcraft_core::CellError::Value), formula: None, style });
         self.cell_pictures.insert(c, picture);
@@ -301,7 +380,11 @@ impl Sheet {
     pub fn input_text(&self, c: CellRef) -> String {
         if self.cell_pictures.contains_key(&c) { String::new() } else { self.cell(c).map(|cell| cell.input_text()).unwrap_or_default() }
     }
+    /// Formatting a chart sheet's (non-existent) cells is dropped, like a content write.
     pub fn set_style(&mut self, c: CellRef, style: StyleId) {
+        if self.is_chart_sheet() {
+            return;
+        }
         let mut cell = self.cells.get(c).unwrap_or_default();
         cell.style = style;
         self.cells.set(c, cell);
@@ -600,6 +683,42 @@ mod tests {
         // Without a filter the index is the plain line map.
         let plain = LineIndex::new(&s.rows, s.default_row_height, gridcraft_core::MAX_ROWS);
         assert_eq!(plain.start(4), 4.0 * s.default_row_height as f64 + 10.0);
+    }
+
+    /// A chart sheet is one chart and no cells, and older JSON (which has no kind) is a worksheet.
+    #[test]
+    fn chart_sheets_hold_one_chart_and_no_cells() {
+        let chart = Chart { id: 7, kind: crate::features::ChartKind::ColumnClustered, title: Some("Sales".into()), ..Chart::default() };
+        let s = Sheet::chart_sheet("Chart1", chart.clone());
+        assert!(s.is_chart_sheet());
+        assert_eq!(s.chart_sheet_chart().map(|c| c.id), Some(7));
+        assert!(s.cells.is_empty(), "a chart sheet must not carry cells");
+        assert!(!s.show_gridlines && !s.show_headings, "a chart sheet has no grid");
+        // A write to a chart sheet's cells is refused rather than stored somewhere invisible and
+        // lost on save.
+        let mut s = s;
+        s.set_value(CellRef::new(0, 0), gridcraft_core::Value::Number(1.0));
+        s.set_style(CellRef::new(0, 0), StyleId::DEFAULT);
+        let mut row = vec![(0u32, Cell::default())];
+        s.set_row_cells(0, &mut row);
+        assert!(s.cells.is_empty(), "a chart sheet cannot store cells");
+        // A worksheet is the default and has no chart sheet chart.
+        let w = Sheet::new("Sheet1");
+        assert!(!w.is_chart_sheet());
+        assert!(w.chart_sheet_chart().is_none());
+        // JSON keeps the kind, and a file written before the field existed is a worksheet.
+        let json = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some("chartSheet"));
+        let back: Sheet = serde_json::from_value(json.clone()).expect("deserialize");
+        assert!(back.is_chart_sheet());
+        assert_eq!(back.charts, s.charts);
+        let mut older = json;
+        older.as_object_mut().expect("an object").remove("kind");
+        let older: Sheet = serde_json::from_value(older).expect("older JSON");
+        assert!(!older.is_chart_sheet());
+        assert_eq!(older.kind, SheetKind::Worksheet);
+        assert_eq!(SheetKind::parse("chartSheet"), Some(SheetKind::ChartSheet));
+        assert_eq!(SheetKind::ChartSheet.as_str(), "chartSheet");
     }
 
     #[test]
