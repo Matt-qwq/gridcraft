@@ -790,9 +790,20 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
   build does the same, so #45 as filed is closed by scope. Two CI guards hold it: a strict test over
   the engine's command specs, and `cargo xtask i18n` (unwrapped literals **and** wrapped keys with
   no entry).
-- **What is left:** the ~460 untranslated *leaf* strings that are not commands — the rest of the
-  dialogs, menus and context menus, status messages, some task panes, and the function help beyond
-  `zh_functions.rs`'s 159. **Estimate: 20–35 h**, all translation, no engineering.
+- **Finished 11-14 (four surface waves).** A rendered-app audit — 60+ dialogs opened and their
+  whole accessibility tree read, every Backstage page, the command palette, the panes, a tooltip
+  sweep — found the last residue and fixed it: Format Cells showed Page Setup's paper-size word for a
+  type size, its specimen word for the sample, and the outline-level word for Outline (the catalog
+  is keyed by English text, so a word used in two contexts needs a `context|label` key: five call
+  sites now use `Format Cells|…`); 36 command-menu group names were half English in the palette; the
+  Backstage template tiles drew English for ever; the formula bar's expand button said *expand*
+  while expanded; the filter's `(Blanks)` entry, the status-bar count, the ruler hints and the page
+  presets were built at run time. Catalog: **1,813 entries**, all 451 `tr()` keys and all 362
+  command labels covered, and the rendered Chinese build was walked page by page.
+- **What is left:** function help beyond `zh_functions.rs`'s 159 entries, and text that is English on
+  purpose (brand, file formats, font names, format codes, function names, protocol/param errors). The
+  old 20–35 h estimate was the gap to a heuristic ~2,200-strings figure; the measured leaf work
+  turned out to be ~70 entries.
   [localization-parity.md](localization-parity.md)
 
 ### 12. Get & Transform, external data, data model (F)
