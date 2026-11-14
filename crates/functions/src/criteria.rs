@@ -1,4 +1,8 @@
 //! Excel criteria (COUNTIF, SUMIFS, DCOUNT…) and wildcard matching.
+//!
+//! A criterion visits every cell of its range, so [`Criterion::matches`] borrows the cell value
+//! and builds no text: a text criterion carries its wildcard pattern already tokenised, and the
+//! matchers walk the cell text in place instead of lower-casing it into a buffer.
 
 use std::cmp::Ordering;
 
@@ -24,8 +28,13 @@ enum Operand {
     Number(f64),
     Bool(bool),
     Error(CellError),
-    /// Text (lower-cased chars kept for wildcard matching).
-    Text(String),
+    /// Text: the operand itself, for the ordering operators, and its tokenised form for the
+    /// wildcard equality of `=`/`<>`. Both are built once when the criterion is parsed; tokenising
+    /// per cell (as this module used to) costs a vector per cell visited.
+    Text {
+        text: String,
+        tokens: Vec<Tok>,
+    },
     /// A criterion cut to its first 255 UTF-16 units in the middle of a surrogate pair: the
     /// complete characters before the cut, followed (in Excel) by a lone high surrogate.
     ///
@@ -118,36 +127,43 @@ impl Criterion {
         } else if let Some(e) = CellError::parse(rest) {
             Operand::Error(e)
         } else {
-            Operand::Text(rest.to_string())
+            Operand::Text { text: rest.to_string(), tokens: tokenize(rest) }
         };
         Criterion { op, operand, bare_empty: false }
     }
 
     /// Whether a cell value satisfies the criterion.
     pub(crate) fn matches(&self, v: &Value) -> bool {
-        let v = match v {
-            Value::Array(a) => a.data.first().cloned().unwrap_or(Value::Empty),
-            other => other.clone(),
-        };
+        // A cell holding an array matches like its first element (implicit intersection). Only one
+        // level is peeled, as before: a nested array compares like any other non-scalar value.
+        match v {
+            Value::Array(a) => self.match_value(a.data.first().unwrap_or(&Value::Empty)),
+            other => self.match_value(other),
+        }
+    }
+
+    /// `matches` for one value, borrowing the cell rather than cloning it.
+    fn match_value(&self, v: &Value) -> bool {
         if self.bare_empty {
-            return matches!(&v, Value::Empty) || matches!(&v, Value::Text(t) if t.is_empty());
+            return match v {
+                Value::Empty => true,
+                Value::Text(t) => t.is_empty(),
+                _ => false,
+            };
         }
         match &self.operand {
-            Operand::Blank => {
-                let blank = matches!(v, Value::Empty);
-                match self.op {
-                    Op::Eq => blank,
-                    Op::Ne => !blank,
-                    // "<" / ">" with nothing: Excel compares against "" for text cells, but an
-                    // empty string never matches ("<=" and ">=" count it in neither).
-                    _ => match &v {
-                        Value::Text(t) if !t.is_empty() => cmp_op(self.op, compare_text(t, "")),
-                        _ => false,
-                    },
-                }
-            }
+            Operand::Blank => match self.op {
+                Op::Eq => matches!(v, Value::Empty),
+                Op::Ne => !matches!(v, Value::Empty),
+                // "<" / ">" with nothing: Excel compares against "" for text cells, but an
+                // empty string never matches ("<=" and ">=" count it in neither).
+                _ => match v {
+                    Value::Text(t) if !t.is_empty() => cmp_op(self.op, compare_text(t, "")),
+                    _ => false,
+                },
+            },
             Operand::Number(n) => {
-                let cell = match &v {
+                let cell = match v {
                     Value::Number(x) => Some(*x),
                     // Numeric text matches only for equality (COUNTIF("1") counts text "1").
                     Value::Text(t) if matches!(self.op, Op::Eq | Op::Ne) => parse_number_text(t),
@@ -158,34 +174,28 @@ impl Criterion {
                     None => self.op == Op::Ne,
                 }
             }
-            Operand::Bool(b) => match &v {
+            Operand::Bool(b) => match v {
                 Value::Bool(x) => cmp_op(self.op, x.cmp(b)),
                 _ => self.op == Op::Ne,
             },
-            Operand::Error(e) => match &v {
+            Operand::Error(e) => match v {
                 Value::Error(x) => cmp_op(self.op, x.code().cmp(&e.code())),
                 _ => self.op == Op::Ne,
             },
-            Operand::Text(pat) => match self.op {
-                Op::Eq | Op::Ne => {
-                    // Blank cells hold no text: `"*"` skips them and `"<>*"` counts them.
-                    let cell_text = match &v {
-                        Value::Text(t) => Some(t.to_string()),
-                        _ => None,
-                    };
-                    let m = cell_text.is_some_and(|t| wildcard_match(pat, &t));
-                    if self.op == Op::Eq { m } else { !m }
-                }
-                _ => match &v {
-                    Value::Text(t) => cmp_op(self.op, compare_text(t, pat)),
+            Operand::Text { text, tokens } => match self.op {
+                // Blank cells hold no text: `"*"` skips them and `"<>*"` counts them.
+                Op::Eq => matches!(v, Value::Text(t) if match_tokens(tokens, t)),
+                Op::Ne => !matches!(v, Value::Text(t) if match_tokens(tokens, t)),
+                _ => match v {
+                    Value::Text(t) => cmp_op(self.op, compare_text(t, text)),
                     _ => false,
                 },
             },
             Operand::CutText(kept) => match self.op {
                 Op::Eq => false,
                 Op::Ne => true,
-                Op::Lt | Op::Le => matches!(&v, Value::Text(t) if compare_text(t, kept) != Ordering::Greater),
-                Op::Gt | Op::Ge => matches!(&v, Value::Text(t) if compare_text(t, kept) == Ordering::Greater),
+                Op::Lt | Op::Le => matches!(v, Value::Text(t) if compare_text(t, kept) != Ordering::Greater),
+                Op::Gt | Op::Ge => matches!(v, Value::Text(t) if compare_text(t, kept) == Ordering::Greater),
             },
         }
     }
@@ -248,6 +258,10 @@ fn tokenize(pattern: &str) -> Vec<Tok> {
 /// Lowercase one char to exactly one char, so positions in the lowered text match the original
 /// (U+0130 `İ` folds to `i`, like `fold` in text.rs).
 fn lower_char(c: char) -> char {
+    // ASCII is the overwhelming majority of the text these matchers see; skip the iterator.
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
     c.to_lowercase().next().unwrap_or(c)
 }
 
@@ -262,9 +276,45 @@ pub(crate) fn has_wildcards(pattern: &str) -> bool {
 
 /// Case-insensitive whole-text match with `*`, `?` and `~` escapes.
 pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let p = tokenize(pattern);
-    let t = lower_chars(text);
-    match_from(&p, &t, true).is_some()
+    match_tokens(&tokenize(pattern), text)
+}
+
+/// `match_from`, but walking `text` in place: no lowered copy of it is made, so matching a cell
+/// allocates nothing. Byte offsets are always char boundaries (each step adds `len_utf8`).
+fn match_tokens(p: &[Tok], text: &str) -> bool {
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    loop {
+        if pi == p.len() && ti == text.len() {
+            return true;
+        }
+        let cur = text.get(ti..).and_then(|rest| rest.chars().next());
+        let step = match (p.get(pi), cur) {
+            (Some(Tok::Star), _) => {
+                star = Some((pi, ti));
+                pi += 1;
+                continue;
+            }
+            (Some(Tok::Any), Some(c)) => Some(c.len_utf8()),
+            (Some(Tok::Char(pc)), Some(c)) if *pc == lower_char(c) => Some(c.len_utf8()),
+            _ => None,
+        };
+        if let Some(n) = step {
+            pi += 1;
+            ti += n;
+            continue;
+        }
+        // Backtrack: let the last star swallow one more char and retry from after it.
+        match star {
+            Some((sp, st)) if st < text.len() => {
+                let Some(c) = text.get(st..).and_then(|rest| rest.chars().next()) else { return false };
+                star = Some((sp, st + c.len_utf8()));
+                pi = sp + 1;
+                ti = st + c.len_utf8();
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Greedy-free matcher: returns the matched length of `t` when `p` matches a prefix of `t`
@@ -351,6 +401,8 @@ pub(crate) fn lookup_equal(needle: &Value, hay: &Value, wild: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use gridcraft_core::Array;
+
     use super::*;
 
     fn m(c: &str, v: Value) -> bool {
@@ -397,6 +449,79 @@ mod tests {
         assert!(!m("<>*", Value::from("")));
         assert!(!m("?*", Value::Empty));
         assert!(m("<>a*", Value::Empty));
+    }
+
+    /// Wildcards across the text shapes the *IF functions meet: empty text, ASCII and non-ASCII,
+    /// escaped wildcards, consecutive stars, and non-text cells. `<>` is exactly the negation and
+    /// a blank cell holds no text at all.
+    #[test]
+    fn wildcard_shapes() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("a*b", "ab", true),
+            ("a*b", "axxxb", true),
+            ("a*b", "a", false),
+            ("a*b", "axxx", false),
+            ("a*b", "bxa", false),
+            ("A*B", "aXXb", true),
+            ("a?b", "a b", true),
+            ("a?b", "ab", false),
+            ("a?b", "a\nb", true),
+            ("i*", "\u{130}stanbul", true),
+            ("?*", "\u{130}", true),
+            ("\u{e4}*", "\u{c4}rger", true),
+            ("a*b", "a\u{e9}b", true),
+            ("*", "", true),
+            ("*", "x", true),
+            ("a*", "", false),
+            ("*b", "b", true),
+            ("**b", "b", true),
+            ("a*b*c", "a1b2c", true),
+            ("a*b*c", "a1b2", false),
+            ("~*", "*", true),
+            ("~*", "a", false),
+            ("~?", "?", true),
+            ("~?", "a", false),
+            ("a~*b", "a*b", true),
+            ("a~*b", "axb", false),
+            ("~", "~", true),
+        ];
+        for (pat, text, want) in cases {
+            assert_eq!(m(pat, Value::from(*text)), *want, "criterion {pat:?} on text {text:?}");
+            assert_eq!(wildcard_match(pat, text), *want, "wildcard_match {pat:?} on {text:?}");
+            assert_eq!(m(&format!("<>{pat}"), Value::from(*text)), !*want, "criterion <>{pat:?} on text {text:?}");
+            assert!(!m(pat, Value::Empty), "pattern {pat:?} must not match a blank cell");
+            assert!(m(&format!("<>{pat}"), Value::Empty), "pattern <>{pat:?} must match a blank cell");
+        }
+    }
+
+    /// The `<>`, blank, error and array corners the borrow-instead-of-clone refactor touched.
+    #[test]
+    fn blank_error_and_array_corners() {
+        // `<>` with nothing: every non-blank cell, whatever its type.
+        assert!(!m("<>", Value::Empty));
+        assert!(m("<>", Value::from("")));
+        assert!(m("<>", Value::Number(0.0)));
+        assert!(m("<>", Value::Error(CellError::NA)));
+        assert!(m("=", Value::Empty));
+        assert!(!m("=", Value::from("")));
+        // `<>text` counts every non-text cell, and errors compare by code, not by message.
+        assert!(m("<>a*", Value::Error(CellError::NA)));
+        assert!(m("<>a*", Value::Number(1.0)));
+        assert!(m("<>#N/A", Value::Error(CellError::Value)));
+        assert!(!m("<>#N/A", Value::Error(CellError::NA)));
+        assert!(!m(">5", Value::Error(CellError::Value)));
+        assert!(m("<>5", Value::from("abc")));
+        assert!(!m("5", Value::from("abc")));
+        // A cell holding an array matches like its first element, and only one level is peeled.
+        let row = |v: Vec<Value>| Value::Array(std::sync::Arc::new(Array::row(v)));
+        assert!(Criterion::parse(&Value::from(">5")).matches(&row(vec![Value::Number(6.0), Value::Number(1.0)])));
+        assert!(!Criterion::parse(&Value::from(">5")).matches(&row(vec![Value::Number(1.0), Value::Number(6.0)])));
+        assert!(Criterion::parse(&Value::from("b*")).matches(&row(vec![Value::from("banana"), Value::Number(1.0)])));
+        // A one-cell array of Empty behaves like a blank cell.
+        let blank = Value::Array(std::sync::Arc::new(Array::filled(1, 1, Value::Empty)));
+        assert!(m("", blank.clone()));
+        assert!(!m("*", blank.clone()));
+        assert!(m("<>*", blank));
     }
 
     #[test]
