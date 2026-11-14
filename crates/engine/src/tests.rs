@@ -5844,11 +5844,9 @@ fn a_label_font_is_set_at_each_level_and_survives_a_save() {
     s.execute("insert.chart", json!({"type": "treemap", "range": "A1:E7"})).unwrap();
     let treemap = s.doc().unwrap().wb.active().unwrap().charts[1].id;
     s.execute("chart.setDataLabels", json!({"chart": treemap, "fontSize": 10})).unwrap();
-    assert_eq!(
-        chart(&s).series[0].labels.as_ref().and_then(|l| l.font),
-        Some(LabelFont { size: Some(10.0), ..LabelFont::default() }),
-        "a chartex label font lives on the series"
-    );
+    // The treemap is the second chart on the sheet; `chart()` above is the column one.
+    let treemap_labels = s.doc().unwrap().wb.active().unwrap().charts[1].series[0].labels.as_ref().and_then(|l| l.font);
+    assert_eq!(treemap_labels, Some(LabelFont { size: Some(10.0), ..LabelFont::default() }), "a chartex label font lives on the series");
 
     // Every level survives a save and reopen.
     let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
