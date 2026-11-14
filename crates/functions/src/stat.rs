@@ -1,6 +1,8 @@
 //! Statistical functions: aggregates, order statistics, regression and probability
 //! distributions (with their inverses).
 
+use std::collections::HashMap;
+
 use gridcraft_core::{CellError, Value};
 
 use crate::special::{erf, gamma, invert, ln_beta, ln_gamma, norm_cdf, norm_inv, norm_pdf, reg_gamma_p, reg_gamma_q, reg_inc_beta};
@@ -57,21 +59,44 @@ fn median(v: Vec<f64>) -> R<f64> {
     if n % 2 == 1 { Ok(hi) } else { Ok(s.get(n / 2 - 1).copied().unwrap_or(0.0).midpoint(hi)) }
 }
 
+/// The counting key of a value: `-0.0` counts as `0.0`, every other value by its bits.
+fn mode_key(x: f64) -> u64 {
+    if x == 0.0 { 0.0f64.to_bits() } else { x.to_bits() }
+}
+
 /// Values occurring at least twice, ordered by first occurrence, with their (equal, maximal) count.
+///
+/// Counted through a hash map. The linear scan this replaced looked every value up in a list of
+/// the distinct values seen so far, so `MODE` over 100k distinct values made ~5·10⁹ comparisons
+/// and took 2.7 s; the cost now grows with the argument count (13–15 ms at 100k).
+/// NaN is skipped: it compares unequal to everything, so it never reached a count of two and was
+/// never a mode in the scan either.
 fn modes(v: &[f64]) -> Vec<f64> {
-    let mut counts: Vec<(f64, usize)> = Vec::new();
+    let mut counts: HashMap<u64, (f64, usize)> = HashMap::new();
     for &x in v {
-        if let Some(e) = counts.iter_mut().find(|e| e.0 == x) {
-            e.1 += 1;
-        } else {
-            counts.push((x, 1));
+        if x.is_nan() {
+            continue;
         }
+        // The first occurrence's value is kept, as the scan did.
+        counts.entry(mode_key(x)).or_insert((x, 0)).1 += 1;
     }
-    let best = counts.iter().map(|e| e.1).max().unwrap_or(0);
+    let best = counts.values().map(|e| e.1).max().unwrap_or(0);
     if best < 2 {
         return Vec::new();
     }
-    counts.into_iter().filter(|e| e.1 == best).map(|e| e.0).collect()
+    // A second pass in argument order: removing the entry de-duplicates a value met again.
+    let mut out = Vec::new();
+    for &x in v {
+        if x.is_nan() {
+            continue;
+        }
+        if let Some(e) = counts.remove(&mode_key(x))
+            && e.1 == best
+        {
+            out.push(e.0);
+        }
+    }
+    out
 }
 
 fn mode_sngl(v: &[f64]) -> R<f64> {
@@ -2399,6 +2424,40 @@ mod tests {
         }
         assert_eq!(rows_of(&ev("MODE.MULT", vec![n(1.0), t("1"), n(1.0), t("x")])), vec![vec![nv(1.0)]]);
         is_err(ev("MODE.MULT", vec![n(1.0), b(true), b(true), n(2.0)]), CellError::NA);
+    }
+
+    /// The modes come out in first-occurrence order (never sorted and never by hash order), and
+    /// `-0.0` and `0.0` are one value: the scan compared them with `==`, so the hash count keys
+    /// them on the same normalized bits.
+    #[test]
+    fn mode_first_occurrence_order_and_signed_zero() {
+        assert_eq!(rows_of(&ev("MODE.MULT", vec![c(&[3.0, 1.0, 2.0, 2.0, 3.0, 1.0])])), vec![vec![nv(3.0)], vec![nv(1.0)], vec![nv(2.0)]]);
+        // A tie across both signs of zero is one mode, reported where it first appears.
+        close(ev("MODE", vec![c(&[-0.0, 0.0, -0.0, 0.0, 5.0])]), 0.0);
+        assert_eq!(rows_of(&ev("MODE.MULT", vec![c(&[-0.0, 0.0, -0.0, 0.0, 5.0])])), vec![vec![nv(0.0)]]);
+        assert_eq!(rows_of(&ev("MODE.MULT", vec![c(&[0.0, -0.0, 0.0, -0.0, 5.0])])), vec![vec![nv(0.0)]]);
+        // NaN compares unequal to everything, so it is never a mode and never a count of two.
+        is_err(ev("MODE", vec![c(&[f64::NAN, f64::NAN, 1.0])]), CellError::NA);
+        close(ev("MODE", vec![c(&[f64::NAN, 1.0, 1.0, f64::NAN])]), 1.0);
+    }
+
+    /// Counting used to be a linear scan of the distinct values seen so far, so this call made
+    /// ~2·10¹⁰ comparisons: four times the 100k case measured at 2.7 s in a release build, and
+    /// slower still in this profile, so the call effectively hung. That it finishes at all is what
+    /// the test proves — the count is hashed now, so the cost stays linear in the argument count —
+    /// and the values are checked so the work cannot be skipped.
+    #[test]
+    fn mode_counts_many_arguments_without_a_linear_scan() {
+        let mut v: Vec<f64> = (0..200_000).map(|i| i as f64).collect();
+        is_err(ev("MODE", vec![c(&v)]), CellError::NA);
+        // One value repeated among the distinct ones is found (and its first occurrence reported).
+        if let Some(x) = v.get_mut(1) {
+            *x = 17.0;
+        }
+        if let Some(x) = v.get_mut(199_999) {
+            *x = 17.0;
+        }
+        close(ev("MODE", vec![c(&v)]), 17.0);
     }
 
     #[test]
