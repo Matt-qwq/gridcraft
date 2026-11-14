@@ -32,24 +32,41 @@ const MAX_DEPTH: usize = 8;
 /// The watched text surfaces: the call name the scan matches (on the last segment of the path
 /// before the opening paren, so ui.label, egui::Button::new and egui::ComboBox::from_label all land
 /// here) and which argument carries the label. egui's own signatures differ --
-/// selectable_label(selected, text), selectable_value(current, value, text), checkbox(checked,
-/// text) -- which is what keeps the value/id argument out of the report. Adding a user-facing widget
-/// means adding a row.
+/// selectable_label(checked, text), selectable_value(current, value, text), radio(selected, text),
+/// checkbox(checked, text), WidgetInfo::selected(typ, enabled, selected, label) -- which is what
+/// keeps the value/id argument out of the report. Adding a user-facing widget means adding a row.
+///
+/// Every index here is checked against the egui the workspace pins (Cargo.toml: 0.36). A surface
+/// whose argument is not text is deliberately absent, because a wrong index reports the argument
+/// next to the label instead of the label: on_hover_ui / on_hover_ui_at_pointer take a closure (the
+/// closure body is walked on its own, so the labels inside it are still found), text_edit_singleline
+/// / text_edit_multiline take the buffer (the prompt is hint_text, below), and ComboBox::from_id_salt,
+/// ComboBox::new's first argument and Popup::menu take an id salt or an anchor response.
+///
+/// The two WidgetInfo rows are the only surfaces that read an argument from position 2 and 3; both
+/// names are unambiguous in this tree (no other call, method or setter is spelled labeled/selected).
 const SURFACES: &[(&str, usize)] = &[
     ("label", 0),
     ("button", 0),
+    ("link", 0),
+    ("small_button", 0),
     ("selectable_label", 1),
     ("selectable_value", 2),
     ("menu_button", 0),
     ("checkbox", 1),
+    ("radio", 1),
     ("radio_value", 2),
+    ("toggle_value", 1),
     ("heading", 0),
     ("small", 0),
     ("weak", 0),
-    ("text_edit_singleline", 0),
     ("on_hover_text", 0),
-    ("on_hover_ui", 0),
+    ("on_hover_text_at_pointer", 0),
+    ("on_disabled_hover_text", 0),
     ("tooltip_text", 0),
+    ("hint_text", 0),
+    ("labeled", 2),
+    ("selected", 3),
     ("from_label", 0),
 ];
 
@@ -1002,6 +1019,67 @@ fn demo(ui: &mut Ui) {
             vec![(6, "Total: {total}".to_string())],
             "an id, a field lookup, an index key, a placeholder-only template, a lone glyph and an
              already-translated label are not untranslated text"
+        );
+    }
+
+    #[test]
+    fn reports_the_tooltip_link_hint_and_accessibility_surfaces() {
+        let src = "\
+fn demo(ui: &mut Ui, resp: Response) {
+    resp.on_hover_text_at_pointer(\"Drag to fill cells\");
+    resp.clone().on_hover_text_at_pointer(tr(ui, \"Fill handle\"));
+    resp.on_disabled_hover_text(\"Nothing to undo\");
+    ui.link(\"More workbooks\");
+    ui.link(lang.tr(\"Page Setup\"));
+    ui.small_button(\"Keep\");
+    ui.small_button(crate::widgets::tr(ui, \"Delete\"));
+    ui.toggle_value(&mut self.bold, \"Bold\");
+    ui.radio(mode == Mode::Fit, \"Fit selection\");
+    ui.add(TextEdit::singleline(&mut self.name).hint_text(\"Type to filter\"));
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, \"Paste\"));
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, on, \"Format Painter\"));
+}
+";
+        assert_eq!(
+            found(src),
+            vec![
+                (2, "Drag to fill cells".to_string()),
+                (4, "Nothing to undo".to_string()),
+                (5, "More workbooks".to_string()),
+                (7, "Keep".to_string()),
+                (9, "Bold".to_string()),
+                (10, "Fit selection".to_string()),
+                (11, "Type to filter".to_string()),
+                (12, "Paste".to_string()),
+                (13, "Format Painter".to_string()),
+            ],
+            "the wrapped twin on the line under each one is skipped, the unwrapped label is not"
+        );
+    }
+
+    #[test]
+    fn ignores_calls_whose_argument_is_a_closure_an_id_or_a_buffer() {
+        // A wrong index here would report the argument beside the label -- a layout enum, an id salt
+        // or a &mut String -- so these calls carry no surface at all. The closure bodies are still
+        // walked on their own, which is where their labels are found.
+        let src = "\
+fn demo(ui: &mut Ui, resp: Response, buf: &mut String) {
+    resp.on_hover_ui(|ui| {
+        ui.label(\"Inside the hover ui\");
+    });
+    resp.on_hover_ui_at_pointer(|ui| ui.label(\"At the pointer\"));
+    let by_id = ComboBox::from_id_salt(\"sort_menu\");
+    let menu = Popup::menu(&resp);
+    ui.add(TextEdit::singleline(buf));
+    ui.text_edit_singleline(buf);
+    let labelled = ComboBox::from_label(\"Alignment\");
+}
+";
+        assert_eq!(
+            found(src),
+            vec![(3, "Inside the hover ui".to_string()), (5, "At the pointer".to_string()), (10, "Alignment".to_string()),],
+            "only the labels are text: the closure, the id salt and the buffer are not, and
+             from_label is the one ComboBox constructor that takes a label"
         );
     }
 
