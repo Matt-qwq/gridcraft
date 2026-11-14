@@ -1442,7 +1442,10 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
         let bars: Vec<(usize, &Series)> = all.iter().filter(|(i, x)| !x.secondary && !is_line(kind(*i, x))).copied().collect();
         let lines: Vec<(usize, &Series)> = all.iter().filter(|(i, x)| !x.secondary && is_line(kind(*i, x))).copied().collect();
         let sec: Vec<(usize, &Series)> = all.iter().filter(|(_, x)| x.secondary).copied().collect();
-        primary_g = G::Bar { bar: false, grouping: "clustered" };
+        // The primary group's direction is its own series': a combo of bars is written as horizontal
+        // bars (barDir="bar"), and the axis pair further down follows that direction.
+        let bar = matches!(all.iter().find(|(_, x)| !x.secondary).and_then(|(i, x)| kind(*i, x)).map(group_for), Some(G::Bar { bar: true, .. }));
+        primary_g = G::Bar { bar, grouping: "clustered" };
         if !bars.is_empty() || (lines.is_empty() && sec.is_empty()) {
             s.push_str(&group_xml(primary_g, &bars, ch, (1, 2), wb, si));
         }
@@ -1553,11 +1556,18 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
         }
     }
     if secondary.is_some() {
+        // The secondary value axis sits opposite the primary one: on the right of a column chart's
+        // plot, and along the top of a bar chart's. Its hidden category axis keeps the side the
+        // primary category axis is on.
+        let (cat_pos, val_pos) = match primary_g {
+            G::Bar { bar: true, .. } => ("l", "t"),
+            _ => ("b", "r"),
+        };
         s.push_str(&axis_xml(&Ax {
             cat: true,
             id: 3,
             cross: 4,
-            pos: "b",
+            pos: cat_pos,
             delete: true,
             grid: no_grid,
             title: None,
@@ -1568,7 +1578,7 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart, book_name: &str) -> Cha
             cat: false,
             id: 4,
             cross: 3,
-            pos: "r",
+            pos: val_pos,
             delete: false,
             grid: no_grid,
             title: None,

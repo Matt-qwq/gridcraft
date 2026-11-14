@@ -265,6 +265,18 @@ fn set_series_axis(s: &mut Session, p: &Json) -> Result<Json> {
     };
     edit(s, |cx| {
         let c = cx.sheet_mut(si)?.charts.get_mut(ci).ok_or_else(|| bad(C, "no such chart"))?;
+        // A bar chart keeps its bars: a series left without a kind of its own is drawn as the
+        // combo's default (columns for the first, a line for the rest), which would turn the chart
+        // sideways. Excel has no bar-and-line combination, so the chart's own kind carries over.
+        // Column (and line, area, radar) charts keep that default.
+        if matches!(c.kind, ChartKind::BarClustered | ChartKind::BarStacked | ChartKind::BarStacked100) {
+            let base = c.kind;
+            for ser in &mut c.series {
+                if ser.kind.is_none() {
+                    ser.kind = Some(base);
+                }
+            }
+        }
         let count = c.series.len();
         let ser = c.series.get_mut(index).ok_or_else(|| bad(C, format!("no series {index}: the chart has {count}")))?;
         ser.secondary = secondary;
@@ -1277,5 +1289,48 @@ mod tests {
         assert!(cs.is_chart_sheet());
         assert!(cs.cells.is_empty(), "a chart sheet holds no cells");
         assert_eq!(cs.used_range(), None);
+    }
+    /// A bar chart's series keeps its bars when it moves to the secondary axis: the combo default
+    /// (columns for the first series, a line for the rest) would turn the chart sideways. A column
+    /// chart still gets that default, so the command behaves as it always has for columns.
+    #[test]
+    fn a_bar_charts_secondary_axis_keeps_its_bars() {
+        use gridcraft_model::ChartKind;
+
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Q1", "Q2"], ["North", 48, 51], ["South", 39, 44]]})).unwrap();
+        s.execute("selection.set", json!({"range": "A1:C3"})).unwrap();
+        s.execute("insert.chart", json!({"type": "bar", "at": "D2"})).unwrap();
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().charts[0].kind, ChartKind::BarClustered);
+        s.execute("chart.setSeriesAxis", json!({"series": 1})).unwrap();
+        {
+            let c = &s.doc().unwrap().wb.active().unwrap().charts[0];
+            assert_eq!(c.kind, ChartKind::Combo);
+            assert!(c.series[1].secondary);
+            assert_eq!(c.series[0].kind, Some(ChartKind::BarClustered), "the group that stayed put keeps the bars");
+            assert_eq!(c.series[1].kind, Some(ChartKind::BarClustered), "and so does the one that moved");
+        }
+        // The bars, the secondary axis and the direction all survive a save and reopen.
+        let r = s.execute("file.saveBytes", json!({"format": "xlsx"})).unwrap();
+        let b64 = r["base64"].as_str().unwrap().to_string();
+        s.execute("file.open", json!({"name": "bar-secondary.xlsx", "base64": b64})).unwrap();
+        let c = &s.doc().unwrap().wb.active().unwrap().charts[0];
+        assert_eq!(c.kind, ChartKind::Combo);
+        assert_eq!(c.series.iter().map(|s| s.kind).collect::<Vec<_>>(), [Some(ChartKind::BarClustered), Some(ChartKind::BarClustered)]);
+        assert_eq!(c.series.iter().map(|s| s.secondary).collect::<Vec<_>>(), [false, true]);
+
+        // A column chart is untouched: neither series gets a kind of its own, so the first stays a
+        // column and the moved one is drawn as the combo's line.
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Region", "Q1", "Q2"], ["North", 48, 51], ["South", 39, 44]]})).unwrap();
+        s.execute("selection.set", json!({"range": "A1:C3"})).unwrap();
+        s.execute("insert.chart", json!({"type": "column", "at": "D2"})).unwrap();
+        s.execute("chart.setSeriesAxis", json!({"series": 1})).unwrap();
+        let c = &s.doc().unwrap().wb.active().unwrap().charts[0];
+        assert_eq!(c.kind, ChartKind::Combo);
+        assert_eq!(c.series[0].kind, None, "the first series keeps the combo default (a column)");
+        assert_eq!(c.series[1].kind, None, "and the moved one the combo default (a line)");
     }
 }

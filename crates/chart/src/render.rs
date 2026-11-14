@@ -193,6 +193,29 @@ fn plot_kind(chart: &Chart, s: &SeriesData) -> ChartKind {
     if chart.kind == ChartKind::Combo { if s.kind == ChartKind::Combo { ChartKind::Line } else { s.kind } } else { chart.kind }
 }
 
+/// Whether a bar kind runs its bars horizontally (Excel's `barDir="bar"`).
+fn is_bar_kind(k: ChartKind) -> bool {
+    matches!(k, ChartKind::BarClustered | ChartKind::BarStacked | ChartKind::BarStacked100)
+}
+
+/// Whether a combo chart's categories run down the plot rather than along it: its primary group is
+/// a bar kind, which is how Excel draws a `barDir="bar"` group. A group of its own can't turn the
+/// chart sideways, so one bar group among columns still draws as columns.
+fn combo_horizontal(chart: &Chart, data: &ChartData) -> bool {
+    let any_primary = data.series.iter().any(|s| !s.secondary);
+    let mut seen = false;
+    for s in &data.series {
+        if any_primary && s.secondary {
+            continue;
+        }
+        seen = true;
+        if !is_bar_kind(plot_kind(chart, s)) {
+            return false;
+        }
+    }
+    seen
+}
+
 /// Colour of point `j` for charts that colour by point (pie, doughnut, treemap, sunburst): a
 /// per-point fill override wins, then the series colour for the first point, then the palette.
 fn point_color(data: &ChartData, j: usize) -> Rgba {
@@ -610,6 +633,8 @@ fn draw_kind(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
             }
             match chart.kind {
                 BarClustered | BarStacked | BarStacked100 => cartesian(ctx, chart, data, area, true),
+                // A combo of bar groups: horizontal bars, with the secondary value axis on the top.
+                Combo if combo_horizontal(chart, data) => cartesian(ctx, chart, data, area, true),
                 Scatter | ScatterLines | Bubble => scatter(ctx, chart, data, area),
                 Histogram => histogram(ctx, chart, data, area),
                 Waterfall => waterfall(ctx, chart, data, area),
@@ -1013,13 +1038,43 @@ fn frame(ctx: &mut Ctx, area: Bx, cat: CatAxis, y: &ValAxis, y2: Option<&ValAxis
         let level_w: Vec<f32> =
             outer.iter().map(|l| (l.iter().take(2000).map(|t| ctx.tw(t, ls)).fold(0.0f32, f32::max) + 6.0).min(area.w * 0.15)).collect();
         let levels_w: f32 = level_w.iter().sum();
-        let right = ylabels.last().map(|(_, t)| ctx.tw(t, ls) / 2.0).unwrap_or(0.0).min(area.w * 0.2) + 2.0;
-        let plot = Bx { x: area.x + lw + levels_w, y: area.y + 2.0, w: area.w - lw - levels_w - right, h: area.h - lh - 6.0 };
+        // A bar chart's secondary value axis runs along the top of the plot, so the labels above it
+        // (and, when the axis names a display unit, the row that name sits in) are taken off the
+        // plot's height, as the vertical frame takes its right-hand label column off the width.
+        let y2labels = y2.map(|a| a.labels());
+        let band = match (&y2labels, y2.is_some_and(|a| a.units.is_some())) {
+            (Some(_), true) => lh * 2.0 + 4.0,
+            (Some(_), false) => lh + 4.0,
+            (None, _) => 2.0,
+        };
+        // The last tick label of either axis must fit past the right-hand edge of the plot.
+        let edge = |l: &[(f64, String)]| l.last().map(|(_, t)| ctx.tw(t, ls) / 2.0).unwrap_or(0.0);
+        let right = edge(&ylabels).max(y2labels.as_deref().map(edge).unwrap_or(0.0)).min(area.w * 0.2) + 2.0;
+        let h = if y2labels.is_some() { area.h - band - lh - 4.0 } else { area.h - lh - 6.0 };
+        let plot = Bx { x: area.x + lw + levels_w, y: area.y + band, w: area.w - lw - levels_w - right, h };
         if !plot.ok() {
             return plot;
         }
         ctx.hit_rect(Hit::AxisX, area.x, plot.y, plot.x - area.x, plot.h);
         ctx.hit_rect(Hit::AxisY, plot.x, plot.bottom(), plot.w, area.bottom() - plot.bottom());
+        if let (Some(a), Some(l)) = (y2, &y2labels) {
+            // The secondary value axis on the top edge: its line, its labels above it (the same
+            // thinning a crowded axis gets) and the band a click on it selects.
+            ctx.hline(plot.x, plot.right(), plot.y, AXIS, 0.75);
+            ctx.hit_rect(Hit::AxisY, plot.x, plot.y - band, plot.w, band);
+            let vw2 = maxw(ctx, l);
+            let slot2 = plot.w / l.len().max(1) as f32;
+            let k2 = (((vw2 + 6.0) / slot2.max(1e-3)).ceil() as usize).max(1);
+            for (i, (v, t)) in l.iter().enumerate() {
+                if i % k2 == 0 {
+                    let xx = plot.x + a.scale.frac(*v) * plot.w;
+                    ctx.text(xx, plot.y - 3.0, t, ls, TEXT, HAlign::Center, VAlign::Bottom);
+                }
+            }
+            if let Some(u) = a.units {
+                ctx.text(plot.x - 4.0, plot.y - lh - 2.0, u.label(), ls * 0.9, TEXT, HAlign::Right, VAlign::Bottom);
+            }
+        }
         let vw = maxw(ctx, &ylabels);
         let slot = plot.w / ylabels.len().max(1) as f32;
         let k = (((vw + 6.0) / slot.max(1e-3)).ceil() as usize).max(1);
@@ -1455,10 +1510,14 @@ fn cartesian(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx, horizonta
     if ncat == 0 {
         return;
     }
-    let kinds: Vec<ChartKind> = data.series.iter().map(|s| if horizontal { chart.kind } else { plot_kind(chart, s) }).collect();
+    // A combo's series carry their own kind whichever way the categories run; every other chart's
+    // series are its own kind (`plot_kind` falls back to it).
+    let kinds: Vec<ChartKind> = data.series.iter().map(|s| plot_kind(chart, s)).collect();
     let fams: Vec<Fam> = kinds.iter().map(|k| family(*k)).collect();
     let any_primary = data.series.iter().any(|s| !s.secondary);
-    let sec: Vec<bool> = data.series.iter().map(|s| s.secondary && any_primary && !horizontal).collect();
+    // A series is on the secondary axis wherever its chart runs its categories: a bar chart's
+    // secondary value axis runs along the top of the plot instead of down its right side.
+    let sec: Vec<bool> = data.series.iter().map(|s| s.secondary && any_primary).collect();
 
     // Totals for 100% stacking, per axis.
     let mut totals = [vec![0.0f64; ncat], vec![0.0f64; ncat]];

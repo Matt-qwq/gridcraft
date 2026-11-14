@@ -2349,3 +2349,164 @@ fn single_axis_geometry_is_unchanged() {
         assert_near("line point on the slot centre", p[0], px + (j as f32 + 0.5) * cw);
     }
 }
+
+/// The plot rectangle (x, y, width, height) of a bar chart: its value axis band runs along the
+/// bottom of the plot and its category axis band down the left, so the two bands give the box.
+fn bar_plot_box(d: &Drawing) -> (f32, f32, f32, f32) {
+    let across = d
+        .hits
+        .iter()
+        .filter_map(|r| match (&r.hit, &r.shape) {
+            (Hit::AxisY, HitShape::Rect { x, w, h, .. }) if *h > 4.0 && *w > 4.0 => Some((*x, *w)),
+            _ => None,
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("the value axis is a click target");
+    let down = d
+        .hits
+        .iter()
+        .filter_map(|r| match (&r.hit, &r.shape) {
+            (Hit::AxisX, HitShape::Rect { y, h, w, .. }) if *w > 4.0 && *h > 4.0 => Some((*y, *h)),
+            _ => None,
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("the category axis is a click target");
+    (across.0, down.0, across.1, down.1)
+}
+
+/// Every bar filled in a colour as (x, y, width, height), in draw order.
+fn rects(prims: &[Prim], colour: Rgba) -> Vec<(f32, f32, f32, f32)> {
+    prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Rect { x, y, w, h, fill: Some(f), .. } if *f == colour && *w > 1.0 && *h > 1.0 => Some((*x, *y, *w, *h)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every place a text is drawn.
+fn text_positions(prims: &[Prim], s: &str) -> Vec<(f32, f32)> {
+    prims
+        .iter()
+        .filter_map(|p| match p {
+            Prim::Text { x, y, text, .. } if text == s => Some((*x, *y)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A combo whose primary group is bars (Excel's barDir="bar", two groups sharing the category
+/// axis): the categories run down the side, both groups sit in the slot one above the other, and the
+/// second group is measured against the secondary axis, which is drawn along the top of the plot —
+/// the horizontal frame's counterpart of the vertical one's right-hand axis.
+#[test]
+fn combo_bar_chart_draws_horizontal_groups_on_their_own_axes() {
+    let m = ApproxMeasure;
+    let mut c = bare(ChartKind::Combo);
+    // Bounds of its own, so a bar's length says which axis it was measured against.
+    c.y2_axis.min = Some(0.0);
+    c.y2_axis.max = Some(60.0);
+    let d = ChartData {
+        categories: cats(3),
+        series: vec![
+            drawn("primary", &[1.0, 2.0, 3.0], P, ChartKind::BarClustered, false),
+            drawn("secondary", &[10.0, 20.0, 30.0], S, ChartKind::BarClustered, true),
+        ],
+        ..ChartData::default()
+    };
+    let drawing = draw(&c, &d, 640.0, 400.0, &m);
+    let (px, py, pw, ph) = bar_plot_box(&drawing);
+    let ch = ph / 3.0;
+    let bw = ch / 3.5;
+    let (p, s) = (rects(&drawing.prims, P), rects(&drawing.prims, S));
+    assert_eq!(p.len(), 3, "three primary bars: {p:?}");
+    assert_eq!(s.len(), 3, "three secondary bars: {s:?}");
+    for j in 0..3 {
+        // Categories run down the plot: slot j's centre is measured off its bottom edge.
+        let centre = py + ph - (j as f32 + 0.5) * ch;
+        assert_near("bar thickness", p[j].3, bw);
+        assert_near("bar thickness", s[j].3, bw);
+        // The primary group sits in the slot, the secondary one above it: side by side, no overlap.
+        assert_near("the primary group is in the slot", p[j].1, centre);
+        assert_near("the secondary group is beside it", s[j].1 + s[j].3, centre);
+        assert!(s[j].1 >= py - 0.01 && p[j].1 + p[j].3 <= py + ph + 0.01, "inside slot {j}: {:?} {:?}", p[j], s[j]);
+    }
+    // Each group against its own axis: the third primary bar is 3 of 3.5 (the primary scale) and the
+    // third secondary bar is exactly half the plot (30 of 0..60). On the primary scale it would be
+    // full length.
+    assert_near("the primary bars are measured on 0..3.5", p[2].2, 513.96);
+    assert_near("the secondary bars are measured on 0..60", s[2].2, pw / 2.0);
+    // The pinned geometry of the 640 x 400 chart.
+    assert_near("plot left", px, 20.95);
+    assert_near("plot width", pw, 599.62);
+    assert_near("plot top", py, 26.60);
+    assert_near("plot height", ph, 346.80);
+    // The secondary axis owns the band above the plot: a click there selects the value axis, its
+    // labels sit above the top edge and the primary's stay below the bottom one.
+    let band = drawing
+        .hits
+        .iter()
+        .filter_map(|r| match (&r.hit, &r.shape) {
+            (Hit::AxisY, HitShape::Rect { x, y, w, h }) if near(*y + *h, py) => Some((*x, *y, *w, *h)),
+            _ => None,
+        })
+        .next()
+        .expect("the secondary axis is a click target");
+    assert_near("the secondary band is as wide as the plot", band.2, pw);
+    assert_near("the secondary band is one label row", band.3, 16.60);
+    assert!(
+        drawing
+            .prims
+            .iter()
+            .any(|p| matches!(p, Prim::Line { pts, dash: false, .. } if pts.len() == 2 && near(pts[0][1], py) && near(pts[1][0] - pts[0][0], pw))),
+        "the secondary axis draws its line along the top edge"
+    );
+    let above = |t: &str| text_positions(&drawing.prims, t).into_iter().filter(|p| p.1 < py).collect::<Vec<_>>();
+    assert!(above("0").iter().any(|p| near(p.0, px)), "the secondary axis starts at the plot's left edge: {:?}", above("0"));
+    assert!(above("60").iter().any(|p| near(p.0, px + pw)), "and ends at its right edge: {:?}", above("60"));
+    assert!(text_positions(&drawing.prims, "3.5").iter().any(|p| p.1 > py + ph), "the primary axis's labels stay below the plot");
+    assert!(text_positions(&drawing.prims, "A").iter().any(|p| p.0 < px), "the categories run down the left");
+}
+
+/// A bar chart's own content, which the secondary axis's top band must not move: one group and two
+/// groups, with the categories down the side and the bars spreading off the plot's left edge.
+#[test]
+fn single_axis_bar_geometry_is_unchanged() {
+    let m = ApproxMeasure;
+    let data = |n: usize| ChartData {
+        categories: cats(4),
+        series: (0..n).map(|i| drawn(&format!("s{i}"), &[1.0, 2.0, 3.0, 4.0], P, ChartKind::BarClustered, false)).collect(),
+        ..ChartData::default()
+    };
+    let one = draw(&bare(ChartKind::BarClustered), &data(1), 640.0, 400.0, &m);
+    let (px, py, pw, ph) = bar_plot_box(&one);
+    let ch = ph / 4.0;
+    assert_near("plot left", px, 20.95);
+    assert_near("plot width", pw, 604.58);
+    assert_near("plot top", py, 34.20);
+    assert_near("plot height", ph, 339.20);
+    let b = rects(&one.prims, P);
+    assert_eq!(b.len(), 4);
+    for (j, bar) in b.iter().enumerate() {
+        assert_near("bar thickness", bar.3, ch / 2.5);
+        assert_near("centred on the slot", bar.1 + bar.3 / 2.0, py + ph - (j as f32 + 0.5) * ch);
+    }
+    assert!(near(b[0].0, 20.95) && near(b[0].1, 314.04) && near(b[0].2, 120.92) && near(b[0].3, 33.92), "first bar: {:?}", b[0]);
+    // Two series: two bars per slot, each a 3.5th of it.
+    let two = draw(&bare(ChartKind::BarClustered), &data(2), 640.0, 400.0, &m);
+    let (_, py2, _, ph2) = bar_plot_box(&two);
+    let (ch2, bw2) = (ph2 / 4.0, ph2 / 4.0 / 3.5);
+    let b = rects(&two.prims, P);
+    assert_eq!(b.len(), 8, "{b:?}");
+    for j in 0..4 {
+        let centre = py2 + ph2 - (j as f32 + 0.5) * ch2;
+        for k in 0..2 {
+            let bar = b[k * 4 + j];
+            assert_near("bar thickness", bar.3, bw2);
+            assert_near("bars sit beside each other in the slot", bar.1, centre - k as f32 * bw2);
+        }
+    }
+    // Bars are drawn series by series: b[0] and b[4] are the two bars of the first category.
+    assert!(near(b[0].1, 328.23) && near(b[4].1, 302.41), "first pair of bars: {:?} {:?}", b[0], b[4]);
+}
