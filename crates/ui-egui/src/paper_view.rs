@@ -781,7 +781,11 @@ fn ruler_margins(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, pg: &PageGrid
     let current = margins_in(sh);
     let metric = metric(app);
     let tip = |ui: &egui::Ui, app: &SheetApp, edge: Edge, inches: f32| {
-        let value = if metric { format!("{:.2} cm", inches * 2.54) } else { format!("{inches:.2} in") };
+        // The number is formatted first so the unit stays part of the template the catalog holds
+        // ("{:.2} cm" reads "{:.2} 厘米" in Chinese); a format! would bake the unit in English.
+        let number = if metric { inches * 2.54 } else { inches };
+        let unit = if metric { "{:.2} cm" } else { "{:.2} in" };
+        let value = app.ui.language.tr(unit).replace("{:.2}", &format!("{number:.2}"));
         let text = format!("{}: {value}", app.ui.language.tr(edge.label()));
         egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new("ruler_margin_tip"), egui::PopupAnchor::Pointer).show(|ui| {
             ui.label(text);

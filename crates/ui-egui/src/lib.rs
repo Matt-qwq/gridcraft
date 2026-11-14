@@ -896,7 +896,13 @@ impl SheetApp {
             let text = if msgs.len() == 1 {
                 msgs[0].to_string()
             } else {
-                format!("{} items in this file were handled differently. First: {}", msgs.len(), msgs[0])
+                // The count and the first item go into a catalog template: a format! here would
+                // hand the bar an English sentence it can no longer look up.
+                self.ui
+                    .language
+                    .tr("{count} items in this file were handled differently. First: {first}")
+                    .replace("{count}", &msgs.len().to_string())
+                    .replace("{first}", msgs[0])
             };
             self.notice = Some(Notice { text, kind: NoticeKind::Info, action: None });
         }
@@ -1453,7 +1459,9 @@ impl SheetApp {
             }
         }
         if self.grid.drag_select && !cur.is_single() {
-            return format!("{}R x {}C", cur.height(), cur.width());
+            // The rows-by-columns shorthand the Name Box shows while a range is dragged ("4R x 3C").
+            // The letters are the interface's, so they are a template; the counts are the selection's.
+            return self.ui.language.tr("{rows}R x {cols}C").replace("{rows}", &cur.height().to_string()).replace("{cols}", &cur.width().to_string());
         }
         sel.active.a1()
     }
@@ -1473,4 +1481,27 @@ pub fn now_ms() -> f64 {
 
 pub fn cell(r: u32, c: u32) -> CellRef {
     CellRef::new(r, c)
+}
+
+#[cfg(test)]
+mod name_box_tests {
+    use super::*;
+    use crate::i18n::Language;
+
+    /// The Name Box's rows-by-columns shorthand is a catalog template, so a Chinese build reads
+    /// "4 行 x 3 列" where an English one reads "4R x 3C".
+    #[test]
+    fn the_name_box_counts_rows_and_columns_in_the_interface_language() {
+        let mut session = gridcraft_engine::Session::new();
+        session.new_workbook();
+        let mut app = SheetApp::new(session, Default::default());
+        app.session.run("selection.set", json!({"range": "A1:C4"})).expect("the selection is set");
+        app.grid.drag_select = true;
+        assert_eq!(app.name_box_text(), "4R x 3C");
+        app.ui.language = Language::Zh;
+        assert_eq!(app.name_box_text(), "4 行 x 3 列");
+        // One cell keeps showing its address: the shorthand is for a dragged range only.
+        app.session.run("selection.set", json!({"cell": "B2"})).expect("the selection is set");
+        assert_eq!(app.name_box_text(), "B2");
+    }
 }

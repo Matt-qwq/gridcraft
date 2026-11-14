@@ -2272,14 +2272,26 @@ fn hidden_around(i: u32, size: impl Fn(u32) -> f32) -> (bool, bool) {
 // ------------------------------------------------------------------ interaction
 
 /// The toast shown while an object is dragged: its size, or its position.
-fn object_toast(kind: &str, f: &crate::chartview::Frame, moving: bool) -> String {
+///
+/// The noun goes through the catalog on its own, not the whole sentence, so a chart reads "图表"
+/// here the way it does in the ribbon and the Format pane.
+fn object_toast(kind: &str, f: &crate::chartview::Frame, moving: bool, language: crate::i18n::Language) -> String {
+    let name = language.tr(object_name(kind));
     if moving {
-        format!("{} at {:.0}, {:.0}", object_name(kind), f.x.round(), f.y.round())
+        // "Chart at 10, 20": the words are in the template, the number is the drag's.
+        language
+            .tr("{object} at {x}, {y}")
+            .replace("{object}", name)
+            .replace("{x}", &f.x.round().to_string())
+            .replace("{y}", &f.y.round().to_string())
     } else {
-        format!("{} {:.0} × {:.0}", object_name(kind), f.w.round(), f.h.round())
+        // A size is a noun and two numbers in every language ("Chart 120 × 60"), so only the
+        // noun comes from the catalog and no template without a word is catalogued.
+        format!("{name} {:.0} × {:.0}", f.w.round(), f.h.round())
     }
 }
 
+/// The object kind as the interface names it: the catalog's English key, translated by the caller.
 fn object_name(kind: &str) -> &'static str {
     match kind {
         "chart" => "Chart",
@@ -2979,7 +2991,7 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                     }
                     d.steps = d.steps.saturating_add(1);
                 }
-                app.toast = Some((object_toast(d.kind, &f, d.handle.is_none()), crate::now_ms()));
+                app.toast = Some((object_toast(d.kind, &f, d.handle.is_none(), app.ui.language), crate::now_ms()));
                 app.grid.drag = Drag::Object(d);
                 scroll_by(app, auto);
             }
@@ -3450,7 +3462,7 @@ fn nudge_selected_object(app: &mut SheetApp, sh: &Sheet, key: egui::Key, shift: 
     }
     let (command, params) = object_move_call(kind, id, cell, adx, ady, w, h);
     let _ = app.session.run(command, params);
-    app.toast = Some((object_toast(kind, &f, !shift), crate::now_ms()));
+    app.toast = Some((object_toast(kind, &f, !shift, app.ui.language), crate::now_ms()));
     true
 }
 
@@ -4334,7 +4346,9 @@ pub(crate) fn paint_overlays(
     if let Some(h) = hover.and_then(|c| sh.hyperlinks.get(&c))
         && app.editor.is_none()
     {
-        let tip = h.tooltip.clone().unwrap_or_else(|| format!("{}\nClick once to follow. Click and hold to select this cell.", h.target));
+        let tip = h.tooltip.clone().unwrap_or_else(|| {
+            crate::widgets::tr(ui, "{target}\nClick once to follow. Click and hold to select this cell.").replace("{target}", &h.target)
+        });
         egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::new("link_tip"), egui::PopupAnchor::Pointer).show(|ui| {
             ui.label(tip);
         });
@@ -4577,7 +4591,7 @@ fn paint_pages(app: &mut SheetApp, p: &Painter, geo: &Geo, sh: &Sheet) {
         p.text(
             rr.center(),
             Align2::CENTER_CENTER,
-            format!("Page {n}"),
+            app.ui.language.tr("Page {n}").replace("{n}", &n.to_string()),
             theme::ui_bold((rr.height().min(rr.width()) / 6.0).clamp(14.0, 72.0)),
             Color32::from_black_alpha(45),
         );
@@ -5242,5 +5256,78 @@ mod selected_object_tests {
         assert_eq!(selected_object(&sh, Some(7)).map(|(_, _, a)| a), Some(anchor()));
         assert_eq!(selected_object(&sh, Some(99)), None);
         assert_eq!(selected_object(&sh, None), None);
+    }
+}
+
+#[cfg(test)]
+mod toast_i18n_tests {
+    use super::{object_name, object_toast};
+    use crate::chartview::Frame;
+    use crate::i18n::Language;
+
+    /// The placeholders a template carries, in order: a translation keeps them all.
+    fn placeholders(text: &str) -> Vec<&str> {
+        text.split('{').skip(1).filter_map(|rest| rest.split_once('}').map(|(name, _)| name)).collect()
+    }
+
+    fn frame() -> Frame {
+        Frame { x: 10.0, y: 20.0, w: 120.0, h: 60.0 }
+    }
+
+    /// The object kind is the catalog's word: the same one the ribbon and the Format pane show, so
+    /// a chart is not "图表" in the ribbon and "Chart" under the pointer.
+    #[test]
+    fn every_object_kind_is_a_catalog_word() {
+        for (kind, english) in [
+            ("chart", "Chart"),
+            ("image", "Picture"),
+            ("slicer", "Slicer"),
+            ("pivotSlicer", "Slicer"),
+            ("timeline", "Timeline"),
+            ("shape", "Shape"),
+            ("not a kind any sheet holds", "Shape"),
+        ] {
+            assert_eq!(object_name(kind), english, "{kind:?}");
+            assert_ne!(Language::Zh.tr(english), english, "{english:?} has no Simplified Chinese");
+        }
+    }
+
+    /// The drag toast reads Chinese in a Chinese build: the numbers survive and no English letter
+    /// is left around them, for a position and for a size.
+    #[test]
+    fn the_drag_toast_reads_chinese() {
+        assert_eq!(object_toast("chart", &frame(), true, Language::En), "Chart at 10, 20");
+        assert_eq!(object_toast("chart", &frame(), true, Language::Zh), "图表 位于 10, 20");
+        assert_eq!(object_toast("chart", &frame(), false, Language::En), "Chart 120 × 60");
+        assert_eq!(object_toast("chart", &frame(), false, Language::Zh), "图表 120 × 60");
+        assert_eq!(object_toast("timeline", &frame(), false, Language::Zh), "日程表 120 × 60");
+        for moving in [true, false] {
+            for kind in ["chart", "image", "slicer", "pivotSlicer", "timeline", "shape"] {
+                let zh = object_toast(kind, &frame(), moving, Language::Zh);
+                assert!(!zh.is_empty(), "{kind:?} toasts nothing");
+                assert!(!zh.chars().any(|c| c.is_ascii_alphabetic()), "{kind:?} ({moving}) still reads English: {zh:?}");
+            }
+        }
+    }
+
+    /// The templates this wave landed keep their placeholders in Chinese, so what fills them still
+    /// lands in its slot (a lost placeholder shows a sentence with a hole in it).
+    #[test]
+    fn the_new_templates_keep_their_placeholders_in_chinese() {
+        for template in [
+            "{object} at {x}, {y}",
+            "Page {n}",
+            "{target}\nClick once to follow. Click and hold to select this cell.",
+            "{count} items in this file were handled differently. First: {first}",
+            "{:.2} cm",
+            "{:.2} in",
+            "Worksheet {name}{hidden}, active cell {cell}{value}, {cells} cells selected",
+            "Chart sheet {name}{hidden}, {charts} charts",
+        ] {
+            let zh = Language::Zh.tr(template);
+            assert_ne!(zh, template, "{template:?} has no Simplified Chinese");
+            assert_eq!(placeholders(zh), placeholders(template), "{template:?} => {zh:?}");
+            assert_eq!(Language::En.tr(template), template, "{template:?} stays English");
+        }
     }
 }

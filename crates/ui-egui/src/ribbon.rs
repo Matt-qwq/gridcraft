@@ -614,7 +614,8 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
     let st = active_style(app);
     // Clipboard
     let paste = big_button(ui, Icon::Paste, "Paste", "Paste", true);
-    paste.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Paste"));
+    let paste_label = tr(ui, "Paste");
+    paste.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), paste_label));
     for sequence in
         keytip_table::group_extension(app.keytips.prefix().unwrap_or_default(), &["edit.paste", "edit.pasteSpecial", "dialog:pasteSpecial"])
     {
@@ -742,7 +743,8 @@ fn home(app: &mut SheetApp, ui: &mut Ui) {
             if b {
                 act(app, "home.borders", json!({"preset": app.grid.last_border.clone()}));
             }
-            ba.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Border presets"));
+            let presets_label = tr(ui, "Border presets");
+            ba.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), presets_label));
             egui::Popup::menu(&ba).show(|ui| {
                 for (label, preset) in [
                     ("Bottom Border", "bottom"),
@@ -1242,7 +1244,8 @@ fn size_combo(app: &mut SheetApp, ui: &mut Ui, st: &Style) {
     let looks = if resp.has_focus() || ui.rect_contains_pointer(frame) { &visuals.widgets.hovered } else { &visuals.widgets.inactive };
     let stroke = if resp.has_focus() { visuals.selection.stroke } else { looks.bg_stroke };
     ui.painter().set(bg, egui::epaint::RectShape::new(frame, looks.corner_radius, looks.weak_bg_fill, stroke, egui::StrokeKind::Inside));
-    arrow.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Font Size"));
+    let size_label = tr(ui, "Font Size");
+    arrow.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), size_label));
     let sizes = [8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 36.0, 48.0, 72.0];
     let labels: Vec<String> = sizes.iter().map(|s| format!("{}", *s as i32)).collect();
     let items: Vec<(&str, String)> = labels.iter().map(|s| (s.as_str(), s.clone())).collect();
@@ -1522,7 +1525,8 @@ fn insert(app: &mut SheetApp, ui: &mut Ui) {
     sep(ui);
     let pic = big_button(ui, Icon::Picture, "Pictures", "Insert a picture", true);
     anchor_keytip(app, ui, &pic, &["insert.picture"]);
-    pic.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Pictures"));
+    let pictures_label = tr(ui, "Pictures");
+    pic.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), pictures_label));
     egui::Popup::menu(&pic).show(|ui| {
         for (label, placement) in [("Place in Cell", "cell"), ("Place over Cells", "overCells")] {
             if ui.button(tr(ui, label)).clicked() {

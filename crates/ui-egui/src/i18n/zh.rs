@@ -1619,6 +1619,31 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Vertical anchor" => "垂直对齐",
         "What this means" => "了解详情",
 
+        // Labels and sentences the interface builds at run time: a drag toast, the grid's
+        // screen-reader description, a ruler measurement, a print-preview page number. The
+        // placeholders are part of the key, so the words around them translate while the number,
+        // the address and the sheet name stay as the document has them. A template that holds no
+        // word at all (an object's size, "120 × 60") is not a key: there is nothing to translate.
+        "(not shown)" => "（未显示）",
+        "{count} items in this file were handled differently. First: {first}" => "共 {count} 项内容在此文件中的处理方式不同。第一项：{first}",
+        "{object} at {x}, {y}" => "{object} 位于 {x}, {y}",
+        "{rows}R x {cols}C" => "{rows} 行 x {cols} 列",
+        "{:.2} cm" => "{:.2} 厘米",
+        "{:.2} in" => "{:.2} 英寸",
+        "Page {n}" => "第 {n} 页",
+        "{target}\nClick once to follow. Click and hold to select this cell." => "{target}\n单击可跳转。按住可选择此单元格。",
+        "Chart sheet {name}{hidden}, {charts} chart" => "图表工作表 {name}{hidden}，共 {charts} 个图表",
+        "Chart sheet {name}{hidden}, {charts} charts" => "图表工作表 {name}{hidden}，共 {charts} 个图表",
+        "Worksheet {name}{hidden}, active cell {cell}{value}, {cells} cell selected" => {
+            "工作表 {name}{hidden}，活动单元格 {cell}{value}，已选择 {cells} 个单元格"
+        }
+        "Worksheet {name}{hidden}, active cell {cell}{value}, {cells} cells selected" => {
+            "工作表 {name}{hidden}，活动单元格 {cell}{value}，已选择 {cells} 个单元格"
+        }
+        "Border presets" => "边框预设",
+        "Border preview" => "边框预览",
+        "Shape" => "形状",
+
         // Command labels the menus, the ribbon and the tooltips take from the registry
         // (`crates/engine/src/cmd`). The English label is the key, so these spell the label
         // exactly as the `cmd!` line does; "Most Recently Used" is the Insert Function
